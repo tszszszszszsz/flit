@@ -100,6 +100,7 @@ stay on those dates.
 | 2027-01-05 | Integration | CLI fold and rekey parity, relay pairing read, tests |
 | 2027-01-06 | Docs | Final rig inventory and completion note |
 | 2027-01-07 | Device | Install and launch smoke on one physical device |
+| 2027-01-08 | Device | Partial feature walk with one phone and one CLI peer |
 
 ## Rules for a day
 
