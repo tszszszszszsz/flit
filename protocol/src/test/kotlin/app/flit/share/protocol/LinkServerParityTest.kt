@@ -136,7 +136,7 @@ class LinkServerParityTest {
             while (isActive) {
                 val p = inbox.receive()
                 launch(Dispatchers.IO) {
-                    val raw = p.serverLink("192.0.2.77")
+                    val raw = p.serverLink("127.0.0.1")
                     try {
                         server.serve(if (tls) TlsLink(raw, identity, clientMode = false) else raw)
                     } catch (ce: kotlinx.coroutines.CancellationException) {
@@ -160,7 +160,7 @@ class LinkServerParityTest {
         // 2. register POST — delegate.learning works over the label
         val sender = PeerInfo(
             alias = "parity-sender", version = "2.2",
-            fingerprint = "SENDER_FP_0000000000000000000000000000000000000",
+            fingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         )
         val reg = cli.exchange(
             "POST", "127.0.0.1", 53317, tls, Protocol.PATH_REGISTER,
@@ -171,7 +171,7 @@ class LinkServerParityTest {
         )
         assertEquals(200, reg.status, "register tls=$tls answered ${reg.status}: ${reg.text().take(200)}")
         assertTrue(
-            delim.events.snapshot().any { it == "register:parity-sender@192.0.2.77" },
+            delim.events.snapshot().any { it == "register:parity-sender@127.0.0.1" },
             "register event missing: ${delim.events.snapshot().takeLast(8)}",
         )
 
@@ -320,7 +320,7 @@ class LinkServerParityTest {
                 val p = inbox.receive()
                 val s = serverRef.get()
                 launch(Dispatchers.IO) {
-                    val raw = p.serverLink("192.0.2.77")
+                    val raw = p.serverLink("127.0.0.1")
                     try {
                         s.serve(TlsLink(raw, identity, clientMode = false))
                     } catch (ce: kotlinx.coroutines.CancellationException) {
@@ -334,7 +334,7 @@ class LinkServerParityTest {
         val cli = PeerHttpClient(identity, links = SimLinkProvider(identity, tls, inbox))
         val sender = PeerInfo(
             alias = "death-sender", version = "2.2",
-            fingerprint = "SENDER_FP_0000000000000000000000000000000000000",
+            fingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         )
 
         // 1. live core takes half a body and loses its process to the abort.
@@ -502,7 +502,7 @@ class LinkServerParityTest {
                 val p = inbox.receive()
                 val s = serverRef.get() ?: continue
                 launch(Dispatchers.IO) {
-                    val raw = p.serverLink("192.0.2.77")
+                    val raw = p.serverLink("127.0.0.1")
                     try {
                         s.serve(TlsLink(raw, identity, clientMode = false))
                     } catch (t: Throwable) {

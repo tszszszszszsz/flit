@@ -58,6 +58,22 @@ object Protocol {
     const val HEADER_CIRCLE_CERT: String = "X-Flit-Circle-Cert"
 
     /**
+     * Base64 DER of the prepare sender's self-signed cert. The receiver
+     * computes the SHA-256 of the DER itself; a fingerprint written in the
+     * request body is caller-declared and is never trusted on its own while
+     * the certificate gate is on.
+     */
+    const val HEADER_PREPARE_CERT: String = "X-Flit-Prepare-Cert"
+
+    /**
+     * Base64 signature over the exact UTF-8 bytes of the prepare-upload body,
+     * made with the private key of [HEADER_PREPARE_CERT]. A certificate alone
+     * is public to every peer that completed a handshake and is replayable,
+     * so the route verifies this signature before it trusts the digest.
+     */
+    const val HEADER_PREPARE_SIG: String = "X-Flit-Prepare-Sig"
+
+    /**
      * Flit-only marker on a prepare-upload request. A v2.2 sender never sends
      * it, so the receiver can add Flit response semantics without changing a
      * byte of the v2.2 answer.

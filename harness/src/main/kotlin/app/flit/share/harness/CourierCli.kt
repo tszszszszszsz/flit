@@ -15,6 +15,7 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
@@ -399,6 +400,22 @@ object CourierCli {
                 println("${ts()}   ${id.take(8)} holding for ${parcel.toFp.take(12)}")
                 continue
             }
+            // Only a parcel this identity would open needs its outer signed
+            // PARCEL event checked. Its body carries toFp, the envelope and
+            // the derived expiry, so before opening it must name this circle,
+            // be authored by a current member and carry a valid signature.
+            // A forged outer event is a carrier instruction to refuse, not a
+            // parcel to decrypt: quarantine the file and conclude the row.
+            val outer = parcel.event
+            val outerOk = outer.circleId == st.circleId &&
+                norm(outer.authorFp) in members &&
+                CircleCore.verify(outer)
+            if (!outerOk) {
+                stageRefusal(rows, row, id, nowMs)
+                quarantine.add(f)
+                refused = true
+                continue
+            }
             val envB64 = runCatching {
                 (WireJson.json.parseToJsonElement(parcel.event.body) as? JsonObject)?.get("envelope")
             }.getOrNull() as? JsonPrimitive
@@ -446,19 +463,27 @@ object CourierCli {
                     bodyReadable(event.body) &&
                     CircleCore.verify(event)
             }
-            if (allowed.isEmpty()) {
-                println("${ts()}   ${id.take(8)} no allowed event(s), kept ${row.state}")
+            // Reserve a replay id only AFTER the signature checks above:
+            // accept() records the id even for a forgery, so the production
+            // order stays verify → dedup → accept, matching FlitCircleSync.fresh.
+            // Only the inner events from this parcel are gated here; events
+            // already in circle.state were admitted on an earlier receive and
+            // must not be dropped by a window decision on today's clock.
+            val freshAllowed = CircleCore.dedup(CircleCore.order(allowed))
+                .filter { CircleCore.accept(it, nowMs) == CircleCore.Decision.Accept }
+            if (freshAllowed.isEmpty()) {
+                println("${ts()}   ${id.take(8)} no fresh allowed event(s), kept ${row.state}")
                 continue
             }
-            val refusedCount = opened.size - allowed.size
+            val refusedCount = opened.size - freshAllowed.size
             if (refusedCount > 0) {
                 println("${ts()}   ${id.take(8)} refused $refusedCount event(s) outside the local fold gates")
             }
             foldedEvents.clear()
-            foldedEvents.addAll(CircleCore.order(CircleCore.dedup(foldedEvents + allowed)))
+            foldedEvents.addAll(CircleCore.order(CircleCore.dedup(foldedEvents + freshAllowed)))
             folded = true
             archive.add(f)
-            deliveredLogs.add(id.take(8) to allowed.size)
+            deliveredLogs.add(id.take(8) to freshAllowed.size)
             val idx = rows.indexOfFirst { it.id == row.id }
             if (idx >= 0) rows[idx] = row.copy(state = nextState(row, Kind.RECEIVE_OK, nowMs))
         }
@@ -601,6 +626,10 @@ object CourierCli {
         return runCatching {
             Files.createDirectories(f.parent)
             Files.write(tmp, encodeRows(rows).toByteArray(Charsets.UTF_8))
+            // Set 0600 on the temp file so the atomically moved ledger is
+            // never briefly readable by another local user. Unsupported
+            // filesystems keep the prior behaviour, as in Harness.kt.
+            runCatching { Files.setPosixFilePermissions(tmp, PosixFilePermissions.fromString("rw-------")) }
             try {
                 Files.move(tmp, f, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
             } catch (e: AtomicMoveNotSupportedException) {
@@ -623,7 +652,7 @@ object CourierCli {
         } else emptyList()
 
     /** The CLI's Circle view, loaded with the same seven-line shape as Harness.kt. */
-    private fun loadCliCircleState(): CircleCliState? {
+    internal fun loadCliCircleState(): CircleCliState? {
         val f = harnessHome().resolve(CIRCLE_STATE_FILE)
         if (!Files.exists(f)) return null
         val lines = runCatching { Files.readAllLines(f) }.getOrNull() ?: return null
@@ -635,7 +664,13 @@ object CourierCli {
                 key = lines[2],
                 host = lines[3],
                 members = lines[4].split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList(),
-                events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5]).toMutableList(),
+                // The state file is trusted storage, not trustworthy content:
+                // drop any event that does not verify against its own author
+                // before it can seed lamport/cert lookups in drop or enter the
+                // fold in receive. Mirrors Harness.loadCircleState.
+                events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5])
+                    .filter { CircleCore.verify(it) }
+                    .toMutableList(),
                 rekeyGen = lines[6].toIntOrNull() ?: 0,
                 // Same optional eighth line as Harness.loadCircleState; legacy
                 // seven-line files still load with no pin.

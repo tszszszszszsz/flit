@@ -56,11 +56,11 @@ class ProtocolServerDoorTest {
         val cli = ProtocolClient(identity, links = SimLinkProvider(identity, tls = false, inbox))
         try {
             val serveJob = launch(Dispatchers.IO) {
-                server.serve(inbox.receive().serverLink("192.0.2.31"))
+                server.serve(inbox.receive().serverLink("127.0.0.1"))
             }
             val self = PeerInfo(
                 alias = "door-walker", version = Protocol.VERSION,
-                deviceType = "headless", fingerprint = "DOOR_TEST_FP_0000000000000000000000000000000000",
+                deviceType = "headless", fingerprint = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
                 port = 53317, protocol = "https",
             )
             val answered = cli.register(SendTarget("127.0.0.1", 53317, tls = false), self, timeoutMs = 10_000)
@@ -74,7 +74,7 @@ class ProtocolServerDoorTest {
             assertNotNull(seen, "the delegate never saw the register")
             assertEquals("door-walker", seen.first.alias)
             assertEquals(self.fingerprint, seen.first.fingerprint)
-            assertEquals("192.0.2.31", seen.second)
+            assertEquals("127.0.0.1", seen.second)
         } finally {
             cli.close()
         }

@@ -286,7 +286,10 @@ class PadCanonicalTest {
             routeFields,
         )
         assertEquals(
-            setOf("HEADER_PANIC_CERT", "HEADER_CIRCLE_CERT", "HEADER_FLIT_CLIENT", "HEADER_FLIT_REFUSAL"),
+            setOf(
+                "HEADER_PANIC_CERT", "HEADER_CIRCLE_CERT", "HEADER_PREPARE_CERT",
+                "HEADER_PREPARE_SIG", "HEADER_FLIT_CLIENT", "HEADER_FLIT_REFUSAL",
+            ),
             Protocol::class.java.declaredFields.map { it.name }.filter { it.startsWith("HEADER_") }.toSet(),
         )
         assertEquals("2.2", Protocol.VERSION)

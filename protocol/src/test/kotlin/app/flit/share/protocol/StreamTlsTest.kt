@@ -206,6 +206,28 @@ class StreamTlsTest {
         server.finish()
     }
 
+    @Test
+    fun `handshake exposes the peer certificate for pinning`() {
+        val identity = TlsIdentity.generate()
+        val p = PipePair()
+        val server = ServerTlsJob { tls ->
+            assertEquals(-1, tls.input.read())
+            tls.close()
+        }.start(p, identity)
+
+        val client = StreamTls.startClient(p.aIn, p.aOut, identity)
+        server.awaitHandshake()
+
+        // Available right after the handshake: the caller can compare this
+        // digest with a declared pin before any plaintext byte is written.
+        val peer = client.peerCertificate()
+        assertTrue(peer != null, "mutual TLS handshake must present a peer certificate")
+        assertEquals(identity.fingerprint, TlsIdentity.fingerprintOf(peer!!))
+
+        client.close()
+        server.finish()
+    }
+
     companion object {
         private const val PIPE = 512 * 1024
     }

@@ -8,13 +8,14 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * Pure JVM pins for [CircleAuthority.foldable]. Every event here is a plain
- * data-class value: no signing, certificate pinning, socket, store, Android
- * class or clock is involved, and the gate keeps no state between calls.
+ * Pure JVM pins for [CircleAuthority.foldable] and [CircleAuthority.authorityOf].
+ * Every event here is a plain data-class value: no signing, certificate
+ * pinning, socket, store, Android class or clock is involved, and the gate
+ * keeps no state between calls.
  *
- * Coverage: the full truth table (JOIN, REKEY, ordinary verbs, circle match),
- * fingerprint and role normalisation, empty roles, and totality on hostile
- * field values that carry no authority meaning.
+ * Coverage: the full truth table (JOIN, REKEY, ROLE, KICK, ordinary verbs,
+ * circle match), fingerprint and role normalisation, empty roles, and totality
+ * on hostile field values that carry no authority meaning.
  */
 class CircleAuthorityTest {
     private fun event(
@@ -50,7 +51,7 @@ class CircleAuthorityTest {
 
     @Test
     fun everyOrdinaryVerbFoldsInsideItsCircle() {
-        assertEquals(10, ORDINARY.size)
+        assertEquals(8, ORDINARY.size)
         ORDINARY.forEach { type ->
             assertTrue(
                 CircleAuthority.foldable(event(type), CIRCLE, emptyMap()),
@@ -136,14 +137,83 @@ class CircleAuthorityTest {
     }
 
     @Test
-    fun governanceVerbsOtherThanRekeyStayOrdinary() {
-        listOf(CircleEvent.ROLE, CircleEvent.KICK, CircleEvent.LEAVE).forEach { type ->
-            assertTrue(
+    fun leaveStaysOrdinaryWhileRoleAndKickNeedAuthority() {
+        assertTrue(CircleAuthority.foldable(event(CircleEvent.LEAVE), CIRCLE, emptyMap()))
+        listOf(CircleEvent.ROLE, CircleEvent.KICK, CircleEvent.REKEY).forEach { type ->
+            assertFalse(
                 CircleAuthority.foldable(event(type), CIRCLE, emptyMap()),
-                "$type is not a key change",
+                "$type changes the roster or key and cannot fold without roles",
             )
         }
-        assertFalse(CircleAuthority.foldable(event(CircleEvent.REKEY), CIRCLE, emptyMap()))
+    }
+
+    @Test
+    fun `role folds only from the owner on the supplied roles snapshot`() {
+        val role = event(CircleEvent.ROLE, body = """{"targetFp":"$BOB","role":"ADMIN"}""")
+        assertTrue(CircleAuthority.foldable(role, CIRCLE, roles(ALICE to "OWNER")))
+        assertTrue(CircleAuthority.foldable(role, CIRCLE, roles(ALICE to " owner ")))
+        assertFalse(CircleAuthority.foldable(role, CIRCLE, roles(ALICE to "ADMIN")))
+        assertFalse(CircleAuthority.foldable(role, CIRCLE, roles(ALICE to "MEMBER")))
+        assertFalse(CircleAuthority.foldable(role, CIRCLE, roles(BOB to "OWNER")))
+        assertFalse(CircleAuthority.foldable(role, CIRCLE, emptyMap()))
+        assertEquals(CircleAuthority.Authority.OWNER, CircleAuthority.authorityOf(role))
+    }
+
+    @Test
+    fun `admin mode kick folds only from an officer and vote kick folds from a member`() {
+        val adminKick = event(CircleEvent.KICK, body = """{"targetFp":"$BOB","mode":"admin"}""")
+        assertTrue(CircleAuthority.foldable(adminKick, CIRCLE, roles(ALICE to "OWNER")))
+        assertTrue(CircleAuthority.foldable(adminKick, CIRCLE, roles(ALICE to "ADMIN")))
+        assertFalse(CircleAuthority.foldable(adminKick, CIRCLE, roles(ALICE to "MEMBER")))
+        assertFalse(CircleAuthority.foldable(adminKick, CIRCLE, emptyMap()))
+        assertEquals(CircleAuthority.Authority.OFFICER, CircleAuthority.authorityOf(adminKick))
+
+        val voteKick = event(CircleEvent.KICK, body = """{"targetFp":"$BOB","mode":"vote"}""")
+        assertTrue(CircleAuthority.foldable(voteKick, CIRCLE, roles(ALICE to "MEMBER")))
+        assertTrue(CircleAuthority.foldable(voteKick, CIRCLE, roles(ALICE to "ADMIN")))
+        assertFalse(CircleAuthority.foldable(voteKick, CIRCLE, emptyMap()))
+        assertEquals(CircleAuthority.Authority.MEMBER, CircleAuthority.authorityOf(voteKick))
+
+        // A mode-less CLI kick is still an ordinary member vote-kick.
+        val modeLess = event(CircleEvent.KICK, body = """{"targetFp":"$BOB"}""")
+        assertTrue(CircleAuthority.foldable(modeLess, CIRCLE, roles(ALICE to "MEMBER")))
+        assertEquals(CircleAuthority.Authority.MEMBER, CircleAuthority.authorityOf(modeLess))
+    }
+
+    @Test
+    fun `privileged verbs are refused when no roles are supplied`() {
+        assertEquals(
+            setOf(CircleEvent.JOIN, CircleEvent.ROLE, CircleEvent.KICK, CircleEvent.REKEY),
+            CircleAuthority.PRIVILEGED,
+        )
+        CircleAuthority.PRIVILEGED.forEach { type ->
+            assertFalse(
+                CircleAuthority.foldable(event(type), CIRCLE, emptyMap()),
+                "$type must not fold without a roster",
+            )
+        }
+        assertFalse(CircleAuthority.foldable(event(CircleEvent.JOIN), CIRCLE, roles(ALICE to "OWNER")))
+        assertTrue(CircleAuthority.foldable(event(CircleEvent.MESSAGE), CIRCLE, emptyMap()))
+    }
+
+    @Test
+    fun `authorityOf classifies kick by mode and leaves other verbs unchanged`() {
+        assertEquals(
+            CircleAuthority.Authority.OFFICER,
+            CircleAuthority.authorityOf(event(CircleEvent.KICK, body = """{"mode":" ADMIN "}""")),
+        )
+        assertEquals(
+            CircleAuthority.Authority.MEMBER,
+            CircleAuthority.authorityOf(event(CircleEvent.KICK, body = """{"mode":"vote"}""")),
+        )
+        assertEquals(
+            CircleAuthority.Authority.MEMBER,
+            CircleAuthority.authorityOf(event(CircleEvent.KICK, body = "not json")),
+        )
+        assertEquals(CircleAuthority.Authority.NONE, CircleAuthority.authorityOf(event(CircleEvent.MESSAGE)))
+        assertEquals(CircleAuthority.Authority.NONE, CircleAuthority.authorityOf(event(CircleEvent.JOIN)))
+        assertEquals(CircleAuthority.Authority.OWNER, CircleAuthority.authorityOf(event(CircleEvent.ROLE)))
+        assertEquals(CircleAuthority.Authority.OFFICER, CircleAuthority.authorityOf(event(CircleEvent.REKEY)))
     }
 
     @Test
@@ -210,6 +280,7 @@ class CircleAuthorityTest {
         const val OTHER_CIRCLE = "circle-2"
         const val ALICE = "AABBCC"
         const val BOB = "DDEEFF"
-        val ORDINARY: Set<String> = CircleEvent.TYPES - setOf(CircleEvent.JOIN, CircleEvent.REKEY)
+        val ORDINARY: Set<String> = CircleEvent.TYPES -
+            setOf(CircleEvent.JOIN, CircleEvent.REKEY, CircleEvent.ROLE, CircleEvent.KICK)
     }
 }

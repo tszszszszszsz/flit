@@ -245,4 +245,165 @@ class PanicTest {
             client.close()
         }
     }
+
+    // ---- origin binding ---------------------------------------------------
+
+    @Test
+    fun `hop zero carries the origin's own signature and certificate`() {
+        val origin = TlsIdentity.generate()
+        val alert = PanicCore.create(origin.fingerprint, "need help", origin)
+
+        assertEquals(alert.sig, alert.originSig, "origin did not sign its own canonical")
+        assertEquals(
+            Base64.getEncoder().encodeToString(origin.certificate.encoded),
+            alert.originCert,
+        )
+        assertTrue(PanicCore.verify(alert))
+        assertTrue(PanicCore.verifyOrigin(alert))
+    }
+
+    @Test
+    fun `attacker-signed alert claiming a victim origin is refused by verifyOrigin`() {
+        val victim = TlsIdentity.generate()
+        val attacker = TlsIdentity.generate()
+        TlsIdentity.pin(attacker.certificate)
+        val honest = PanicCore.create(victim.fingerprint, "from the victim", victim)
+        assertTrue(PanicCore.verifyOrigin(honest))
+
+        // The sender signature is the attacker's own, so PanicCore.verify
+        // still passes; only the origin claim is forged.
+        val claimed = honest.copy(
+            senderFp = attacker.fingerprint,
+            originFp = victim.fingerprint,
+        )
+        val attackerCert = Base64.getEncoder().encodeToString(attacker.certificate.encoded)
+        val wrongCert = claimed.copy(
+            sig = attacker.signPanic(PanicCore.canonical(claimed)),
+            originSig = attacker.signPanic(PanicCore.canonical(claimed)),
+            originCert = attackerCert,
+        )
+        assertTrue(PanicCore.verify(wrongCert), "attacker's own sender signature should verify")
+        assertFalse(PanicCore.verifyOrigin(wrongCert), "foreign cert accepted as the victim's")
+
+        // Right certificate, but the origin signature was made by the attacker.
+        val wrongSig = wrongCert.copy(
+            originCert = Base64.getEncoder().encodeToString(victim.certificate.encoded),
+        )
+        assertFalse(PanicCore.verifyOrigin(wrongSig), "attacker's origin signature accepted")
+
+        // A genuine origin signature cannot be reused for edited bytes.
+        assertFalse(PanicCore.verifyOrigin(honest.copy(text = "a different note")))
+        assertFalse(PanicCore.verifyOrigin(honest.copy(originSig = "not base64 !!")))
+        assertFalse(PanicCore.verifyOrigin(honest.copy(originCert = "not base64 !!")))
+    }
+
+    @Test
+    fun `forward preserves the origin signature and id, and both still verify`() {
+        val origin = TlsIdentity.generate()
+        val relay = TlsIdentity.generate()
+        val alert = PanicCore.create(origin.fingerprint, "relay this", origin)
+        val next = PanicCore.forward(alert, relay.fingerprint, relay)
+        assertNotNull(next)
+
+        assertEquals(alert.originSig, next.originSig)
+        assertEquals(alert.originCert, next.originCert)
+        assertEquals(alert.id, next.id)
+        assertEquals(origin.fingerprint, next.originFp)
+        assertEquals(relay.fingerprint, next.senderFp)
+        assertTrue(PanicCore.verify(next), "relay's re-signed hop did not verify")
+        assertTrue(PanicCore.verifyOrigin(next), "origin signature lost across the forward")
+
+        // Dedup still keys on the unchanged id, not on the relay's signature.
+        val now = System.currentTimeMillis()
+        assertEquals(PanicCore.Decision.Accept, PanicCore.accept(next, now))
+        assertEquals(PanicCore.Decision.Duplicate, PanicCore.accept(alert, now))
+    }
+
+    @Test
+    fun `hop reset with a foreign origin signature is refused`() {
+        val origin = TlsIdentity.generate()
+        val relay = TlsIdentity.generate()
+        val alert = PanicCore.create(origin.fingerprint, "relay this", origin)
+        val next = PanicCore.forward(alert, relay.fingerprint, relay)
+        assertNotNull(next)
+
+        // The relay claims itself as the origin and re-signs a canonical whose
+        // hop count is no longer zero. Accepting hops 1/2 let this pass; only
+        // the preserved hop-zero signature is an origin signature now.
+        val claimed = next.copy(
+            originFp = relay.fingerprint,
+            originCert = Base64.getEncoder().encodeToString(relay.certificate.encoded),
+            originSig = relay.signPanic(
+                PanicCore.canonical(
+                    next.id,
+                    relay.fingerprint,
+                    next.sentMs,
+                    next.text,
+                    next.hops,
+                    relay.fingerprint,
+                ),
+            ),
+        )
+        val forged = claimed.copy(sig = relay.signPanic(PanicCore.canonical(claimed)))
+
+        assertTrue(PanicCore.verify(forged), "sender signature should still verify")
+        assertFalse(PanicCore.verifyOrigin(forged), "non-hop-zero origin signature accepted")
+    }
+
+    @Test
+    fun `legacy blank origin falls back to the verified sender`() {
+        val identity = TlsIdentity.generate()
+        val relay = TlsIdentity.generate()
+        val legacy = PanicCore.create(identity.fingerprint, "legacy", identity).copy(
+            originFp = "",
+            originSig = "",
+            originCert = "",
+        )
+        val signed = legacy.copy(sig = identity.signPanic(PanicCore.canonical(legacy)))
+
+        assertTrue(PanicCore.verify(signed))
+        assertTrue(PanicCore.verifyOrigin(signed), "legacy alert should trust its verified sender")
+        assertFalse(PanicCore.verifyOrigin(signed.copy(sig = "bad sig")), "unverified sender accepted")
+
+        val next = PanicCore.forward(signed, relay.fingerprint, relay)
+        assertNotNull(next)
+        assertEquals(identity.fingerprint, next.originFp, "forward lost the sender fallback")
+    }
+
+    @Test
+    fun `oversized fields are refused by validShape, evaluate and verifyOrigin`() {
+        val identity = TlsIdentity.generate()
+        val alert = PanicCore.create(identity.fingerprint, "bounded", identity)
+        val now = System.currentTimeMillis()
+
+        assertTrue(PanicCore.validShape(alert))
+        assertEquals(
+            PanicCore.Decision.Invalid,
+            PanicCore.evaluate(alert.copy(text = "x".repeat(PanicCore.MAX_TEXT_CHARS + 1)), now),
+        )
+        assertEquals(
+            PanicCore.Decision.Invalid,
+            PanicCore.evaluate(alert.copy(id = "x".repeat(PanicCore.MAX_ID_CHARS + 1)), now),
+        )
+        assertEquals(
+            PanicCore.Decision.Invalid,
+            PanicCore.evaluate(alert.copy(senderFp = "x".repeat(PanicCore.MAX_FP_CHARS + 1)), now),
+        )
+        assertEquals(
+            PanicCore.Decision.Invalid,
+            PanicCore.evaluate(alert.copy(originFp = "x".repeat(PanicCore.MAX_FP_CHARS + 1)), now),
+        )
+        assertEquals(
+            PanicCore.Decision.Invalid,
+            PanicCore.evaluate(alert.copy(sig = "x".repeat(PanicCore.MAX_SIG_CHARS + 1)), now),
+        )
+        assertEquals(
+            PanicCore.Decision.Invalid,
+            PanicCore.evaluate(alert.copy(originSig = "x".repeat(PanicCore.MAX_SIG_CHARS + 1)), now),
+        )
+        val oversizedCert = alert.copy(originCert = "x".repeat(PanicCore.MAX_CERT_CHARS + 1))
+        assertFalse(PanicCore.validShape(oversizedCert))
+        assertEquals(PanicCore.Decision.Invalid, PanicCore.evaluate(oversizedCert, now))
+        assertFalse(PanicCore.verifyOrigin(oversizedCert))
+    }
 }

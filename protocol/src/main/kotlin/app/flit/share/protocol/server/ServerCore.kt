@@ -13,6 +13,7 @@ import app.flit.share.protocol.model.PrepareUploadResponse
 import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.panic.PanicCore
 import app.flit.share.protocol.tls.TlsIdentity
+import java.net.InetAddress
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
@@ -47,7 +48,28 @@ sealed interface UploadResult {
 /** Application-side hooks; the product decides, the server does wire details. */
 interface ServerDelegate {
     fun onRegister(info: PeerInfo, ip: String) {}
-    fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision
+
+    /**
+     * Two-argument form kept for every existing delegate. The route calls the
+     * three-argument form below, whose default implementation falls back here,
+     * so an older delegate still sees the prepare request unchanged.
+     */
+    fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision =
+        PrepareDecision.Decline
+
+    /**
+     * [presentedFp] is the SHA-256 DER digest of the certificate whose
+     * signature over the exact request body the route verified. It is null
+     * when the certificate gate is off. Possession of the key is all the
+     * route establishes; whether that identity is trusted is the delegate's
+     * decision, made against its own persisted lists.
+     */
+    fun onPrepare(
+        request: PrepareUploadRequest,
+        peerIp: String,
+        presentedFp: String?,
+    ): PrepareDecision = onPrepare(request, peerIp)
+
     fun onUploadStart(sessionId: String, fileId: String, file: FileInfo) {}
 
     /** Resumed an interrupted file: [prefixBytes] already sat on the receiver. */
@@ -92,6 +114,14 @@ data class ServerConfig(
     val deviceModel: String? = "Flit",
     val deviceType: String? = "headless",
     val downloadApiEnabled: Boolean = false,
+
+    /**
+     * When true, prepare-upload must carry a certificate and a signature over
+     * the exact body; the route verifies both before calling the delegate and
+     * hands it the bound digest instead of the caller-declared fingerprint.
+     * A supplier (read per request) lets the app flip the gate at runtime.
+     */
+    val requirePrepareCert: () -> Boolean = { false },
 
     /**
      * Keep incomplete uploads on disk and let a Flit sender resume them
@@ -201,6 +231,9 @@ internal class ActiveSession(
      */
     var turbo: Boolean = false
 
+    /** Chunk POSTs currently in flight; capped at [ServerCore.MAX_TURBO_STREAMS]. */
+    var chunkStreams: Int = 0
+
     var lastTouch: Long = System.currentTimeMillis()
 
     /** Dead senders must not block a reconnecting one's new prepare. */
@@ -286,19 +319,45 @@ class ServerCore(
 
     private suspend fun registerRoute(x: HttpExchange, decodeBody: Boolean) {
         if (decodeBody) {
-            val raw = x.readBodyText()
+            val raw = x.readBodyCapped(MAX_CONTROL_BODY_BYTES)
+            if (raw == null) {
+                x.respondText(413, MIME_TEXT, "Body too large")
+                return
+            }
             if (raw.isNotBlank()) {
-                runCatching { WireJson.decode<PeerInfo>(raw) }.getOrNull()?.let { peer ->
-                    if (peer.fingerprint.isNotBlank()) delegate.onRegister(peer, x.origin)
+                val peer = runCatching { WireJson.decode<PeerInfo>(raw) }.getOrNull()
+                if (peer != null) {
+                    // The announce gate lives in the app; a direct POST is a
+                    // second entry point and gets the same boundary checks
+                    // before the delegate learns anything.
+                    if (!validRegisterOffer(peer, x.origin)) {
+                        x.respondText(403, MIME_TEXT, "Rejected")
+                        return
+                    }
+                    delegate.onRegister(peer, x.origin)
                 }
             }
         }
         x.respondText(200, MIME_JSON, WireJson.encode(selfInfo().sansAnnounce()))
     }
 
+    /** Shape and carrier checks every register offer must pass before the delegate. */
+    private fun validRegisterOffer(peer: PeerInfo, origin: String): Boolean {
+        val fp = canonicalRegisterFingerprint(peer.fingerprint)
+        if (fp == null) return false
+        val alias = peer.alias.trim()
+        if (alias.isEmpty() || alias.length > MAX_REGISTER_ALIAS_CHARS) return false
+        if (alias.any { it.isISOControl() }) return false
+        return validRegisterOrigin(origin)
+    }
+
     private suspend fun prepareRoute(x: HttpExchange) {
         val peerIp = x.origin
-        val raw = x.readBodyText()
+        val raw = x.readBodyCapped(MAX_CONTROL_BODY_BYTES)
+        if (raw == null) {
+            x.respondText(413, MIME_TEXT, "Body too large")
+            return
+        }
         val req: PrepareUploadRequest? = if (raw.isBlank()) null else {
             runCatching { WireJson.decode<PrepareUploadRequest>(raw) }.getOrNull()
         }
@@ -307,20 +366,24 @@ class ServerCore(
             return
         }
 
-        val decision = delegate.onPrepare(req, peerIp)
-        if (decision is PrepareDecision.Decline) {
-            // A deliberate refusal is a concluded story, not a dead carrier.
-            // Only a Flit-marked sender gets the extra header, so a v2.2 peer
-            // still sees the unchanged `403 Rejected` answer and keeps
-            // treating it as its own business.
-            if (x.header(Protocol.HEADER_FLIT_CLIENT) == Protocol.FLIT_CLIENT_VALUE) {
-                x.respondText(
-                    403, MIME_TEXT, "Rejected",
-                    mapOf(Protocol.HEADER_FLIT_REFUSAL to Protocol.REFUSAL_DECLINED),
-                )
-            } else {
-                x.respondText(403, MIME_TEXT, "Rejected")
+        // The fingerprint in the body is caller-declared. With the gate on,
+        // the only identity the delegate may see is the digest of a certificate
+        // that signed THIS exact body. Anything else is refused here, before
+        // the delegate is called at all.
+        val boundFp = if (config.requirePrepareCert()) {
+            val verified = verifyPrepareBinding(x, raw, req)
+            if (verified == null) {
+                refusePrepare(x)
+                return
             }
+            verified
+        } else {
+            null
+        }
+
+        val decision = delegate.onPrepare(req, peerIp, boundFp)
+        if (decision is PrepareDecision.Decline) {
+            refusePrepare(x)
             return
         }
         val acceptIds = (decision as? PrepareDecision.Accept)?.ids ?: req.files.keys
@@ -365,7 +428,10 @@ class ServerCore(
                 session = candidate
             }
         }
-        if (badNames) x.respondStatus(204)
+        if (badNames) {
+            x.respondStatus(204)
+            return
+        }
 
         val tokens = candidate.files.entries.associate { it.key to it.value.token }
         // The chunk hint travels only when this session is a Flit↔Flit
@@ -378,6 +444,54 @@ class ServerCore(
         x.respondText(200, MIME_JSON, WireJson.encode(resp))
     }
 
+    /**
+     * Existing prepare refusal, shared by the binding gate and the delegate:
+     * 403 `Rejected`, with the Flit marker only for a Flit-marked sender so a
+     * v2.2 peer keeps seeing its unchanged answer.
+     */
+    private suspend fun refusePrepare(x: HttpExchange) {
+        if (x.header(Protocol.HEADER_FLIT_CLIENT) == Protocol.FLIT_CLIENT_VALUE) {
+            x.respondText(
+                403, MIME_TEXT, "Rejected",
+                mapOf(Protocol.HEADER_FLIT_REFUSAL to Protocol.REFUSAL_DECLINED),
+            )
+        } else {
+            x.respondText(403, MIME_TEXT, "Rejected")
+        }
+    }
+
+    /**
+     * Binds a prepare request to a key the sender actually holds. The header
+     * certificate supplies the public key and the digest; the signature over
+     * the raw body stops a peer from replaying a victim's public certificate
+     * under the victim's declared fingerprint. Returns the verified digest or
+     * null for absent, oversized, malformed, unsigned, wrongly signed or
+     * mismatched input. No pin store is written here: trust is the delegate's
+     * decision against its own persisted lists.
+     */
+    private fun verifyPrepareBinding(
+        x: HttpExchange,
+        raw: String,
+        req: PrepareUploadRequest,
+    ): String? {
+        val encodedCert = x.header(Protocol.HEADER_PREPARE_CERT)?.trim()
+            ?.takeIf { it.isNotBlank() && it.length <= MAX_PREPARE_CERT_CHARS }
+            ?: return null
+        val encodedSig = x.header(Protocol.HEADER_PREPARE_SIG)?.trim()
+            ?.takeIf { it.isNotBlank() && it.length <= MAX_PREPARE_SIG_CHARS }
+            ?: return null
+        val der = runCatching { Base64.getDecoder().decode(encodedCert) }.getOrNull() ?: return null
+        val cert = der?.let {
+            runCatching {
+                CertificateFactory.getInstance("X.509").generateCertificate(it.inputStream()) as? X509Certificate
+            }.getOrNull()
+        } ?: return null
+        if (!TlsIdentity.verifyWithCertificate(cert, raw.toByteArray(Charsets.UTF_8), encodedSig)) return null
+        val fp = TlsIdentity.fingerprintOf(cert)
+        if (fp != canonicalFingerprint(req.info.fingerprint)) return null
+        return fp
+    }
+
     /** Outcome of the upload-route claim, including the two honest refusals. */
     private sealed class ClaimResult {
         class Ok(
@@ -388,6 +502,7 @@ class ServerCore(
         ) : ClaimResult()
         object Refused : ClaimResult()
         object ResumeMismatch : ClaimResult()
+        object TooManyStreams : ClaimResult()
     }
 
     private suspend fun uploadRoute(x: HttpExchange) {
@@ -413,6 +528,7 @@ class ServerCore(
                     // healthy 4-stream upload must never be miscounted as
                     // three failed single-stream tries.
                     if (!s!!.turbo) ClaimResult.Refused
+                    else if (s.chunkStreams >= MAX_TURBO_STREAMS) ClaimResult.TooManyStreams
                     else {
                         s.lastTouch = System.currentTimeMillis()
                         val fresh = f.tracker == null
@@ -440,6 +556,7 @@ class ServerCore(
                                 if (base > 0) it.add(0, base)
                             }
                         }
+                        s.chunkStreams++
                         ClaimResult.Ok(f, fresh, seededBase)
                     }
                 }
@@ -470,13 +587,26 @@ class ServerCore(
                 x.respondText(409, MIME_TEXT, "Resume base changed — start over")
                 return
             }
+            ClaimResult.TooManyStreams -> {
+                x.respondText(409, MIME_TEXT, "Too many chunk streams")
+                return
+            }
         }
         val pf = accepted.pf
         if (range != null) {
-            uploadChunkRoute(
-                x, sessionId, fileId, pf, range, peerIp,
-                accepted.freshChunks, accepted.resumedBase,
-            )
+            try {
+                uploadChunkRoute(
+                    x, sessionId, fileId, pf, range, peerIp,
+                    accepted.freshChunks, accepted.resumedBase,
+                )
+            } finally {
+                // One claim is one in-flight stream. Release it on every exit,
+                // including a carrier dying mid-chunk.
+                mutex.withLock {
+                    val s = session
+                    if (s != null && s.id == sessionId && s.chunkStreams > 0) s.chunkStreams--
+                }
+            }
             return
         }
 
@@ -502,6 +632,7 @@ class ServerCore(
         var bytes: Long = 0
         var ok = false
         var resumed = false
+        var oversized = false
         if (resume != null) {
             val usable = if (resume.from == pf.temp) true else runCatching {
                 Files.createDirectories(pf.temp.parent)
@@ -578,6 +709,13 @@ class ServerCore(
                 while (true) {
                     val n = x.readBody(buf, 0, buf.size)
                     if (n <= 0) break
+                    if (bytes + n > pf.file.size) {
+                        // No byte past the declared size may reach disk. A body
+                        // that long cannot be a prefix of this file, so there
+                        // is nothing worth keeping for a resume.
+                        oversized = true
+                        break
+                    }
                     md.update(buf, 0, n)
                     out.write(buf, 0, n)
                     bytes += n
@@ -593,7 +731,7 @@ class ServerCore(
 
             val digestHex = md.digest().joinToString("") { "%02x".format(it) }
             val declared = pf.file.sha256?.trim()
-            ok = declared.isNullOrEmpty() || digestHex.equals(declared, ignoreCase = true)
+            ok = !oversized && (declared.isNullOrEmpty() || digestHex.equals(declared, ignoreCase = true))
 
             if (ok) {
                 if (sink == null) {
@@ -605,18 +743,18 @@ class ServerCore(
                 }
                 if (resumed) resumeToken?.let { parts.remove(it) }
             } else if (sink == null) {
-                if (bytes < pf.file.size) {
+                if (!oversized && bytes < pf.file.size) {
                     // A short body is a genuine prefix: the sender died (or
                     // was cut) before shipping the rest, and sequential
                     // writes mean every byte up to `bytes` is real. Keep it
                     // for the next resume; the final sha still gates.
                     keepPart(resumeToken ?: Protocol.resumeToken(pf.file), pf.temp, peerIp)
                 } else {
-                    // Full length but the digest failed: these bytes are not
-                    // a prefix of anything trustworthy. Keeping them would
-                    // let the next probe advertise a corrupt base, so drop
-                    // the part, its sidecar and its registry entry — the
-                    // sender starts clean.
+                    // Full length but the digest failed, or more bytes than
+                    // declared: these bytes are not a prefix of anything
+                    // trustworthy. Keeping them would let the next probe
+                    // advertise a corrupt base, so drop the part, its sidecar
+                    // and its registry entry — the sender starts clean.
                     val t = resumeToken ?: Protocol.resumeToken(pf.file)
                     runCatching { Files.deleteIfExists(pf.temp) }
                     runCatching { Files.deleteIfExists(tokenSidecar(pf.temp)) }
@@ -624,7 +762,8 @@ class ServerCore(
                 }
             }
             sink?.done(ok)
-            x.respondStatus(if (ok) 200 else 422)
+            if (oversized) x.respondText(413, MIME_TEXT, "Body exceeds declared size")
+            else x.respondStatus(if (ok) 200 else 422)
         } catch (e: CancellationException) {
             runCatching { sink?.done(false) }
             if (sink == null) {
@@ -743,6 +882,7 @@ class ServerCore(
         val len = r.second - start + 1
         val tracker = pf.tracker!!
         var sentInChunk = 0L
+        var chunkOversized = false
         try {
             java.io.RandomAccessFile(pf.temp.toFile(), "rw").use { raf ->
                 val buf = ByteArray(256 * 1024)
@@ -750,6 +890,12 @@ class ServerCore(
                 while (true) {
                     val n = x.readBody(buf, 0, buf.size)
                     if (n <= 0) break
+                    if (sentInChunk + n > len) {
+                        // Nothing beyond the claimed range may be written: it
+                        // would overwrite the next chunk and desync the ledger.
+                        chunkOversized = true
+                        break
+                    }
                     raf.seek(start + sentInChunk)
                     raf.write(buf, 0, n)
                     sentInChunk += n
@@ -773,6 +919,7 @@ class ServerCore(
             tracker.add(start, sentInChunk)
             delegate.onUploadProgress(sessionId, fileId, info, minOf(total, tracker.bytesWritten), total)
             when {
+                chunkOversized -> x.respondText(413, MIME_TEXT, "Chunk body exceeds declared range")
                 sentInChunk < len -> x.respondText(400, MIME_TEXT, "Short chunk body")
                 tracker.complete() -> finalizeChunk(x, sessionId, fileId, pf, tracker)
                 else -> x.respondStatus(200)
@@ -902,17 +1049,20 @@ class ServerCore(
     /**
      * Flit-only panic route. The sender's self-signed cert travels in a
      * header and is pinned under its own SHA-256 DER: a claimed senderFp is
-     * trusted only if the cert's real fingerprint matches it and the
-     * signature verifies over the canonical bytes. Bad wire → 400; bad
-     * identity → 403; anything valid (including a duplicate/stale relay)
-     * gets a quiet 200 so senders never retry a delivered alert forever.
+     * trusted only if the cert's real digest matches it, its signature covers
+     * the canonical bytes, and the origin's own signature binds originFp. Bad
+     * wire → 400; bad identity → 403; anything valid (including a duplicate or
+     * stale relay) gets a quiet 200 so senders never retry forever. A refusal
+     * leaves the pin store and the dedup set untouched.
      */
     private suspend fun panicRoute(x: HttpExchange) {
-        val raw = x.readBodyText()
+        val raw = x.readBodyCapped(MAX_CONTROL_BODY_BYTES)
+        if (raw == null) {
+            x.respondText(413, MIME_TEXT, "Body too large")
+            return
+        }
         val alert = runCatching { WireJson.decode<PanicAlert>(raw) }.getOrNull()
-        if (alert == null || alert.id.isBlank() || alert.senderFp.isBlank() ||
-            alert.sig.isBlank() || alert.hops < 0
-        ) {
+        if (alert == null || !PanicCore.validShape(alert)) {
             x.respondText(400, MIME_TEXT, "Invalid panic alert")
             return
         }
@@ -932,14 +1082,43 @@ class ServerCore(
             x.respondText(403, MIME_TEXT, "Malformed sender certificate")
             return
         }
-        val pinnedFp = TlsIdentity.pin(cert)
-        if (!pinnedFp.equals(alert.senderFp.trim(), ignoreCase = true) || !PanicCore.verify(alert)) {
+        val fp = TlsIdentity.fingerprintOf(cert)
+        val bound = fp.equals(alert.senderFp.trim(), ignoreCase = true)
+        if (!bound) {
             x.respondText(403, MIME_TEXT, "Forged panic alert")
             return
         }
-
-        if (PanicCore.accept(alert) == PanicCore.Decision.Accept) {
+        // Cert-in-hand checks write nothing to the pin store, so a refused
+        // alert cannot evict a legitimate recipient. The sender signature
+        // covers the current hop; originSig/originCert bind the declared
+        // origin to its own key and survive relay re-signing.
+        if (!TlsIdentity.verifyWithCertificate(cert, PanicCore.canonical(alert), alert.sig) ||
+            !PanicCore.verifyOrigin(alert)
+        ) {
+            x.respondText(403, MIME_TEXT, "Forged panic alert")
+            return
+        }
+        // Reserve the id atomically before delivery: two racing requests for
+        // the same alert must not both reach the delegate. Only Accept enters
+        // the bounded replay set, so a duplicate, stale or hop-spent alert
+        // leaves both the replay memory and the pin tiers untouched.
+        if (PanicCore.accept(alert) != PanicCore.Decision.Accept) {
+            x.respondStatus(200)
+            return
+        }
+        try {
             delegate.onPanic(alert, x.origin)
+        } catch (_: Throwable) {
+            x.respondText(500, MIME_TEXT, "Panic delegate error")
+            return
+        }
+        // Pin only after the verdict, the delegate and both crypto checks.
+        // The shared pin-based gate is a post-condition of the cert-in-hand
+        // verification above, not a second chance for a refused alert.
+        TlsIdentity.pin(cert)
+        if (!PanicCore.verify(alert)) {
+            x.respondText(403, MIME_TEXT, "Forged panic alert")
+            return
         }
         x.respondStatus(200)
     }
@@ -957,7 +1136,7 @@ class ServerCore(
      * binding and the join proof.
      */
     private suspend fun circleRoute(x: HttpExchange) {
-        val raw = x.readBodyCapped(CircleCore.MAX_REQUEST_BYTES)
+        val raw = x.readBodyCapped(MAX_CONTROL_BODY_BYTES)
         if (raw == null) {
             x.respondText(400, MIME_TEXT, "Circle request too large")
             return
@@ -991,13 +1170,16 @@ class ServerCore(
             x.respondText(403, MIME_TEXT, "Malformed sender certificate")
             return
         }
-        val pinnedFp = TlsIdentity.pin(cert)
+        val fp = TlsIdentity.fingerprintOf(cert)
         if (request.memberFp.isBlank() ||
-            !pinnedFp.equals(request.memberFp.trim(), ignoreCase = true)
+            !fp.equals(request.memberFp.trim(), ignoreCase = true)
         ) {
             x.respondText(403, MIME_TEXT, "Certificate does not match member fingerprint")
             return
         }
+        // No pin here. CircleCore.verify pins an event's own certificate only
+        // after its digest and signature pass; pinning the header on sight let
+        // a refused request evict a legitimate recipient from the LRU.
         // A join carries its own signed proof: a bare claim (or a stale /
         // forged proof) must never reach the delegate, which would otherwise
         // hand out the group key to whoever knows a member fingerprint. The
@@ -1120,6 +1302,79 @@ class ServerCore(
 
     companion object {
         const val MAX_ATTEMPTS = 3
+
+        /** Shared cap for every control-route body; the same 8 MiB Circle uses. */
+        const val MAX_CONTROL_BODY_BYTES = 8 * 1024 * 1024
+
+        /** Bounds applied to the prepare binding headers before decoding. */
+        const val MAX_PREPARE_CERT_CHARS = 8 * 1024
+        const val MAX_PREPARE_SIG_CHARS = 2 * 1024
+
+        /** Upper bound on a register alias; blanks and control chars are refused. */
+        const val MAX_REGISTER_ALIAS_CHARS = 128
+
+        /**
+         * Register accepts only a 64-hex SHA-256 fingerprint after trimming.
+         * Anything else — a short label, `manual@…`, control characters — is
+         * a claim the announce gate would never have admitted.
+         */
+        private fun canonicalRegisterFingerprint(input: String?): String? {
+            if (input == null || input.length > 256) return null
+            val fp = input.trim()
+            if (fp.length != 64) return null
+            if (fp.any { it !in '0'..'9' && it !in 'A'..'F' && it !in 'a'..'f' }) return null
+            return fp.uppercase()
+        }
+
+        /**
+         * An IP origin must be loopback or on the listener's link/private
+         * ranges. Non-IP carrier labels (Bluetooth/relay pipes) have no source
+         * IP to gate and keep working; a global IP is refused.
+         */
+        private fun validRegisterOrigin(origin: String): Boolean {
+            val value = origin.trim()
+            if (value.isEmpty()) return true // pipe carriers have no source IP to gate
+            if (value.length > 128 || value.any { it.isISOControl() }) return false
+            val ipv4Parts = value.split('.')
+            val ipv4 = ipv4Parts.size == 4 && ipv4Parts.all { part ->
+                val octet = part.toIntOrNull()
+                octet != null && part.length <= 3 && octet in 0..255
+            }
+            val ipv6 = value.contains(':') &&
+                value.all {
+                    it.isDigit() || it in 'a'..'f' || it in 'A'..'F' ||
+                        it == ':' || it == '.' || it == '%'
+                } &&
+                (value.contains("::") || value.split(':').count { it.isNotEmpty() } == 8)
+            if (!ipv4 && !ipv6) return true
+            val ip = runCatching { InetAddress.getByName(value) }.getOrNull() ?: return false
+            if (ip.isLoopbackAddress || ip.isLinkLocalAddress || ip.isSiteLocalAddress) return true
+            val bytes = ip.address
+            if (bytes.size == 4) {
+                return bytes[0] == 10.toByte() ||
+                    (bytes[0] == 172.toByte() && bytes[1].toInt() in 16..31) ||
+                    (bytes[0] == 192.toByte() && bytes[1] == 168.toByte())
+            }
+            return (bytes[0].toInt() and 0xFE) == 0xFC // IPv6 unique-local
+        }
+
+        /**
+         * Same canonicalization TrustGate applies to wire fingerprints: trim,
+         * drop ':' separators, require bounded uppercase hex. Keep the two
+         * comparisons identical so a colon-formatted declaration binds to the
+         * same certificate digest on both sides of the gate.
+         */
+        private fun canonicalFingerprint(input: String?): String? {
+            if (input == null || input.length > 256) return null
+            val trimmed = input.trim()
+            if (trimmed.isEmpty()) return null
+            val hex = buildString(trimmed.length) {
+                for (c in trimmed) if (c != ':') append(c)
+            }
+            if (hex.length !in 64..128 || hex.length % 2 != 0) return null
+            if (hex.any { it !in '0'..'9' && it !in 'A'..'F' && it !in 'a'..'f' }) return null
+            return hex.uppercase()
+        }
 
         /** Suggested chunk size for multi-socket uploads — receiver's hint. */
         const val TURBO_CHUNK_BYTES = 8L * 1024 * 1024

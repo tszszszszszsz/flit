@@ -33,12 +33,18 @@ import java.util.concurrent.atomic.AtomicLongArray
  * `host:port` names a self-hosted relay instead of the peer and the hint
  * names the fingerprint to pair with. Direct routes leave it null and are
  * byte-for-byte unchanged.
+ *
+ * [expectServerFp] is the sender-side anchor: when set, the TLS peer's leaf
+ * certificate must hash to this fingerprint. It is checked after the
+ * handshake and before a single request byte is written; null keeps the
+ * legacy "any self-signed peer" behavior.
  */
 data class SendTarget(
     val ip: String,
     val port: Int,
     val tls: Boolean,
     val relayFor: String? = null,
+    val expectServerFp: String? = null,
 ) {
     fun baseUrl(): String = "${if (tls) "https" else "http"}://$ip:$port"
 }
@@ -90,6 +96,7 @@ class ProtocolClient(
                     http.exchange(
                         method = "GET", host = target.ip, port = target.port, tls = target.tls,
                         relayFor = target.relayFor,
+                        expectServerFp = target.expectServerFp,
                         pathAndQuery = Protocol.PATH_INFO, timeoutMs = timeoutMs,
                     ),
                 )
@@ -200,6 +207,7 @@ class ProtocolClient(
                 http.exchange(
                     method = "POST", host = target.ip, port = target.port, tls = target.tls,
                     relayFor = target.relayFor,
+                    expectServerFp = target.expectServerFp,
                     pathAndQuery = "${Protocol.PATH_CANCEL}?sessionId=${enc(sessionId)}",
                     timeoutMs = 2000,
                 )
@@ -239,13 +247,16 @@ class ProtocolClient(
         }
 
         val preparePath = Protocol.PATH_PREPARE_UPLOAD + (pin?.let { "?pin=" + enc(it) } ?: "")
+        // ONE string for the body and the signature: the receiver verifies
+        // over the exact UTF-8 bytes it parsed, never a re-encoded copy.
+        val prepareBody = WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap))
         val prepare = try {
             postJson(
                 target,
                 preparePath,
-                WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap)),
+                prepareBody,
                 timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
-                extraHeaders = prepareHeaders(multi),
+                extraHeaders = prepareHeaders(multi, prepareBody),
             )
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -321,12 +332,14 @@ class ProtocolClient(
                                 // A fresh session for just this file, so a
                                 // resumed part can be re-claimed after the
                                 // receiver reaped the dead one.
+                                val reprepareBody =
+                                    WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareMap1))
                                 val resp = postJson(
                                     target,
                                     Protocol.PATH_PREPARE_UPLOAD + (pin?.let { "?pin=" + enc(it) } ?: ""),
-                                    WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareMap1)),
+                                    reprepareBody,
                                     ACCEPT_TIMEOUT_MS,
-                                    extraHeaders = prepareHeaders(false),
+                                    extraHeaders = prepareHeaders(false, reprepareBody),
                                 )
                                 if (resp.status == 403 &&
                                     resp.headers[Protocol.HEADER_FLIT_REFUSAL.lowercase()] == Protocol.REFUSAL_DECLINED
@@ -410,6 +423,7 @@ class ProtocolClient(
                 http.exchange(
                     method = "POST", host = target.ip, port = target.port, tls = target.tls,
                     relayFor = target.relayFor,
+                    expectServerFp = target.expectServerFp,
                     pathAndQuery = uploadPath,
                     headers = buildMap {
                         put("Content-Type", "application/octet-stream")
@@ -547,6 +561,7 @@ class ProtocolClient(
                                 http.exchange(
                                     method = "POST", host = target.ip, port = target.port, tls = target.tls,
                                     relayFor = target.relayFor,
+                                    expectServerFp = target.expectServerFp,
                                     pathAndQuery = uploadPath,
                                     headers = buildMap {
                                         put("Content-Type", "application/octet-stream")
@@ -624,11 +639,27 @@ class ProtocolClient(
             val resp = http.exchange(
                 method = "GET", host = target.ip, port = target.port, tls = target.tls,
                 relayFor = target.relayFor,
+                expectServerFp = target.expectServerFp,
                 pathAndQuery = "${Protocol.PATH_PARTIAL}?token=${enc(contentToken)}",
                 timeoutMs = 2_000,
             )
             if (resp.status == 200) json<PartialInfo>(resp).size else null
         }.getOrNull()
+    }
+
+    /**
+     * Prepare headers: the Flit marker is always sent (so the receiver may
+     * answer a refusal honestly), the multi marker only when the caller asked
+     * for turbo. [body] is the EXACT UTF-8 string handed to the HTTP layer:
+     * the receiver verifies [Protocol.HEADER_PREPARE_SIG] over those bytes
+     * with the certificate in [Protocol.HEADER_PREPARE_CERT]. The DER alone
+     * is public and replayable; the signature is the proof of possession.
+     */
+    internal fun prepareHeaders(multi: Boolean, body: String): Map<String, String> = buildMap {
+        if (multi) put(MULTI_HEADER, "1")
+        put(Protocol.HEADER_FLIT_CLIENT, Protocol.FLIT_CLIENT_VALUE)
+        put(Protocol.HEADER_PREPARE_CERT, Base64.getEncoder().encodeToString(identity.certificate.encoded))
+        put(Protocol.HEADER_PREPARE_SIG, identity.sign(body.toByteArray(Charsets.UTF_8)))
     }
 
     private suspend fun postJson(
@@ -640,6 +671,7 @@ class ProtocolClient(
     ) = http.exchange(
         method = "POST", host = target.ip, port = target.port, tls = target.tls,
         relayFor = target.relayFor,
+        expectServerFp = target.expectServerFp,
         pathAndQuery = pathAndQuery,
         headers = buildMap {
             put("Content-Type", "application/json")
@@ -677,16 +709,6 @@ class ProtocolClient(
 
         /** Marks a prepare-upload as multi-socket capable (Flit↔Flit only). */
         internal const val MULTI_HEADER = "X-Flit-Multi"
-
-        /**
-         * Prepare headers: the Flit client marker is always sent (so the
-         * receiver may answer a refusal honestly); the multi marker is only
-         * sent when the caller asked for turbo.
-         */
-        internal fun prepareHeaders(multi: Boolean): Map<String, String> = buildMap {
-            if (multi) put(MULTI_HEADER, "1")
-            put(Protocol.HEADER_FLIT_CLIENT, Protocol.FLIT_CLIENT_VALUE)
-        }
 
         /** Hex SHA-256 of a freshly opened stream; used as the upload checksum. */
         fun sha256Hex(open: () -> InputStream): String {

@@ -13,6 +13,12 @@ import kotlinx.serialization.Serializable
  * a relay that increments it changes the signed bytes and MUST re-sign with
  * its own identity (`PanicCore.forward`); a bumped count with the original
  * signature fails verification.
+ *
+ * [originSig] and [originCert] bind [originFp] to a key. [sig] alone cannot do
+ * that: a relay signs the current hop, so an attacker can sign as itself while
+ * naming a trusted victim in originFp. Both new fields are signed over the
+ * hop-0 canonical by the origin itself and ride through forwards unchanged;
+ * like [sig] and the wire certificate, they are excluded from `canonical`.
  */
 @Serializable
 data class PanicAlert(
@@ -24,4 +30,8 @@ data class PanicAlert(
     val sig: String = "",
     /** Original author, preserved across re-signed forwards for trust gating. */
     val originFp: String = "",
+    /** Origin's own signature over the hop-0 canonical; never re-signed by a relay. */
+    val originSig: String = "",
+    /** Origin's DER certificate, Base64; binds originSig to originFp by its own digest. */
+    val originCert: String = "",
 )

@@ -5,6 +5,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
+import java.security.cert.X509Certificate
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLEngineResult
 import javax.net.ssl.SSLException
@@ -111,6 +112,16 @@ class StreamTls private constructor(
                 if (++guard > 4096) throw SSLException("TLS handshake did not converge")
             }
         }
+    }
+
+    /**
+     * The leaf certificate the peer actually presented in the handshake.
+     * Null when the session has no peer identity; callers that declare a pin
+     * must treat that as a failure, never as a pass. Safe to call right after
+     * [handshake] returns, before any plaintext byte is exchanged.
+     */
+    fun peerCertificate(): X509Certificate? = synchronized(mutex) {
+        runCatching { engine.session.peerCertificates.firstOrNull() as? X509Certificate }.getOrNull()
     }
 
     /** Reads up to [len] decrypted bytes into [b][off..]; 1..len, or -1 at EOF. */

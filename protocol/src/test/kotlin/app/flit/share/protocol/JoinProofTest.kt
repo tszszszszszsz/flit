@@ -11,12 +11,14 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.UUID
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -173,12 +175,13 @@ class JoinProofTest {
             ),
             "sync was asked for a join proof",
         )
-        assertNull(
+        assertEquals(
+            "join proof replay",
             CircleCore.joinProofFailure(
                 request(id.fingerprint, listOf(proofEvent(id, created = NOW + 999L))),
                 HOST, NOW + 999L,
             ),
-            "a fresh proof later in the same bucket must stay valid",
+            "the same proof digest re-signed later is a replay, not a fresh proof",
         )
     }
 
@@ -337,6 +340,46 @@ class JoinProofTest {
         assertNull(TlsIdentity.pinned(victim.fingerprint), "failed proof poisoned the pin store")
     }
 
+    @Test
+    fun `a validly signed but refused JOIN proof leaves the pin store unchanged`() {
+        val signer = identity()
+        // All three events carry a genuine signature over their own bytes.
+        // Each is refused at a LATER gate, after signature verification.
+        val wrongInvite = selfSignedProofEvent(signer, proofBody(signer, invite = "invite-2"))
+        val staleAt = NOW - 2L * BUCKET_MS
+        val staleBucket = selfSignedProofEvent(
+            signer,
+            CircleCore.joinProofBody(
+                HOST, CIRCLE, INVITE, signer.fingerprint, CircleCore.joinProofBucket(staleAt),
+            ),
+            created = staleAt,
+        )
+        val accepted = selfSignedProofEvent(signer, proofBody(signer))
+
+        TlsIdentity.forgetPin(signer.fingerprint)
+        assertNull(TlsIdentity.pinned(signer.fingerprint), "fixture started pinned")
+
+        assertEquals(
+            "invalid join proof",
+            CircleCore.joinProofFailure(request(signer.fingerprint, listOf(wrongInvite)), HOST, NOW),
+        )
+        assertNull(TlsIdentity.pinned(signer.fingerprint), "wrong-invite proof pinned its certificate")
+
+        assertEquals(
+            "join proof replay",
+            CircleCore.joinProofFailure(request(signer.fingerprint, listOf(staleBucket)), HOST, NOW),
+        )
+        assertNull(TlsIdentity.pinned(signer.fingerprint), "stale-bucket proof pinned its certificate")
+
+        assertNull(CircleCore.joinProofFailure(request(signer.fingerprint, listOf(accepted)), HOST, NOW))
+        assertNotNull(TlsIdentity.pinned(signer.fingerprint), "an accepted proof did not pin its certificate")
+
+        assertEquals(
+            "join proof replay",
+            CircleCore.joinProofFailure(request(signer.fingerprint, listOf(accepted)), HOST, NOW),
+        )
+    }
+
     // ---- helpers -----------------------------------------------------------
 
     private fun proofBody(
@@ -358,6 +401,26 @@ class JoinProofTest {
         proofBody(signer, memberFp, host, invite, CircleCore.joinProofBucket(created)),
         0L, created,
     )
+
+    /** Signs a proof event directly, bypassing create()/sign(), which pin. */
+    private fun selfSignedProofEvent(
+        signer: TlsIdentity,
+        body: String,
+        created: Long = NOW,
+    ): CircleEvent {
+        val bare = CircleEvent(
+            id = UUID.randomUUID().toString(),
+            circleId = CIRCLE,
+            authorFp = signer.fingerprint,
+            lamport = 0L,
+            type = CircleEvent.JOIN,
+            body = body,
+            sig = "",
+            createdMs = created,
+            cert = Base64.getEncoder().encodeToString(signer.certificate.encoded),
+        )
+        return bare.copy(sig = signer.sign(CircleCore.canonical(bare)))
+    }
 
     private fun request(
         memberFp: String,

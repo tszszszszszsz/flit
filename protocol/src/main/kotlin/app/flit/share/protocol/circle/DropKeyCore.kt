@@ -11,6 +11,7 @@ import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.security.spec.MGF1ParameterSpec
 import java.util.Base64
+import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.OAEPParameterSpec
@@ -43,6 +44,20 @@ object DropKeyCore {
     /** Base64 cap per wrapped value (a 2048-bit RSA wrap is 344 chars). */
     const val MAX_WRAPPED_CHARS = 512
 
+    /** Longest accepted landing file name, in UTF-16 code units. */
+    const val MAX_NAME_CHARS = 256
+
+    /**
+     * Windows device names: reserved even when lower-cased or given an
+     * extension, so a landing name whose stem matches one is refused.
+     */
+    private val RESERVED_NAMES = setOf(
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CONIN$", "CONOUT$",
+    )
+
     /** AAD domain tag, length-prefixed by the [CircleCore.canonical] field rule. */
     const val DOMAIN = "FLITDROP1"
 
@@ -61,6 +76,29 @@ object DropKeyCore {
     )
 
     private val random = SecureRandom()
+
+    /**
+     * Pure gate for the single file name a keyed drop may use as its landing
+     * destination. Receivers join this name to a directory verbatim
+     * (`resolveSibling` in the CLI, `File(parent, name)` in the app), so every
+     * form that could select another directory, a device or a disguised
+     * sibling is refused. Total on hostile input: no path resolution, no
+     * store, no exception.
+     *
+     * A name is accepted only when it is non-blank, at most [MAX_NAME_CHARS],
+     * has no separator, drive/stream marker or ISO control character, no `.`
+     * or `..` segment, no trailing dot or space, and is not a Windows reserved
+     * device name (with or without an extension).
+     */
+    fun safeLandingName(name: String): Boolean {
+        if (name.isBlank() || name.length > MAX_NAME_CHARS) return false
+        if (name.any { c ->
+            c == '/' || c == '\\' || c == ':' || c.code < 0x20 || c.code in 0x7F..0x9F
+        }) return false
+        if (name == "." || name == ".." || name.contains("..")) return false
+        if (name.endsWith('.') || name.endsWith(' ')) return false
+        return name.substringBefore('.').uppercase(Locale.ROOT) !in RESERVED_NAMES
+    }
 
     /**
      * Draws a fresh key and IV from [SecureRandom]. Neither value comes from
@@ -166,22 +204,32 @@ object DropKeyCore {
         }.getOrNull()
     }
 
-    /** Builds the exact keyed `file` body accepted by [CircleCore.validFileBody]. */
-    fun keyedFileBody(v: KeyedFile): String = buildJsonObject {
-        put("name", JsonPrimitive(v.name))
-        put("size", JsonPrimitive(v.size))
-        put("sha256", JsonPrimitive(v.sha256))
-        put("keyGen", JsonPrimitive(v.keyGen))
-        put("cipherSha", JsonPrimitive(v.cipherSha))
-        put("iv", JsonPrimitive(v.iv))
-        put("wraps", buildJsonObject {
-            v.wraps.forEach { (fp, wrapped) -> put(fp, JsonPrimitive(wrapped)) }
-        })
-    }.toString()
+    /**
+     * Builds the exact keyed `file` body accepted by [CircleCore.validFileBody].
+     * An unsafe landing name is refused here too, so a sender never mints an
+     * event that [parseFileKeyBody] would refuse on arrival.
+     */
+    fun keyedFileBody(v: KeyedFile): String {
+        require(safeLandingName(v.name)) { "unsafe landing name" }
+        return buildJsonObject {
+            put("name", JsonPrimitive(v.name))
+            put("size", JsonPrimitive(v.size))
+            put("sha256", JsonPrimitive(v.sha256))
+            put("keyGen", JsonPrimitive(v.keyGen))
+            put("cipherSha", JsonPrimitive(v.cipherSha))
+            put("iv", JsonPrimitive(v.iv))
+            put("wraps", buildJsonObject {
+                v.wraps.forEach { (fp, wrapped) -> put(fp, JsonPrimitive(wrapped)) }
+            })
+        }.toString()
+    }
 
     /**
      * Parses a keyed `file` body, or returns null when [CircleCore.validFileBody]
-     * refuses it or when it is not the keyed form. No partial value is returned.
+     * refuses it, when it is not the keyed form, or when its `name` fails
+     * [safeLandingName]. No partial value is returned. Refusing the name here
+     * is what stops a signed keyed event from selecting a landing path outside
+     * the receiver's directory: callers only ever see a safe single file name.
      */
     fun parseFileKeyBody(body: String): KeyedFile? {
         if (!CircleCore.validFileBody(body)) return null
@@ -189,6 +237,7 @@ object DropKeyCore {
             val obj = parseBody(body) ?: return null
             if (obj.keys != CircleCore.KEYED_FILE_BODY_KEYS) return null
             val name = obj.string("name") ?: return null
+            if (!safeLandingName(name)) return null
             val sha256 = obj.string("sha256") ?: return null
             val size = obj.number("size")?.toLongOrNull() ?: return null
             val keyGen = obj.number("keyGen")?.toIntOrNull() ?: return null

@@ -1,5 +1,6 @@
 package app.flit.share.harness
 
+import app.flit.share.TrustGate
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleCore
@@ -13,6 +14,7 @@ import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.discovery.UdpDiscovery
+import app.flit.share.protocol.relay.RelayCore
 import app.flit.share.protocol.relay.RelaySubscriber
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
@@ -30,7 +32,9 @@ import java.io.ByteArrayInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.time.LocalTime
@@ -89,7 +93,7 @@ internal class ParsedArgs(argv: Array<String>) {
             "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
             "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host", "--role",
             "--bag", "--to", "--cert", "--ttl", "--out", "--sha", "--drop-id", "--key",
-            "--host-fp",
+            "--host-fp", "--only-trusted", "--qr-only", "--pinned", "--known",
         )
     }
 }
@@ -106,9 +110,21 @@ internal fun harnessHome(): Path =
         ?.let { Path.of(it) }
         ?: Path.of(System.getProperty("user.home"), ".config", "flit", "flit-harness")
 
+/** Private harness state: no other local user may read the home or circle log. */
+private fun privateDir(path: Path) {
+    Files.createDirectories(path)
+    runCatching { Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwx------")) }
+}
+
+/** Write owner-only local state (0600): keyed-drop plaintext and circle state. */
+internal fun privateWrite(path: Path, bytes: ByteArray) {
+    Files.write(path, bytes)
+    runCatching { Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------")) }
+}
+
 internal fun loadOrCreateIdentity(): TlsIdentity {
     val base = harnessHome()
-    Files.createDirectories(base)
+    privateDir(base)
     val file = base.resolve("identity.p12")
     return if (Files.exists(file)) TlsIdentity.load(file.toFile())
     else TlsIdentity.generate().also { it.save(file.toFile()) }
@@ -121,6 +137,23 @@ private fun announceTargets(arg: String?): List<InetSocketAddress> =
         if (parts.size != 2) return@mapNotNull null
         runCatching { InetSocketAddress(parts[0], parts[1].toInt()) }.getOrNull()
     }.orEmpty()
+
+/** --pinned / --known are comma-separated fingerprint lists for the prepare gate. */
+private fun gateFpList(arg: String?): Set<String> =
+    arg?.split(',')?.mapNotNull { normalized(it) }?.toSet().orEmpty()
+
+/** Gate flags take a value (`true`/`1`/`yes`); a bare occurrence also enables. */
+private fun gateFlag(args: ParsedArgs, flag: String): Boolean =
+    args.has(flag) && (args.opt(flag)?.trim()?.lowercase(Locale.ROOT)
+        ?.let { it == "1" || it == "true" || it == "yes" } ?: true)
+
+/** A week is already an absurd park wait; larger values are a bad argument, not a long wait. */
+private const val MAX_PARK_TIMEOUT_SECONDS = 7L * 24 * 60 * 60
+
+/** null = malformed or oversized; the caller reports a clean CLI error. */
+internal fun parsedParkTimeoutMs(raw: String?): Long? =
+    if (raw == null) RelayCore.DEFAULT_PARK_TIMEOUT_MS
+    else raw.toLongOrNull()?.takeIf { it in 0..MAX_PARK_TIMEOUT_SECONDS }?.times(1_000L)
 
 private val fmt = DateTimeFormatter.ofPattern("HH:mm:ss")
 internal fun ts(): String = LocalTime.now().format(fmt)
@@ -167,7 +200,7 @@ discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
 bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pipe carrier
-relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
+relay [--port P] [--host IP] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad> [--circle ID] [--invite TOKEN]
@@ -520,6 +553,34 @@ internal class CircleHostState {
 private fun normalized(fp: String?): String? =
     fp?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotBlank() && it.length <= 128 }
 
+/**
+ * Resolve a keyed-drop plaintext name to exactly one file under [destDir].
+ *
+ * The name is read from a signed `file` event, but its author may be hostile:
+ * `../`, an absolute path, a separator or a symlinked parent must never turn
+ * into a write outside the landing directory. The name must be a single
+ * component, the candidate is normalized, and both the base and the parent
+ * are real-pathed so a pre-planted symlink cannot smuggle the write out.
+ */
+internal fun safeLandingPath(destDir: Path, name: String): Path? {
+    val single = name.trim()
+    if (single.isEmpty() || single.length > 255) return null
+    if (single == "." || single == "..") return null
+    if (single.any { it == '/' || it == '\\' || it == '\u0000' }) return null
+    val base = runCatching { destDir.toAbsolutePath().normalize().toRealPath() }.getOrNull() ?: return null
+    val target = base.resolve(single).normalize()
+    if (!target.startsWith(base) || target.fileName?.toString() != single) return null
+    val parent = runCatching { target.parent.toRealPath() }.getOrNull() ?: return null
+    if (parent != base) return null
+    // An existing sibling that is itself a symlink would make Files.write
+    // follow it out of the directory; judge it by its real path too.
+    if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+        val real = runCatching { target.toRealPath() }.getOrNull() ?: return null
+        if (!real.startsWith(base)) return null
+    }
+    return target
+}
+
 /** Bounds a key learned from a REKEY body, mirroring the app store's key cap. */
 internal const val MAX_CIRCLE_KEY_CHARS = 256
 
@@ -552,9 +613,24 @@ private fun circleBool(obj: JsonObject, key: String): Boolean? {
 internal class ConsoleDelegate(
     /** The serving CLI's own identity, used to unwrap a keyed drop for this device. */
     private val cliIdentity: TlsIdentity? = null,
+    /** Landing directory that bounds keyed-drop plaintext names. */
+    private val destDir: Path = Path.of("flit-downloads"),
+    /** Prepare-time gates; both off keeps the legacy auto-accept path. */
+    private val trustConfig: TrustGate.Config = TrustGate.Config(),
+    /** Fingerprints whose presented certificate is trusted (`onlyTrusted`). */
+    pinnedFps: Set<String> = emptySet(),
+    /** Fingerprints learned by scanning a QR (`qrOnly`). */
+    knownFps: Set<String> = emptySet(),
 ) : ServerDelegate {
     val seen = ConcurrentHashMap<String, Pair<String, PeerInfo>>() // fingerprint → (ip, info)
     val circleHost = CircleHostState()
+
+    private val pinnedSet = pinnedFps.mapNotNull { normalized(it) }.toSet()
+    private val knownSet = knownFps.mapNotNull { normalized(it) }.toSet()
+    private val trustStores = object : TrustGate.Stores {
+        override fun pinned(fp: String): Boolean = normalized(fp) in pinnedSet
+        override fun known(fp: String): Boolean = normalized(fp) in knownSet
+    }
 
     override fun onCircle(request: CircleRequest, ip: String): CircleResponse = circleHost.onCircle(request)
 
@@ -574,7 +650,22 @@ internal class ConsoleDelegate(
         println("${ts()} panic from ${alert.senderFp.take(12)} ($ip): ${alert.text} [hops=${alert.hops}]")
     }
 
-    override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
+    /** Legacy two-arg callers present no certificate, so a gated run refuses them. */
+    override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision =
+        onPrepare(request, peerIp, null)
+
+    override fun onPrepare(
+        request: PrepareUploadRequest,
+        peerIp: String,
+        presentedFp: String?,
+    ): PrepareDecision {
+        val verdict = TrustGate.evaluate(
+            request.info.fingerprint, presentedFp, trustConfig, trustStores,
+        )
+        if (!verdict.accept) {
+            println("${ts()} offer refused ${request.info.alias} ($peerIp): ${verdict.reason} code=${verdict.code}")
+            return PrepareDecision.Decline
+        }
         println("${ts()} offer from ${request.info.alias} ($peerIp): ${request.files.size} file(s)")
         for ((id, f) in request.files) {
             println("${ts()}   - $id → ${f.fileName} (${f.size} bytes, ${f.fileType}, sha=${f.sha256?.take(12) ?: "<none>"})")
@@ -639,8 +730,13 @@ internal class ConsoleDelegate(
             runCatching { Files.deleteIfExists(path) }
             return
         }
-        Files.write(path.resolveSibling(keyed.name), plain)
-        println("${ts()} drop-open ${keyed.name} $plainSha (${plain.size} bytes)")
+        val plainTarget = safeLandingPath(destDir, keyed.name)
+        if (plainTarget == null) {
+            println("${ts()} drop-refused ${keyed.name.take(12)}: unsafe name")
+            return
+        }
+        privateWrite(plainTarget, plain)
+        println("${ts()} drop-open ${plainTarget.fileName} $plainSha (${plain.size} bytes)")
     }
 
     override fun onSessionEnd(sessionId: String, cancelled: Boolean) {
@@ -655,6 +751,13 @@ private suspend fun serve(args: ParsedArgs) {
     val alias = args.opt("--alias") ?: "Flit (${System.getenv("USER") ?: "dev"})"
             // accept --dir and --dest (same meaning; --dest used in scripts)
         val destDir = Path.of(args.opt("--dir") ?: args.opt("--dest") ?: "flit-downloads")
+    // Prepare-gate flags are value flags: the route parses the cert header only
+    // when at least one gate is on, and the delegate applies the same config.
+    val onlyTrusted = gateFlag(args, "--only-trusted")
+    val qrOnly = gateFlag(args, "--qr-only")
+    val pinnedFps = gateFpList(args.opt("--pinned"))
+    val knownFps = gateFpList(args.opt("--known"))
+    val certGate = onlyTrusted || qrOnly
     val config = ServerConfig(
         alias = alias,
         port = args.optInt("--port", Protocol.DEFAULT_PORT),
@@ -662,8 +765,18 @@ private suspend fun serve(args: ParsedArgs) {
         destDir = destDir,
         deviceModel = System.getenv("FLIT_MODEL"),
         deviceType = "headless",
+        requirePrepareCert = { certGate },
     )
-    val delegate = ConsoleDelegate(identity)
+    val delegate = ConsoleDelegate(
+        identity,
+        destDir = destDir,
+        trustConfig = TrustGate.Config(onlyTrusted, qrOnly),
+        pinnedFps = pinnedFps,
+        knownFps = knownFps,
+    )
+    if (certGate) {
+        println("${ts()} prepare gate: onlyTrusted=$onlyTrusted qrOnly=$qrOnly pinned=${pinnedFps.size} known=${knownFps.size}")
+    }
     val circleId = args.opt("--circle") ?: UUID.randomUUID().toString().replace("-", "").take(16)
     val circleInvite = args.opt("--invite")
         ?: (UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", ""))
@@ -739,7 +852,7 @@ private suspend fun discover(args: ParsedArgs) {
     val tls = !args.has("--http")
     val alias = args.opt("--alias") ?: "Flit-discover"
 
-    val delegate = ConsoleDelegate()
+    val delegate = ConsoleDelegate(destDir = Path.of("flit-tmp-discover"))
     val server = ProtocolServer(
         identity, delegate,
         ServerConfig(alias = alias, port = 0, tls = tls, destDir = Path.of("flit-tmp-discover")),
@@ -823,11 +936,25 @@ private suspend fun send(args: ParsedArgs) {
  */
 private fun relay(args: ParsedArgs) {
     val token = args.opt("--token")
-    val server = RelayServer(
+    val host = args.opt("--host") ?: "127.0.0.1"
+    // The protocol-side relay is the hardened socket half: it hands the
+    // caller's IP to RelayCore.offer (wrong-token backoff), caps parked
+    // tickets and defaults to a finite park wait. Check the bind policy here
+    // too so an operator gets a clean refusal instead of a live open relay.
+    val loopback = runCatching { java.net.InetAddress.getByName(host).isLoopbackAddress }.getOrDefault(false)
+    RelayCore.bindTokenProblem(token, loopback)?.let { problem ->
+        System.err.println("!! refusing non-loopback relay bind on $host: $problem token (use a strong --token or bind loopback)")
+        exitProcess(2)
+    }
+    val parkTimeoutMs = parsedParkTimeoutMs(args.opt("--park-timeout")) ?: run {
+        System.err.println("!! bad --park-timeout ${args.opt("--park-timeout")} (expected 0..$MAX_PARK_TIMEOUT_SECONDS seconds)")
+        exitProcess(2)
+    }
+    val server = app.flit.share.protocol.relay.RelayServer(
         token = token,
-        parkTimeoutMs = args.optInt("--park-timeout", 0) * 1000L,
-    ).start(args.optInt("--port", Protocol.DEFAULT_PORT + 1))
-    println("${ts()} relaying on 0.0.0.0:${server.port} token=${if (token != null) "set" else "none"}")
+        parkTimeoutMs = parkTimeoutMs,
+    ).start(args.optInt("--port", Protocol.DEFAULT_PORT + 1), host)
+    println("${ts()} relaying on $host:${server.port} token=${if (token != null) "set" else "none"}")
     println("${ts()} pairing requests and subscriptions by fingerprint; the pipe inside is opaque")
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { server.close() }
@@ -843,7 +970,7 @@ private suspend fun resolveTarget(targetArg: String, args: ParsedArgs, identity:
         return SendTarget(host, port, !args.has("--http"))
     }
 
-    val delegate = ConsoleDelegate()
+    val delegate = ConsoleDelegate(destDir = Path.of("flit-tmp-discover"))
     val server = ProtocolServer(
         identity, delegate,
         ServerConfig(alias = alias, port = 0, destDir = Path.of("flit-tmp-discover")),
@@ -928,7 +1055,7 @@ internal class CircleCliState(
 
 private fun circleStatePath(): Path = harnessHome().resolve("circle.state")
 
-private fun loadCircleState(): CircleCliState? {
+internal fun loadCircleState(): CircleCliState? {
     val f = circleStatePath()
     if (!Files.exists(f)) return null
     val lines = Files.readAllLines(f)
@@ -940,7 +1067,12 @@ private fun loadCircleState(): CircleCliState? {
             key = lines[2],
             host = lines[3],
             members = lines[4].split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList(),
-            events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5]).toMutableList(),
+            // The state file is trusted storage, not trustworthy content: drop
+            // any event that does not verify against its own author before the
+            // CLI folds it into the log or mints an answer from it.
+            events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5])
+                .filter { CircleCore.verify(it) }
+                .toMutableList(),
             rekeyGen = lines[6].toIntOrNull() ?: 0,
             // A legacy seven-line file still loads, but forces a fresh verified
             // join before any answer can be persisted.
@@ -951,7 +1083,7 @@ private fun loadCircleState(): CircleCliState? {
 
 internal fun saveCircleState(st: CircleCliState) {
     val f = circleStatePath()
-    Files.createDirectories(f.parent)
+    privateDir(f.parent)
     val lines = listOf(
         st.circleId, st.invite, st.key, st.host,
         st.members.joinToString(","),
@@ -959,7 +1091,7 @@ internal fun saveCircleState(st: CircleCliState) {
         st.rekeyGen.toString(),
         st.hostFp,
     )
-    Files.write(f, lines.joinToString("\n").toByteArray(Charsets.UTF_8))
+    privateWrite(f, lines.joinToString("\n").toByteArray(Charsets.UTF_8))
 }
 
 private fun circleTarget(raw: String): SendTarget {
@@ -1054,10 +1186,16 @@ internal fun circleRoleMap(st: CircleCliState): Map<String, String> {
 /**
  * The single fold gate for events arriving in a host answer, mirroring the
  * app's `FlitCircleSync.fresh`: shape/circle, the shared authority gate on a
- * pre-answer role snapshot (JOIN never folds, REKEY needs OWNER/ADMIN), closed
- * body gates, bounded readable JSON, signature, local-id dedup, deterministic
- * order and the harness event cap. No replay id is reserved before the
- * signature passes.
+ * pre-answer role snapshot, closed body gates, bounded readable JSON,
+ * signature, local-id dedup, deterministic order and the harness event cap.
+ *
+ * Every privileged verb — JOIN, ROLE, KICK and REKEY — must be authored by a
+ * fingerprint already present in that pre-answer role snapshot before the
+ * shared `foldable` gate sees it. The snapshot is taken before any answer
+ * event is admitted, so a ROLE or KICK in this batch cannot promote its own
+ * signer or revoke an officer mid-fold. Of the four, JOIN never folds at all;
+ * ROLE needs an OWNER, and executive (admin-mode) KICK plus REKEY need an
+ * officer. No replay id is reserved before the signature passes.
  */
 internal fun circleFreshEvents(
     st: CircleCliState,
@@ -1065,10 +1203,12 @@ internal fun circleFreshEvents(
     roles: Map<String, String> = circleRoleMap(st),
 ): List<CircleEvent> {
     val localIds = st.events.mapTo(HashSet()) { it.id }
-    // Taken before any answer event is admitted: a ROLE or LEAVE in this batch
-    // must not grant or revoke authority mid-fold.
+    // `roles` is taken before any answer event is admitted: ROLE, KICK, REKEY
+    // (and JOIN) in this batch must not grant or revoke authority mid-fold.
     val candidates = events.filter { e ->
         e.circleId == st.circleId &&
+            (e.type.trim().lowercase(Locale.ROOT) !in CircleAuthority.PRIVILEGED ||
+                normalized(e.authorFp) in roles) &&
             CircleAuthority.foldable(e, st.circleId, roles) &&
             (e.type != CircleEvent.FILE || CircleCore.validFileBody(e.body)) &&
             (e.type != CircleEvent.RECEIPT || CircleCore.validReceiptBody(e.body)) &&
@@ -1379,7 +1519,7 @@ internal suspend fun deliverCircleFile(
 /** Best-effort fingerprint → route sweep on the rig's normal discovery path. */
 private suspend fun discoverCircleRoutes(identity: TlsIdentity, waitSecs: Int = 3): MutableMap<String, SendTarget> {
     val routes = LinkedHashMap<String, SendTarget>()
-    val delegate = ConsoleDelegate()
+    val delegate = ConsoleDelegate(destDir = Path.of("flit-tmp-circle-file"))
     val server = ProtocolServer(
         identity, delegate,
         ServerConfig(alias = "flit-circle-file", port = 0, tls = true, destDir = Path.of("flit-tmp-circle-file")),

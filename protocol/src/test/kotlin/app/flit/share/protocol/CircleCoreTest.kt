@@ -391,7 +391,7 @@ class CircleCoreTest {
         )
         val sync = FakeExchange(
             "POST", Protocol.PATH_CIRCLE_SYNC,
-            body = WireJson.encode(request.copy(events = listOf(syncProof))), headers = certHeader,
+            body = WireJson.encode(request.copy(action = CircleRequest.ACTION_SYNC, events = listOf(syncProof))), headers = certHeader,
         )
         val bogus = FakeExchange("POST", "${Protocol.API_ROOT}/circle/sync", body = "{}")
         val malformed = FakeExchange("POST", Protocol.PATH_CIRCLE_SYNC, body = "{")

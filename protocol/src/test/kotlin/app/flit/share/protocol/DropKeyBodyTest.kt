@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -265,6 +266,90 @@ class DropKeyBodyTest {
         assertTrue(CircleCore.validFileBody(good))
         for (body in refusedBodies) {
             refused(body, "structurally refused body")
+        }
+    }
+
+    // ---- landing-name gate ---------------------------------------------------
+
+    @Test
+    fun `safeLandingName accepts a plain bounded file name`() {
+        for (name in listOf("a.gflit", "report-2026.pdf", "notes", "my file.txt")) {
+            assertTrue(DropKeyCore.safeLandingName(name), "rejected $name")
+        }
+        assertTrue(DropKeyCore.safeLandingName("a".repeat(DropKeyCore.MAX_NAME_CHARS)))
+        assertEquals(256, DropKeyCore.MAX_NAME_CHARS)
+    }
+
+    @Test
+    fun `safeLandingName refuses traversal segments`() {
+        for (name in listOf(".", "..", "...", "..foo", "foo..bar", "../evil.txt", "a/../b")) {
+            assertFalse(DropKeyCore.safeLandingName(name), "accepted traversal $name")
+        }
+    }
+
+    @Test
+    fun `safeLandingName refuses absolute POSIX and drive-relative names`() {
+        for (name in listOf("/etc/passwd", "/tmp/x", "C:evil.txt", "D:evil.txt")) {
+            assertFalse(DropKeyCore.safeLandingName(name), "accepted absolute $name")
+        }
+    }
+
+    @Test
+    fun `safeLandingName refuses Windows paths and UNC prefixes`() {
+        for (name in listOf(
+            "C:\\Windows\\System32\\evil.txt",
+            "C:/Windows/evil.txt",
+            "\\\\server\\share\\evil.txt",
+        )) {
+            assertFalse(DropKeyCore.safeLandingName(name), "accepted Windows path $name")
+        }
+    }
+
+    @Test
+    fun `safeLandingName refuses any forward or backslash separator`() {
+        for (name in listOf("dir/file.txt", "dir\\file.txt", "a/b\\c")) {
+            assertFalse(DropKeyCore.safeLandingName(name), "accepted separator $name")
+        }
+    }
+
+    @Test
+    fun `safeLandingName refuses names over MAX_NAME_CHARS`() {
+        assertFalse(DropKeyCore.safeLandingName("a".repeat(DropKeyCore.MAX_NAME_CHARS + 1)))
+        assertFalse(DropKeyCore.safeLandingName("a".repeat(CircleCore.MAX_BODY_CHARS)))
+    }
+
+    @Test
+    fun `safeLandingName refuses blank and control-character names`() {
+        for (name in listOf("", "   ", "\t", "bad\u0000name", "line\nbreak", "x\u007Fy")) {
+            assertFalse(DropKeyCore.safeLandingName(name), "accepted $name")
+        }
+    }
+
+    @Test
+    fun `safeLandingName refuses reserved device names and trailing dot or space`() {
+        for (name in listOf("CON", "con.txt", "NUL", "com1", "LPT9.log", "name.", "name ")) {
+            assertFalse(DropKeyCore.safeLandingName(name), "accepted reserved-looking $name")
+        }
+    }
+
+    @Test
+    fun `parseFileKeyBody refuses a keyed body whose name is unsafe`() {
+        // These bodies pass the structural gate, so the name check is what
+        // refuses them: no parsed KeyedFile can carry a landing path.
+        for (name in listOf("../../evil.txt", "/etc/passwd", "C:\\Windows\\evil.txt", "dir\\evil.txt")) {
+            val body = keyedBody { it["name"] = JsonPrimitive(name) }
+            assertTrue(CircleCore.validFileBody(body), "structural gate accepted $name")
+            assertNull(DropKeyCore.parseFileKeyBody(body), "parse accepted $name")
+        }
+        assertNull(DropKeyCore.parseFileKeyBody(keyedBody {
+            it["name"] = JsonPrimitive("a".repeat(DropKeyCore.MAX_NAME_CHARS + 1))
+        }))
+    }
+
+    @Test
+    fun `keyedFileBody refuses to mint a body with an unsafe landing name`() {
+        assertFailsWith<IllegalArgumentException> {
+            DropKeyCore.keyedFileBody(sample().copy(name = "../evil.txt"))
         }
     }
 }

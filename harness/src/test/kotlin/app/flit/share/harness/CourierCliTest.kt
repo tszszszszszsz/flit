@@ -11,6 +11,8 @@ import app.flit.share.protocol.tls.TlsIdentity
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
@@ -120,6 +122,64 @@ class CourierCliTest {
         require(s.isNotEmpty())
         return (if (s[0] == 'A') 'B' else 'A') + s.substring(1)
     }
+
+    /** Seed the CLI circle state that receive's outer and replay gates read. */
+    private fun seedCircle(circleId: String, me: String) {
+        saveCircleState(
+            CircleCliState(
+                circleId = circleId, host = "",
+                members = mutableListOf(me), events = mutableListOf(),
+            ),
+        )
+    }
+
+    /** Put one production parcel file and its matching pending row on disk. */
+    private fun stageParcel(bag: Path, home: Path, event: CircleEvent, toFp: String, circleId: String) {
+        val parcel = CourierCarryCore.parcelOf(event) ?: error("production parcelOf refused a valid parcel")
+        Files.writeString(
+            bag.resolve("${parcel.id}.parcel"),
+            CourierCarryCore.encode(CarryState(listOf(parcel))),
+            Charsets.UTF_8,
+        )
+        Files.createDirectories(home)
+        Files.writeString(
+            home.resolve(CourierCli.STATE_FILE),
+            CourierCli.encodeRows(
+                listOf(
+                    CourierCli.Row(
+                        parcel.id, toFp, event.authorFp, circleId, "pending",
+                        parcel.createdMs, parcel.expiresMs,
+                    ),
+                ),
+            ),
+            Charsets.UTF_8,
+        )
+    }
+
+    /** The signed outer PARCEL event wrapping one sealed envelope. */
+    private fun parcelEvent(
+        circleId: String,
+        authorFp: String,
+        identity: TlsIdentity,
+        toFp: String,
+        envelope: CourierEnvelope,
+        now: Long,
+    ): CircleEvent {
+        val body = buildJsonObject {
+            put("toFp", JsonPrimitive(toFp))
+            put("envelope", JsonPrimitive(CourierEnvelope.encode(envelope)))
+        }.toString()
+        return CircleCore.create(circleId, authorFp, identity, PARCEL, body, lamport = 1L, createdMs = now)
+    }
+
+    private fun foldedEvents(): List<CircleEvent> {
+        val lines = Files.readAllLines(expectedHome().resolve("circle.state"))
+        return WireJson.json.decodeFromString<List<CircleEvent>>(lines[5])
+    }
+
+    private fun singleRow(): CourierCli.Row = CourierCli.decodeRows(
+        Files.readString(expectedHome().resolve(CourierCli.STATE_FILE), Charsets.UTF_8),
+    ).single()
 
     // ---- state codec --------------------------------------------------------
 
@@ -350,6 +410,9 @@ class CourierCliTest {
         val home = expectedHome()
         val circleId = "cli-refused-open"
         val now = System.currentTimeMillis()
+        // The outer gate must pass for this test to reach the envelope-open
+        // refusal it is named for: same circle and the sender on the roster.
+        seedCircle(circleId, identity.fingerprint)
         val inner = CircleCore.create(
             circleId, identity.fingerprint, identity, CircleEvent.MESSAGE,
             """{"text":"never folded"}""", lamport = 0L, createdMs = now,
@@ -466,5 +529,165 @@ class CourierCliTest {
             ).single()
             assertEquals("delivered", row.state)
         }
+    }
+
+    // ---- outer parcel gate and inner replay gate ----------------------------
+
+    @Test
+    fun `receive refuses a forged outer signature and a non-member outer author`() = inIsolatedHome {
+        val identity = loadOrCreateIdentity()
+        val me = identity.fingerprint
+        val outsider = TlsIdentity.generate()
+        val home = expectedHome()
+        val circleId = "cli-outer-gate"
+        val now = System.currentTimeMillis()
+        seedCircle(circleId, me)
+
+        val inner = CircleCore.create(
+            circleId, me, identity, CircleEvent.MESSAGE, """{"text":"never folded"}""",
+            lamport = 0L, createdMs = now,
+        )
+        val envelope = CourierEnvelope.seal(
+            listOf(inner), circleId, me, me, identity.certificate, identity, now,
+        ) ?: error("production seal refused a small, valid event")
+        val valid = parcelEvent(circleId, me, identity, me, envelope, now)
+        val forgedSignature = valid.copy(sig = flipFirst(valid.sig))
+        val nonMember = parcelEvent(circleId, outsider.fingerprint, outsider, me, envelope, now)
+        val wrongCircle = parcelEvent("other-circle", me, identity, me, envelope, now)
+
+        for ((label, outer) in listOf(
+            "forged signature" to forgedSignature,
+            "non-member author" to nonMember,
+            "wrong circle" to wrongCircle,
+        )) {
+            withTempDir("courier-cli-outer-gate-") { bag ->
+                stageParcel(bag, home, outer, me, circleId)
+                assertEquals(
+                    CourierCli.EXIT_OPEN_REFUSED,
+                    CourierCli.run(
+                        ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
+                    ),
+                    label,
+                )
+                assertEquals("refused", singleRow().state, label)
+                assertTrue(foldedEvents().isEmpty(), "$label must not reach circle.state")
+                assertTrue(
+                    Files.isRegularFile(home.resolve(CourierCli.REJECTED_DIR).resolve("${outer.id}.parcel")),
+                    "$label must be quarantined",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `receive refuses a stale inner event inside a fresh envelope`() = inIsolatedHome {
+        val identity = loadOrCreateIdentity()
+        val me = identity.fingerprint
+        val home = expectedHome()
+        val circleId = "cli-stale-inner"
+        val now = System.currentTimeMillis()
+        seedCircle(circleId, me)
+
+        // The envelope itself is fresh, so open succeeds; only the inner
+        // event's createdMs is outside CircleCore's replay window.
+        val stale = CircleCore.create(
+            circleId, me, identity, CircleEvent.MESSAGE, """{"text":"old replay"}""",
+            lamport = 0L, createdMs = now - CircleCore.REPLAY_WINDOW_MS - 60_000L,
+        )
+        val envelope = CourierEnvelope.seal(
+            listOf(stale), circleId, me, me, identity.certificate, identity, now,
+        ) ?: error("production seal refused a small, valid event")
+        val outer = parcelEvent(circleId, me, identity, me, envelope, now)
+
+        withTempDir("courier-cli-stale-inner-") { bag ->
+            stageParcel(bag, home, outer, me, circleId)
+            assertEquals(
+                0,
+                CourierCli.run(
+                    ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
+                ),
+            )
+            assertTrue(foldedEvents().isEmpty(), "a stale inner event must not reach circle.state")
+            assertEquals("pending", singleRow().state, "a parcel with no fresh event stays for retry")
+        }
+    }
+
+    @Test
+    fun `receive still folds a fresh inner event through the new gates`() = inIsolatedHome {
+        val identity = loadOrCreateIdentity()
+        val me = identity.fingerprint
+        val home = expectedHome()
+        val circleId = "cli-fresh-inner"
+        val now = System.currentTimeMillis()
+        seedCircle(circleId, me)
+
+        val fresh = CircleCore.create(
+            circleId, me, identity, CircleEvent.MESSAGE, """{"text":"fold me"}""",
+            lamport = 0L, createdMs = now,
+        )
+        val envelope = CourierEnvelope.seal(
+            listOf(fresh), circleId, me, me, identity.certificate, identity, now,
+        ) ?: error("production seal refused a small, valid event")
+        val outer = parcelEvent(circleId, me, identity, me, envelope, now)
+
+        withTempDir("courier-cli-fresh-inner-") { bag ->
+            stageParcel(bag, home, outer, me, circleId)
+            assertEquals(
+                0,
+                CourierCli.run(
+                    ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
+                ),
+            )
+            assertEquals(listOf(fresh.id), foldedEvents().map { it.id })
+            assertEquals("delivered", singleRow().state)
+            assertTrue(
+                Files.isRegularFile(home.resolve(CourierCli.RECEIVED_DIR).resolve("${outer.id}.parcel")),
+            )
+        }
+    }
+
+    // ---- circle.state load gate and ledger permissions ----------------------
+
+    @Test
+    fun `loadCliCircleState drops a forged unsigned event from circle state`() = inIsolatedHome {
+        val identity = loadOrCreateIdentity()
+        val me = identity.fingerprint
+        val circleId = "cli-forged-state-event"
+        val signed = CircleCore.create(
+            circleId, me, identity, CircleEvent.MESSAGE, """{"text":"kept"}""", lamport = 0L,
+        )
+        val forged = signed.copy(
+            id = "forged-unsigned",
+            sig = "",
+            body = """{"text":"dropped"}""",
+        )
+        saveCircleState(
+            CircleCliState(
+                circleId = circleId, host = "",
+                members = mutableListOf(me),
+                events = mutableListOf(signed, forged),
+            ),
+        )
+
+        val loaded = CourierCli.loadCliCircleState()!!
+        assertEquals(listOf(signed.id), loaded.events.map { it.id })
+        assertFalse(loaded.events.any { it.body == forged.body })
+    }
+
+    @Test
+    fun `courier state writes are private to the local user`() = inIsolatedHome {
+        val home = expectedHome()
+        Files.createDirectories(home)
+        assumeTrue(
+            Files.getFileAttributeView(home, PosixFileAttributeView::class.java) != null,
+            "POSIX file attributes are unavailable here",
+        )
+        withTempDir("courier-cli-perms-") { bag ->
+            assertEquals(0, CourierCli.run(ParsedArgs(arrayOf("courier", "sweep", "--bag", bag.toString()))))
+        }
+        assertEquals(
+            PosixFilePermissions.fromString("rw-------"),
+            Files.getPosixFilePermissions(home.resolve(CourierCli.STATE_FILE)),
+        )
     }
 }

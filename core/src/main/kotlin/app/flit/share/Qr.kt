@@ -36,6 +36,10 @@ import java.net.URLEncoder
  *
  * The scheme is deliberately ours (`flit://`): LocalSend peers never emit
  * it and Flit never emits anything resembling theirs.
+ *
+ * A code is an untrusted routing instruction. Dialable fields are confined
+ * to the local network: `parseAddCode` refuses a non-LAN [ip] and the
+ * [lanOnly] mark tells the app that a [relay] host is off-LAN too.
  */
 data class QrAdd(
     val ip: String = "",
@@ -78,6 +82,106 @@ data class QrAdd(
         if (!circle.isNullOrBlank()) append("&circle=").append(URLEncoder.encode(circle, Charsets.UTF_8.name()))
         if (!invite.isNullOrBlank()) append("&invite=").append(URLEncoder.encode(invite, Charsets.UTF_8.name()))
     }
+
+    /**
+     * LAN-only mark carried by every parsed code. Derived from the two
+     * dialable fields, never put on the wire and never part of equality, so
+     * v1/v2/v3 codes still round-trip byte-for-byte. A relay hostname is not
+     * an IP literal and is therefore off-LAN by inspection (DNS can point it
+     * anywhere); the app gates on this before dialing a scanned code.
+     */
+    val lanOnly: Boolean
+        get() = (ip.isBlank() || isLanAddress(ip)) &&
+            (relay.isNullOrBlank() || FlitRoute.parseRelay(relay)?.let { isLanAddress(it.first) } == true)
+}
+
+/**
+ * Whether [host] is a literal IP address on the local network: RFC1918
+ * space, IPv4 loopback/link-local, IPv6 loopback (`::1`), ULA (`fc00::/7`)
+ * and IPv6 link-local (`fe80::/10`). IPv4-mapped IPv6 is judged by its
+ * embedded IPv4 half.
+ *
+ * Pure: no DNS, no sockets, no clock. A hostname, a public address, an
+ * unspecified/multicast/reserved address or anything malformed is false —
+ * a name cannot be known to stay on-link by inspection, so it is refused
+ * even when it currently happens to resolve to a private address.
+ */
+fun isLanAddress(host: String): Boolean {
+    val raw = host.trim().trim('[', ']').substringBefore('%')
+    if (raw.isEmpty()) return false
+    parseIpv4(raw)?.let { return isLanIpv4(it) }
+    val v6 = parseIpv6(raw) ?: return false
+    // ::ffff:a.b.c.d — the v4 half decides, including its loopback/LAN ranges.
+    if (v6.take(5).all { it == 0 } && v6[5] == 0xFFFF) {
+        return isLanIpv4(intArrayOf(v6[6] ushr 8, v6[6] and 0xFF, v6[7] ushr 8, v6[7] and 0xFF))
+    }
+    if (v6.take(7).all { it == 0 } && v6[7] == 1) return true              // ::1
+    if ((v6[0] and 0xFE00) == 0xFC00) return true                          // fc00::/7 ULA
+    if ((v6[0] and 0xFFC0) == 0xFE80) return true                          // fe80::/10 link-local
+    return false
+}
+
+/** Strict dotted-quad: four decimal octets, no sign, no leading zeros. */
+private fun parseIpv4(raw: String): IntArray? {
+    val parts = raw.split('.')
+    if (parts.size != 4) return null
+    val out = IntArray(4)
+    for (i in 0..3) {
+        val p = parts[i]
+        if (p.isEmpty() || p.length > 1 && p[0] == '0' || !p.all { it in '0'..'9' }) return null
+        val n = p.toIntOrNull() ?: return null
+        if (n !in 0..255) return null
+        out[i] = n
+    }
+    return out
+}
+
+private fun isLanIpv4(b: IntArray): Boolean = when {
+    b[0] == 10 -> true                          // 10.0.0.0/8
+    b[0] == 172 && b[1] in 16..31 -> true       // 172.16.0.0/12
+    b[0] == 192 && b[1] == 168 -> true          // 192.168.0.0/16
+    b[0] == 127 -> true                         // loopback
+    b[0] == 169 && b[1] == 254 -> true          // link-local
+    else -> false
+}
+
+/**
+ * Strict IPv6 literal → eight 16-bit words. Accepts `::` compression and
+ * an embedded IPv4 tail, rejects shorthand, extra colons and junk.
+ */
+private fun parseIpv6(raw: String): IntArray? {
+    var s = raw
+    if (s.contains('.')) {
+        val lastColon = s.lastIndexOf(':')
+        if (lastColon < 0 || lastColon == s.length - 1) return null
+        val tail = parseIpv4(s.substring(lastColon + 1)) ?: return null
+        s = s.substring(0, lastColon + 1) +
+            ((tail[0] shl 8) or tail[1]).toString(16) + ":" +
+            ((tail[2] shl 8) or tail[3]).toString(16)
+    }
+    fun hexGroup(seg: String): Int? {
+        if (seg.isEmpty() || seg.length > 4 || !seg.all { it in "0123456789abcdefABCDEF" }) return null
+        return seg.toInt(16)
+    }
+    val groups = ArrayList<Int>(8)
+    val marks = s.indexOf("::")
+    if (marks >= 0) {
+        if (s.indexOf("::", marks + 2) >= 0) return null
+        val halves = s.split("::", limit = 2)
+        fun expand(part: String): List<Int>? =
+            if (part.isEmpty()) emptyList() else part.split(':').map { hexGroup(it) ?: return null }
+        val left = expand(halves[0]) ?: return null
+        val right = if (halves.size > 1) expand(halves[1]) ?: return null else emptyList()
+        if (left.size + right.size >= 8) return null // :: must compress a group
+        groups.addAll(left)
+        repeat(8 - left.size - right.size) { groups.add(0) }
+        groups.addAll(right)
+    } else {
+        val segs = s.split(':')
+        if (segs.size != 8) return null
+        for (seg in segs) groups.add(hexGroup(seg) ?: return null)
+    }
+    return if (groups.size == 8) groups.toIntArray() else null
 }
 
 /**
@@ -91,6 +195,11 @@ data class QrAdd(
  * ip is present. v1 ignores every later hint. v3 must additionally carry a
  * non-blank circle id and invite token — an invite code missing either is
  * malformed and refused rather than silently downgraded to a pairing.
+ *
+ * LAN gate: an [ip] is a literal address by contract (the sender announces
+ * its on-link IPv4), so a public or malformed one is refused here. A relay
+ * host may be a name and is kept, but the returned code's [QrAdd.lanOnly]
+ * mark is false; the scanner / deep-link call site gates on it before dialing.
  */
 fun parseAddCode(text: String): QrAdd? {
     val t = text.trim()
@@ -110,6 +219,7 @@ fun parseAddCode(text: String): QrAdd? {
     val version = (params["v"] ?: "1").toIntOrNull() ?: return null
     if (version !in 1..3) return null
     val ip = params["ip"]?.trim().orEmpty()
+    if (ip.isNotEmpty() && !isLanAddress(ip)) return null // no off-LAN dial from a code
     val port = (params["port"] ?: params["p"])?.toIntOrNull() ?: 0
     if (version == 1 && (ip.isEmpty() || port !in 1..65535)) return null
     val relay = if (version >= 2) params["relay"]?.trim()?.ifBlank { null } else null

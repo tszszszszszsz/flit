@@ -12,6 +12,7 @@ import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import java.io.File
+import java.io.IOException
 import java.io.OutputStream
 import java.math.BigInteger
 import java.net.Socket
@@ -188,29 +189,92 @@ class TlsIdentity private constructor(
         const val MAX_PINS = 512
 
         /**
-         * Certificates trusted for device signatures (panic alerts and Circle
-         * events alike), keyed by the SHA-256 of their DER — the very same
-         * value announced as a device fingerprint.
-         * Pinning by the certificate's OWN digest (never a caller-supplied
-         * label) is what makes a claimed senderFp unforgeable: an attacker's
-         * cert lands under the attacker's fingerprint, not the victim's.
-         * Bounded and LRU: every [pinned] lookup counts as an access, so pins
-         * still in use survive while stale ones are evicted first.
+         * Unauthenticated route pins (a certificate off a wire header, with no
+         * verified signature behind it) share only this small LRU. A flood of
+         * them can evict other *unverified* pins, never a verified one.
          */
-        private val panicPins = PinCache(MAX_PINS)
+        const val UNVERIFIED_PIN_QUOTA = 16
 
-        /** Pins [cert] under its own fingerprint; returns that fingerprint. */
+        /** How long a successful cert-in-hand verification may promote one pin. */
+        private const val VERIFY_GRACE_MS = 5_000L
+
+        /**
+         * Two-tier pin store: verified pins (installed only after a signature
+         * check or an out-of-band trusted action) live in a protected tier;
+         * bare [pin] calls land in the small unverified tier and cannot evict
+         * the protected ones. Keyed by the SHA-256 of the certificate's DER —
+         * the very same value announced as a device fingerprint — so a
+         * claimed senderFp can never borrow another device's identity.
+         */
+        private val panicPins = PinCache(MAX_PINS, UNVERIFIED_PIN_QUOTA)
+
+        /**
+         * Short-lived provenance marker: every successful [verifyWithCertificate]
+         * records the verified digest. The very next [pin] of that same cert
+         * (CircleCore/CourierEnvelope/CircleResponse/panic routes all follow
+         * this exact verify-then-pin order) is promoted to the protected tier
+         * without those owners needing a new API. Consumed on use.
+         *
+         * Access-ordered ring: a hard cap at [MAX_PINS] even when more valid
+         * certificates are verified inside one grace window. Oldest-accessed
+         * marker is dropped unconditionally, so a flood can never grow it
+         * without bound; the 5 s grace check at consume time is unchanged.
+         */
+        private val recentVerifiedLock = Any()
+        private val recentVerified = object : LinkedHashMap<String, Long>(MAX_PINS, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+                size > MAX_PINS
+        }
+
+        /**
+         * Pins [cert] under its own fingerprint; returns that fingerprint.
+         * Unverified by default: the small quota bounds what an untrusted
+         * route header can write. A verification just completed for this same
+         * certificate promotes the pin to the protected tier.
+         */
         fun pin(cert: X509Certificate): String {
             val fp = certificateFingerprint(cert)
-            panicPins.put(fp, cert)
+            if (consumeRecentVerification(fp)) panicPins.putVerified(fp, cert)
+            else panicPins.putUnverified(fp, cert)
             return fp
         }
+
+        /**
+         * Pins a certificate trusted out of band (QR pairing, an explicit
+         * trusted-device action, or a signature already verified through this
+         * API). Protected tier: unverified route floods never evict it.
+         */
+        fun pinVerified(cert: X509Certificate): String {
+            val fp = certificateFingerprint(cert)
+            panicPins.putVerified(fp, cert)
+            synchronized(recentVerifiedLock) { recentVerified.remove(fp) }
+            return fp
+        }
+
+        private fun consumeRecentVerification(fp: String): Boolean {
+            val at = synchronized(recentVerifiedLock) {
+                recentVerified.remove(fp.trim().uppercase())
+            } ?: return false
+            return System.currentTimeMillis() - at <= VERIFY_GRACE_MS
+        }
+
+        private fun markRecentVerification(cert: X509Certificate) {
+            val fp = certificateFingerprint(cert)
+            synchronized(recentVerifiedLock) { recentVerified[fp] = System.currentTimeMillis() }
+        }
+
+        /** Test hook: the marker ring is hard-bounded at [MAX_PINS]. */
+        internal fun recentVerifiedSize(): Int = synchronized(recentVerifiedLock) { recentVerified.size }
 
         fun pinned(fingerprint: String): X509Certificate? = panicPins.get(fingerprint)
 
         fun forgetPin(fingerprint: String) {
             panicPins.remove(fingerprint)
+            synchronized(recentVerifiedLock) { recentVerified.remove(fingerprint.trim().uppercase()) }
         }
+
+        /** Snapshot of protected-tier fingerprints, for app/desktop gate tests. */
+        fun verifiedPinFingerprints(): Set<String> = panicPins.verifiedFingerprints()
 
         fun fingerprintOf(cert: X509Certificate): String = certificateFingerprint(cert)
 
@@ -225,8 +289,37 @@ class TlsIdentity private constructor(
          * claimed fingerprint first, checks the signature, and only then pins.
          * A forged event can therefore no longer poison the pin store.
          */
-        fun verifyWithCertificate(cert: X509Certificate, bytes: ByteArray, sig: String): Boolean =
-            verifySignature(cert, bytes, sig)
+        fun verifyWithCertificate(cert: X509Certificate, bytes: ByteArray, sig: String): Boolean {
+            if (!verifySignatureWithCertificate(cert, bytes, sig)) return false
+            // Only a signature that passed (valid cert, canonical Base64,
+            // matching key) may mark this digest for the protected pin tier.
+            markRecentVerification(cert)
+            return true
+        }
+
+        /**
+         * Public name for the cert-in-hand check used by the prepare route:
+         * verify a signature over the EXACT body bytes with the certificate
+         * carried in the request. The caller binds that certificate to its
+         * own DER digest before trusting anything it claims.
+         */
+        fun verifySignature(cert: X509Certificate, bytes: ByteArray, sig: String): Boolean =
+            verifyWithCertificate(cert, bytes, sig)
+
+        /**
+         * Sender-side TLS peer check, run after the handshake and before the
+         * first request byte. A null or blank pin keeps the legacy behavior;
+         * a declared pin requires the peer's leaf certificate digest to match
+         * exactly (case-insensitive hex). Absent cert and mismatch both fail.
+         */
+        internal fun checkPeerPin(cert: X509Certificate?, expectedFp: String?) {
+            if (expectedFp.isNullOrBlank()) return
+            val presented = cert?.let(::certificateFingerprint)
+                ?: throw IOException("TLS peer presented no certificate for the expected pin")
+            if (!presented.equals(expectedFp.trim(), ignoreCase = true)) {
+                throw IOException("TLS peer certificate does not match the expected fingerprint")
+            }
+        }
 
         /** Panic compatibility wrapper — identical check, no second crypto path. */
         fun verifyPanic(senderFp: String, canonical: ByteArray, sig: String): Boolean =
@@ -288,39 +381,71 @@ class TlsIdentity private constructor(
 }
 
 /**
- * Bounded, thread-safe pin store keyed by uppercase-hex certificate fingerprint.
- * Backed by an access-ordered map: [get] promotes an entry, so pins that keep
- * being verified stay resident and only stale pins are evicted at [capacity].
- * Kept internal (not part of the public TlsIdentity API) so the eviction policy
- * can be exercised directly with a small capacity in unit tests.
+ * Bounded, thread-safe two-tier pin store keyed by uppercase-hex certificate
+ * fingerprint. Both tiers are access-ordered LRUs ([get] promotes an entry);
+ * eviction in one tier never touches the other, so an unauthenticated flood
+ * of [putUnverified] calls cannot push out a [putVerified] pin.
+ *
+ * Kept internal (not part of the public TlsIdentity API) so the eviction
+ * policy can be exercised directly with a small capacity in unit tests.
+ * [unverifiedCapacity] defaults to [capacity], preserving the original
+ * single-tier behaviour for callers that construct their own cache.
  */
-internal class PinCache(private val capacity: Int = TlsIdentity.MAX_PINS) {
+internal class PinCache(
+    private val capacity: Int = TlsIdentity.MAX_PINS,
+    private val unverifiedCapacity: Int = capacity,
+) {
     init {
         require(capacity > 0) { "capacity must be positive" }
+        require(unverifiedCapacity > 0) { "unverified capacity must be positive" }
     }
 
     private val lock = Any()
-    private val pins = object : LinkedHashMap<String, X509Certificate>(capacity, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, X509Certificate>?): Boolean =
-            size > capacity
+    private val verified = lru(capacity)
+    private val unverified = lru(unverifiedCapacity)
+
+    private fun lru(cap: Int): LinkedHashMap<String, X509Certificate> =
+        object : LinkedHashMap<String, X509Certificate>(cap, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, X509Certificate>?): Boolean =
+                size > cap
+        }
+
+    /** Legacy single-tier write: an unauthenticated pin, with a small quota. */
+    fun put(fingerprint: String, cert: X509Certificate) = putUnverified(fingerprint, cert)
+
+    fun putUnverified(fingerprint: String, cert: X509Certificate) = synchronized(lock) {
+        val fp = fingerprint.trim().uppercase()
+        // A verified pin is never downgraded or evicted by a bare pin call.
+        if (!verified.containsKey(fp)) unverified[fp] = cert
     }
 
-    fun put(fingerprint: String, cert: X509Certificate) = synchronized(lock) {
-        pins[fingerprint.trim().uppercase()] = cert
+    fun putVerified(fingerprint: String, cert: X509Certificate) = synchronized(lock) {
+        val fp = fingerprint.trim().uppercase()
+        unverified.remove(fp)
+        verified[fp] = cert
     }
 
-    /** Returns the pinned certificate and promotes it in the access order. */
+    /** Returns the pinned certificate; verified tier wins and both promote recency. */
     fun get(fingerprint: String): X509Certificate? = synchronized(lock) {
-        pins[fingerprint.trim().uppercase()]
+        val fp = fingerprint.trim().uppercase()
+        verified[fp] ?: unverified[fp]
     }
+
+    /** Immutable snapshot of protected-tier keys — never a live view. */
+    fun verifiedFingerprints(): Set<String> = synchronized(lock) { verified.keys.toSet() }
 
     fun remove(fingerprint: String) = synchronized(lock) {
-        pins.remove(fingerprint.trim().uppercase())
+        val fp = fingerprint.trim().uppercase()
+        unverified.remove(fp)
+        verified.remove(fp)
     }
 
-    fun size(): Int = synchronized(lock) { pins.size }
+    fun size(): Int = synchronized(lock) { verified.size + unverified.size }
 
-    fun clear() = synchronized(lock) { pins.clear() }
+    fun clear() = synchronized(lock) {
+        verified.clear()
+        unverified.clear()
+    }
 }
 
 /** Uppercase-hex SHA-256 of a certificate's DER encoding — the wire fingerprint. */
@@ -338,17 +463,38 @@ private fun verifySignature(senderFp: String, canonical: ByteArray, sig: String)
     val fp = senderFp.trim().uppercase()
     val cert = TlsIdentity.pinned(fp) ?: return false
     if (TlsIdentity.fingerprintOf(cert) != fp) return false
-    return verifySignature(cert, canonical, sig)
+    return verifySignatureWithCertificate(cert, canonical, sig)
 }
 
-/** The one crypto check, reused by pin-based and cert-in-hand verification. */
-private fun verifySignature(cert: X509Certificate, canonical: ByteArray, sig: String): Boolean = try {
-    val verifier = Signature.getInstance(signatureAlgorithm(cert.publicKey.algorithm))
-    verifier.initVerify(cert.publicKey)
-    verifier.update(canonical)
-    verifier.verify(Base64.getDecoder().decode(sig.trim()))
-} catch (_: Exception) {
-    false // malformed base64, wrong algorithm, or plain forgery
+/** OID of the X.509 KeyUsage extension. */
+private const val OID_KEY_USAGE = "2.5.29.15"
+
+/**
+ * The one crypto check, reused by pin-based and cert-in-hand verification
+ * (so [TlsIdentity.verifyWithCertificate] enforces all three layers):
+ * 1. the certificate is currently valid,
+ * 2. it is allowed to sign when it carries a KeyUsage extension,
+ * 3. the signature is canonical Base64 — decode, re-encode, compare to the
+ *    trimmed input — so unpadded or non-canonical strings cannot be smuggled
+ *    past a verifier that would have accepted them.
+ */
+private fun verifySignatureWithCertificate(cert: X509Certificate, canonical: ByteArray, sig: String): Boolean {
+    return try {
+        cert.checkValidity()
+        if (cert.getExtensionValue(OID_KEY_USAGE) != null) {
+            val usage = cert.keyUsage
+            if (usage == null || usage.size <= 0 || !usage[0]) return false // digitalSignature
+        }
+        val trimmed = sig.trim()
+        val decoded = Base64.getDecoder().decode(trimmed)
+        if (Base64.getEncoder().encodeToString(decoded) != trimmed) return false
+        val verifier = Signature.getInstance(signatureAlgorithm(cert.publicKey.algorithm))
+        verifier.initVerify(cert.publicKey)
+        verifier.update(canonical)
+        verifier.verify(decoded)
+    } catch (_: Exception) {
+        false // expired/not-yet-valid, malformed base64, wrong algorithm, or forgery
+    }
 }
 
 /** Trusts everything — peers are self-signed by design; identity is the announced fingerprint. */

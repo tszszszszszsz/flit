@@ -1,6 +1,10 @@
 # The rig standard, green before any commit merges:
-# Projected until green XML: 362 protocol + 112 core + 212 app + 92 harness = 778
-# tests + debug/release assemblies + the CLI dist.
+# Last full green test XML (2026-11-28): 443 protocol + 167 core + 254 app +
+# 108 harness = 972 tests, 0 failures, 0 errors, 0 skipped, read from the four
+# modules' JUnit XML. A background rerun of the full rig (tests plus assemblies)
+# follows the R8 keep-rule change; no green claim is made here for that rerun.
+# Earlier figures (the projected four-module 362 + 112 + 212 + 92 = 778 and the
+# three-module 362 + 324 + 92 = 778) are historical.
 name: rig
 
 on:

@@ -2,6 +2,7 @@ package app.flit.share
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -299,5 +300,89 @@ class FlitQrTest {
         val noise = ByteArray(100 * 100) { (((it * 31) % 7) * 36).toByte() }
         assertNull(Qr.decodeGray(noise, 100, 100))
         assertNull(Qr.decodeRgb(IntArray(100 * 100) { it * 7919 }, 100, 100))
+    }
+
+    // ==== LAN-only deep links ====
+
+    @Test
+    fun `isLanAddress accepts private loopback and link-local ipv4`() {
+        assertTrue(isLanAddress("192.168.100.80"))
+        assertTrue(isLanAddress("10.0.0.7"))
+        assertTrue(isLanAddress("172.16.0.1"))
+        assertTrue(isLanAddress("172.31.255.255"))
+        assertTrue(isLanAddress("127.0.0.1"))
+        assertTrue(isLanAddress("169.254.42.7"))
+        // RFC1918 boundaries are strict: the next address past each block is public.
+        assertFalse(isLanAddress("172.32.0.1"))
+        assertFalse(isLanAddress("192.169.0.1"))
+        assertFalse(isLanAddress("11.0.0.1"))
+    }
+
+    @Test
+    fun `isLanAddress rejects public malformed and hostname addresses`() {
+        assertFalse(isLanAddress("8.8.8.8"))
+        assertFalse(isLanAddress("1.2.3.4"))
+        assertFalse(isLanAddress("relay.example.org")) // a name can resolve anywhere
+        assertFalse(isLanAddress("localhost"))
+        assertFalse(isLanAddress(""))
+        assertFalse(isLanAddress("0.0.0.0")) // unspecified, not a LAN peer
+        assertFalse(isLanAddress("224.0.0.1")) // multicast
+        assertFalse(isLanAddress("999.1.1.1"))
+        assertFalse(isLanAddress("01.2.3.4")) // octal-looking shorthand is malformed
+        assertFalse(isLanAddress("10.0.0"))
+        assertFalse(isLanAddress("+10.0.0.1"))
+        assertFalse(isLanAddress("10.0.0.1:53317")) // a port is not part of a host
+    }
+
+    @Test
+    fun `isLanAddress accepts valid ipv6 lan literals only`() {
+        assertTrue(isLanAddress("::1"))                    // loopback
+        assertTrue(isLanAddress("[::1]"))                  // bracketed, as in a relay
+        assertTrue(isLanAddress("fc00::1"))                // ULA fc00::/7
+        assertTrue(isLanAddress("fd12:3456:789a::1"))
+        assertTrue(isLanAddress("fe80::1"))                // link-local fe80::/10
+        assertTrue(isLanAddress("febf::abcd"))
+        assertTrue(isLanAddress("fe80::1%wlan0"))          // zone id is not part of the address
+        assertTrue(isLanAddress("::ffff:127.0.0.1"))       // mapped loopback
+        assertTrue(isLanAddress("::ffff:192.168.1.9"))     // mapped private
+        assertFalse(isLanAddress("2001:db8::1"))           // global / documentation
+        assertFalse(isLanAddress("::ffff:8.8.8.8"))        // mapped public
+        assertFalse(isLanAddress("fec0::1"))               // deprecated site-local
+        assertFalse(isLanAddress("::"))                    // unspecified
+        assertFalse(isLanAddress("fe80::zz"))              // malformed
+        assertFalse(isLanAddress("1:2:3:4:5:6:7:8:9"))     // too many groups
+        assertFalse(isLanAddress("1:::2"))                 // extra colon
+        assertFalse(isLanAddress("2001:db8::1:2:3:4:5:6:7")) // :: must compress a group
+    }
+
+    @Test
+    fun `a code with a public or malformed ip is refused`() {
+        assertNull(parseAddCode("flit://add?v=1&ip=8.8.8.8&port=53317"))
+        assertNull(parseAddCode("flit://add?v=2&ip=2001:db8::1&port=53317"))
+        assertNull(parseAddCode("flit://add?v=3&ip=relay.example.org&port=53317&circle=c&invite=i"))
+        assertNull(parseAddCode("flit://add?v=2&ip=999.1.1.1&port=53317"))
+        // A valid LAN IPv6 literal is still a valid pairing address.
+        // %25 is URL-decoded to '%' (the zone separator) before inspection.
+        val v6 = parseAddCode("flit://add?v=2&ip=fe80::1%25wlan0&port=53317")
+        assertEquals("fe80::1%wlan0", v6?.ip)
+        assertTrue(v6?.lanOnly ?: false)
+    }
+
+    @Test
+    fun `a public relay host is parsed but marked off-LAN`() {
+        val lan = parseAddCode("flit://add?v=2&ip=192.168.1.9&port=53317&relay=192.168.1.1:443")
+        assertTrue(lan?.lanOnly ?: false)
+        val named = parseAddCode("flit://add?v=2&ip=192.168.1.9&port=53317&relay=relay.example.org:443")
+        assertEquals("relay.example.org:443", named?.relay)
+        assertFalse(named?.lanOnly ?: true)
+        val relayOnly = parseAddCode("flit://add?v=2&relay=relay.example.org:443")
+        assertEquals("relay.example.org:443", relayOnly?.relay)
+        assertFalse(relayOnly?.lanOnly ?: true)
+        // The mark is derived, not part of equality: v2/v3 wire roundtrips
+        // with a named relay keep working byte-for-byte.
+        val v2 = QrAdd(fingerprint = "AB", relay = "relay.example.org:443")
+        assertEquals(v2, parseAddCode(v2.uri()))
+        val v3 = v3Invite.copy(ip = "", port = 0, mac = null)
+        assertEquals(v3, parseAddCode(v3.uri()))
     }
 }

@@ -56,17 +56,29 @@ android {
         }
     }
 
-    // Netty jars carry overlapping META-INF bookkeeping; drop the copies.
+    // Netty jars carry overlapping META-INF bookkeeping; drop only that.
+    // Upstream license/NOTICE text must travel with the APK: merge one copy
+    // per path instead of stripping every copy (which would break packaging
+    // on duplicate entries and drop redistribution terms).
     packaging {
-        resources.excludes += setOf(
-            "META-INF/INDEX.LIST",
-            "META-INF/io.netty.versions.properties",
-            "META-INF/DEPENDENCIES",
-            "META-INF/LICENSE.md",
-            "META-INF/LICENSE.txt",
-            "META-INF/AL2.0",
-            "META-INF/LGPL2.1",
-        )
+        resources {
+            excludes += setOf(
+                "META-INF/INDEX.LIST",
+                "META-INF/io.netty.versions.properties",
+                "META-INF/DEPENDENCIES",
+            )
+            pickFirsts += setOf(
+                "META-INF/LICENSE",
+                "META-INF/LICENSE.txt",
+                "META-INF/LICENSE.md",
+                "META-INF/LICENSE-notice.md",
+                "META-INF/NOTICE",
+                "META-INF/NOTICE.txt",
+                "META-INF/NOTICE.md",
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1",
+            )
+        }
     }
 
     compileOptions {

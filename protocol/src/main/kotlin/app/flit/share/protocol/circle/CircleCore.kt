@@ -29,7 +29,18 @@ object CircleCore {
     /** Small future tolerance for two phones' unsynchronised clocks. */
     const val CLOCK_SKEW_MS = 5 * 60 * 1000L
 
-    /** Bounded FIFO memory — a bounded log must not grow without limit. */
+    /**
+     * How long a reservation is retained. It covers the whole past window
+     * plus the future-skew allowance, so an id is never dropped while a signed
+     * event carrying it could still pass [withinWindow].
+     */
+    private const val RETAIN_MS = REPLAY_WINDOW_MS + CLOCK_SKEW_MS
+
+    /**
+     * Bounded memory for LIVE reservations — a bounded log must not grow
+     * without limit. Stale reservations are pruned; a live (in-window) id is
+     * never dropped to make room, so a full set refuses the newcomer instead.
+     */
     const val MAX_SEEN = 4096
 
     /** Largest accepted event body (a chat line / file-metadata JSON object). */
@@ -75,8 +86,10 @@ object CircleCore {
 
     /**
      * Exact precedence for [evaluate]/[accept]: Invalid → OutsideWindow →
-     * Duplicate → Accept. Only Accept records the id; every other decision
-     * leaves the bounded seen set untouched.
+     * Duplicate → Full → Accept. Only Accept records the id; every other
+     * decision leaves the bounded seen set untouched. Expired reservations are
+     * purged before the capacity check, so a live id is never evicted: when
+     * every slot is still live the newcomer is refused as [Full].
      */
     sealed interface Decision {
         /** Structurally fresh and in-window: the id is now reserved. Verify the signature FIRST. */
@@ -90,9 +103,48 @@ object CircleCore {
 
         /** [validShape] failed: blank/oversized fields, bad type, non-positive clock. Not recorded. */
         data object Invalid : Decision
+
+        /**
+         * All [MAX_SEEN] slots are still live, so admitting the new id would
+         * have to drop an in-window replay record. The id is NOT recorded and
+         * the caller must refuse the event; a later retry can succeed once a
+         * slot expires. [fresh] maps this to false.
+         */
+        data object Full : Decision
     }
 
+    /** Reservation key → reserved-until-ms. Shared by [evaluate] and [fresh]. */
     private val seen = LinkedHashMap<String, Long>()
+
+    /**
+     * Reservation deadline for a key reserved at [nowMs]. Saturates at
+     * [Long.MAX_VALUE] so an extreme clock cannot wrap into a past deadline.
+     */
+    private fun reservedUntil(nowMs: Long): Long =
+        if (nowMs > Long.MAX_VALUE - RETAIN_MS) Long.MAX_VALUE else nowMs + RETAIN_MS
+
+    /** Drops only reservations that can no longer be presented in-window. */
+    private fun purgeExpiredLocked(nowMs: Long) {
+        val entries = seen.entries.iterator()
+        while (entries.hasNext()) {
+            if (entries.next().value < nowMs) entries.remove()
+        }
+    }
+
+    private fun isReservedLocked(key: String): Boolean = key in seen
+
+    /**
+     * Atomic check-and-record under the [seen] monitor. Purging runs FIRST,
+     * then duplicate detection, then capacity; an in-window id is never
+     * evicted, so a full set returns [Decision.Full] instead of admitting one.
+     */
+    private fun reserveLocked(key: String, nowMs: Long): Decision {
+        purgeExpiredLocked(nowMs)
+        if (isReservedLocked(key)) return Decision.Duplicate
+        if (seen.size >= MAX_SEEN) return Decision.Full
+        seen[key] = reservedUntil(nowMs)
+        return Decision.Accept
+    }
 
     /**
      * Deterministic signing input: a domain tag plus length-prefixed UTF-8
@@ -549,19 +601,50 @@ object CircleCore {
     fun validJoinProofBody(body: String): Boolean = joinProofBytes(body) != null
 
     /**
-     * Stateless refusal reason for a JOIN request, or null when the proof is
-     * admissible. Other actions need no proof and return null. The precedence
-     * is: `join proof required` (no JOIN event and no `proof` field at all),
+     * Signature-only check for a JOIN proof. Mirrors [verify]'s shape,
+     * fingerprint binding and signature check, but NEVER writes a pin: the
+     * parsed certificate is returned so [joinProofFailure] can pin it only
+     * after every gate (bucket, nonce, digest, single-use) has accepted.
+     * An embedded cert is bound to its OWN SHA-256 DER before the signature is
+     * checked; a cert-less relayed event is checked against an existing pin,
+     * which reads but never writes. Returned pair: (signature valid, cert to pin).
+     */
+    private fun verifyProofSignature(e: CircleEvent): Pair<Boolean, X509Certificate?> {
+        if (!validShape(e) || e.sig.isBlank() || e.sig.length > MAX_SIG_CHARS) return false to null
+        val signed = canonical(e)
+        if (e.cert.isBlank()) {
+            return TlsIdentity.verify(e.authorFp, signed, e.sig) to null
+        }
+        val cert = runCatching {
+            CertificateFactory.getInstance("X.509")
+                .generateCertificate(Base64.getDecoder().decode(e.cert).inputStream())
+        }.getOrNull() as? X509Certificate ?: return false to null
+        val fp = runCatching { TlsIdentity.fingerprintOf(cert) }.getOrNull() ?: return false to null
+        if (!fp.equals(e.authorFp, ignoreCase = true)) return false to null
+        if (!TlsIdentity.verifyWithCertificate(cert, signed, e.sig)) return false to null
+        return true to cert
+    }
+
+    /**
+     * Refusal reason for a JOIN request, or null when the proof is admissible.
+     * Other actions need no proof and return null. The precedence is:
+     * `join proof required` (no JOIN event and no `proof` field at all),
      * `invalid join proof` (bad body, wrong author/circle, a forged or
      * unparseable signature, or a nonce that does not match this host, circle,
      * invite and member), `join proof replay` (a bucket other than the host's
-     * current one, or the same proof presented twice in one request).
+     * current one, the same proof presented twice in one request, a digest
+     * already reserved in this process, or a full replay set).
      *
-     * The signature check is [verify]: an embedded certificate is bound to its
-     * OWN SHA-256 DER before the signature is checked and only pinned on
-     * success, so a forged author can never poison the shared pin store. This
-     * function owns no replay set — bucket rollover is the bound — and it
-     * never changes canonical bytes, TYPES, create, sign or verify.
+     * The signature check is [verifyProofSignature], which does NOT pin: a
+     * validly self-signed proof with a wrong invite, bucket or nonce must leave
+     * the pin store untouched. An embedded certificate is bound to its OWN
+     * SHA-256 DER before the signature is checked, and is pinned only after the
+     * full gate accepts and the single-use reservation succeeds. Single-use
+     * state is keyed on the proof's domain-tagged digest — not the event id,
+     * which a re-signer can change — in the same bounded set as
+     * [evaluate]/[fresh]; that reservation fails closed when the set is full of
+     * live entries. This never changes canonical bytes, TYPES, create, sign or
+     * verify.
      */
     fun joinProofFailure(req: CircleRequest, hostFp: String, nowMs: Long): String? {
         if (req.action != CircleRequest.ACTION_JOIN) return null
@@ -577,7 +660,8 @@ object CircleCore {
                 validJoinProofBody(it.body)
         } ?: return "invalid join proof"
 
-        if (!verify(proof) || nowMs <= 0L) return "invalid join proof"
+        val (signatureOk, certToPin) = verifyProofSignature(proof)
+        if (!signatureOk || nowMs <= 0L) return "invalid join proof"
         val bucket = joinProofBucket(proof.createdMs)
         val current = joinProofBucket(nowMs)
         val lower = if (current > Long.MIN_VALUE + 1L) current - 1L else current
@@ -588,9 +672,15 @@ object CircleCore {
         if (!MessageDigest.isEqual(expected, presented)) return "invalid join proof"
         if (joins.count { it.id == proof.id && it.body == proof.body } > 1) return "join proof replay"
         // A captured proof is a bearer token until its bucket rolls over.
-        // Reserve the event id in the same bounded set used by accept/fresh so
-        // this process will not admit the verbatim event a second time.
-        if (!fresh(proof.id, nowMs)) return "join proof replay"
+        // Reserve the DOMAIN-TAGGED PROOF DIGEST, not the carrying event id:
+        // re-signing with a fresh id reproduces the same 32 bytes, so an
+        // id-keyed reservation would admit the same proof again. The shared
+        // bounded set now fails closed with false when it is full of live ids.
+        val proofKey = JOIN_PROOF_TAG + ":" + presented.joinToString("") { "%02X".format(it) }
+        if (!fresh(proofKey, nowMs)) return "join proof replay"
+        // Pin only now: every gate accepted and the proof is single-use. A
+        // refused proof never writes a pin under any path above.
+        certToPin?.let { TlsIdentity.pin(it) }
         return null
     }
 
@@ -598,9 +688,15 @@ object CircleCore {
      * Production replay guard: atomic check-and-record over ONE bounded id
      * set shared by [accept] and [fresh]. Decisions are checked in this exact
      * order: [Decision.Invalid] ([validShape] failed), [Decision.OutsideWindow]
-     * (clock), [Decision.Duplicate] (id already reserved), [Decision.Accept].
-     * Only Accept records the id, so a refused event can be retried after the
-     * cause is fixed; a second Accept can never happen for the same id.
+     * (clock), [Decision.Duplicate] (id already reserved), [Decision.Full] (all
+     * slots still live), [Decision.Accept]. Only Accept records the id, so a
+     * refused event can be retried after the cause is fixed; a second Accept
+     * can never happen for the same id.
+     *
+     * Reservations carry a reserved-until deadline of `now + [RETAIN_MS]`
+     * (saturating at [Long.MAX_VALUE]). [purgeExpiredLocked] removes ONLY
+     * expired entries, never a live one, so a flood of fresh ids cannot drop
+     * the replay record of an event that still passes the window.
      *
      * Callers MUST call [verify] first: this function reserves ids before
      * crypto, so verifying afterwards would burn the id of a forgery. The
@@ -615,15 +711,7 @@ object CircleCore {
     ): Decision {
         if (!validShape(e)) return Decision.Invalid
         if (!withinWindow(e.createdMs, nowMs)) return Decision.OutsideWindow
-        synchronized(seen) {
-            if (e.id in seen) return Decision.Duplicate
-            seen[e.id] = nowMs
-            while (seen.size > MAX_SEEN) {
-                val oldest = seen.entries.iterator().next()
-                seen.remove(oldest.key)
-            }
-        }
-        return Decision.Accept
+        return synchronized(seen) { reserveLocked(e.id, nowMs) }
     }
 
     private fun withinWindow(createdMs: Long, nowMs: Long): Boolean =
@@ -640,21 +728,18 @@ object CircleCore {
     ): Decision = evaluate(e, nowMs)
 
     /**
-     * Id-only form of the same bounded reservation: true only the first time
-     * an id is presented, false for a blank/oversized id or a repeat. It uses
-     * the SAME set as [evaluate]/[accept] — reserving an id here makes a later
-     * event with that id a [Decision.Duplicate], and vice versa. Use it for
-     * caller-owned ids that have no signed event yet; never as a replacement
-     * for [evaluate]'s shape/window checks on a real event.
+     * Key-only form of the same bounded reservation: true only the first time
+     * a key is presented, false for a blank/oversized key, a repeat, or a full
+     * set of live reservations. It uses the SAME set as [evaluate]/[accept] —
+     * reserving a key here makes a later event with that id a
+     * [Decision.Duplicate], and vice versa. JOIN proofs reserve their
+     * domain-tagged digest here; saturation fails closed as a replay refusal.
+     * Use it for caller-owned keys that have no signed event yet; never as a
+     * replacement for [evaluate]'s shape/window checks on a real event.
      */
     fun fresh(id: String, nowMs: Long = System.currentTimeMillis()): Boolean = synchronized(seen) {
-        if (id.isBlank() || id.length > MAX_FIELD_CHARS || id in seen) return@synchronized false
-        seen[id] = nowMs
-        while (seen.size > MAX_SEEN) {
-            val oldest = seen.entries.iterator().next()
-            seen.remove(oldest.key)
-        }
-        true
+        if (id.isBlank() || id.length > MAX_FIELD_CHARS) return@synchronized false
+        reserveLocked(id, nowMs) == Decision.Accept
     }
 
     /** Test/lifecycle hook: forget every remembered id. */

@@ -4,6 +4,8 @@ import java.io.File
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -56,5 +58,48 @@ class FlitSpoolTest {
         val nested = File(root, "crush-$now-1-nested").apply { mkdirs() }
         val renamed = File(root, "renamed-123-file.txt.hide")
         assertTrue(FlitSpool.stale(listOf(nested, renamed), emptyList(), now).isEmpty())
+    }
+
+    @Test
+    fun `the spool allowlist admits spool-shaped direct children of cacheDir`() {
+        val cache = dir()
+        val good = File(cache, "share-$now-7-notes.txt").apply { writeText("x") }
+        assertEquals(good.absoluteFile, FlitSpool.spoolPath(good.absolutePath, cache))
+        assertTrue(FlitSpool.validSpoolToken(good.absolutePath, cache))
+        // Shape, not existence: a token whose copy has gone still names a spool.
+        val missing = File(cache, "queue-$now-11-await.txt")
+        assertEquals(missing.absoluteFile, FlitSpool.spoolPath(missing.absolutePath, cache))
+    }
+
+    @Test
+    fun `the spool allowlist rejects arbitrary absolute paths and URIs`() {
+        val cache = dir()
+        val elsewhere = File(dir(), "share-$now-8-notes.txt").apply { writeText("x") }
+        for (bad in listOf(
+            "/etc/passwd",
+            elsewhere.absolutePath,
+            "content://some/provider",
+            "share-$now-9-notes.txt", // relative — resolves outside cacheDir
+            File(cache, "notes.txt").absolutePath, // real file, wrong shape
+            File(cache, "share-$now-x-notes.txt").absolutePath, // non-numeric parts
+        )) {
+            assertNull(FlitSpool.spoolPath(bad, cache), "accepted $bad")
+            assertFalse(FlitSpool.validSpoolToken(bad, cache), "accepted $bad")
+        }
+    }
+
+    @Test
+    fun `the spool allowlist rejects symlink targets and symlinked parents`() {
+        val cache = dir()
+        val outside = File(dir(), "secret.txt").apply { writeText("secret") }
+        val link = File(cache, "queue-$now-9-notes.txt")
+        Files.createSymbolicLink(link.toPath(), outside.toPath())
+        assertNull(FlitSpool.spoolPath(link.absolutePath, cache))
+
+        val alias = File(cache, "share-$now-10-alias")
+        Files.createSymbolicLink(alias.toPath(), outside.parentFile.toPath())
+        val nested = File(alias, "queue-$now-11-notes.txt").apply { writeText("x") }
+        assertNull(FlitSpool.spoolPath(nested.absolutePath, cache))
+        assertEquals("secret", outside.readText())
     }
 }

@@ -3,7 +3,11 @@ kotlin = "2.2.0"
 kotlinxSerialization = "1.9.0"
 coroutines = "1.10.2"
 ktor = "3.2.2"
-bouncycastle = "1.81.1"
+# Supply-chain floor: BC 1.81.1 is affected; 1.87 is published for both
+# bcprov-jdk18on and bcpkix-jdk18on and is the current release.
+bouncycastle = "1.87"
+# Single Netty patch level for every io.netty module (>= 4.2.18.Final required).
+netty = "4.2.21.Final"
 slf4j = "2.0.17"
 agp = "8.13.2"
 composeBom = "2026.06.00"
@@ -12,6 +16,9 @@ zxing = "3.5.3"
 camerax = "1.4.2"
 
 [libraries]
+# Declared with the toolchain version so resolution can keep kotlin-reflect
+# aligned with the Kotlin compiler instead of a transitive older/newer copy.
+kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlin" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }

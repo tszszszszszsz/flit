@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
+import java.io.IOException
 import java.io.InputStream
 
 /**
@@ -55,8 +56,13 @@ class PeerHttpClient(
         timeoutMs: Long = 10_000,
         /** Milestone E: the fingerprint a relay route must pair with; direct routes pass null. */
         relayFor: String? = null,
+        /** Sender-side pin: the TLS peer must present this certificate digest before any request byte. */
+        expectServerFp: String? = null,
     ): Response = withContext(Dispatchers.IO) {
-        raw(method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength, bodyProgress, timeoutMs, relayFor)
+        raw(
+            method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength,
+            bodyProgress, timeoutMs, relayFor, expectServerFp,
+        )
     }
 
     private suspend fun raw(
@@ -71,8 +77,19 @@ class PeerHttpClient(
         bodyProgress: ((Long) -> Unit)?,
         timeoutMs: Long,
         relayFor: String?,
+        expectServerFp: String?,
     ): Response {
-        links.connect(host, port, tls, timeoutMs.toInt(), relayFor).use { link ->
+        // Fail closed on any carrier: a pin is a TLS statement, so a plain
+        // route can never satisfy it. TCP/TlsLink also check inside connect();
+        // this is the end-to-end guard for providers that wrap other pipes.
+        if (!tls && !expectServerFp.isNullOrBlank()) {
+            throw IOException("plain HTTP cannot satisfy a TLS peer fingerprint pin")
+        }
+        links.connect(host, port, tls, timeoutMs.toInt(), relayFor, expectServerFp).use { link ->
+            // The certificate must come from the carrier's real handshake,
+            // never from a header, a config value or a caller-supplied label.
+            // This runs before the request head is built or written.
+            TlsIdentity.checkPeerPin(link.peerCertificate, expectServerFp)
             val out = link.output
             val head = StringBuilder().apply {
                 append(method).append(' ').append(pathAndQuery).append(" HTTP/1.1\r\n")
