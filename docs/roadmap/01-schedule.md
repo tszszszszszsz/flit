@@ -102,6 +102,7 @@ stay on those dates.
 | 2027-01-07 | Device | Install and launch smoke on one physical device |
 | 2027-01-08 | Device | Partial feature walk with one phone and one CLI peer |
 | 2027-01-09 | Docs | Confidence assessment, desktop plan and remaining verification plan |
+| 2027-01-10 | Docs | Desktop planning wave summary and gated extraction order |
 
 ## Rules for a day
 

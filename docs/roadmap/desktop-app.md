@@ -4,11 +4,11 @@
 
 No desktop GUI exists in this repository. `flit-cli` in `harness/` is the only
 companion on a box, and the JVM modules are `protocol`, `harness` and `app`, with
-the Android application in `app/src/main`. A GUI desktop application was already
-recorded as a scope cut in `docs/PRODUCT-DECISIONS.md` §5 ("No GUI desktop app.
-`flit-cli` is the Linux companion") and in `docs/roadmap/00-plan.md`;
-`docs/ARCHITECTURE.md` lists a GUI desktop app as not built. This document
-reopens that decision as a design target. It does not add a desktop source set,
+the Android application in `app/src/main`. The earlier GUI-desktop scope cut
+is already superseded in `docs/PRODUCT-DECISIONS.md` §5 and
+`docs/roadmap/00-plan.md`, which point to this document; `docs/ARCHITECTURE.md`
+lists a GUI desktop app as not built. This document is that design target. It
+does not add a desktop source set,
 a module, a build task or a release step, and it does not change the v2.2 wire
 surface: no new route, header, DTO field or Circle event verb is proposed.
 
@@ -18,8 +18,8 @@ The recommended stack is Compose Multiplatform desktop with Kotlin 2.2.0, CMP
 1.9.x and JDK 21, declared as a single `jvm("desktop")` target. The target list
 stays at one entry for now; no web, iOS or shared JVM target is implied by the
 word "Multiplatform" here. Material 3 in Compose supplies the existing
-expressive presentation vocabulary, and a desktop window can reuse the stateless
-Compose layout code rather than re-express it.
+expressive presentation vocabulary, and a desktop window can reuse the Compose
+layout code that has no Android imports rather than re-express it.
 
 The reasons are code reuse and seam shape, not novelty:
 
@@ -61,7 +61,7 @@ seams move into it, with platform adapters left where they are:
 | `FlitCircleHost.kt` | Pure host decisions and event folding | Android notification and lifecycle wiring |
 | `FlitRoute.kt` | Route model and pure transitions | Platform navigation host |
 | `FlitKnown.kt` | Known-peer logic written over its `Store` interface | The `Store` actual that persists on each platform |
-| `FlitRoster.kt` | Pure roster models and reducers behind a `Store` | The roster `Store` actual |
+| `FlitRoster.kt` | Pure roster models and reducers | A planned `FlitRosterStore` seam and its Android adapter |
 | `ParcelScanState.kt`, `Qr.kt` | Frame holders, reducers, encode/decode | CameraX Y-plane capture in the app |
 | `CourierCardUi.kt`, `SheetUi.kt` | Pure card state and formatting helpers | Compose rendering where it depends on platform UI |
 | `FlitEngine.kt` | Pure islands only, identified case by case | The engine's I/O, file, permission and notification ports |
@@ -83,7 +83,7 @@ set is a build failure, not a review note.
 CLI state converges at the same time. `CircleCliState` in
 `harness/.../Harness.kt:917` and the courier-side state loaded by
 `CourierCli.kt:626` move onto the shared `CircleState` codec from
-`FlitCircleStore.kt:138-195`. The CLI keeps its own state file location and
+`FlitCircleStore.kt:177-198`. The CLI keeps its own state file location and
 reducer calls, but it serializes the shared type rather than a second schema.
 The identity home is the CLI's existing
 `~/.config/flit/flit-harness/identity.p12`, resolved by `harnessHome()` in
@@ -142,22 +142,22 @@ The 778-test baseline (362 protocol + 324 app + 92 harness) stays green; moving
 a seam is not a reason to drop a case. New cases raise the total, so the
 baseline is a floor and not a target count.
 
-- `:common:test` holds JVM tests for every seam moved into `:core` and the pure
+- `:core:test` holds JVM tests for every seam moved into `:core` and the pure
   helpers in `ui-common`, including the shared `CircleState` codec cases that
   replace the two CLI schemas.
 - `:desktop:test` holds JVM tests for identity-home resolution, discovery and
   file state holders, settings state and parcel round-trips.
 - Compose UI tests cover the desktop cards and their state transitions using the
   Compose test APIs, with no device and no network.
-- Desktop-to-`flit-cli` walks are labelled `harness/CPU`, the same evidence
-  class as the other on-box walks. They do not become `DEVICE` evidence.
+- Desktop-to-`flit-cli` walks are labelled SIM-HARN, the evidence class used
+  for other on-box walks. They do not become `DEVICE` evidence.
 - The existing `localsend-cli` interop checks are kept.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Compose BOM and CMP version alignment | Pin Kotlin 2.2.0 against CMP 1.9.x and one matching Compose/Material 3 set, and confirm a single resolved version set before any screen is built. A mismatch breaks rendering rather than one isolated test. |
+| Compose BOM and CMP version alignment | Gate 0 resolves this before any screen is built. The Android BOM `2026.06.00` resolves Compose `1.11.3`; CMP `1.9.3` maps to Compose `1.9.4`, so the earlier `1.9.x` suggestion is not compatible with the current BOM. Align the CMP version to the BOM's Compose line (the `1.11.x` family is the nearest match) or change the BOM deliberately; keep the Compose compiler plugin tied to Kotlin `2.2.0`. The published KMP-plugin envelope for Kotlin `2.2.0` ends at Gradle `8.14` and AGP `8.10.0`, while this repo pins Gradle `8.14.3` and AGP `8.13.2`, so the plugin matrix must be proven by a configuration run before extraction starts. Confirm one resolved Compose set with `:app:dependencies`. A mismatch breaks rendering rather than one isolated test. |
 | Identity continuity | Keep the CLI home as the desktop default and never mint a second key on first desktop launch; document the one-home-per-node rule and the override. |
 | Android-only platform features | Keep `android.*` out of `:core`, `ui-common` and the desktop source set; BLE, CameraX, SAF and FGS remain app actuals, enforced by compile failure. |
 | Packaging and signing | Treat JDK 21 runtime targeting and per-OS bundles as Phase 2 work; macOS signing/notarization and Windows signing are a release gate, not a Phase 1 claim. |

@@ -37,8 +37,8 @@ note from an earlier document without naming its source.
   `receipt`, `pad`, `courier`, `parcel` and `--host-fp`. The distribution under
   `harness/build/install/flit-cli/bin/flit-cli` lists all of them. Steps 1, 3
   and 4 below require a launcher whose own help output exposes the commands
-  used; use that launcher and record its hash. Do not report output from a
-  command the selected launcher rejects.
+  used; steps 2 and 6 also depend on `--host-fp`. Use that launcher and record
+  its hash. Do not report output from a command the selected launcher rejects.
 - Seed fixtures on the box and record in-run digests:
   `printf 'full-walk-seed-1\n' > /tmp/opencode/walk-seed.txt`,
   `head -c 8192 /dev/urandom > /tmp/opencode/walk-8k.bin`, and `sha256sum` on
@@ -87,8 +87,9 @@ refusing with `no key id for drop` because the only file sent was a direct peer
 send; rerunning the command against that legacy event reproduces the refusal,
 not a receipt. A keyed drop must land first.
 
-**Observation to capture.** From B: `file <sha12> → … event(s), … member(s),
-gen=…` and the status line with `status is local-only, never gossiped`. In B's
+**Observation to capture.** From B: `file <id8> → N event(s), M member(s),
+gen=G`, the full-sha line ending `status is local-only, never gossiped`, and
+`confirmed <sha12>: N author(s)` when a receipt is tallied. In B's
 stored `circle.state`, the `file` body must show exactly `name`, `size`,
 `sha256`, `keyGen`, `cipherSha`, `iv` and `wraps`, with one wrap per current
 member and each wrap key equal to a roster fingerprint. From the phone:

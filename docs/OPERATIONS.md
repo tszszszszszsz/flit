@@ -764,8 +764,7 @@ flit-cli circle sync
 
 `poll` keeps every `--option` occurrence and also accepts one comma-separated
 `--option A,B,…` value (`ParsedArgs.opts`); the older overwrite behavior was
-replaced. `vote`
-takes a single integer `--option N` (Harness.kt:1187-1188).
+replaced. `vote` takes a single integer `--option N` (Harness.kt:1623-1638).
 
 On the phone, join by pasting a QR v3 code or tapping a `flit://add?v=3&…` link
 (the VIEW intent starts sharing and joins). Evidence recorded: inbound sync

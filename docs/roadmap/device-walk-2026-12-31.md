@@ -130,9 +130,9 @@ flit-cli circle vote --option 1 --host <phone-ip>:53317
 flit-cli circle sync --host <phone-ip>:53317
 ```
 
-Use one comma-separated `--option` value. A repeated `--option` flag overwrites
-the earlier one in the argument parser, as recorded in `docs/OPERATIONS.md` §6.8
-and `docs/TESTING.md`.
+The parser records every `--option` value, so repeated flags and one
+comma-separated value both produce the full option list; see `ParsedArgs.opts`
+and `docs/OPERATIONS.md` §6.8.
 
 On the phone, confirm the post renders in the Circle feed with author and
 timestamp, and tap the rendered `no` option. Then post from the phone composer

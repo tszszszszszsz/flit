@@ -88,6 +88,7 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2027-01-07 | Device | Install, launch and render observation on one physical device |
 | 2027-01-08 | Device | Partial walk: join, messages, file, pad, poll and vote with a CLI peer |
 | 2027-01-09 | Docs | Confidence assessment, desktop plan, scope reversal, remaining verification plan |
+| 2027-01-10 | Docs | Twenty-task desktop planning wave: orchestrators, specialists, docs and QA |
 
 ## Integration gate
 
