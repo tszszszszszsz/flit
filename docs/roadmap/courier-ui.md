@@ -1,6 +1,6 @@
 # Courier file-card states (app UI)
 
-File-card presentation for Circle file drops delivered through a courier, driven by a typed handoff projection from decrypted events rather than by the raw parcel wire body.
+File-card presentation for Circle file drops carried by a courier, driven by a typed handoff projection from decrypted events rather than by the raw parcel wire body.
 
 ## Date and layer
 
@@ -16,7 +16,7 @@ File-card presentation for Circle file drops delivered through a courier, driven
 
 ## Scope
 
-Present courier delivery on the existing Circle file card without changing what a delivery count means or what an Open action proves. Three additions to the current feed:
+Present courier handoff status on the existing Circle file card without changing what a delivery count means or what an Open action proves. Three additions to the current feed:
 
 1. Opaque `parcel` events are filtered out of the rendered feed. Their decrypted `file` events, folded into the signed log by the sync layer, render as ordinary file cards.
 2. A carry line on `FileCard`, read from the typed handoff map supplied by `FlitEngine.courierHandoffs`. The UI never parses `parcel` bodies or envelope text.
@@ -73,7 +73,11 @@ Constants: `HANDOFF_WAITING = "waiting"`, `HANDOFF_HANDED = "handed"`, `HANDOFF_
 | Recipient (`meFp == toFp`) | any | `A courier carried a copy for you` |
 | Other member | any | `<courier> is carrying a copy for <to>` |
 
-`<to>` and `<courier>` resolve through `aliasOf`. No carry line is drawn for a card with no handoff entry; that card keeps the sender's `local · N sent · M pending · …` line, or the neutral `file drop · open to view if it arrived` when no delivery record exists.
+`<to>` and `<courier>` resolve through `aliasOf`. `HANDED` means the peer
+accepted the offer; it never claims the file was opened or landed there. No
+carry line is drawn for a card with no handoff entry; that card keeps the
+sender's `local · N sent · M pending · …` line, or the neutral
+`file drop · open to view if it arrived` when no delivery record exists.
 
 **State ownership.**
 

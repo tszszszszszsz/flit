@@ -33,13 +33,13 @@ Three nodes are online at the start: A is the phone running the Flit app, B and 
 
 The carried envelope is a signed `CircleEvent`; its type and exact body keys are defined by the 2026-11-27 protocol layer and are not restated here. Handoff adds no protocol route: the envelope travels in `CircleRequest.ACTION_SYNC` / `CircleResponse`, the same exchange used by `FlitCircleSync.fanout`, `FlitCircleSync.sync` and `CircleHostState.onCircle`, and the file bytes travel with `ProtocolClient.sendFiles`. A file drop stays a reference body of exactly `{"name":...,"size":...,"sha256":...}` (`CircleCore.FILE_BODY_KEYS`, enforced by `CircleCore.validFileBody` and `circleBodyValid`); the sender's local spool path and queue token never enter a signed event.
 
-Every receiving node applies the existing pipeline in this order: `validShape → CircleCore.verify → CircleCore.evaluate`/`accept → store`. Incoming bodies must parse as one bounded JSON object through `circleBodyReadable`. `evaluate` keeps the decision precedence Invalid → OutsideWindow → Duplicate → Accept, and only Accept reserves the id in the bounded `CircleCore` seen set. Delta selection uses `circleDelta` with `CircleWatermark(lamport, id)`; the repair pass uses `circleRepairBatch`. The walk asserts the resulting accept, duplicate or refusal through phone and CLI logs rather than new wire bytes.
+Every receiving node applies the existing pipeline in this order: `validShape → CircleCore.verify → CircleCore.evaluate`/`accept → store`. Incoming bodies must parse as one bounded JSON object through `circleBodyReadable`. `evaluate` keeps the decision precedence Invalid → OutsideWindow → Duplicate → Accept, and only Accept reserves the id in the bounded `CircleCore` seen set. For courier parcels the carry core applies `Invalid → Expired → OutsideWindow → Duplicate → Full → Accept` over the 24 h courier replay window (`MAX_PARCEL_TTL_MS`), not `CircleCore.REPLAY_WINDOW_MS` (6 h). Delta selection uses `circleDelta` with `CircleWatermark(lamport, id)`; the repair pass uses `circleRepairBatch`. The walk asserts the resulting accept, duplicate or refusal through phone and CLI logs rather than new wire bytes.
 
 ### Constants held by the walk
 
 | Constant | Value | Role in the walk |
 |---|---|---|
-| `CircleCore.REPLAY_WINDOW_MS` | `6 * 60 * 60 * 1000L` | A carry event older than six hours is OutsideWindow, not news |
+| Courier replay window (`MAX_PARCEL_TTL_MS`) | `24 * 60 * 60 * 1000L` | A carry event older than the 24 h courier replay window is OutsideWindow, not news; `CircleCore.REPLAY_WINDOW_MS` (6 h) does not bound courier carry |
 | `CircleCore.CLOCK_SKEW_MS` | `5 * 60 * 1000L` | Future tolerance for the three nodes' clocks |
 | `CircleCore.MAX_BODY_CHARS` | `16 * 1024` | Upper bound on a carry envelope body |
 | `CircleCore.MAX_EVENTS_PER_REQUEST` | `1024` | Cap on one sync batch and repair batch |
@@ -57,7 +57,7 @@ Circle id, key, roster, event log and rekey generation live in `FlitCircleStore`
 
 - Phone log lines from `FlitCircleSync`: `circle fan-out: N new event(s), M peer(s)[, K backed off]`, `circle sync: full-log repair to M peer(s)`, `circle sync: +K event(s) from <fp>`, and `recv-ok <name> → <path> (<bytes> bytes)`.
 - CLI log lines from `ConsoleDelegate`: `seen …`, `offer from …`, `recv-start …`, `recv-resume … from <prefix> bytes`, `recv-ok …`, `recv-BAD …`, `recv-ERR …`. Carrier evidence comes from `flit-cli courier drop`, `carry`, `receive` and `status`: one row per parcel in `courier.state`, a file in `courier-bag/` or `courier-received/`, and the subcommand syntax in `courier-cli.md` (§2.4 of `docs/OPERATIONS.md`).
-- File-card states on the phone come from `courier-ui.md`. Sender-side confirmation is not claimed: delivery receipts land on 2026-12-11, so the handoff is confirmed on C's log and landed hash, not by a remote status on A's card.
+- File-card states on the phone come from `courier-ui.md`. Sender-side confirmation is not claimed: delivery receipts land on 2026-12-11, so the handoff is confirmed on C's log and landed hash, not by a remote status on A's card. An OK answer means C accepted the offer; a transport OK alone is never recorded as end-to-end delivery.
 
 ### Walk steps
 
@@ -72,7 +72,7 @@ Circle id, key, roster, event log and rekey generation live in `FlitCircleStore`
 
 1. Handoff adds no route: the carry event uses `CircleRequest.ACTION_SYNC` / `CircleResponse` and the bytes use `ProtocolClient.sendFiles`.
 2. Every carried envelope passes `validShape → verify → evaluate → store` in that order; a forgery reserves no id and lands no bytes.
-3. A carry event outside `[createdMs - 6h, createdMs + 5min]` is OutsideWindow and is not stored.
+3. A carry event outside `[createdMs - 24h, createdMs + 5min]` is OutsideWindow and is not stored.
 4. One carry id is accepted once; a replay is Duplicate and produces no second delivery.
 5. A file announcement body stays exactly `{name,size,sha256}`; no spool path or queue token appears on the signed wire.
 6. Landed bytes are hash-exact; a mismatch reports `recv-BAD` and drops the temp and its sidecars.
@@ -93,7 +93,7 @@ Circle id, key, roster, event log and rekey generation live in `FlitCircleStore`
 | Carrier throws during handoff | Pending; no conclusion from a throw | Spool and envelope | Nothing | No `recv-ok` on C, carrier error line, `flit-cli courier status` still `pending` |
 | Forged or unsigned carry envelope | Refused at `verify`; no id reserved | Holder's own copy | The forged envelope | No card on C, refusal line in CLI log, exit `3` and file in `courier-rejected/` on a failed `open` |
 | Carry id replayed after acceptance | Duplicate; no second delivery | Landed file on C | The duplicate event | One `recv-ok`, one `delivered` row in `courier.state`, no new `.part`/`.token` |
-| Carry older than 6 h or >5 min ahead | OutsideWindow | Holder's copy | The stale event | No card on C, no `recv-ok`; `flit-cli courier sweep` moves the row to `expired` |
+| Carry older than 24 h or >5 min ahead | OutsideWindow | Holder's copy | The stale event | No card on C, no `recv-ok`; `flit-cli courier sweep` moves the row to `expired` |
 | Body hash mismatch on landing | `recv-BAD` | Nothing at receiver | Temp file and sidecars | `recv-BAD <name>`, empty receive directory |
 | C left before handoff | Refused after departure; no new parcel to C | Parcel stays local in B's `courier-bag/` | Remote delivery to C | No `recv-start` on C; on a stale parcel C's `open` refusal sets `refused` and moves the file to `courier-rejected/` |
 

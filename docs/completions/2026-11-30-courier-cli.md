@@ -25,9 +25,9 @@ device evidence is claimed at this layer.
 | `docs/PERFORMANCE.md` | Bag-copy and one-shot cost, without invented numbers |
 | `docs/ARCHITECTURE.md` | CLI carrier seam paragraph |
 | `README.md` | One CLI bullet, no device claim |
-| `docs/completions/2026-11-30-courier-cli.md` | This note |
-| `docs/roadmap/courier-cli.md` | Command surface finalized against the implementation |
-| `docs/roadmap/courier-device-walk.md` | Expected command strings aligned with the finalized surface |
+| `docs/completions/2026-11-30-courier-cli.md` | Completion record for the 2026-11-30 CLI layer |
+| `docs/roadmap/courier-cli.md` | CLI command surface and bag layout |
+| `docs/roadmap/courier-device-walk.md` | Expected command strings aligned with the CLI surface |
 | `docs/roadmap/01-schedule.md`, `docs/roadmap/02-waves.md` | CLI layer dated 2026-11-30 |
 
 Package `app.flit.share.harness` uses `ParsedArgs` only; there is no second
@@ -103,11 +103,16 @@ All paths are under `harnessHome()`:
 | Envelope suffix | `".parcel"` | Written verbatim from `CourierCarryCore.encode(CourierCarryCore.parcelOf(envelope))` |
 | `EXIT_BAD_ARGS` | `2` | Bad argument or missing/unreadable bag, no state change |
 | `EXIT_OPEN_REFUSED` | `3` | A parcel whose `open` returns a refusal |
-| Row `state` values | `pending`, `carried`, `delivered`, `expired`, `refused` | Closed set; mirrors the carried/delivered/refused vocabulary |
+| Row `state` values | `pending`, `carried`, `delivered`, `expired`, `refused` | Closed set; `delivered` is the local row label for a parcel opened and folded here, not a remote delivery proof |
 
 `expiresMs` is derived by `CourierCarryCore.parcelOf` as
 `createdMs + MAX_PARCEL_TTL_MS`. Quota constants and maximum parcel bytes come
 from the carry layer; the harness declares no second copy of either.
+
+`carried` records custody by a courier, not delivery. A transport OK or an OK
+sync answer means the peer accepted an offer; it is not proof that an envelope
+was opened or that bytes landed. Every status row is local to the node that
+wrote it, and no remote receipt is inferred.
 
 ## State transitions
 
@@ -178,7 +183,7 @@ per test.
 
 | Label | Claimed here | Basis |
 | --- | --- | --- |
-| CODE | Yes | The frozen `CourierCli` API in `CourierCli.kt`, the `"courier"` dispatch and value flags in `Harness.kt`, and the bag layout in the roadmap |
+| CODE | Yes | The `CourierCli` API in `CourierCli.kt`, the `"courier"` dispatch and value flags in `Harness.kt`, and the bag layout in the roadmap |
 | PURE | Yes | `CourierCliTest` run by `:harness:test` |
 | SIM-HARN | Yes | `CourierCarrierHarnessTest` run by `:harness:test` with production `CourierCarryCore`/`CourierEnvelope` seams |
 | DEVICE | No | No device walk at this layer |

@@ -49,8 +49,16 @@ object ParcelCodec {
     /** Largest sequence emitted or accepted (wire and app display cap). */
     const val MAX_FRAMES = 64
 
-    /** Defensive frame-layer cap; named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`. */
+    /** Defensive frame-layer ceiling, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`. */
     const val MAX_AIR_GAP_PARCEL_BYTES = 131072
+
+    /**
+     * Largest raw payload accepted for encoding. `CourierEnvelope.MAX_ENVELOPE_CHARS * 3 / 4`
+     * bounds envelope plaintext at 9216 bytes; 5120 leaves conservative room for the
+     * CircleEvent JSON wrapper, its base64 text, the envelope fields, signer cert and
+     * signature. [MAX_AIR_GAP_PARCEL_BYTES] stays the defensive frame-layer ceiling.
+     */
+    const val MAX_AIR_GAP_PAYLOAD_BYTES = 5120
 
     /** Largest raw chunk carried by one frame. */
     const val MAX_CHUNK_BYTES = 512
@@ -131,7 +139,7 @@ object ParcelCodec {
         signerFp: String,
         identity: TlsIdentity,
     ): List<String> = runCatching {
-        if (payload.isEmpty() || payload.size > MAX_AIR_GAP_PARCEL_BYTES) return emptyList()
+        if (payload.isEmpty() || payload.size > MAX_AIR_GAP_PAYLOAD_BYTES) return emptyList()
         if (parcelId.isBlank() || parcelId.length > MAX_FIELD_CHARS) return emptyList()
         val sender = signerFp.trim().uppercase()
         val target = recipientFp.trim().uppercase()
@@ -227,7 +235,7 @@ object ParcelCodec {
         val body = WireJson.json.parseToJsonElement(events[0].body) as? JsonObject ?: return null
         val encoded = (body["text"] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() } ?: return null
         val bytes = runCatching { b64url.decode(encoded) }.getOrNull() ?: return null
-        if (bytes.isEmpty() || bytes.size > MAX_AIR_GAP_PARCEL_BYTES) return null
+        if (bytes.isEmpty() || bytes.size > MAX_AIR_GAP_PAYLOAD_BYTES) return null
 
         return ParcelPayload(
             parcelId = first.parcelId,
@@ -245,15 +253,15 @@ object ParcelCodec {
         val parts = text.split('.')
         if (parts.size != 12) return null
         if (parts[0] != FRAME_MAGIC) return null
-        val version = parts[1].toIntOrNull() ?: return null
+        val version = canonicalInt(parts[1]) ?: return null
         if (version != VERSION) return null
 
         val parcelId = decodeText(parts[2]) ?: return null
         if (parcelId.isBlank() || parcelId.length > MAX_FIELD_CHARS) return null
-        val seq = parts[3].toIntOrNull() ?: return null
-        val count = parts[4].toIntOrNull() ?: return null
-        val sz = parts[5].toIntOrNull() ?: return null
-        val total = parts[6].toIntOrNull() ?: return null
+        val seq = canonicalInt(parts[3]) ?: return null
+        val count = canonicalInt(parts[4]) ?: return null
+        val sz = canonicalInt(parts[5]) ?: return null
+        val total = canonicalInt(parts[6]) ?: return null
         if (count < 1 || count > MAX_FRAMES) return null
         if (seq < 1 || seq > count) return null
         if (sz < 1 || sz > MAX_CHUNK_BYTES) return null
@@ -350,11 +358,25 @@ object ParcelCodec {
         out.write(value)
     }
 
-    private fun decodeText(part: String): String? = runCatching {
-        String(b64url.decode(part), Charsets.UTF_8)
-    }.getOrNull()
+    /** Canonical decimal only: ASCII digits, no sign, no leading zero, no non-ASCII digit. */
+    private fun canonicalInt(part: String): Int? {
+        if (part.isEmpty() || part.any { it !in '0'..'9' }) return null
+        if (part.length > 1 && part[0] == '0') return null
+        return part.toIntOrNull()
+    }
 
-    private fun decodeBytes(part: String): ByteArray? = runCatching { b64url.decode(part) }.getOrNull()
+    private fun decodeText(part: String): String? = decodeBytes(part)?.let {
+        String(it, Charsets.UTF_8)
+    }
+
+    /** Rejects padding and any non-canonical re-encoding of the same bytes. */
+    private fun decodeBytes(part: String): ByteArray? {
+        if (part.isEmpty() || '=' in part) return null
+        return runCatching {
+            val decoded = b64url.decode(part)
+            if (b64.encodeToString(decoded) != part) null else decoded
+        }.getOrNull()
+    }
 
     private fun parseCrc(part: String): Long? {
         if (part.length != 8 || part.any { it !in '0'..'9' && it !in 'a'..'f' }) return null

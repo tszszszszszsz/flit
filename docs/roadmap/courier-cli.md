@@ -39,7 +39,7 @@ courier sweep  [--bag DIR]                         # drop expired parcels and en
 one-shot command. It has no Android import, no route and no header; encryption
 and the parcel bag codec stay in `protocol/`. The harness makes `harnessHome()`,
 `loadOrCreateIdentity()` and `saveCircleState()` internal so the object can use
-them. The frozen surface is:
+them. The declared API is:
 
 ```kotlin
 object CourierCli {
@@ -92,6 +92,8 @@ above; `usage()` prints the synopsis. `bagDir` and `statePath` root every path i
 
 **Transitions.** `nextState(row, kind, nowMs)` is the single reducer; `Kind` is exactly `CARRY`, `RECEIVE_OK`, `RECEIVE_REFUSED`, `SWEEP`. `pending → carried` on `CARRY` (after `carry` verifies the bag), `pending|carried → delivered` on `RECEIVE_OK` (a returned `open` with events for this identity), anything → `refused` on `RECEIVE_REFUSED` (a returned refusal), and anything → `expired` on `SWEEP` when `nowMs >= expiresMs`. A thrown `open` is not a conclusion and does not reach `nextState`: the row stays `pending` and the parcel stays in the bag for a later attempt, matching the carrier-death contract used by Circle file delivery. `drop` refuses a new parcel when the current `CarryState` plus the parcel would exceed the quota constants from courier-carry.md.
 
+`carried` is custody, not delivery. A transport OK or an OK sync answer means the peer accepted an offer, not that an envelope was opened or that bytes landed. Row states are local to the node that wrote them and no remote receipt is inferred; `delivered` is the local label for a parcel opened and folded here.
+
 **Constants owned here:** `BAG_DIR = "courier-bag"`, `RECEIVED_DIR = "courier-received"`, `REJECTED_DIR = "courier-rejected"`, `STATE_FILE = "courier.state"`, envelope suffix `.parcel`, `EXIT_BAD_ARGS = 2` for a bad argument or missing bag and `EXIT_OPEN_REFUSED = 3` for a parcel that fails `open`, both returned by `run`. TTL is derived by `CourierCarryCore.parcelOf` as `createdMs + MAX_PARCEL_TTL_MS`; quota constants and maximum parcel bytes come from courier-carry.md. Neither is duplicated in the harness.
 
 **Status output** reuses `${ts()}` and the one-line style of `circle`: one row per parcel with a padded state value, and a closing count by state. No fingerprint beyond the short form is printed, and no parcel content is printed.
@@ -104,7 +106,7 @@ above; `usage()` prints the synopsis. `bagDir` and `statePath` root every path i
 4. `receive` folds an event only after `CourierEnvelope.open` returns it for the local fingerprint; a parcel for another fingerprint stays `pending` in the bag.
 5. A duplicate envelope id produces no second fold: `CircleCore.dedup` removes it, and the row moves straight to `delivered`.
 6. `open` failure sets `refused` and moves the file to `courier-rejected/`; a throw leaves the row `pending` and the file in the bag.
-7. `sweep` deletes an envelope file only when its row is `expired` or `refused`; `delivered` rows keep their file in `courier-received/` as a local record.
+7. `sweep` deletes an envelope file only when its row is `expired` or `refused`; `delivered` rows (opened and folded here, not a remote delivery proof) keep their file in `courier-received/` as a local record.
 8. Every accepted event is folded through `CircleCore.order`/`dedup`; the carrier adds no governance decision and no second signature path.
 9. State writes are one-shot and whole-file, as `saveCircleState` does; no load→modify→save races with another CLI process on the same `FLIT_HARNESS_HOME`.
 10. No command adds a route, header, DTO field or key parameter to the v2.2 wire.
@@ -120,7 +122,7 @@ above; `usage()` prints the synopsis. `bagDir` and `statePath` root every path i
 | Parcel addressed to another fingerprint | stays `pending`, re-exported | envelope kept in `courier-bag/` | nothing | CODE / SIM-HARN |
 | `open` returns a refusal (forged or tampered envelope) | row `refused` | nothing in Circle state | envelope moved to `courier-rejected/`, payload dropped | SIM-HARN |
 | `open` throws (carrier/IO fault) | stays `pending`, retried | envelope kept | nothing | CODE / SIM-HARN |
-| Duplicate envelope id on `receive` | row `delivered`, no second fold | first folded event | duplicate event | SIM-HARN |
+| Duplicate envelope id on `receive` | row `delivered` (opened here), no second fold | first folded event | duplicate event | SIM-HARN |
 | `courier.state` corrupt or short | decode as empty, report the count | bag files untouched | stale local rows only | CODE |
 | Envelope file vanished between `status` and `receive` | skip with a warning, row stays `pending` | remaining envelopes | nothing | CODE |
 

@@ -31,8 +31,14 @@ Constants in `ParcelCodec`:
 | --- | --- | --- |
 | `FRAME_MAGIC` | `"FLITPARCEL1"` | Domain tag at the head of every frame and the CRC domain tag. |
 | `MAX_CHUNK_BYTES` | `512` | Largest raw chunk bytes in one frame; the UTF-8 string stays scannable. |
-| `MAX_FRAMES` | `64` | Largest `count`; `seq` space `1..64`. Matches the app's `MAX_PARCEL_FRAMES = 64`, so the CLI cannot emit a sequence the app refuses to display. |
-| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` | Defensive frame-layer cap (128 KiB), named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` (`12 * 1024`). With `MAX_CHUNK_BYTES = 512` and `MAX_FRAMES = 64` the reachable maximum is 32768 bytes. |
+| `MAX_FRAMES` | `64` | Defensive wire cap on `count`; `seq` space `1..64`. Matches the app's `MAX_PARCEL_FRAMES = 64`, so the CLI cannot emit a sequence the app refuses to display. |
+| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` | Defensive wire cap on framed bytes (128 KiB), named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` (`12 * 1024`); it bounds malformed input, not a reachable size. |
+
+The effective ceiling is set by `CourierEnvelope.MAX_ENVELOPE_CHARS = 12 * 1024`:
+the sealed envelope is at most 12288 Base64 characters, which at 512 bytes per
+chunk is about 24 frames and, with the signature, wrapped key and certificate
+included, roughly 5 KiB of payload. The 64-frame and 128 KiB wire caps above are
+defensive bounds on malformed input, not reachable sizes.
 
 API in `ParcelCodec.kt`:
 

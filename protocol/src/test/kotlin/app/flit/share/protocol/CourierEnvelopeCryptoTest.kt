@@ -3,6 +3,7 @@ package app.flit.share.protocol
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.courier.CourierEnvelope
+import app.flit.share.protocol.courier.MAX_PARCEL_TTL_MS
 import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.tls.TlsIdentity
 import java.security.PrivateKey
@@ -204,15 +205,17 @@ class CourierEnvelopeCryptoTest {
     @Test
     fun `open accepts an envelope at the replay window boundary`() {
         val events = listOf(signedEvent("window edge"))
-        val sealed = sealTo(events, nowMs = NOW - CircleCore.REPLAY_WINDOW_MS)
-        assertEquals(events, CourierEnvelope.open(sealed, recipient, NOW))
+        val createdMs = NOW
+        val sealed = sealTo(events, nowMs = createdMs)
+        assertEquals(events, CourierEnvelope.open(sealed, recipient, createdMs + MAX_PARCEL_TTL_MS))
     }
 
     @Test
     fun `open refuses an envelope older than the replay window`() {
         val events = listOf(signedEvent("stale"))
-        val sealed = sealTo(events, nowMs = NOW - CircleCore.REPLAY_WINDOW_MS - 1L)
-        assertNull(CourierEnvelope.open(sealed, recipient, NOW))
+        val createdMs = NOW
+        val sealed = sealTo(events, nowMs = createdMs)
+        assertNull(CourierEnvelope.open(sealed, recipient, createdMs + MAX_PARCEL_TTL_MS + 1L))
     }
 
     @Test

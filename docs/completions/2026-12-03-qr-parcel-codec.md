@@ -7,9 +7,9 @@ sequence of frame strings back into a signed, recipient-addressed payload. The
 payload crypto stays in `CourierEnvelope`; this layer adds no second crypto
 path.
 
-Counts were read from a fresh `--rerun-tasks` JUnit run. No device evidence is
-claimed here; real-camera decode stays with the 2026-12-08 walk. The commit for
-this layer stays on 2026-12-03.
+Counts are to be taken from a fresh `--rerun-tasks` JUnit run. No device
+evidence is claimed here; real-camera decode stays with the 2026-12-08 walk.
+The layer is dated 2026-12-03.
 
 ## Files in the layer
 
@@ -25,8 +25,8 @@ this layer stays on 2026-12-03.
 | `docs/OPERATIONS.md` | Manual carry procedure |
 | `docs/PERFORMANCE.md` | Frame count and byte caps, no invented timings |
 | `docs/ARCHITECTURE.md` | Parcel seam |
-| `docs/completions/2026-12-03-qr-parcel-codec.md` | This draft note |
-| `docs/roadmap/qr-parcel-codec.md` | API finalized against the corrected seams |
+| `docs/completions/2026-12-03-qr-parcel-codec.md` | Layer record for 2026-12-03 |
+| `docs/roadmap/qr-parcel-codec.md` | API aligned with the seams recorded below |
 | `docs/roadmap/qr-parcel-cli.md` | CLI aligned to the codec caps |
 | `docs/roadmap/qr-parcel-app.md` | App aligned to the codec caps |
 | `docs/roadmap/qr-parcel-device-walk.md` | Walk aligned to the caps; no walk claimed here |
@@ -89,22 +89,25 @@ level M with a margin of 2 modules, so both sides produce and read the same
 bytes; the protocol module deals only in `String` and `ByteArray`.
 
 The exact encoding of individual fields inside the frame string is held by
-`ParcelCodec.kt` and documented in `docs/CONTRACTS.md`; this draft records the
+`ParcelCodec.kt` and documented in `docs/CONTRACTS.md`; this record covers the
 semantic fields and constants only.
 
 ## Constants
 
 | Constant | Value | Basis |
 | --- | --- | --- |
-| `MAX_FRAMES` | `64` | Wire cap and app display cap, so every emitted sequence is one the app will display |
-| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` | Defensive frame-layer cap, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` |
+| `MAX_FRAMES` | `64` | Defensive wire cap and app display cap, so every emitted sequence is one the app will display |
+| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` | Defensive wire cap on framed bytes, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` |
 | `MAX_CHUNK_BYTES` | `512` | Largest raw data chunk in one frame |
 | `FRAME_MAGIC` | `"FLITPARCEL1"` | Frame magic / domain tag |
 
-At `MAX_CHUNK_BYTES = 512` and `MAX_FRAMES = 64` the reachable framed size is
-32768 bytes, below the 131072-byte defensive cap. The frame-layer cap is a
-separate constant from the courier envelope's Base64 cap
-(`MAX_ENVELOPE_CHARS = 12 * 1024`); neither is restated in the CLI or app.
+The effective ceiling is the courier envelope's Base64 cap
+(`MAX_ENVELOPE_CHARS = 12 * 1024`): the sealed envelope is at most 12288
+characters, which at 512 bytes per chunk is about 24 frames and, with the
+signature, wrapped key and certificate included, roughly 5 KiB of payload. The
+64-frame and 131072-byte wire caps are defensive bounds on malformed input, not
+reachable sizes; neither the wire caps nor the envelope cap is restated in the
+CLI or app.
 
 ## Verification
 
@@ -122,7 +125,7 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks :protocol:test
 | Total | 416 | 436 | — |
 
 `--rerun-tasks` is required: stale XML has previously reported green against an
-older class layout. No run was made for this draft, so no result is claimed.
+older class layout. No run is claimed here.
 
 ## Tests
 
@@ -131,7 +134,7 @@ older class layout. No run was made for this draft, so no result is claimed.
 | `ParcelCodecTest` | 14 | Single- and multi-frame round-trip, descriptor fields with `seq == count` on the final frame, chunks at `MAX_CHUNK_BYTES`, `parse` bounds and caps, and `complete` accepting a full verified frame set |
 | `ParcelCodecTamperTest` | 6 | CRC mismatch after a change to a covered field, digest mismatch, missing and conflicting frames, wrong recipient, and refusal returning `null` with no bytes released |
 
-Case counts come from the JUnit XML of the fresh run, not from a target figure.
+Case counts are to come from the JUnit XML of a fresh run, not from a target figure.
 Test names follow the `@Test` declarations in each class. No harness or app
 test is added in this layer.
 
@@ -140,7 +143,7 @@ test is added in this layer.
 | Label | Claimed here | Basis |
 | --- | --- | --- |
 | CODE | Yes | `ParcelCodec.kt` matches the corrected API, constants and frame grammar |
-| PURE | Yes | 14 + 6 cases green after `--rerun-tasks` |
+| PURE | TBD | 14 + 6 cases planned for a fresh `--rerun-tasks` run |
 | SIM-HARN | No | CLI encode/decode is the 2026-12-04 layer |
 | DEVICE | No | No device walk at this layer; camera and air-gap walks belong to later dates |
 
@@ -166,12 +169,6 @@ decode is not verified by this layer.
 
 ## Verification status
 
-All counts and the CODE/PURE evidence rows were recorded from the fresh
-`--rerun-tasks` run. The frame string layout is in `ParcelCodec.kt` and
-`docs/CONTRACTS.md` §16. No DEVICE observation is claimed here.
-
-## Verification status
-
-Draft. Counts and evidence labels above stay as placeholders until the
-integration run. This draft records no Gradle result, no git operation and no
-commit. The DEVICE row is not claimed.
+Draft. Counts and evidence labels above stay placeholders until the
+integration run. No Gradle result is claimed here. The frame string layout is
+in `ParcelCodec.kt` and `docs/CONTRACTS.md` §16. The DEVICE row is not claimed.

@@ -11,6 +11,7 @@ import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -18,8 +19,11 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.cert.X509Certificate
 import java.util.Base64
+import java.util.Comparator
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -56,7 +60,21 @@ class CourierCarrierHarnessTest {
             System.getenv("FLIT_HARNESS_HOME")?.takeIf { it.isNotBlank() }
 
         /** `user.home` is JVM-global: only one test may switch it at a time. */
-        private val homeLock = Any()
+        internal val homeLock = Any()
+
+        /** Temp roots handed out to nodes, removed after each test. */
+        internal val tempRoots = mutableListOf<Path>()
+
+        internal fun trackTempRoot(root: Path) = synchronized(homeLock) {
+            tempRoots.add(root)
+        }
+
+        internal fun deleteRecursively(path: Path) {
+            if (!Files.exists(path)) return
+            Files.walk(path).use { stream ->
+                stream.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
+            }
+        }
 
         private fun <T> isolatedHome(block: () -> T): T {
             assumeTrue(
@@ -68,8 +86,16 @@ class CourierCarrierHarnessTest {
         }
     }
 
+    @AfterEach
+    fun cleanTempRoots() = synchronized(homeLock) {
+        val roots = tempRoots.toList()
+        tempRoots.clear()
+        roots.forEach { deleteRecursively(it) }
+    }
+
     private class Node(tag: String) {
         val root: Path = Files.createTempDirectory("courier-$tag-")
+            .also { CourierCarrierHarnessTest.trackTempRoot(it) }
         /** The value installed as `user.home` while this node is active. */
         val home: Path = root.resolve("home").also { Files.createDirectories(it) }
         /** The portable handoff unit, passed as `--bag`. */
@@ -347,6 +373,65 @@ class CourierCarrierHarnessTest {
         assertTrue(b.circleEvents().isEmpty(), "a refused parcel must not reach circle.state")
         assertEquals(1L, b.rejectedFiles(), "the refused parcel is quarantined in courier-rejected/")
         assertTrue(b.bagFiles().isEmpty(), "a quarantined parcel leaves the portable bag")
+    }
+
+    @Test
+    fun `receive skips an inner event with a bogus signature`() = isolatedHome {
+        val a = Node("a-forged")
+        val b = Node("b-forged")
+        val circleId = "courier-forged-sig"
+        val aId = a.inHome { loadOrCreateIdentity() }
+        val bId = b.inHome { loadOrCreateIdentity() }
+        val now = System.currentTimeMillis()
+
+        // A seals a well-shaped event carrying a bogus signature. The envelope
+        // itself is genuine and decrypts for B, so this is not an open refusal:
+        // the event can only be caught by receive's fold-time signature gate.
+        val signed = CircleCore.create(
+            circleId, aId.fingerprint, aId, CircleEvent.MESSAGE,
+            """{"text":"forged authorship"}""", lamport = 0L, createdMs = now,
+        )
+        assertTrue(CircleCore.verify(signed), "the source event must start out verifiable")
+        val forged = signed.copy(sig = "not-a-signature")
+        assertFalse(CircleCore.verify(forged), "the inner event must be genuinely unverifiable")
+
+        val envelope = CourierEnvelope.seal(
+            listOf(forged), circleId, aId.fingerprint, bId.fingerprint,
+            bId.certificate, aId, now,
+        ) ?: error("production seal refused a well-shaped forged event")
+        val opened = CourierEnvelope.open(envelope, bId, now)
+        assertEquals(listOf(forged), opened, "the forged event must survive open undecided")
+
+        val body = buildJsonObject {
+            put("toFp", JsonPrimitive(bId.fingerprint))
+            put("envelope", JsonPrimitive(CourierEnvelope.encode(envelope)))
+        }.toString()
+        val parcelEvent = CircleCore.create(
+            circleId, aId.fingerprint, aId, PARCEL, body, lamport = 1L, createdMs = now,
+        )
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
+        Files.writeString(
+            a.bag.resolve("${parcel.id}.parcel"),
+            CourierCarryCore.encode(CarryState(listOf(parcel))),
+            StandardCharsets.UTF_8,
+        )
+        a.writeRows(
+            listOf(
+                CourierCli.Row(
+                    parcel.id, bId.fingerprint, aId.fingerprint, circleId,
+                    "pending", parcel.createdMs, parcel.expiresMs,
+                ),
+            ),
+        )
+
+        copyBag(a, b)
+        b.writeRows(a.readRows())
+        b.seedRoster(circleId, bId.fingerprint, aId.fingerprint)
+
+        b.cli("receive")
+
+        assertTrue(b.circleEvents().isEmpty(), "a bogus-signature event must never reach circle.state")
+        assertNotEquals("delivered", b.readRows().single().state, "a skipped event must not be reported delivered")
     }
 
     @Test

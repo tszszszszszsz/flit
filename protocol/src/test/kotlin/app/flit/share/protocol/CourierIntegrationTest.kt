@@ -6,6 +6,7 @@ import app.flit.share.protocol.courier.CarryState
 import app.flit.share.protocol.courier.CourierCarryCore
 import app.flit.share.protocol.courier.CourierEnvelope
 import app.flit.share.protocol.courier.CourierParcel
+import app.flit.share.protocol.courier.MAX_PARCEL_TTL_MS
 import app.flit.share.protocol.tls.TlsIdentity
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -147,7 +148,7 @@ class CourierIntegrationTest {
         val decoded = CourierEnvelope.decode(sealed.encoded) ?: error("decode refused its own encode")
         val bag = CourierCarryCore.fold(CarryState(), sealed.parcel)
 
-        assertNull(CourierEnvelope.open(decoded, recipient, now + 7L * 60 * 60 * 1000L))
+        assertNull(CourierEnvelope.open(decoded, recipient, now + MAX_PARCEL_TTL_MS + 1000L))
         assertNull(CourierEnvelope.open(decoded, recipient, now - CircleCore.CLOCK_SKEW_MS - 1000L))
         assertTrue(CourierCarryCore.select(bag, recipient.fingerprint, now + parcelTtlMs).isEmpty())
         assertEquals(1, CourierCarryCore.select(bag, recipient.fingerprint, now).size)

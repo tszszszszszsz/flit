@@ -59,7 +59,7 @@ oversized `envelope`, the same closed-key discipline `validFileBody` applies to
 | `MAX_ENVELOPE_CHARS` | `12 * 1024` | Base64 envelope cap; body stays under `CircleCore.MAX_BODY_CHARS` (16 KiB) after JSON framing. |
 | `MAX_PARCELS` | `256` | Bounded carrier bag. |
 | `MAX_SEEN` | `4096` | Bounded id reservation, matching `CircleCore.MAX_SEEN`. |
-| `REPLAY_WINDOW_MS` | `6 * 60 * 60 * 1000L` | Reused from `CircleCore`. |
+| Courier replay window (`MAX_PARCEL_TTL_MS`) | `24 * 60 * 60 * 1000L` | `evaluate` uses the 24 h parcel TTL as its bounded replay window, not `CircleCore.REPLAY_WINDOW_MS` (6 h). |
 | `CLOCK_SKEW_MS` | `5 * 60 * 1000L` | Reused from `CircleCore`. |
 | `MAX_PARCEL_TTL_MS` | `24 * 60 * 60 * 1000L` | Ceiling for an undelivered parcel. |
 | `MAX_FIELD_CHARS` | `256` | Reused from `CircleCore` for `toFp`. |
@@ -107,12 +107,12 @@ sealed interface Decision {
 ```
 
 Exact precedence for `evaluate`: `Invalid → Expired → OutsideWindow →
-Duplicate → Full → Accept`. Expiry is checked before the replay window so a
-TTL-elapsed parcel is reported as Expired rather than shadowed by the shorter
-window. Every non-Accept decision leaves the bounded `seen`
-set untouched, so a parcel refused as Full can be offered again once space
-frees. The window compares two positive timestamps by subtraction, never
-`nowMs ± window`, so an extreme clock cannot overflow into a false Accept.
+Duplicate → Full → Accept`. Expiry is checked before the window so a
+TTL-elapsed parcel is reported as Expired; the courier replay window is the
+same bounded 24 h span as the TTL. Every non-Accept decision leaves the
+bounded `seen` set untouched, so a parcel refused as Full can be offered again
+once space frees. The window compares two positive timestamps by subtraction,
+never `nowMs ± window`, so an extreme clock cannot overflow into a false Accept.
 Callers verify the event with `CircleCore.verify` before calling `evaluate`;
 reserving an id before crypto would burn it for a forgery.
 
@@ -172,6 +172,10 @@ addressee verifies and opens the envelope with the courier-envelope rules. The
 route returns a normal signed `CircleResponse`; no new header, route or
 `CircleRequest` field is introduced.
 
+An OK answer on the sync route means the peer accepted the offered parcel; it
+is not proof that the envelope was opened or that bytes landed, and no remote
+receipt is inferred by the core.
+
 ## Invariants
 
 1. Every accepted parcel carries a signed `parcel` event accepted by
@@ -203,12 +207,12 @@ route returns a normal signed `CircleResponse`; no new header, route or
 | --- | --- | --- | --- | --- |
 | Wrong type, bad body keys, blank/oversized `toFp` or `envelope` | Invalid; no id reserved | Nothing | Incoming event | `PURE` reject; carrier log `courier: invalid parcel body` |
 | Signature fails or cert fingerprint does not match `authorFp` | Refused before `evaluate` | Existing bag unchanged | Incoming event | `PURE` forged-author reject; `courier: parcel signature refused` |
-| `createdMs` older than 6 h or more than 5 min ahead | OutsideWindow | Existing bag unchanged | Incoming event | `PURE` window reject; `courier: parcel outside window` |
+| `createdMs` older than the 24 h courier replay window or more than 5 min ahead | OutsideWindow | Existing bag unchanged | Incoming event | `PURE` window reject; `courier: parcel outside window` |
 | `nowMs >= expiresMs` | Expired | Existing bag unchanged | Incoming or held parcel | `PURE` expiry test; `courier: parcel expired` |
 | Id already reserved or already in the bag | Duplicate | Held copy stays | Incoming copy | `PURE` dedup test; `courier: duplicate parcel id` |
 | Bag at `MAX_PARCELS` | Full; no id reserved | All 256 held parcels | Incoming offer | `PURE` cap test; `courier: bag full, 256 parcel(s) held` |
 | Addressee not met; no route to `toFp` | Pending | Parcel stays in the bag for a later encounter | Nothing | `SIM-HARN` carrier test; `courier: holding for <fp>` |
-| Peer acknowledged the handoff | Delivered | Nothing | Acknowledged parcels after `ack` | `SIM-HARN` handoff test; `courier: handed off N parcel(s) to <fp>` |
+| Peer accepted the offer (OK answer) | Offer accepted; `ack` removes the held row; no end-to-end proof | Nothing | Acknowledged parcels after `ack` | `SIM-HARN` handoff test; `courier: handed off N parcel(s) to <fp>` |
 | Carrier restarts before an ack | Re-offer | Persisted bag and signed event survive | Nothing until addressee dedups by id | `SIM-HARN` restart test; `courier: re-offered, recipient deduped` |
 | Corrupt `courier-bag/` or `courierBag` row | Empty bounded state | Unrelated Circle state | Corrupt row | `PURE` tolerant-decode test; `courier: bag row unreadable, starting empty` |
 

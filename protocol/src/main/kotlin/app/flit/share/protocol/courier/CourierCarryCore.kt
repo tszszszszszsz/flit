@@ -162,8 +162,10 @@ fun order(parcels: Iterable<CourierParcel>): List<CourierParcel> {
  * Atomic check-and-record over the shared bounded [seen] set. Precedence is
  * exact: Invalid → Expired → OutsideWindow → Duplicate → Full → Accept. Only
  * Accept reserves an id, so a Full or OutsideWindow offer can be retried.
- * Expiry is checked before the replay window so a TTL-elapsed parcel is
- * reported as Expired rather than shadowed by the shorter window.
+ * The replay window is the full parcel TTL (24 h, [MAX_PARCEL_TTL_MS]), matching
+ * the envelope replay window. Expiry is checked first, so a TTL-elapsed parcel
+ * is always reported as Expired; the window's remaining role is to reject a
+ * parcel dated further than [CircleCore.CLOCK_SKEW_MS] in the future.
  *
  * The window compares two positive timestamps by subtraction, never
  * `nowMs ± window`, so an extreme clock cannot overflow into a false Accept.
@@ -197,7 +199,7 @@ private fun invalid(p: CourierParcel): Boolean {
 
 private fun withinWindow(createdMs: Long, nowMs: Long): Boolean =
     nowMs > 0L &&
-        nowMs - createdMs <= CircleCore.REPLAY_WINDOW_MS &&
+        nowMs - createdMs <= MAX_PARCEL_TTL_MS &&
         createdMs - nowMs <= CircleCore.CLOCK_SKEW_MS
 
 /**

@@ -85,6 +85,12 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   [Open file, sharing restoration and the MIUI limit](docs/open-file-and-sharing-restore.md).
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
+- Phone QR parcel screen: a signed air-gap parcel can be shown on screen as a sequence of QR
+  frames and read back with the camera (or pasted as frame text when camera access is denied).
+  The app keeps one frame per id and sequence, folds the frames back through the codec into one
+  verified payload, and hands the bytes to the existing receive path. No file name travels in a
+  frame; the save name is local. This is code and JVM-tested only, with no camera or device walk
+  claimed.
 
 ## Documentation
 

@@ -3,6 +3,7 @@ package app.flit.share.protocol
 import app.flit.share.protocol.parcel.ParcelCodec
 import app.flit.share.protocol.tls.TlsIdentity
 import java.security.MessageDigest
+import java.security.cert.X509Certificate
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -37,6 +38,20 @@ class ParcelCodecTest {
 
     private fun sha256Hex(payload: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(payload).joinToString("") { "%02x".format(it) }
+
+    private fun assertEncodeRefused(
+        payload: ByteArray = "payload".toByteArray(),
+        parcelId: String = "parcel-refusal",
+        recipientFp: String = recipient.fingerprint,
+        recipientCert: X509Certificate = recipient.certificate,
+        signerFp: String = sender.fingerprint,
+        identity: TlsIdentity = sender,
+    ) {
+        val frames = ParcelCodec.encodeParcel(
+            payload, parcelId, recipientFp, recipientCert, signerFp, identity,
+        )
+        assertTrue(frames.isEmpty(), "encode emits no frame when an input is refused")
+    }
 
     @Test
     fun `parse returns null for empty junk and non-parcel strings`() {
@@ -201,6 +216,79 @@ class ParcelCodecTest {
         assertNull(
             ParcelCodec.complete(frames, recipient.fingerprint, stranger),
             "the right fingerprint with the wrong private key opens nothing",
+        )
+    }
+
+    @Test
+    fun `encodeParcel refuses an empty payload`() {
+        assertEncodeRefused(payload = ByteArray(0))
+    }
+
+    @Test
+    fun `encodeParcel refuses a payload above the effective envelope cap`() {
+        // 8 KiB is inside the defensive 128 KiB frame cap, but the sealed
+        // envelope exceeds CourierEnvelope.MAX_ENVELOPE_CHARS after base64,
+        // so seal refuses and no sequence is emitted.
+        assertEncodeRefused(payload = ByteArray(8192) { 7 })
+    }
+
+    @Test
+    fun `encodeParcel refuses blank and oversized parcel ids`() {
+        assertEncodeRefused(parcelId = "   ")
+        assertEncodeRefused(parcelId = "I".repeat(257))
+    }
+
+    @Test
+    fun `encodeParcel refuses a certificate whose fingerprint differs from recipientFp`() {
+        val stranger = TlsIdentity.generate()
+        assertEncodeRefused(recipientCert = stranger.certificate)
+    }
+
+    @Test
+    fun `encodeParcel refuses a signerFp that is not the identity fingerprint`() {
+        val stranger = TlsIdentity.generate()
+        assertEncodeRefused(signerFp = stranger.fingerprint)
+    }
+
+    @Test
+    fun `parse refuses non-canonical numeric fields`() {
+        val frame = encode("canonical".toByteArray(), "parcel-numeric").first()
+        val parts = frame.split(".").toMutableList()
+        fun mutated(index: Int, value: String): String =
+            parts.toMutableList().also { it[index] = value }.joinToString(".")
+
+        assertNull(
+            ParcelCodec.parse(mutated(1, " 1")),
+            "a version with leading whitespace is not canonical",
+        )
+        assertNull(
+            ParcelCodec.parse(mutated(3, "1_0")),
+            "a seq with a digit separator is not canonical",
+        )
+        assertNull(
+            ParcelCodec.parse(mutated(4, "1e0")),
+            "a count in exponent form is not canonical",
+        )
+        assertNull(
+            ParcelCodec.parse(mutated(6, "99999999999999999999")),
+            "an overflowing total is not canonical",
+        )
+    }
+
+    @Test
+    fun `parse refuses padded base64 fields`() {
+        // "abcdef" encodes to eight unpadded URL-safe chars; two '=' after a
+        // full quantum leave an invalid ending unit for the URL-safe decoder.
+        val frame = encode("padded".toByteArray(), "abcdef").first()
+        val parts = frame.split(".").toMutableList()
+
+        val paddedId = parts[2] + "=="
+        assertNull(
+            ParcelCodec.parse(parts.toMutableList().also { it[2] = paddedId }.joinToString(".")),
+        )
+        val paddedChunk = parts[10] + "===="
+        assertNull(
+            ParcelCodec.parse(parts.toMutableList().also { it[10] = paddedChunk }.joinToString(".")),
         )
     }
 }

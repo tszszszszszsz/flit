@@ -289,6 +289,11 @@ val share: StateFlow<ShareIntake?> = _share
         }
     }
 
+    /** Ledger row for a QR parcel landed directly to MediaStore by the activity. */
+    fun recordParcelReceived(name: String, bytes: Int, uri: String) {
+        addReceived(ReceivedFile(name, bytes.toLong(), System.currentTimeMillis(), null, uri))
+    }
+
     /** After a copy to SAF/Downloads, point the ledger at the surviving artifact. */
     private fun relocateReceived(old: ReceivedFile, uri: String) {
         val updated = old.copy(path = null, uri = uri)
@@ -756,7 +761,7 @@ val share: StateFlow<ShareIntake?> = _share
         for (parcel in bag.parcels) {
             if (parcel.id in liveIds) continue // still held, no outcome change
             // The shas are keyed by the emitted parcel event id (see
-            // circleCourierDrop/courierTrack), not by the decoded envelope id.
+            // circleCourierDrop/postParcel), not by the decoded envelope id.
             for (sha in courierParcelShas.remove(parcel.id).orEmpty()) {
                 if (_courierHandoffs.value[sha]?.outcome == COURIER_WAITING) {
                     setCourierHandoffOutcome(sha, COURIER_FAILED)
@@ -929,13 +934,12 @@ val share: StateFlow<ShareIntake?> = _share
             }
 
             val posted = runCatching {
-                FlitCircleSync.postParcel(target, CourierEnvelope.encode(envelope))
+                FlitCircleSync.postParcel(target, CourierEnvelope.encode(envelope), shas)
             }.getOrNull()
             if (posted == null) {
                 logLine("courier drop: post failed for ${target.take(12)} — no parcel event was logged")
                 return@launch
             }
-            FlitCircleSync.courierTrack(posted.id, shas)
             courierParcelShas[posted.id] = shas.toMutableSet()
             logLine("courier: dropped $files file event(s) for ${target.take(12)}")
             refreshCircle()
@@ -1166,6 +1170,9 @@ val share: StateFlow<ShareIntake?> = _share
     )
     private lateinit var appCtx: Context
     private var identity: TlsIdentity? = null
+
+    /** Local identity for the air-gap parcel screen; null before sharing starts. */
+    fun parcelIdentity(): TlsIdentity? = identity
     private var server: ProtocolServer? = null
     private var client: ProtocolClient? = null
     /** Bluetooth data carrier, built only when the option is on. */
@@ -1406,6 +1413,8 @@ val share: StateFlow<ShareIntake?> = _share
     fun stop() {
         startSeq++
         clearCourierHooks()
+        _courierHandoffs.value = emptyMap()
+        courierParcelShas.clear()
         stopMirrorWatcher()
         // E's parked read is blocking; close the socket so the worker wakes
         // and sees the new sequence instead of lingering on a dead engine.

@@ -8,15 +8,15 @@ CRC, digest and crypto stay in the 2026-12-03 `ParcelCodec` and the
 is a single seam in `harness/`, beside `parse-qr`, with no app, route or socket
 surface.
 
-Counts come from a fresh `--rerun-tasks` run. The commit for the layer stays
-on 2026-12-04. No device walk is claimed here; the
+Counts are to be taken from a fresh `--rerun-tasks` run. The layer is dated
+2026-12-04. No device walk is claimed here; the
 air-gap walk stays on 2026-12-08.
 
 ## Files in the layer
 
 | File | Content |
 | --- | --- |
-| `harness/src/main/kotlin/app/flit/share/harness/ParcelCli.kt` | `object ParcelCli`: frozen API, encode/decode paths, zxing PNG seam, exit codes and its own `usage()` |
+| `harness/src/main/kotlin/app/flit/share/harness/ParcelCli.kt` | `object ParcelCli`: declared API, encode/decode paths, zxing PNG seam, exit codes and its own `usage()` |
 | `harness/src/main/kotlin/app/flit/share/harness/Harness.kt` | `"parcel"` dispatch, one `usage()` line, `parcelUsage()` and `--out` in `ParsedArgs.VALUE_FLAGS`; no other command changed |
 | `harness/src/test/kotlin/app/flit/share/harness/ParcelCliTest.kt` | Pure flag parsing, certificate gate and frame naming |
 | `harness/src/test/kotlin/app/flit/share/harness/ParcelCliHarnessTest.kt` | Two temp homes, encode → decode round-trip through the production codec |
@@ -24,11 +24,11 @@ air-gap walk stays on 2026-12-08.
 | `docs/CONTRACTS.md` | CLI surface of the `parcel` command |
 | `docs/SECURITY.md` | Certificate supplied out of band, no pin registry or self-addressed fallback |
 | `docs/FAILURE-MODES.md` | Bad certificate, missing frame, missing directory and bad output path |
-| `docs/OPERATIONS.md` | Final `parcel encode` / `parcel decode` command reference in §11 |
+| `docs/OPERATIONS.md` | `parcel encode` / `parcel decode` command reference in §11 |
 | `docs/PERFORMANCE.md` | PNG render and read cost, no invented timings |
 | `docs/ARCHITECTURE.md` | One-shot CLI parcel seam over `ParcelCodec` |
-| `docs/completions/2026-12-04-qr-parcel-cli.md` | This draft note |
-| `docs/roadmap/qr-parcel-cli.md` | API finalized against the frozen surface below |
+| `docs/completions/2026-12-04-qr-parcel-cli.md` | Layer record for 2026-12-04 |
+| `docs/roadmap/qr-parcel-cli.md` | API aligned with the surface recorded below |
 | `docs/roadmap/qr-parcel-device-walk.md` | Commands aligned; no walk claimed here |
 | `docs/roadmap/01-schedule.md`, `docs/roadmap/02-waves.md` | Build-ahead note for the 2026-12-04 layer |
 | `README.md` | One CLI bullet, no device claim |
@@ -38,7 +38,7 @@ argument parser, no HTTP route, no radio and no Android import in this layer.
 
 ## Public surface
 
-The exact API held by this wave, in `app.flit.share.harness.ParcelCli`:
+The API declared in `app.flit.share.harness.ParcelCli`:
 
 ```
 data class EncodeResult(val dir: Path, val frames: Int, val sealedChars: Int, val sha256: String)
@@ -56,7 +56,7 @@ directly, without spawning a process. `run` returns the process exit code;
 The adapter loads its identity with `loadOrCreateIdentity()` and roots its
 paths in `harnessHome()`, so two `FLIT_HARNESS_HOME` values isolate two nodes
 on one box. Field-level meaning of `sealedChars` is fixed by the adapter
-implementation owned by this wave; the frozen shape is recorded above.
+implementation in `ParcelCli.kt`; the shape is recorded above.
 
 ## Command surface
 
@@ -170,8 +170,7 @@ prints `ParcelCli.usage()`, and `--out` in `ParsedArgs.VALUE_FLAGS`. The
 
 ## Verification
 
-The rig command from [TESTING.md](../TESTING.md) §3, to be run after the layer
-lands:
+The rig command from [TESTING.md](../TESTING.md) §3:
 
 ```bash
 source env.sh && ./gradlew --no-daemon --rerun-tasks \
@@ -181,7 +180,7 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
 ```
 
 Counts are to be taken from a fresh `--rerun-tasks` XML run, not from a target
-figure. The inherited baseline is 158 protocol + 239 app + 39 harness = 436
+figure. The inherited baseline is 158 protocol + 239 app + 51 harness = 448
 ([TESTING.md](../TESTING.md) §2); this layer adds harness cases only.
 
 | Module | Baseline | Current rig | Task |
@@ -189,18 +188,15 @@ figure. The inherited baseline is 158 protocol + 239 app + 39 harness = 436
 | `protocol` | 158 | 158 (unchanged) | `:protocol:test` |
 | `app` | 239 | 239 (unchanged) | `:app:testDebugUnitTest` |
 | `harness` | 39 | 51 | `:harness:test` |
-| Total | 436 | 448 | — |
-
-Result: `BUILD SUCCESSFUL` after `--rerun-tasks`; 158 protocol + 239 app + 51
-harness = 448 tests, 0 failures.
+| Total | 436 | 478 | — |
 
 ## Tests
 
-Two new harness classes add 12 cases, counted from the JUnit XML.
+Two new harness classes add 12 cases, to be counted from the JUnit XML.
 
 | Class | Cases | What it pins |
 | --- | --- | --- |
-| `ParcelCliTest` | 9 | Pure flag parsing, the certificate gate against `--to`, frame naming and the frozen result shapes; no sockets |
+| `ParcelCliTest` | 9 | Pure flag parsing, the certificate gate against `--to`, frame naming and the result shapes; no sockets |
 | `ParcelCliHarnessTest` | 3 | Two temp homes, encode → decode through the production `ParcelCodec`, byte-for-byte equality and the refusal paths |
 
 The harness exercise uses production codec and envelope seams, not a lookalike
@@ -211,9 +207,9 @@ roots are per test. No protocol or app cases are added by this layer.
 
 | Label | Claimed here | Basis |
 | --- | --- | --- |
-| CODE | Yes — contract | Frozen API above and the `Harness.kt` wiring; the adapter file is owned by this wave |
-| PURE | Yes | `ParcelCliTest` counts from the integration run |
-| SIM-HARN | Yes | `ParcelCliHarnessTest` counts from the integration run |
+| CODE | Yes — contract | The `ParcelCli` API above and the `Harness.kt` wiring |
+| PURE | TBD | `ParcelCliTest` counts to be taken from the integration run |
+| SIM-HARN | TBD | `ParcelCliHarnessTest` counts to be taken from the integration run |
 | DEVICE | No | No camera, phone or air-gap observation; the device walk is the 2026-12-08 layer |
 
 No radio, phone, camera or QR observation is claimed on this date.
@@ -239,5 +235,5 @@ No radio, phone, camera or QR observation is claimed on this date.
 ## Verification status
 
 Draft. Counts and the PURE / SIM-HARN evidence rows stay placeholders until the
-integration run. This draft records no Gradle result, no git operation and no
-commit. No DEVICE observation is claimed.
+integration run. No Gradle result is claimed here. No DEVICE observation is
+claimed.

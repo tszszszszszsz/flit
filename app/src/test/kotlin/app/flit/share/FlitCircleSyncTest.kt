@@ -1022,7 +1022,12 @@ class FlitCircleSyncTest {
         val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
         // The parcel event was persisted on an earlier pass. Its log id must not
         // stop the carry core from folding the row — carry.evaluate dedups ids.
-        var current = courierState(meFp, "AABB", events = listOf(parcelEvent))
+        var current = courierState(meFp, "AABB", events = listOf(parcelEvent)).copy(
+            members = listOf(
+                Member(meFp, "", Role.MEMBER),
+                Member(sender.fingerprint, "", Role.MEMBER),
+            ),
+        )
         val bagWrites = mutableListOf<String>()
         val published = mutableListOf<CourierCardUi.CourierHandoff>()
         FlitCircleSync.resetForTest()
@@ -1181,17 +1186,12 @@ class FlitCircleSyncTest {
             FlitCircleSync.courierReceive(current, listOf(parcelEvent))
 
             assertTrue(
-                logs.any { it.contains("rejected 3 opened event(s)") },
+                logs.any { it.contains("refused parcel from non-member") },
                 logs.toString(),
             )
-            assertTrue(upserted.isEmpty(), "no opened event from a non-member author may be folded")
-            assertTrue(published.isEmpty(), "a rejected file event publishes no Open affordance")
-            assertTrue(bagWrites.isNotEmpty())
-            assertEquals(
-                listOf(parcelEvent.id),
-                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().map { it.id },
-                "the parcel row is held for a later legitimate handoff",
-            )
+            assertTrue(upserted.isEmpty(), "no event from a non-member parcel author may be folded")
+            assertTrue(published.isEmpty(), "a refused parcel publishes no Open affordance")
+            assertTrue(bagWrites.isEmpty(), "a non-member parcel never enters the bag")
         } finally {
             FlitCircleSync.resetForTest()
         }

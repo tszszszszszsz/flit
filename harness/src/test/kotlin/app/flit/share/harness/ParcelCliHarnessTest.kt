@@ -17,6 +17,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.Comparator
 import java.util.Random
 import javax.imageio.ImageIO
 import kotlin.test.Test
@@ -39,16 +40,36 @@ import kotlin.test.assertTrue
  * an identity. The frame directory is a plain temp path handed between nodes.
  *
  * Because `user.home` is JVM-global, all tests run through [isolatedHome]: the
- * walk is skipped when the environment pins one harness home and a single lock
- * is held while `user.home` is switched.
+ * walk is skipped when the environment pins one harness home (rather than
+ * silently sharing the caller's real home), a single lock is held while
+ * `user.home` is switched, and every node's temp root is deleted afterwards.
  */
 class ParcelCliHarnessTest {
 
     companion object {
+        /**
+         * [harnessHome] reads this env var before `user.home`. With it set the
+         * per-node switch cannot produce two homes, so the walk is skipped
+         * instead of sharing (and corrupting) a real harness home.
+         */
         private val fixedHarnessHome: String? =
             System.getenv("FLIT_HARNESS_HOME")?.takeIf { it.isNotBlank() }
 
+        /** `user.home` is JVM-global: only one test may switch it at a time. */
         private val homeLock = Any()
+
+        /** Temp roots opened by [Node] while the lock is held, cleaned up after the block. */
+        private val tempRoots = mutableListOf<Path>()
+
+        /** Best-effort recursive removal of one node's private temp root. */
+        private fun deleteTree(root: Path) {
+            if (!Files.exists(root)) return
+            Files.walk(root).use { stream ->
+                stream.sorted(Comparator.reverseOrder<Path>()).forEach { path ->
+                    runCatching { Files.deleteIfExists(path) }
+                }
+            }
+        }
 
         private fun <T> isolatedHome(block: () -> T): T {
             assumeTrue(
@@ -56,29 +77,37 @@ class ParcelCliHarnessTest {
                 "ParcelCliHarnessTest switches user.home per node, but " +
                     "harnessHome() prefers FLIT_HARNESS_HOME=$fixedHarnessHome.",
             )
-            return synchronized(homeLock, block)
+            return synchronized(homeLock) {
+                tempRoots.clear()
+                try {
+                    block()
+                } finally {
+                    tempRoots.forEach(::deleteTree)
+                    tempRoots.clear()
+                }
+            }
         }
 
         private fun sha256Hex(bytes: ByteArray): String =
             MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-    }
 
-    private class Node(tag: String) {
-        val root: Path = Files.createTempDirectory("parcel-$tag-")
-        val home: Path = root.resolve("home").also { Files.createDirectories(it) }
+        private class Node(tag: String) {
+            val root: Path = Files.createTempDirectory("parcel-$tag-").also { tempRoots.add(it) }
+            val home: Path = root.resolve("home").also { Files.createDirectories(it) }
 
-        fun <T> inHome(block: () -> T): T {
-            val previous = System.getProperty("user.home")
-            System.setProperty("user.home", home.toString())
-            try {
-                return block()
-            } finally {
-                if (previous == null) System.clearProperty("user.home")
-                else System.setProperty("user.home", previous)
+            fun <T> inHome(block: () -> T): T {
+                val previous = System.getProperty("user.home")
+                System.setProperty("user.home", home.toString())
+                try {
+                    return block()
+                } finally {
+                    if (previous == null) System.clearProperty("user.home")
+                    else System.setProperty("user.home", previous)
+                }
             }
-        }
 
-        fun identity(): TlsIdentity = inHome { loadOrCreateIdentity() }
+            fun identity(): TlsIdentity = inHome { loadOrCreateIdentity() }
+        }
     }
 
     private fun framePngs(frames: Path): List<Path> = Files.list(frames).use { stream ->
@@ -114,14 +143,32 @@ class ParcelCliHarnessTest {
         return frames
     }
 
-    /** Read one rendered PNG back to the opaque frame string, like a scanner. */
+    /**
+     * Read one rendered PNG back to the opaque frame string, like a scanner.
+     * A dense frame may not decode at full resolution, so sample at scales
+     * 1..4 exactly as production `ParcelCli.readFrame` does and fail only after every
+     * attempt has missed.
+     */
     private fun frameString(png: Path): String {
         val img = ImageIO.read(png.toFile()) ?: error("$png is not an image")
-        val px = IntArray(img.width * img.height)
-        img.getRGB(0, 0, img.width, img.height, px, 0, img.width)
-        return MultiFormatReader()
-            .decode(BinaryBitmap(HybridBinarizer(RGBLuminanceSource(img.width, img.height, px))))
-            .text
+        for (d in 1..4) {
+            val w = img.width / d
+            val h = img.height / d
+            if (w < 1 || h < 1) continue
+            val small = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
+            val g = small.createGraphics()
+            g.drawImage(img, 0, 0, w, h, null)
+            g.dispose()
+            val px = IntArray(w * h)
+            small.getRGB(0, 0, w, h, px, 0, w)
+            val text = runCatching {
+                MultiFormatReader()
+                    .decode(BinaryBitmap(HybridBinarizer(RGBLuminanceSource(w, h, px))))
+                    .text
+            }.getOrNull()
+            if (text != null) return text
+        }
+        error("$png has no readable frame at scales 1..4")
     }
 
     /** Rewrite a PNG so it carries a frame whose own CRC no longer matches. */

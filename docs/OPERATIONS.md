@@ -46,10 +46,10 @@ than a JVM class-file stack trace (install-cli.sh:1-70).
 
 ## 2. `flit-cli` reference
 
-The canonical command list is the no-argument output of `flit-cli` itself,
-defined at `Harness.kt:136-156`. The README's shorter list is a user-facing
-summary; where the two differ, the help text and the arg parser decide
-and the differences are recorded at the end of this section.
+The command list below is the no-argument output of `flit-cli` itself,
+defined by `usage()` at `Harness.kt:145-167`. The README's shorter list is a
+user-facing summary; where the two differ, the help text and the arg parser
+decide.
 
 ```
 flit-cli — the LocalSend v2.2 command line (same stack as the Flit app)
@@ -59,7 +59,7 @@ serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--hidden] [--ann
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
-bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
+bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pipe carrier
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
@@ -68,21 +68,26 @@ circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--i
        [--host ip[:port]] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
-courier <drop|carry|receive|status|sweep> [--bag DIR] -- sealed parcels in a portable bag (see §2.4)
+courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
+parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs back into bytes, offline
 ```
 
-Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:72-78):
+The `courier` surface is detailed in §2.4 and `parcel` in §11.
+
+Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:73-78):
 `--alias --port --dir --dest --udp-port --wait --pin --parallel --announce-to
 --bytes --sender --token --park-timeout --relay --text --circle --invite --file
---target --option --host --role --bag --to --cert --ttl`. Everything else is a
-presence flag. Defaults come from `Protocol.DEFAULT_PORT = 53317` and
+--target --option --host --role --bag --to --cert --ttl --out`. Everything else
+is a presence flag. Defaults come from `Protocol.DEFAULT_PORT = 53317` and
 `MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay default is
-`DEFAULT_PORT + 1 = 53318` (Harness.kt:675). The last four flags belong to
-`courier` (§2.4); with no `--bag` the bag is `<identity home>/courier-bag`.
+`DEFAULT_PORT + 1 = 53318` (Harness.kt:706). `--bag --to --cert --ttl` belong to
+`courier` (§2.4) and `--out` to `parcel` (§11). A relative `--bag` is rooted at
+`<identity home>` (`harnessHome()`); an absolute path is used as given. With no
+`--bag` the bag is `<identity home>/courier-bag`.
 
 ### 2.1 Commands, flags and observable output
 
-**`serve`** (Harness.kt:499-580) — run a production v2.2 receiver.
+**`serve`** (Harness.kt:530-611) — run a production v2.2 receiver.
 
 - `--alias N`: advertised name; default `Flit (<USER>)` or `Flit (dev)`.
 - `--port P`: TCP/TLS listener; default 53317.
@@ -107,16 +112,16 @@ Startup prints, in order: `HH:mm:ss serving https://0.0.0.0:<port>
 dir=<abs path>`, `fingerprint <fp>`, `circle <id> invite=<token> — join with:
 flit-cli circle join …`. In hidden mode an extra line explains stand-down.
 Ctrl+C runs the shutdown hook (`discovery.stop(); server.close()`) and prints
-`bye` (Harness.kt:573-576). In relay-only mode there is no shutdown hook around
+`bye` (Harness.kt:604-607). In relay-only mode there is no shutdown hook around
 the subscribe loop; SIGINT/SIGTERM ends the process.
 
-**`discover`** (Harness.kt:582-621) — announce for `--wait S` seconds (default
+**`discover`** (Harness.kt:613-652) — announce for `--wait S` seconds (default
 8) and print every fingerprint seen. Exits 2 with `no peers found` if the roster
 stays empty. Output per peer: `peer <alias> ip=<ip>:<port> tls=<bool>
 type=<deviceType> v=<version> fp=<12>…`. The listener binds an ephemeral port
 and writes to `flit-tmp-discover/`.
 
-**`send`** (Harness.kt:623-662, 685-744) — resolve the target either as a literal
+**`send`** (Harness.kt:654-693, 716-750) — resolve the target either as a literal
 IPv4 `ip[:port]` (regex `^\d{1,3}(\.\d{1,3}){3}(:\d+)?$`) or as an alias found
 by a short discovery rendezvous (`--wait S`, default 5, plus the discovery
 flags). Directories passed as file arguments are walked recursively and their
@@ -126,7 +131,7 @@ pin), `--parallel N` (default 4), `--multi` (multi-stream), `--http`. Output:
 per failure; **exit 3 if any file failed**, exit 1 if no files were found in the
 given paths.
 
-**`info`** (Harness.kt:746-759) — print the peer's `PeerInfo` JSON (announce
+**`info`** (Harness.kt:777-790) — print the peer's `PeerInfo` JSON (announce
 field removed) or exit 2 with `no answer from ip:port`.
 
 **`bt-sim`** (`BtSim.kt:44-136`) — both ends of an exchange in one process over
@@ -137,12 +142,12 @@ wrapped in `TlsLink` when TLS is on. It exercises `/info`, `/register`,
 carrier. With no files, one synthetic random file of `--bytes MB` (default 4) is
 generated; `--dir` sets the landing dir (default `flit-sim-received`), `--sender`
 the alias, `--pin`, `--parallel`, `--multi` mirror `send`. `--no-tls` is
-implemented (`BtSim.kt:49`, `/info` then reports `http`) but omitted
-from the no-arg help string — see the discrepancy note. Exit codes: 1 when
+implemented (`BtSim.kt:49`, `/info` then reports `http`) and listed in the
+no-arg help string (`Harness.kt:154`). Exit codes: 1 when
 neither files nor `--bytes` are given, 2 if `/info` gets no answer, 3 if any file
 fails. This is **harness evidence**, not a radio walk.
 
-**`relay`** (Harness.kt:670-683; RelayServer.kt) — blind pairer.
+**`relay`** (Harness.kt:701-714; RelayServer.kt) — blind pairer.
 
 - `--port P`: default 53318.
 - `--token T`: optional shared token gate, compared in constant time by
@@ -160,16 +165,16 @@ bound), FIFO pairing and ghost-ticket `withdraw` are the same production core
 the app dials. Ctrl+C closes the server and all parked sockets and prints `bye`.
 There is no relay-side storage, queue or discovery.
 
-**`panic`** (Harness.kt:218-230) — `flit-cli panic <ip[:port]> [--text NOTE]`;
+**`panic`** (Harness.kt:249-261) — `flit-cli panic <ip[:port]> [--text NOTE]`;
 default note `check in when you can`. It signs an informational alert with the
 CLI identity and prints `panic to host:port sent|refused`. Informational only:
 no remote action on the recipient ([qr-only-and-panic.md](qr-only-and-panic.md)).
 
-**`parse-qr`** (Harness.kt:179-216) — decode pairing codes from png/jpg captures.
+**`parse-qr`** (Harness.kt:210-247) — decode pairing codes from png/jpg captures.
 It samples at scales 1, 2, 3 and 4 because ZXing's binarizer has module-size
 sweet spots; output is `<path>: <decoded text> (scale 1/N)` or `(no code)`.
 
-**`circle`** (Harness.kt:1034-1264; `circleUsage()` at 158-177) — accountless
+**`circle`** (Harness.kt:1065-1265; `circleUsage()` at 169-188) — accountless
 group coordination over the production `/circle/join` and `/circle/sync` routes.
 CLI state lives at `<identity home>/circle.state` (7 lines: id, invite, key,
 host, members, events JSON, rekeyGen). Subcommands:
@@ -189,37 +194,42 @@ host, members, events JSON, rekeyGen). Subcommands:
 
 `file --file` is deliberately different from `post --file`: a plain post never
 moves bytes. The announcement body is the closed `{name,size,sha256}` shape with
-no spool path and no queue token (Harness.kt:875-880). Delivery statuses are
+no spool path and no queue token (Harness.kt:906-911). Delivery statuses are
 `pending → sent|refused|failed`, are local-only and never gossiped; a thrown
-carrier leaves the recipient `pending` for retry (Harness.kt:882-978). Full
+carrier leaves the recipient `pending` for retry (Harness.kt:913-1009). Full
 semantics and evidence live in [Circle](circle.md#file-delivery-as-built).
 
 ### 2.2 Identity, environment and exit codes
 
 - Identity: `~/.config/flit/flit-harness/identity.p12`, generated on first use
-  and stable across rebuilds and updates (Harness.kt:81-99). Override the whole
+  and stable across rebuilds and updates (Harness.kt:82-100). Override the whole
   home with `FLIT_HARNESS_HOME`. Keeping this file is what lets previously
   trusting peers keep trusting the box after an installer upgrade.
 - `FLIT_MODEL` sets the advertised `deviceModel`; `FLIT_TRACE=1` prints a stack
   trace for the top-level error handler instead of just
   `!! <message> (set FLIT_TRACE=1 for a stack trace)`.
 - Exit codes, consolidated: **1** = generic top-level exception / no files found
-  / bt-sim needs input; **2** = bad `--relay` address, `discover` found nobody,
-  `info` got no answer, bt-sim `/info` got no answer, bad courier argument or
-  missing `--bag`; **3** = at least one file failed to send, or a courier parcel
-  failed `open`. Normal `exitProcess(0)` is implicit. The courier-specific codes
-  are `EXIT_BAD_ARGS = 2` and `EXIT_OPEN_REFUSED = 3` (§2.4).
+  / bt-sim needs input / an unexpected `parcel` throwable; **2** = bad `--relay`
+  address, `discover` found nobody, `info` got no answer, bt-sim `/info` got no
+  answer, bad courier argument or missing `--bag`, or bad `parcel` arguments /
+  missing `--cert`, `--dir` or `--out`; **3** = at least one file failed to send,
+  a courier parcel failed `open`, or `parcel` verification failed. Normal
+  `exitProcess(0)` is implicit. The courier-specific codes are
+  `EXIT_BAD_ARGS = 2` and `EXIT_OPEN_REFUSED = 3` (§2.4); `parcel` maps a
+  `ParcelCliFailure` to 2 or 3 and lets other throwables reach the top-level
+  handler (§11).
 
 ### 2.3 Differences from the README summary
 
-1. The README's "canonical list" line for `bt-sim` includes `--no-tls`; the
-   `usage()` string at Harness.kt:145 omits it while `BtSim.kt:49` implements it.
-   Treat it as a real, supported flag.
+1. `bt-sim --no-tls` is implemented (`BtSim.kt:49`) and appears in the `usage()`
+   line at `Harness.kt:154`; `/info` then reports `http`. It is a real,
+   supported flag.
 2. The README list shows a reduced flag set (no `--alias`, `--port`, `--udp-port`,
    `--http`, `--announce-to`, `--dest`, `--sender`, `--circle`/`--invite` on
    `serve`, no `--alias` on `discover`/`send`, no per-subcommand Circle flags),
    yet claims to be "every command and flag, from `flit-cli` with no arguments".
-   The actual `usage()` output above is the complete list.
+   `usage()` prints the full list — including `--no-tls`, the `courier` flags
+   and the `parcel` line — so the README's reduced set is a summary only.
 3. The README documents `relay --port 53318` as if it were a literal default in
    the help text; the code computes it as `Protocol.DEFAULT_PORT + 1` and the
    help string shows `--port P`. The effective default is still 53318.
@@ -251,11 +261,15 @@ the CLI identity supplied by `loadOrCreateIdentity()`, the same fingerprint
 DER out of band when its signed event has not reached `circle.state`; the
 certificate fingerprint is checked against `--to` before sealing, so a parcel
 cannot be addressed to one fingerprint and encrypted to another. `--ttl MS`
-sets the parcel lifetime in milliseconds; without it the carry layer's
-`MAX_PARCEL_TTL_MS` (24 h) applies, and expiry is derived once as
-`expiresMs = createdMs + TTL` inside the carry limit. `--bag DIR` overrides the
-bag directory; with no `--bag` it is `<identity home>/courier-bag`. `receive`
-takes the bag copied in from another machine.
+injects the current time (`nowMs`) in milliseconds for sealing and expiry
+checks — it is not a lifetime. A positive integer is required; without it the
+CLI uses `System.currentTimeMillis()`, and a non-numeric or non-positive value
+exits 2. Expiry still comes from the carry layer's bounded `MAX_PARCEL_TTL_MS`
+(24 h), derived once as `expiresMs = createdMs + TTL` inside that limit.
+`--bag DIR` overrides the bag directory: an absolute path is used as given, a
+relative path is rooted at `<identity home>` (`harnessHome()`); with no `--bag`
+it is `<identity home>/courier-bag`. `receive` takes the bag copied in from
+another machine.
 
 On-disk layout, all under the identity home (`harnessHome()`, overridable with
 `FLIT_HARNESS_HOME` to separate nodes on one box):
@@ -375,7 +389,7 @@ Flit is open` (FlitService.kt:83-96).
 **The receive gate is a prepare-time decision, not a discovery filter.**
 `onPrepare` declines when QR-only is on and the fingerprint is not in the Known
 devices store, or when "trusted senders only" is on and the fingerprint is not
-pinned; the decision never uses an IP (FlitEngine.kt:967-989). Logs are
+pinned; the decision never uses an IP (FlitEngine.kt:1241-1263). Logs are
 `declined QR-unknown device <alias> (<fp12>)` and `declined offer from <alias>
 (<ip>) — device not trusted`. A decline is a receiver answer that concludes the
 attempt; it is different from a carrier death, which throws and keeps the row
@@ -407,7 +421,7 @@ adb logcat -s FlitSend:I                             # the app's engine log tag
 ```
 
 `debug.flit.nopin` is a developer escape hatch read by `FlitEngine.debugProp`
-(FlitEngine.kt:3220-3224); when set it logs `egress pin skipped
+(FlitEngine.kt:3498-3502); when set it logs `egress pin skipped
 (debug.flit.nopin)`. It is not a user setting.
 
 ## 5. Logs and what they mean
@@ -415,7 +429,7 @@ adb logcat -s FlitSend:I                             # the app's engine log tag
 ### 5.1 App log (`adb logcat -s FlitSend:I`, in-app last 60 lines)
 
 `FlitEngine.logLine()` prefixes `HH:mm:ss`, writes `Log.i("FlitSend", text)`
-and keeps the last 60 lines in memory (FlitEngine.kt:3204-3209). A log line is
+and keeps the last 60 lines in memory (FlitEngine.kt:3483-3487). A log line is
 an observation, not a promise: it says what the engine saw at that instant.
 
 | Line (or family) | Meaning |
@@ -685,10 +699,14 @@ flit-cli serve --dir ~/Public --relay 127.0.0.1:53318 --token T # terminal B
 flit-cli serve --dir ~/Public --circle <id> --invite <token>   # box hosts (also prints join line)
 flit-cli circle join --host 127.0.0.1:53317 --circle <id> --invite <token>
 flit-cli circle post --text "hello from the box"
-flit-cli circle poll --text "where?" --option home --option away
+flit-cli circle poll --text "where?" --option home,away
 flit-cli circle vote --option 0
 flit-cli circle sync
 ```
+
+`poll` takes one comma-separated `--option A,B,…` value (Harness.kt:1170-1173);
+a repeated `--option` overwrites the earlier one in the arg parser. `vote`
+takes a single integer `--option N` (Harness.kt:1187-1188).
 
 On the phone, join by pasting a QR v3 code or tapping a `flit://add?v=3&…` link
 (the VIEW intent starts sharing and joins). Evidence recorded: inbound sync
@@ -799,14 +817,15 @@ answer** (keep the row and bytes). Every landing is verified by sha256
   `kill -9` skips this hook and leaves any in-flight `.part` + `.part.token` on
   disk; that is deliberate for the death walks, because the restart sweep
   repopulates the prefix from the sidecar. For normal operation, use Ctrl+C.
-- `bt-sim`, `discover`, `send`, `info`, `circle`, `courier`, `panic`,
+- `bt-sim`, `discover`, `send`, `info`, `circle`, `courier`, `parcel`, `panic`,
   `parse-qr`: one-shot; they exit on their own. `discover` with no peers exits 2
   by design; so does `courier` with a bad argument or missing `--bag`, and
-  `courier receive` exits 3 when a parcel fails `open`.
+  `courier receive` exits 3 when a parcel fails `open`. `parcel` exits 0 on
+  success, 2 on bad arguments or a missing `--cert`, `--dir` or `--out`, and 3
+  on verification failure (§11).
 - Phone: tap **Stop** in the app (or the Quick Settings tile, which calls
-  `stopService` and reaches the same path). The documented intent is that this
-  is the only path that clears `sharingDesired`, so a later relaunch stays
-  stopped. Code-traced nuance: `FlitService.onDestroy()` also clears the row
+  `stopService` and reaches the same path). This clears `sharingDesired`, so a
+  later relaunch stays stopped. `FlitService.onDestroy()` also clears the row
   whenever that instance owned a live, non-timed-out FGS
   (FlitService.kt:175-184) — including an FGS-start error path that calls
   `stopSelf(startId)` (FlitService.kt:99-116). A plain
@@ -911,17 +930,19 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
 - Where the README CLI summary and the actual `flit-cli` help/arg parser disagree
   (§2.3), the help text and parser decide.
 - Manual air-gap carry by QR frames is an operator procedure with its own size,
-  acknowledgement and evidence limits (§11). No device walk is asserted here.
+  acknowledgement and evidence limits (§11); no device walk is part of it.
 
 ## 11. Manual air-gap carry (QR parcel)
 
 A parcel moves one small named payload between two identities as an ordered
 sequence of QR frames, with no network, Bluetooth, relay or Wi‑Fi Aware carrier
 in the path. The frames are the only thing carried; the payload bytes never go
-over a socket. This section is the operator procedure for that carry. It uses
-the CLI `parcel` commands and the app's parcel display/scan surface; the frame
-grammar, per-frame CRC and size caps belong to the protocol codec and are not
-restated or edited here (see [CONTRACTS.md](CONTRACTS.md) for the grammar and
+over a socket. The operator uses the CLI `parcel` commands and the app's two
+parcel screens: **Show** cycles an outbound payload as QR frames, and **Scan**
+reassembles an inbound payload from the camera (or a pasted frame list) and
+lands it through the app's received-file path. The frame grammar, per-frame CRC
+and size caps belong to the protocol codec (see
+[CONTRACTS.md](CONTRACTS.md) for the grammar and
 [FAILURE-MODES.md](FAILURE-MODES.md) for refusals).
 
 The CLI surface is exactly two commands:
@@ -939,7 +960,7 @@ already are. Both commands are one-shot and offline.
 - Use the built `flit-cli` described in §3 and a phone with the parcel surface
   installed as described in §4. The two `parcel` commands come from the CLI
   layer (`docs/roadmap/qr-parcel-cli.md`) and the app surfaces from the app
-  layer (`docs/roadmap/qr-parcel-app.md`); this procedure adds no build step.
+  layer (`docs/roadmap/qr-parcel-app.md`); neither adds a build step.
 - Have the recipient's certificate as a **Base64 DER file** for `--cert` and
   the recipient's fingerprint for `--to`. The fingerprint is the value the
   receiver prints (`serve` prints `fingerprint <fp>`; the app shows its own
@@ -960,9 +981,10 @@ already are. Both commands are one-shot and offline.
   frame: the operator supplies the output name at decode with `--out`. The
   encoding adapter computes its own SHA‑256 over the file bytes and reports it
   as `sha256`; that is the value to compare at the far end.
-- Exit codes for both commands: **0** success, **2** bad arguments or a missing
-  `--cert`, `--dir` or `--out`, **3** verification failure on decode. These are
-  the only `parcel` exit codes.
+- Exit codes: **0** success, **2** bad arguments or a missing `--cert`, `--dir`
+  or `--out`, **3** verification failure on decode (no output written). An
+  unexpected throwable is not mapped to a `parcel` code: it reaches
+  `Harness.main`'s top-level handler and exits 1 (§2.2).
 
 ### 11.2 Box → phone (display and scan)
 
@@ -984,24 +1006,45 @@ already are. Both commands are one-shot and offline.
    identity)`. Each frame is one opaque UTF‑8 string rendered as a 768 × 768
    PNG with zxing `QRCodeWriter` at error correction M and a 2‑module margin;
    the adapter round-trips every frame string through zxing before writing it.
-   Exit 0 on success; exit 2 for bad arguments or a missing `--cert` or `--dir`.
+   Exit 0 on success; exit 2 for bad arguments or a missing `--cert`, `--dir`
+   or `--to`.
 2. Move the PNG directory to the display by physical copy, or show it on the
    rig monitor. No network path is involved.
-3. Show the frames in file-name order and open the parcel scan surface on the
-   phone. There is no acknowledgement channel, so run several full loops; the
-   receiver deduplicates by frame index and finalizes once. If camera
-   permission is denied, paste newline-separated frame strings into the paste
-   field instead.
-4. On completion the phone lands a normal received file with a ledger row. Read
-   its hash (`adb shell sha256sum <landed path>`) and compare it with the source
-   hash. No `/partial`, `queued`, `.part` or resume line belongs to this path.
+3. Show the frames in file-name order (frame-0001.png, frame-0002.png, …) and
+   open the phone's parcel screen in **Scan** mode. The camera preview feeds
+   `Qr.decodeYPlane`; each decoded string is offered to `ParcelScanState`, which
+   keeps the first copy of every `(parcelId, seq)` and ignores repeats. The
+   progress label reads `frame i of n` from the descriptor's `seq`/`count` (`n`
+   is `?` until the first frame is accepted). There is no acknowledgement
+   channel, so run several full loops; the receiver deduplicates by frame index
+   and finalizes once. If camera permission is denied, paste newline-separated
+   frame strings into the paste field instead — they feed the same state
+   holder.
+4. When every expected frame has been accepted, `ParcelCodec.complete(frames,
+   identity.fingerprint, identity)` verifies the whole payload with the phone's
+   own `TlsIdentity`. The Scan screen then shows the signer fingerprint,
+   SHA-256 and byte count, and writes `ParcelPayload.bytes` through the injected
+   `(ByteArray) -> Unit` writer wired in `MainActivity` into the app's received
+   bucket via the existing receive path — a normal received file with a ledger
+   row under `Downloads/Flit/`. No file name travels in a frame: the local
+   receive path supplies the saved name. Read the landed hash with
+   `adb shell sha256sum <landed path>` and compare it with the source hash. No
+   `/partial`, `queued`, `.part` or resume line belongs to this path; a partial
+   scan closed early writes nothing.
 
 ### 11.3 Phone → box (capture and decode)
 
 1. Place the fixture on the phone once with `adb push` into its Download folder
    and read its hash without moving bytes:
-   `adb shell sha256sum <phone path>`.
-2. Open the phone's parcel display surface and note the frame count. Capture
+   `adb shell sha256sum <phone path>`. For the phone's encode step, supply the
+   recipient (box) certificate and fingerprint as out-of-band fixture setup as
+   in §11.1; neither travels in a frame.
+2. Open the phone's parcel screen in **Show** mode and note the frame count.
+   Show renders the frames returned by `ParcelCodec.encodeParcel(payload,
+   parcelId, recipientFp, recipientCert, signerFp, identity)` as bitmaps through
+   `Qr.encode` at error correction `M`, margin `2`, `PARCEL_FRAME_SIZE_PX = 240`.
+   It advances one frame every `PARCEL_FRAME_INTERVAL_MS = 400L`, wraps from the
+   last frame back to the first, and also offers next/back controls. Capture
    three loops into a fresh directory, one PNG per frame:
 
    ```bash
@@ -1011,8 +1054,10 @@ already are. Both commands are one-shot and offline.
    done
    ```
 
-   `N` is the displayed frame count. This capture rate is a walk convention,
-   not a product display cadence.
+   `N` is the displayed frame count. The 0.5 s sleep is a capture convention,
+   slower than the 400 ms dwell, which is why the walk takes several loops and
+   the decoder deduplicates repeated indices; it is not a product display
+   cadence.
 3. Decode on the box with only the captured PNGs as input:
 
    ```bash
@@ -1063,12 +1108,10 @@ already are. Both commands are one-shot and offline.
 - The parcel is sealed to one recipient fingerprint. A node that is not that
   recipient cannot open it and the carrier cannot read the contents; the
   certificate must arrive out of band and is not part of the frame directory.
-- No device result is asserted here. This section is operator prose derived
-  from the CLI and app seams and the frozen codec constants. No camera walk, no
-  phone-to-phone air gap, no real capture timing and no throughput figure is
-  claimed by it. The separate air-gap walk layer
-  (`docs/roadmap/qr-parcel-device-walk.md`) records its own dated observation
-  and is not summarized as a passed result in this document; the underlying
-  facets carry CODE, PURE and SIM‑HARN evidence only.
+- The CLI and app seams and the frozen codec constants define the carry; no
+  camera walk, phone-to-phone air gap, real capture timing or throughput figure
+  is part of it. The separate air-gap walk layer
+  (`docs/roadmap/qr-parcel-device-walk.md`) records its own dated observation;
+  the underlying facets carry CODE, PURE and SIM‑HARN evidence only.
 - Frame and capture directories are scratch and may be deleted after hash
   verification; keep the identity files as described in §8.3.

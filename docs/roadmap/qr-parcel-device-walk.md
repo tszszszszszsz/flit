@@ -31,8 +31,11 @@ into `docs/completions/`.
   changes. Its result fields are `EncodeResult(dir, frames, sealedChars,
   sha256)` and `DecodeResult(out, bytes, sha256, signerFp, recipientFp)`.
 - 2026-12-07 App — parcel display and camera decode, tests
-  (`docs/roadmap/qr-parcel-app.md`): the screens built on `QrCanvas` and
-  `CameraQrView` (`QrUi.kt:59-82,264-314`).
+  (`docs/roadmap/qr-parcel-app.md`): the parcel screen in `ParcelUi.kt` with Show
+  and Scan modes, the pure `ParcelScanState`, and the additive entry point and
+  injected writer in `MainActivity.kt`. Show renders codec frames through
+  `Qr.encode`; Scan feeds `Qr.decodeYPlane` strings to `ParcelScanState` and
+  writes completed bytes through the existing receive path.
 - Rig facts and commands: `docs/TESTING.md` §2, §3 and §7; evidence tags:
   `docs/FAILURE-MODES.md:9-14`.
 
@@ -45,9 +48,9 @@ Two directions are walked on the same day:
    built on 2026-12-04. The box reconstructs the payload from frame images
    alone and compares SHA-256 with the fixture generated on the box.
 2. Box → phone. The box encodes a fixture into frame images and shows them
-   full-screen on the rig monitor; the phone camera scans them through the
-   parcel surface built on 2026-12-07. The landed file's SHA-256 is compared
-   with the value reported by the CLI encode step.
+   full-screen on the rig monitor; the phone camera scans them through the Scan
+   mode of the parcel screen built on 2026-12-07 (`ParcelUi.kt`). The landed
+   file's SHA-256 is compared with the value reported by the CLI encode step.
 
 Radio state is part of the walk: Wi-Fi and Bluetooth are off on the phone and
 no `flit-cli serve` or `flit-cli relay` process runs on the box. ADB over USB
@@ -103,15 +106,18 @@ travels in a frame, so `--out` names the landed file. The encode side reports
 expected count and hash for each direction, and `sealedChars` is the sealed
 envelope's character count rather than a byte size. Decode takes only frame
 images and writes one reconstructed file. Camera decode on the phone uses the
-surface from `docs/roadmap/qr-parcel-app.md`, which reads the Y-plane through
-`Qr.decodeYPlane` (`Qr.kt:187-216`) rather than adding a second camera path.
+Scan mode in `ParcelUi.kt`: the camera preview reads the Y-plane through
+`Qr.decodeYPlane` (`Qr.kt:187-216`) and offers each decoded string to
+`ParcelScanState`; the app adds no second camera path. Progress comes from the
+descriptor's `seq`/`count`, and completion shows signer, SHA-256 and byte count
+before the injected writer lands the bytes.
 
 ### Recipient certificate and decoder identity
 
 The codec seam takes two inputs that are not frame strings.
-`ParcelCodec.encodeParcel(payload, parcelId, recipientFp, cert, signerFp,
-identity)` seals to the recipient's X.509 certificate, so the sender must hold
-that certificate before encoding; `ParcelCodec.complete(frames,
+`ParcelCodec.encodeParcel(payload, parcelId, recipientFp, recipientCert,
+signerFp, identity)` seals to the recipient's X.509 certificate, so the sender
+must hold that certificate before encoding; `ParcelCodec.complete(frames,
 identity.fingerprint, identity)` decrypts with the decoding device's own
 `TlsIdentity`, so the receiver must hold that identity's private key. Neither
 is carried in a QR frame, and a fingerprint string alone cannot seal or open a
@@ -138,6 +144,24 @@ phone's own identity in direction B. A device that cannot present the matching
 private key cannot open a parcel addressed to it, even with every frame
 captured.
 
+### Parcel screen on the phone
+
+Both phone directions use the one parcel screen entered from `MainActivity.kt`;
+that entry point and its injected writer are additive to the existing receive
+path and change no Circle or transfer behavior. The screen has two modes. Show
+mode calls `ParcelCodec.encodeParcel(payload, parcelId, recipientFp,
+recipientCert, signerFp, identity)` with the recipient certificate staged for
+that direction, renders the returned frames as 240 px QRs at EC `M` and margin
+`2` (`PARCEL_FRAME_SIZE_PX = 240`), and advances every
+`PARCEL_FRAME_INTERVAL_MS = 400L` with next/back controls. Scan mode feeds the
+camera preview through `Qr.decodeYPlane`, offers each decoded string to
+`ParcelScanState`, shows progress `frame i of n` from the descriptor's `seq`
+and `count`, and on completion shows signer, SHA-256 and byte count before
+handing the bytes to the injected `(ByteArray) -> Unit` writer. No file name
+travels in a frame: the writer names the landed file locally. A completed
+parcel joins the received bucket with a ledger row through the existing
+receive path; no partial parcel progress is persisted.
+
 ### Walk fixtures and constants
 
 | Item | Value | Purpose |
@@ -146,17 +170,19 @@ captured.
 | `gap-1k.bin` | 1024 bytes, Python `random.seed(7)` byte stream | multi-frame reassembly |
 | `gap-8k.bin` | 8192 bytes, Python `random.seed(42)` byte stream | largest fixture; checked against the codec caps below |
 | Hash | lowercase hex SHA-256, `sha256sum` on the box and `adb shell sha256sum` on the phone | payload comparison |
-| Capture | `adb exec-out screencap -p` into one PNG per frame, two captures per second | phone → box |
+| Capture | `adb exec-out screencap -p` into one PNG per frame, stepped with the Show mode's next/back controls | phone → box |
 | Loops | three full frame loops per fixture in both directions | exercise dedup without an acknowledgement channel |
 | Evidence | `docs/completions/2026-12-08-air-gap-parcel-walk.md` | dated observation |
 
 The 2026-12-03 codec fixes the caps that size these fixtures:
-`MAX_CHUNK_BYTES = 512`, `MAX_FRAMES = 64` and a defensive frame-layer
-`MAX_AIR_GAP_PARCEL_BYTES = 131072` (128 KiB). With 512-byte chunks and at most
-64 frames, the frame layer allows at most 32768 framed bytes; the sealed
-`CourierEnvelope` string is separately bound by `MAX_ENVELOPE_CHARS = 12288`,
-about 24 frames at 512 bytes per chunk. All three fixtures sit below both caps,
-so none is reduced and the `gap-8k.bin` ceiling case is walked unchanged. The
+`MAX_CHUNK_BYTES = 512`, `MAX_FRAMES = 64` and a defensive wire
+`MAX_AIR_GAP_PARCEL_BYTES = 131072` (128 KiB). The effective ceiling is the
+sealed `CourierEnvelope` string, bound by `MAX_ENVELOPE_CHARS = 12288`: at 512
+bytes per chunk that is about 24 frames and, with the signature, wrapped key and
+certificate included, roughly 5 KiB of payload. The 64-frame and 128 KiB wire
+caps are defensive bounds on malformed input, not reachable sizes. The three
+fixtures are checked against the effective ceiling at encode; `gap-8k.bin` is the
+ceiling case, and its reported counts decide whether it is walked unchanged. The
 CLI encode step reports `frames` (the exact frame count) and `sealedChars`
 (the sealed envelope's character count) for each fixture; those reported
 values, not an assumed fixed count, are recorded in the evidence note. A fixture that did exceed a cap would be refused at encode,
@@ -164,8 +190,9 @@ reduced to fit and rerun (see Failure modes).
 
 Three loops are run because an air gap has no back channel: the sender cannot
 wait for an acknowledgement, so the receiver must tolerate repeated frames.
-The loop count is a walk constant, not a UI cadence owned by 2026-12-07; the
-actual display timing is measured and recorded.
+The loop count is a walk constant, distinct from the app's
+`PARCEL_FRAME_INTERVAL_MS = 400L` frame dwell; the dwell is read from the
+2026-12-07 specification and the observed loop time is measured and recorded.
 
 ### State ownership
 
@@ -192,12 +219,19 @@ actual display timing is measured and recorded.
    out-of-band public material, not part of the payload.
 2. Read the expected hash without moving bytes:
    `adb shell sha256sum /sdcard/Download/flit-gap/gap-1k.bin`.
-3. Open the parcel display surface for that file on the phone, with the box's
-   certificate supplied to the encode step. Record the start line in `logcat`
-   and the frame count shown by the app.
-4. Capture three loops into a fresh directory:
-   `for i in $(seq 1 $((3*N))); do adb exec-out screencap -p > frames/gap-1k-$i.png; sleep 0.5; done`
-   where `N` is the frame count recorded in step 3.
+3. Open the parcel screen from `MainActivity.kt` and switch to Show mode for
+   that file, with the staged box certificate passed as `recipientCert` to
+   `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, recipientCert,
+   signerFp, identity)`. The screen renders each frame at
+   `PARCEL_FRAME_SIZE_PX = 240` (EC `M`, margin `2`) and advances every
+   `PARCEL_FRAME_INTERVAL_MS = 400L`; use next/back to step. Record the start
+   line in `logcat` and the frame count shown by the app.
+4. Capture three loops into a fresh directory. Show advances on a 400 ms dwell,
+   so step with the next/back controls rather than a wall-clock loop: for each
+   of three loops, step to frame 1 and take one
+   `adb exec-out screencap -p > frames/gap-1k-$loop-$seq.png` per `seq`, tapping
+   next between captures. `N` is the frame count recorded in step 3, giving
+   `3*N` PNGs; back revisits a frame only when a capture must be retaken.
 5. Decode with `flit-cli parcel decode --dir <captured-frames-dir> --out
    <output>`, passing only the captured PNGs as `--dir` and using the box's own
    `TlsIdentity` under `FLIT_HARNESS_HOME` for `complete(frames,
@@ -218,14 +252,20 @@ actual display timing is measured and recorded.
    `EncodeResult.sealedChars` and `EncodeResult.sha256` from the encode step.
 2. Show the PNGs full-screen on the rig monitor in manifest order for three
    loops, recording the exact viewer command and the measured loop time.
-3. Point the phone camera at the monitor and open the parcel scan surface; the
-   phone supplies its own identity and private key to
-   `complete(frames, identity.fingerprint, identity)`. Let the three
-   loops pass; record the `logcat` lines for frames taken, deduplication,
-   finalization and the landed path.
+3. Point the phone camera at the monitor, open the parcel screen from
+   `MainActivity.kt` and switch to Scan mode. The camera preview feeds
+   `Qr.decodeYPlane`; each decoded string is offered to `ParcelScanState`,
+   which shows progress `frame i of n` from the descriptor's `seq`/`count`.
+   The phone supplies its own `TlsIdentity` and private key to
+   `ParcelCodec.complete(frames, recipientFp, identity)`. Let the three loops
+   pass; on completion the screen shows signer, SHA-256 and byte count and the
+   injected writer lands the bytes under a locally chosen name. Record the
+   `logcat` lines for frames taken, deduplication, finalization and the landed
+   path.
 4. Read the landed hash with `adb shell sha256sum <landed path>` and compare
-   it with step 1. Check that the parcel card reports the landed result and
-   that no `/partial`, `queued` or `.part` line appears in the log.
+   it with step 1. Check that the Scan mode's completion state reports the same
+   signer, SHA-256 and byte count and that the file sits in the received bucket
+   with a ledger row, with no `/partial`, `queued` or `.part` line in the log.
 5. If no monitor can be placed in front of the camera, record direction B as
    `not verified` with that reason. Direction A remains walked.
 
@@ -273,7 +313,7 @@ unavailable.
 | Recipient certificate not staged (or `--cert PATH` is not Base64 DER, or its `TlsIdentity.fingerprintOf` differs from `--to`), or decoder lacks the matching private key | Encode refuses before any PNG with exit `2`; `complete(frames, identity.fingerprint, identity)` fails with exit `3` | Fixture and captured frames on the rig | No landed file and no `DecodeResult.out` | CLI or `logcat` error naming the missing certificate or key; direction marked `not verified` for that run |
 | Camera permission not granted on the phone | Direction B cannot start | Frame PNGs on the box | Nothing | Permission state in the log; direction B marked `not verified` for that run |
 | Wi-Fi, Bluetooth or a CLI carrier found live | Walk run invalid | Captured frames | The air-gap claim for that run | `settings get` and `pgrep` lines; rerun after fixing state |
-| Fixture above a codec cap (64 frames, 512-byte chunks, 32768 framed bytes, or the 12288-char envelope) | Encode refuses with the cap reason | Fixture file | No frames emitted | CLI error line; fixture reduced to fit and the run repeated |
+| Fixture above a codec cap (64 frames, 512-byte chunks, the 128 KiB defensive byte cap, or the 12288-char sealed envelope) | Encode refuses with the cap reason | Fixture file | No frames emitted | CLI error line; fixture reduced to fit and the run repeated |
 | No monitor or print surface for direction B | Direction B not walked | Encoded frames on the box | Nothing | Setup note; direction A recorded as the walked result |
 
 ## Tests
@@ -307,8 +347,9 @@ certificate placement, capture and hash reads, the `EncodeResult` fields
 `bytes`, `sha256`, `signerFp`, `recipientFp`) where the CLI ran, the recipient
 fingerprint used in each direction, the identity passed to `complete(frames,
 identity.fingerprint, identity)` on each decoding device, the frame and loop
-counts per fixture, the two hashes compared in each direction, and the `logcat`
-and CLI excerpts with timestamps. Each claim is labelled: `DEVICE` for walked
+counts per fixture, the Scan-mode completion state (signer, SHA-256 and byte
+count), the two hashes compared in each direction, and the `logcat` and CLI
+excerpts with timestamps. Each claim is labelled: `DEVICE` for walked
 observations, `SIM-HARN` for the CLI loopback, `PURE` for the test gate and
 `CODE` for source facts. Limitations are listed in the same file: no second
 phone, no phone-to-phone air gap, no QR throughput measurement, no radio

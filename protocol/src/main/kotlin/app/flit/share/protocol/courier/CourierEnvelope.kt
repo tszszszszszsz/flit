@@ -210,7 +210,8 @@ data class CourierEnvelope(
          * Signature-only check. The certificate in [CourierEnvelope.cert] is
          * parsed, its own digest is bound to [CourierEnvelope.fromFp], and the
          * signature is verified against that certificate BEFORE it is pinned —
-         * a failure never writes a pin. The replay window is applied by [open].
+         * a failure never writes a pin. The 24 h parcel-TTL replay window is
+         * applied by [open].
          */
         fun verify(e: CourierEnvelope): Boolean {
             if (!validShape(e) || e.alg != ALG) return false
@@ -226,16 +227,19 @@ data class CourierEnvelope(
 
         /**
          * Verifies, applies the replay/skew window to [CourierEnvelope.createdMs]
-         * and opens the blob with [identity]'s private key. Returns null on any
-         * refusal: bad signature, wrong recipient, stale/future clock, corrupt
-         * wrap or IV, undecodable plaintext or an event that fails Circle's
-         * shape gate. This layer owns no replay set and asserts no authorship —
+         * and opens the blob with [identity]'s private key. The past-side replay
+         * window is the full parcel TTL ([MAX_PARCEL_TTL_MS], 24 h) so a parcel
+         * can still be opened throughout its carried lifetime; the future side
+         * stays at [CircleCore.CLOCK_SKEW_MS]. Returns null on any refusal: bad
+         * signature, wrong recipient, stale/future clock, corrupt wrap or IV,
+         * undecodable plaintext or an event that fails Circle's shape gate.
+         * This layer owns no replay set and asserts no authorship —
          * `CircleCore.verify` does that at fold time.
          */
         fun open(e: CourierEnvelope, identity: TlsIdentity, nowMs: Long): List<CircleEvent>? {
             if (!verify(e)) return null
             if (!e.toFp.equals(identity.fingerprint, ignoreCase = true)) return null
-            if (nowMs <= 0L || nowMs - e.createdMs > CircleCore.REPLAY_WINDOW_MS ||
+            if (nowMs <= 0L || nowMs - e.createdMs > MAX_PARCEL_TTL_MS ||
                 e.createdMs - nowMs > CircleCore.CLOCK_SKEW_MS
             ) return null
 

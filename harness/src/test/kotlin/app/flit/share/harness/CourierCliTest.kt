@@ -13,6 +13,8 @@ import java.nio.file.Path
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
+import java.util.Comparator
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlin.test.Test
@@ -29,6 +31,31 @@ import kotlin.test.assertTrue
  * those production codecs to build a tampered parcel, not a lookalike.
  */
 class CourierCliTest {
+
+    companion object {
+        /** [harnessHome] prefers this env var, which cannot be redirected inside a JDK 21 JVM. */
+        private val fixedHarnessHome: String? =
+            System.getenv("FLIT_HARNESS_HOME")?.takeIf { it.isNotBlank() }
+
+        /** `user.home` is JVM-global: only one test may switch it at a time. */
+        private val homeLock = Any()
+
+        private fun deleteRecursively(path: Path) {
+            if (!Files.exists(path)) return
+            Files.walk(path).use { stream ->
+                stream.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
+            }
+        }
+    }
+
+    private fun <T> withTempDir(prefix: String, block: (Path) -> T): T {
+        val dir = Files.createTempDirectory(prefix)
+        try {
+            return block(dir)
+        } finally {
+            deleteRecursively(dir)
+        }
+    }
 
     private fun row(
         state: String = "pending",
@@ -54,21 +81,29 @@ class CourierCliTest {
 
     /**
      * [harnessHome] reads FLIT_HARNESS_HOME before `user.home`, and that env
-     * var cannot be redirected inside a JDK 21 JVM. When the runner set it, the
-     * home is already the caller's sandbox, so we leave `user.home` alone;
-     * otherwise we point `user.home` at a private temp root for the block.
-     * Every command below that touches a ledger or identity is wrapped here.
+     * var cannot be redirected inside a JDK 21 JVM. A pinned home is the
+     * caller's real harness home, not our sandbox: skip instead of silently
+     * writing there. Otherwise hold one global lock while `user.home` points at
+     * a private temp root, then delete the root. Every command below that
+     * touches a ledger or identity is wrapped here.
      */
     private fun <T> inIsolatedHome(block: () -> T): T {
-        if (!System.getenv("FLIT_HARNESS_HOME").isNullOrBlank()) return block()
-        val previous = System.getProperty("user.home")
-        val root = Files.createTempDirectory("courier-cli-test-")
-        System.setProperty("user.home", root.toString())
-        try {
-            return block()
-        } finally {
-            if (previous == null) System.clearProperty("user.home")
-            else System.setProperty("user.home", previous)
+        assumeTrue(
+            fixedHarnessHome == null,
+            "CourierCliTest switches user.home, but harnessHome() prefers " +
+                "FLIT_HARNESS_HOME=$fixedHarnessHome.",
+        )
+        return synchronized(homeLock) {
+            withTempDir("courier-cli-test-") { root ->
+                val previous = System.getProperty("user.home")
+                System.setProperty("user.home", root.toString())
+                try {
+                    block()
+                } finally {
+                    if (previous == null) System.clearProperty("user.home")
+                    else System.setProperty("user.home", previous)
+                }
+            }
         }
     }
 
@@ -334,30 +369,31 @@ class CourierCliTest {
             lamport = 1L, createdMs = now,
         )
         val parcel = CourierCarryCore.parcelOf(event) ?: error("production parcelOf refused a valid parcel")
-        val bag = Files.createTempDirectory("courier-cli-refused-")
-        Files.writeString(
-            bag.resolve("${parcel.id}.parcel"),
-            CourierCarryCore.encode(CarryState(listOf(parcel))),
-            Charsets.UTF_8,
-        )
-        Files.createDirectories(home)
-        Files.writeString(
-            home.resolve(CourierCli.STATE_FILE),
-            CourierCli.encodeRows(
-                listOf(
-                    CourierCli.Row(
-                        parcel.id, identity.fingerprint, identity.fingerprint, circleId,
-                        "pending", parcel.createdMs, parcel.expiresMs,
+        withTempDir("courier-cli-refused-") { bag ->
+            Files.writeString(
+                bag.resolve("${parcel.id}.parcel"),
+                CourierCarryCore.encode(CarryState(listOf(parcel))),
+                Charsets.UTF_8,
+            )
+            Files.createDirectories(home)
+            Files.writeString(
+                home.resolve(CourierCli.STATE_FILE),
+                CourierCli.encodeRows(
+                    listOf(
+                        CourierCli.Row(
+                            parcel.id, identity.fingerprint, identity.fingerprint, circleId,
+                            "pending", parcel.createdMs, parcel.expiresMs,
+                        ),
                     ),
                 ),
-            ),
-            Charsets.UTF_8,
-        )
-        assertEquals(
-            CourierCli.EXIT_OPEN_REFUSED,
-            CourierCli.run(
-                ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
-            ),
-        )
+                Charsets.UTF_8,
+            )
+            assertEquals(
+                CourierCli.EXIT_OPEN_REFUSED,
+                CourierCli.run(
+                    ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
+                ),
+            )
+        }
     }
 }

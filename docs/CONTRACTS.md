@@ -730,12 +730,14 @@ the events to the recipient's device certificate. No file bytes enter a parcel.
 
 Protocol-owned constants are read from `CircleEvent` / `CircleCore`; the courier
 object facade repeats values for callers. `PARCEL` is declared in
-`CircleEvent.TYPES`, while `REPLAY_WINDOW_MS`, `CLOCK_SKEW_MS`, `MAX_FIELD_CHARS`,
-`MAX_SIG_CHARS` and `MAX_CERT_CHARS` are reused from `CircleCore`, not declared in
-the courier package. The `CourierCarryCore` object repeats the top-level
-`MAX_PARCELS`, `MAX_SEEN` and `MAX_PARCEL_TTL_MS` values for callers that name the
-core explicitly — a facade, not a second source of truth. Values below apply to
-the 2026-11-27 layer.
+`CircleEvent.TYPES`, while `CLOCK_SKEW_MS`, `MAX_FIELD_CHARS`, `MAX_SIG_CHARS` and
+`MAX_CERT_CHARS` are reused from `CircleCore`, not declared in the courier
+package. The courier replay window is the full parcel TTL (`MAX_PARCEL_TTL_MS`,
+24 h), **not** `CircleCore.REPLAY_WINDOW_MS` (6 h, the Circle-event window); only
+the future-side skew stays `CircleCore.CLOCK_SKEW_MS`. The `CourierCarryCore`
+object repeats the top-level `MAX_PARCELS`, `MAX_SEEN` and `MAX_PARCEL_TTL_MS`
+values for callers that name the core explicitly — a facade, not a second source
+of truth. Values below apply to the 2026-11-27 layer.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
@@ -744,9 +746,8 @@ the 2026-11-27 layer.
 | `MAX_ENVELOPE_CHARS` | `12 * 1024` | Base64 cap; framed body stays under `CircleCore.MAX_BODY_CHARS` (16 KiB) |
 | `MAX_PARCELS` | `256` | Bounded carrier bag |
 | `MAX_SEEN` | `4096` | Bounded id reservation, shared by `evaluate` and `fresh` |
-| `REPLAY_WINDOW_MS` | `6 * 60 * 60 * 1000L` (6 h) | Open window for `open` and `evaluate` |
-| `CLOCK_SKEW_MS` | `5 * 60 * 1000L` (5 min) | Future tolerance |
-| `MAX_PARCEL_TTL_MS` | `24 * 60 * 60 * 1000L` (24 h) | Ceiling; `expiresMs = createdMs + MAX_PARCEL_TTL_MS` |
+| `CLOCK_SKEW_MS` | `5 * 60 * 1000L` (5 min) | Future tolerance, reused from `CircleCore` |
+| `MAX_PARCEL_TTL_MS` | `24 * 60 * 60 * 1000L` (24 h) | Parcel lifetime ceiling **and** the courier replay window for `open` and `evaluate`; `expiresMs = createdMs + MAX_PARCEL_TTL_MS` |
 | `MAX_FIELD_CHARS` | `256` | Reused from `CircleCore` for bounded string fields |
 | `MAX_SIG_CHARS` / `MAX_CERT_CHARS` | `1024` / `8 * 1024` | Reused from `CircleCore` for `sig`/`cert` |
 | `KEY_BYTES` / `IV_BYTES` | `32` / `12` | AES-256-GCM content key and IV |
@@ -807,11 +808,15 @@ certificate cannot poison the pin cache. It returns false for a tampered
 `cipherB64`, `ivB64`, `keyWrapB64`, `alg`, `circleId`, `toFp` or `createdMs`,
 and for a blank or malformed `sig` or `cert`.
 
-`open(e, identity, nowMs)` decrypts with the recipient's private key, parses
-the bounded event array and applies `REPLAY_WINDOW_MS`/`CLOCK_SKEW_MS` to
-`createdMs`. It owns no replay set and never calls `CircleCore.evaluate` or
-`accept` on an envelope id; authorship is checked by `CircleCore.verify` at
-fold time. The envelope carries no `expiresMs`.
+`open(e, identity, nowMs)` verifies the envelope signature and recipient first,
+then applies a replay window to `createdMs`: the past side is the full parcel
+TTL (`MAX_PARCEL_TTL_MS`, 24 h), the future side `CircleCore.CLOCK_SKEW_MS`
+(5 min). That 24 h courier replay window is deliberately longer than Circle's
+6 h `REPLAY_WINDOW_MS`, so a courier can still open a parcel throughout its
+carried lifetime. It then decrypts with the recipient's private key and parses
+the bounded event array. It owns no replay set and never calls
+`CircleCore.evaluate` or `accept` on an envelope id; authorship is checked by
+`CircleCore.verify` at fold time. The envelope carries no `expiresMs`.
 
 ### 13.5 Carry digest tag and decisions
 
@@ -825,9 +830,14 @@ The carry core exposes `validParcelBody`, `parcelOf`, `canonical`, `order`,
 `evaluate`, `fresh`, `fold`, `select`, `ack`, `expire`, `merge`, `clear` and
 `encode`/`decode` for `CarryState`. `evaluate` follows exactly
 `Invalid → Expired → OutsideWindow → Duplicate → Full → Accept`; only `Accept`
-reserves an id in the bounded `seen` set shared with `fresh`, so a `Full`
-refusal can be retried after space frees. The window compares two positive
-timestamps by subtraction, and `nowMs >= expiresMs` is never selected.
+reserves an id in the bounded `seen` set shared with `fresh`, so a `Full` or
+`OutsideWindow` refusal can be retried. Expiry is decided first, so a
+TTL-elapsed parcel is always reported `Expired`; the window's remaining role is
+to reject a parcel dated further than `CircleCore.CLOCK_SKEW_MS` in the future.
+The courier replay window is the full `MAX_PARCEL_TTL_MS` (24 h), matching
+`open`, not Circle's 6 h `REPLAY_WINDOW_MS`. It compares two positive timestamps
+by subtraction, never `nowMs ± window`, so an extreme clock cannot overflow into
+a false `Accept`. `nowMs >= expiresMs` is never selected.
 `order` delegates to `CircleCore.order` on the underlying events; `fold` and
 `merge` dedup by id and trim to `MAX_PARCELS` by `order`, so arrival order does
 not change the bag. `select` returns live parcels for the normalised `toFp`,
@@ -858,7 +868,9 @@ order, the closed body keys and the decision precedence. PURE JVM tests cover
 canonical bytes, `encode`/`decode` bounds, tamper rejection, `seal`/`open`,
 recipient wrapping, certificate binding and bag decisions. Carrier (`SIM-HARN`)
 and three-node (`DEVICE`) handoffs are dated 2026-11-30 and 2026-12-02; no such
-evidence is claimed for this layer. See
+evidence is claimed for this layer. A courier "handoff" means a peer accepted an
+offered parcel (a transport OK), never that the parcel was opened or that file
+bytes landed on the recipient. See
 [courier-envelope.md](roadmap/courier-envelope.md) and
 [courier-carry.md](roadmap/courier-carry.md).
 
@@ -960,7 +972,11 @@ the row at its prior state (`pending` or `carried`) and the envelope file in
 `courier-bag/` for a later attempt.
 This matches the carrier-death rule used for Circle file delivery. A duplicate
 envelope id produces no second fold: `CircleCore.dedup` drops it and the row
-moves straight to `delivered`.
+moves straight to `delivered`. `delivered` is a local-only status: this device
+opened the parcel and folded its event. No acknowledgement travels back to the
+sender, so no row claims remote proof of delivery. It is distinct from the app's
+`handed` handoff outcome (§15.4), which means only that a peer accepted an
+offer.
 
 ### 14.5 Bag directory as portable unit
 
@@ -1005,29 +1021,35 @@ projection. No protocol constant, canonical byte layout or envelope codec is
 redefined here; the app calls `CourierEnvelope.seal` / `verify` / `open` and the
 `CourierCarryCore` reducers with the current bag and current time.
 
-### 15.2 `postParcel` and the closed body gate
+### 15.2 `postParcel`, pre-fanout sha registration and the closed body gate
 
-`FlitCircleSync.postParcel(toFp, envelopeB64)` publishes one `parcel` event on
-the existing `post` path. It writes a body with exactly two keys — `toFp`
-normalised by `circleFp()` (uppercase) and `envelope` set to the Base64
-`CourierEnvelope.encode` text — then signs, upserts and fans out through
-`emit` and `fanout`. `PARCEL = "parcel"` is the tenth verb already in
-`CircleEvent.TYPES` (§13.3); there is no new verb table, phase field or body
-builder outside this path.
+`FlitCircleSync.postParcel(toFp, envelopeB64, shas)` publishes one `parcel`
+event on the existing `post` path. It writes a body with exactly two keys —
+`toFp` normalised by `circleFp()` (uppercase) and `envelope` set to the Base64
+`CourierEnvelope.encode` text — then signs and upserts through `emit`. It
+registers the caller's file `shas` with `courierTrack`, keyed by the emitted
+event id, **immediately after `emit` and before `fanout`**, then fans out. The
+order is a contract: a peer can answer synchronously inside `fanout`, so the sha
+keys must already be registered for an OK to publish `handed`. The engine passes
+`shas` to `postParcel` and no longer calls `courierTrack` itself.
+`PARCEL = "parcel"` is the tenth verb already in `CircleEvent.TYPES` (§13.3);
+there is no new verb table, phase field or body builder outside this path.
 
 | Gate | Contract |
 | --- | --- |
 | Mint check | `circleBodyValid(CircleEvent.PARCEL, body)` gains one `PARCEL` case that delegates to `CourierCarryCore.validParcelBody(body)`; it does not reimplement the key set. |
-| Closed keys | `PARCEL_BODY_KEYS = {"toFp","envelope"}` only. An extra key (`token`, `path`, `spoolPath`, `parcelId`, `sha256`, `name`, `size`, phase or any other) is refused. No handoff event and no `parcelId` exist. |
+| Closed keys | `PARCEL_BODY_KEYS = {"toFp","envelope"}` only. An extra key (`token`, `path`, `spoolPath`, `parcelId`, `sha256`, `name`, `size`, phase or any other) is refused. No handoff event and no `parcelId` body key exist; the parcel id used for sha registration is the signed event id. |
 | Bounds | Body non-blank and at most `CircleCore.MAX_BODY_CHARS` (16 KiB); `toFp` a non-blank string at most `MAX_FIELD_CHARS` (256); `envelope` a non-blank string at most `MAX_ENVELOPE_CHARS` (12 * 1024). The cap keeps the framed body under the Circle body limit. |
-| Refusal | A failed gate returns before `CircleCore.create`, `FlitCircleStore.upsert` and `fanout`: no signed event, no wire byte, no bag row. The caller's source events are unchanged. |
-| Inbound | `fresh()` applies `CourierCarryCore.validParcelBody` in the same position as `validFileBody`, before `CircleCore.verify`. `CourierCarryCore.evaluate` runs only after verification; only `Accept` calls `fold` and persists a bag row. `Invalid`, `Expired`, `OutsideWindow`, `Duplicate` and `Full` leave the bag unchanged. |
+| Refusal | A failed gate returns before `CircleCore.create`, `FlitCircleStore.upsert`, sha registration and `fanout`: no signed event, no wire byte, no bag row. The caller's source events are unchanged. |
+| Sha registration | `shas` are trimmed and lowercased, then stored process-locally by the emitted event id through `courierTrack` between `emit` and `fanout`. A carrier holding only ciphertext learns no sha and publishes no handoff. |
+| Inbound outer gate | A `parcel` enters the bag only when its `circleId` matches, its body passes `circleBodyValid`/`validParcelBody`, `CircleCore.verify` passes, **and its `authorFp` is a current roster member after `circleFp()` normalisation**. `CourierCarryCore.evaluate` runs only after those gates; only `Accept` calls `fold` and persists a bag row. `Invalid`, `Expired`, `OutsideWindow`, `Duplicate` and `Full` leave the bag unchanged. |
+| Inbound inner gate | Events opened from an envelope keep the existing gate: same circle, a current-member author after normalisation, no injected `join` or `rekey`, and `fresh()` verifies every signature before anything is persisted. |
 
 `FlitEngine.circleCourierDrop(events, toFp)` obtains the recipient certificate
 from a signed event by that fingerprint or the host roster answer, calls
-`CourierEnvelope.seal`, then posts the returned envelope through `postParcel`.
-With no certificate the drop is refused before any post and the source events
-stay in the sender's own log.
+`CourierEnvelope.seal`, then posts the returned envelope through `postParcel`
+together with the file shas of the signed events. With no certificate the drop
+is refused before any post and the source events stay in the sender's own log.
 
 ### 15.3 `CircleState.courierBag`
 
@@ -1042,7 +1064,7 @@ courierBag: String = ""   // CourierCarryCore.encode(CarryState)
 | Default | `""` is an empty bag. Older rows and existing named-argument constructors decode without the key (`WireJson.ignoreUnknownKeys = true`); no migration is required. |
 | Codec | `FlitCircleStore.encode` keeps the string verbatim; `decode` runs `CourierCarryCore.decode` and normalises it. A null, blank, truncated or otherwise corrupt blob becomes an empty bounded bag and no exception reaches a caller. |
 | Atomicity | Every bag write goes through `FlitCircleStore.update(ctx) { ... }`, which holds `ioLock` across the whole decode → fold → encode → persist sequence. A bag write cannot interleave with a sync `upsert`, a delivery write or another bag write, and cannot clobber the event log, roster or delivery statuses. |
-| Reducers | Protocol ones only: `fold` on `Accept`, `ack` after an OK answer, `expire` on the sweep. The app has no `merge` step: verified incoming events reach the signed log through `FlitCircleSync.fresh() → persistEvents() → FlitCircleStore.upsert`, which dedups by id. `CourierCarryCore.fold` dedups by id and trims to `MAX_PARCELS = 256` by `CourierCarryCore.order`, not arrival order. |
+| Reducers | Protocol ones only: `fold` on `Accept`, `ack` after a peer's OK answer to the offer (offer accepted, **not** proof the parcel was opened), `expire` on the sweep. The app has no `merge` step: verified incoming events reach the signed log through `FlitCircleSync.fresh() → persistEvents() → FlitCircleStore.upsert`, which dedups by id. `CourierCarryCore.fold` dedups by id and trims to `MAX_PARCELS = 256` by `CourierCarryCore.order`, not arrival order. |
 | Selection and TTL | `CourierCarryCore.select(bag, fp, nowMs)` returns live parcels for the normalised addressee, deduped by id and capped at `CircleCore.MAX_EVENTS_PER_REQUEST` (1024). `expiresMs` is derived only as `createdMs + MAX_PARCEL_TTL_MS` (24 h) by `parcelOf`; the app never extends a TTL. |
 | Sweep | `COURIER_TICK_MS = 30_000L` drives `CourierCarryCore.expire` and the publication of local outcomes. A refusal or a thrown carrier leaves the bag intact and re-offers the parcel on a later pass. |
 
@@ -1067,10 +1089,15 @@ courierBag: String = ""   // CourierCarryCore.encode(CarryState)
    (`sha256`, `name`, `size`, `toFp`, `courierFp`, `fromFp`, `outcome`), published
    by `publishCourierHandoff` and updated by `setCourierHandoffOutcome`; its
    `outcome` is one of `waiting` / `handed` / `failed`, and no fourth value is
-   ever written. It is never signed, never persisted and never placed in a
-   `CircleRequest` or an event; a carrier cannot name a SHA key from an envelope
-   it cannot open. `refreshCircle()` includes the map in its content-diff
-   signature so a new outcome publishes without a log change.
+   ever written. `handed` means **the peer accepted the offer** (a transport OK
+   on the `parcel` offer), not that the file opened on the recipient and not
+   end-to-end delivery: there is no remote proof. Only a locally landed SHA
+   produces an Open affordance (§18.5), and UI copy says the offer was handed
+   off/accepted, never that bytes were delivered. It is never signed, never
+   persisted and never placed in a `CircleRequest` or an event; a carrier cannot
+   name a SHA key from an envelope it cannot open. `refreshCircle()` includes the
+   map in its content-diff signature so a new outcome publishes without a log
+   change.
 5. **Numbers reuse existing seams.** `COURIER_TICK_MS = 30_000L` is app-owned;
    dial concurrency stays at `CIRCLE_PEER_DIALS = 4` and backoff at
    `CIRCLE_BACKOFF_BASE_MS = 5_000L` / `CIRCLE_BACKOFF_MAX_MS = 120_000L`. All
@@ -1084,10 +1111,12 @@ courierBag: String = ""   // CourierCarryCore.encode(CarryState)
 The additions are one already-defined verb used by one new app method, one
 defaulted store field and one local flow. No existing parameter, route, DTO
 shape or signed canonical byte changes. CODE establishes the `postParcel` gate,
-the `courierBag` field and the route boundary; PURE JVM tests pin the closed
-body keys, tolerant bag decode and the three local outcome values; the 2026-11-30
-carrier supplies the SIM-HARN observations of a held parcel, an ack after an OK
-answer and a throw that keeps the bag. No DEVICE claim is made for this layer.
+the pre-fanout sha registration, the outer roster-member gate, the `courierBag`
+field and the route boundary; PURE JVM tests pin the closed body keys, tolerant
+bag decode and the three local outcome values; the 2026-11-30 carrier supplies
+the SIM-HARN observations of a held parcel, an ack after a peer's OK (offer
+accepted) and a throw that keeps the bag. None of this is evidence that file
+bytes landed on the recipient. No DEVICE claim is made for this layer.
 See [courier-sync.md](roadmap/courier-sync.md) and
 [courier-ui.md](roadmap/courier-ui.md).
 
@@ -1142,10 +1171,16 @@ so the two limits are never confused.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `MAX_FRAMES` | `64` | Largest `count`; `seq` space is `1..64`. Same as the app's `MAX_PARCEL_FRAMES = 64`, so the codec emits no sequence the app refuses to display. |
+| `MAX_FRAMES` | `64` | Defensive wire cap on `count`; `seq` space is `1..64`. Same as the app's `MAX_PARCEL_FRAMES = 64`, so the codec emits no sequence the app refuses to display. |
 | `MAX_CHUNK_BYTES` | `512` | Largest raw chunk bytes in one frame. |
-| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` (128 KiB) | Defensive frame-layer parcel cap, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` (12 * 1024). With 512-byte chunks and 64 frames the reachable maximum is 32768 bytes, inside this cap. |
+| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` (128 KiB) | Defensive wire cap on framed bytes, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` (12 * 1024). It bounds malformed input; it is not a reachable size. |
 | `FRAME_MAGIC` | `"FLITPARCEL1"` | Domain tag for the per-frame CRC canonical bytes. |
+
+The effective ceiling comes from `CourierEnvelope.MAX_ENVELOPE_CHARS = 12 * 1024`:
+the sealed envelope is at most 12288 Base64 characters, which at 512 bytes per
+chunk is about 24 frames and, with the signature, wrapped key and certificate
+included, roughly 5 KiB of payload. The 64-frame and 128 KiB limits above are
+defensive wire caps that bound malformed input, not sizes a sender can reach.
 
 ### 16.4 API (`ParcelCodec.kt`)
 
@@ -1314,3 +1349,160 @@ identity file under `harnessHome()` and the frame PNGs in `--dir`; certificate
 and assembled bytes live in memory for one invocation. A failed gate leaves no
 output file. This layer is CODE plus harness round-trip evidence on the box;
 no device walk is claimed here.
+
+## 18. QR parcel app contract — show/scan seam and injected writer (2026-12-07)
+
+### 18.1 Layer and ownership
+
+This is the App layer over §16 (frame codec) and §13 (courier envelope), after
+§17 (CLI). It lives in `app/src/main/kotlin/app/flit/share/`:
+`ParcelScanState.kt` owns the Android-free, Compose-free reassembly state;
+`ParcelUi.kt` owns one Compose screen with two modes, Show and Scan;
+`MainActivity.kt` owns one additive entry point to that screen and the injected
+writer that lands verified bytes in the app's received bucket. No protocol
+constant, frame grammar, CRC, digest, signature or route is redefined here; the
+codec remains the only place frame bytes are interpreted. The state holder
+imports no zxing, camera, Android, socket or file class.
+
+The roadmap names the two views `ParcelShowCard` and `ParcelScanCard`; the
+frozen seam is the single `ParcelUi.kt` screen with Show and Scan modes and the
+state/writer boundaries below. Show and Scan are two modes of one screen, not
+two navigation routes, and no Circle or transfer behavior changes.
+
+### 18.2 Constants owned here
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `PARCEL_FRAME_INTERVAL_MS` | `400L` | Dwell per frame before advancing and wrapping. |
+| `PARCEL_FRAME_SIZE_PX` | `240` | Side of the square bitmap drawn from one frame string. |
+| `MAX_PARCEL_FRAMES` | `64` | Hard cap on displayed and assembled frames. |
+| `PARCEL_PASTE_MAX_CHARS` | `16_000` | Cap on the paste field's newline-separated frame text. |
+
+`MAX_PARCEL_FRAMES` is set to `ParcelCodec.MAX_FRAMES = 64`, so the app can
+display every sequence the codec emits. `MAX_AIR_GAP_PARCEL_BYTES` (131072 /
+128 KiB) and `MAX_CHUNK_BYTES` (512) are read from §16.3, never restated; both
+are defensive wire caps, while the effective parcel size is set by the 12 KiB
+sealed-envelope Base64 cap (about 24 frames, roughly 5 KiB of payload). The
+~8 fps analyzer throttle is the reused
+`QrUi.kt` behavior (a 120 ms gate), not a new constant here.
+
+### 18.3 Show mode
+
+Show takes the immutable `List<String>` returned by
+`ParcelCodec.encodeParcel(payload, parcelId, recipientFp, recipientCert,
+signerFp, identity)`. Each string is rendered through
+`Qr.encode(text, PARCEL_FRAME_SIZE_PX)` — zxing `QRCodeWriter`, error correction
+`M`, `MARGIN = 2`, UTF-8 — and `Qr.gray` into a square bitmap; that is the same
+gray layout `Qr.decodeGray` and the camera path's `Qr.decodeYPlane` consume.
+Frames are drawn in codec order, advancing every `PARCEL_FRAME_INTERVAL_MS` and
+wrapping from the last frame back to index zero; next/back controls move one
+frame at a time. The display index lives in a Compose `remember`, is discarded
+on close and is never written to prefs, `FlitCircleStore` or the ledger. The app
+never parses, reorders or rewrites a frame string.
+
+### 18.4 Scan mode and `ParcelScanState`
+
+The state holder is a small pure reducer; the Kotlin file is authoritative for
+the names of its read-only accessors.
+
+```
+class ParcelScanState(recipientFp: String, identity: TlsIdentity) {
+  fun add(frame: String): Boolean                    // accepted, or ignored
+  fun complete(): ParcelCodec.ParcelPayload?
+  // read-only progress view: parcelId, count, accepted-frame count,
+  // and the "frame i of n" label
+}
+```
+
+`add(frame)` calls `ParcelCodec.parse(frame): FrameDescriptor?`; an unparseable
+frame is ignored. Only `parcelId`, `seq` and `count` are read for gating and
+progress; `totalBytes` and `crc` stay inside the codec. At most one frame is
+kept per `(parcelId, seq)` pair and the first copy wins. A frame with a
+different `parcelId` while another parcel is in progress, a frame whose `count`
+disagrees with the first accepted frame, a `seq` past `MAX_PARCEL_FRAMES` and a
+frame beyond the 64-frame cap are all ignored; the current assembly stays.
+Progress is `frame i of n`, where `n` is the descriptor's `count` once known and
+`?` before the first accepted frame.
+
+`complete()` calls `ParcelCodec.complete(frames, recipientFp, identity)`, where
+`identity` is the receiving app's `TlsIdentity`, not just its fingerprint, so
+the codec can open the envelope with the recipient's private key. It returns a
+`ParcelCodec.ParcelPayload` (`parcelId`, `recipientFp`, `signerFp`, `sha256`,
+`bytes`) only when the accepted frames cover every `seq` in `1..count` exactly
+once and every codec gate — CRC, sequence, count, digest, envelope signature
+and recipient — passes. Otherwise it returns null and the frames stay for
+another attempt. One verified payload is handed out once: a second `complete()`
+returns null.
+
+The camera path reuses the `QrUi.kt` `CameraQrView` shape: the existing
+`Manifest.permission.CAMERA` ask, `LifecycleCameraController`, the ~8 fps
+analyzer throttle, a stride-aware copy of the Y plane (row/pixel strides) and
+`Qr.decodeYPlane`. Each decoded string is offered to `add`; a null decode is
+ignored and previously accepted frames are kept. A denied camera leaves a paste
+field of newline-separated frame strings capped at `PARCEL_PASTE_MAX_CHARS`,
+feeding the same state holder. Frames live per scan dialog and are dropped on
+close or completion; a partial parcel is never persisted, and closing with an
+incomplete sequence writes no file, ledger row or delivery record.
+
+The UI seam is therefore:
+
+| Seam | Shape | Contract |
+| --- | --- | --- |
+| Show input | `List<String>` | Immutable `encodeParcel` output, codec order, opaque. |
+| Scan input | `(String) -> Unit` → `add` | One decoded frame string per call; a failed decode sends nothing. |
+| Progress | `String` from state | `frame i of n`, with `?` before the first accepted frame. |
+| Result | `ParcelCodec.ParcelPayload?` | Shown as signer fingerprint, SHA-256 and byte count only after `complete` passes. |
+| Writer | `(ByteArray) -> Unit` | Injected from `MainActivity`; receives `ParcelPayload.bytes` once. |
+| Close | `() -> Unit` | Drops all in-memory frames without writing anything. |
+
+### 18.5 Injected writer
+
+`MainActivity.kt` supplies the `(ByteArray) -> Unit` callback. It saves the
+delivered bytes to the app's received bucket through the existing receive path
+(the one that ends in `FlitEngine.publishReceived`: received ledger and digest
+entry, then per-peer folder → global default → `Downloads/Flit`). `ParcelUi.kt`
+holds no `File`, `ContentResolver`, engine or preference reference; the callback
+is the only bridge from a verified payload to persistence, so a pure test can
+pass a collector instead. No new receive path, route or file format is added.
+
+No file name travels in a frame. The save name is local: the writer chooses it
+on the receiving device, and nothing from the frame text or the payload is
+published as a name. The callback runs once per verified payload; a
+double-`complete`, a failed verification or a closed dialog never calls it a
+second time.
+
+### 18.6 No wire change and compatibility boundary
+
+1. A parcel is an air-gap sequence of QR strings. No `PATH_*` constant, Ktor
+   route, `LinkProvider`, socket, HTTP header, DTO field or status code is
+   added (§1, §2, §3).
+2. `/info`, `/register`, `/prepare-upload`, `/upload` and `/cancel`, their DTO
+   shapes and their status behaviour stay as in §2. The Flit-only
+   `/api/flit/v1` routes stay as in §7 and §15. Nothing in Circle, courier sync
+   or send/transfer behavior changes.
+3. The frame grammar, `FRAME_MAGIC`, per-frame CRC32 and the caps in §16.3 are
+   read from `ParcelCodec`. The app adds no cap of its own above
+   `MAX_PARCEL_FRAMES`, which mirrors `MAX_FRAMES`, and it never re-signs or
+   re-encrypts anything. A parcel frame is not a `flit://add` / `flit://pair`
+   code and carries no key or address field (§8, §16.5).
+4. There is no second verification or reassembly path. `ParcelCodec.complete`
+   is the only gate that releases bytes, and the injected writer is the only
+   place they land.
+5. All new state is process-local: the display index in Compose `remember`, the
+   frames in a per-dialog holder, the camera analyzer and its throttle in the
+   dialog. No partial parcel, frame string, signer fingerprint or displayed
+   payload is written to prefs, `FlitCircleStore`, a Circle event, the courier
+   bag or the ledger; only the writer's verified bytes become durable.
+
+### 18.7 Evidence boundary
+
+CODE establishes the show/scan seam, the reassembly gates and the injected
+writer. PURE JVM tests (no Compose, no Robolectric, no engine start) drive
+`add`/`complete` for in-order, out-of-order, duplicate, missing, mixed-id,
+count-mismatch, over-cap and double-complete cases, plus a rendered-frame
+round-trip at `PARCEL_FRAME_SIZE_PX` through `Qr.encode`/`Qr.gray`/
+`Qr.decodeGray` and a simulated CameraX Y plane with row/pixel strides and one
+rotation step. No DEVICE evidence is claimed for this layer: capturing a real
+multi-frame sequence from a second phone's screen is the 2026-12-08 air-gap
+walk. See [qr-parcel-app.md](roadmap/qr-parcel-app.md), and §16–§17 for the
+codec and CLI that produce the frames used here.

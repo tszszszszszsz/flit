@@ -15,7 +15,7 @@ Folds sealed courier parcels into the app's Circle sync worker and publishes loc
 
 ## Scope
 
-A sender seals the signed events for an absent member with `CourierEnvelope.seal`, publishes the envelope in a `parcel` event over the existing `/circle/sync` route, and present members hold the opaque bytes in a bounded local bag. When a carrier meets the addressee, it re-offers the held signed event in that peer's sync request; removal follows an OK answer. The addressee opens the envelope, verifies and folds the inner events, and the file card's Open action stays gated by the landed-SHA set. Handoff outcomes are local, keyed by SHA-256, and never enter an event.
+A sender seals the signed events for an absent member with `CourierEnvelope.seal`, publishes the envelope in a `parcel` event over the existing `/circle/sync` route, and present members hold the opaque bytes in a bounded local bag. When a carrier meets the addressee, it re-offers the held signed event in that peer's sync request; removal follows an OK answer. An OK answer means the peer accepted the offer; it is not proof that the envelope was opened or that bytes landed, and no remote receipt is inferred. The addressee opens the envelope, verifies and folds the inner events, and the file card's Open action stays gated by the landed-SHA set. Handoff outcomes are local, keyed by SHA-256, and never enter an event.
 
 ## Design
 
@@ -48,7 +48,7 @@ Every bag write goes through `FlitCircleStore.update`, which holds `ioLock` for 
 1. `FlitEngine.circleCourierDrop(events, toFp)` obtains the recipient certificate from a signed event by that fingerprint or the host roster answer, calls `CourierEnvelope.seal`, then posts the returned envelope with `FlitCircleSync.postParcel`. Without that certificate the drop is refused and the source events stay in the sender's own log.
 2. A member folding a `parcel` event runs `CircleCore.verify` first, then `CourierCarryCore.parcelOf` and `evaluate`. Only `Accept` calls `fold` on the bag and persists it. `Invalid`, `OutsideWindow`, `Expired`, `Duplicate` and `Full` leave the bag unchanged and are logged with the reason.
 3. On each `fanout` or calm `sync` pass, the app calls `CourierCarryCore.select(bag, fp, nowMs)` for that peer and appends the selected signed events to `CircleRequest.events`, deduplicated by event id and capped at `CircleCore.MAX_EVENTS_PER_REQUEST = 1024`. A held parcel is re-offered through the same route even when the carrier already has the event in its own bounded log.
-4. An OK answer concludes the offered ids with `CourierCarryCore.ack`; the handoff outcome becomes `handed`. A refusal or a thrown carrier leaves the bag untouched and the outcome `failed`; the parcel is re-offered on a later pass.
+4. An OK answer concludes the offered ids with `CourierCarryCore.ack`; the handoff outcome becomes `handed`, meaning the peer accepted the offer, not that the envelope was opened end-to-end or that bytes landed. A refusal or a thrown carrier leaves the bag untouched and the outcome `failed`; the parcel is re-offered on a later pass.
 5. When `toFp` is this device, `CourierEnvelope.open` decrypts the envelope with the local `TlsIdentity`. Each returned event passes `CircleCore.verify` and is folded through `FlitCircleSync.fresh()` → `persistEvents()` → `FlitCircleStore.upsert`. No new byte route and no second signature path are introduced. A failed or expired open folds nothing and keeps the bag row for the core's expiry sweep.
 
 ### Local handoff projection
@@ -87,7 +87,7 @@ State ownership follows `ARCHITECTURE.md`: circle id/key/roster/events in `FlitC
 | Duplicate envelope id | `Duplicate`; no second fold | Held copy stays | Repeat copy | `courier: duplicate parcel id` |
 | Bag at `MAX_PARCELS` | `Full`; no id reserved | All 256 held parcels | Incoming offer | `courier: bag full, 256 parcel(s) held` |
 | Addressee not met on a pass | Held for a later encounter | Bag and signed event stay | Nothing | `courier: holding for <fp>` |
-| Handoff answered OK | `ack` removes offered ids; outcome `handed` | Opened copy on the recipient | Acknowledged bag rows | `courier: handed off N parcel(s) to <fp>` |
+| Handoff answered OK | `ack` removes offered ids; outcome `handed` = peer accepted the offer, no end-to-end proof | Holder's copy until local open at the recipient | Acknowledged bag rows | `courier: handed off N parcel(s) to <fp>` |
 | Handoff refused or carrier throws | Outcome `failed`; held for retry | Bag stays | Nothing | `courier: handoff failed to <fp>` |
 | `open` fails or envelope expired at recipient | No events folded; outcome `failed` | Bag stays for the core sweep | Parsed parcel only | `courier parcel unreadable — rejected` |
 | `courierBag` row corrupt | Decodes as empty bag; log line written | Unrelated Circle state | Corrupt row | `courier: bag row unreadable, starting empty` |

@@ -12,7 +12,9 @@ import java.nio.file.Path
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
+import java.util.Comparator
 import javax.imageio.ImageIO
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -31,24 +33,57 @@ import kotlin.test.assertTrue
  */
 class ParcelCliTest {
 
+    companion object {
+        /**
+         * [harnessHome] reads FLIT_HARNESS_HOME before `user.home`. With the
+         * variable pinned, redirecting `user.home` cannot isolate the harness
+         * home, so the affected cases skip instead of silently writing into the
+         * caller's real harness home.
+         */
+        private val fixedHarnessHome: String? =
+            System.getenv("FLIT_HARNESS_HOME")?.takeIf { it.isNotBlank() }
+
+        /** `user.home` is JVM-global: only one test may switch it at a time. */
+        private val homeLock = Any()
+
+        /** Best-effort recursive removal of a private temp root after a test. */
+        private fun deleteTree(root: Path) {
+            if (!Files.exists(root)) return
+            Files.walk(root).use { stream ->
+                stream.sorted(Comparator.reverseOrder<Path>()).forEach { path ->
+                    runCatching { Files.deleteIfExists(path) }
+                }
+            }
+        }
+    }
+
     // ---- small local helpers ------------------------------------------------
 
     /**
      * [harnessHome] reads FLIT_HARNESS_HOME before `user.home`, and that env
-     * var cannot be redirected inside a JDK 21 JVM. When the runner set it, the
-     * home is already the caller's sandbox; otherwise point `user.home` at a
-     * private temp root for the block, as CourierCliTest does.
+     * var cannot be redirected inside a JDK 21 JVM. When the runner pins one,
+     * these cases skip rather than silently use the real harness home;
+     * otherwise `user.home` points at a private temp root for the block. The
+     * global lock serialises the JVM-wide property mutation, and the temp root
+     * is removed in the `finally` so no identity or frame fixture leaks.
      */
     private fun <T> inIsolatedHome(block: () -> T): T {
-        if (!System.getenv("FLIT_HARNESS_HOME").isNullOrBlank()) return block()
-        val previous = System.getProperty("user.home")
-        val root = Files.createTempDirectory("parcel-cli-test-")
-        System.setProperty("user.home", root.toString())
-        try {
-            return block()
-        } finally {
-            if (previous == null) System.clearProperty("user.home")
-            else System.setProperty("user.home", previous)
+        assumeTrue(
+            fixedHarnessHome == null,
+            "ParcelCliTest switches user.home for isolation, but " +
+                "harnessHome() prefers FLIT_HARNESS_HOME=$fixedHarnessHome.",
+        )
+        return synchronized(homeLock) {
+            val previous = System.getProperty("user.home")
+            val root = Files.createTempDirectory("parcel-cli-test-")
+            System.setProperty("user.home", root.toString())
+            try {
+                block()
+            } finally {
+                if (previous == null) System.clearProperty("user.home")
+                else System.setProperty("user.home", previous)
+                deleteTree(root)
+            }
         }
     }
 

@@ -2,8 +2,7 @@
 
 Layer: 2026-11-27 Protocol. The work is the signed, recipient-encrypted
 `CourierEnvelope` codec and the bounded `CourierCarryCore` parcel bag, both
-JVM-pure in `protocol/`, with pure tests only. The code is built ahead of the
-scheduled commit date; the commit stays on 2026-11-27.
+JVM-pure in `protocol/`, with pure tests only. The layer is dated 2026-11-27.
 
 ## Files in the layer
 
@@ -58,7 +57,7 @@ encode           decode
 | `MAX_ENVELOPE_CHARS` | `12 * 1024` | Base64 cap; framed body stays under `CircleCore.MAX_BODY_CHARS` |
 | `MAX_PARCELS` | `256` | Bounded carrier bag |
 | `MAX_SEEN` | `4096` | Bounded id reservation |
-| `REPLAY_WINDOW_MS` | `6 * 60 * 60 * 1000L` | Reused from `CircleCore` by reference |
+| Courier replay window (`MAX_PARCEL_TTL_MS`) | `24 * 60 * 60 * 1000L` | `CourierEnvelope.open` and `CourierCarryCore.evaluate` use this bounded 24 h window, not `CircleCore.REPLAY_WINDOW_MS` (6 h) |
 | `CLOCK_SKEW_MS` | `5 * 60 * 1000L` | Reused from `CircleCore` by reference |
 | `MAX_FIELD_CHARS` | `256` | Reused from `CircleCore` for `toFp` and id bounds |
 | `MAX_PARCEL_TTL_MS` | `24 * 60 * 60 * 1000L` | Sole expiry source; `expiresMs = createdMs + MAX_PARCEL_TTL_MS` |
@@ -101,7 +100,7 @@ method declarations in each class.
 | Class | Cases | Test names | What it pins |
 | --- | --- | --- | --- |
 | `CourierEnvelopeCodecTest` | 11 | canonical field order, caps, truncations, trailing fields, tamper | Domain-tagged, length-prefixed canonical bytes with `sig`/`cert` excluded and changed by each covered field; `encode`/`decode` round-trip and refuse truncated, oversized or unknown-field bytes; `MAX_ENVELOPE_CHARS`; tamper refusals |
-| `CourierEnvelopeCryptoTest` | 13 | seal/open, wrap, wrong cert, forged signature, window edges | `seal`/`open` byte-exact round-trip through AES-GCM and RSA wrap; wrong certificate, cert digest not equal to `fromFp`, forged signature and tampered ciphertext/IV/wrapped key fail `verify` without a pin write; `createdMs` outside the replay/skew window refused by `open` |
+| `CourierEnvelopeCryptoTest` | 13 | seal/open, wrap, wrong cert, forged signature, window edges | `seal`/`open` byte-exact round-trip through AES-GCM and RSA wrap; wrong certificate, cert digest not equal to `fromFp`, forged signature and tampered ciphertext/IV/wrapped key fail `verify` without a pin write; `createdMs` outside the 24 h courier replay window or the skew refused by `open` |
 | `CourierCarryCodecTest` | 10 | encode/decode, corrupt blob, duplicates, expiry repair, trim | `CarryState` round-trip; tolerant repair of corrupt, default-valued and absent fields; oversized bag trimmed to `MAX_PARCELS` |
 | `CourierCarryDecisionTest` | 14 | precedence, quota, TTL, ack, select, expire, merge | Six-way `evaluate` precedence, bounded `MAX_PARCELS` quota, TTL derived only from `createdMs + MAX_PARCEL_TTL_MS`, and `fold`, `select`, `ack`, `expire`, `merge`, `clear` on `CarryState` |
 | `CourierIntegrationTest` | 6 | seal → parcel → carry → open → verify; TYPES count | `seal` → `parcel` → carry fold → `open` → `CircleCore.verify`; `PARCEL` present in `CircleEvent.TYPES` with existing verb values and DTO fields unchanged |
@@ -128,8 +127,9 @@ device rows stay unclaimed until their dated walks run.
 - The content key exists only inside `seal` and the wrapped blob. No plaintext
   event, content key or private material is written to disk or logged; logs
   carry counts, ids and fingerprints only.
-- `open` applies the replay window and skew to `createdMs` and owns no replay
-  set; id dedup is the carry core's bounded `evaluate` guard.
+- `open` applies the 24 h courier replay window (`MAX_PARCEL_TTL_MS`) and skew
+  to `createdMs` and owns no replay set; id dedup is the carry core's bounded
+  `evaluate` guard.
 - Authorship of decrypted events is checked by `CircleCore.verify` at fold
   time, never by the carrier. The envelope's `cert` is the same signer named by
   the `parcel` event's `authorFp`; no second trust anchor is introduced.
@@ -139,6 +139,6 @@ device rows stay unclaimed until their dated walks run.
 ## Verification status
 
 All counts and the rig result were recorded from the fresh `--rerun-tasks` run
-after the nested type alias and decision-precedence fixes. No placeholder
-remains. Carrier (`SIM-HARN`) and three-node (`DEVICE`) evidence stay with the
-2026-11-30 and 2026-12-02 layers.
+after the nested type alias and decision-precedence fixes. Carrier
+(`SIM-HARN`) and three-node (`DEVICE`) evidence stay with the 2026-11-30 and
+2026-12-02 layers.

@@ -602,10 +602,16 @@ object FlitCircleSync {
     /**
      * Publish one signed `parcel` over the existing `/circle/sync` route. No new
      * route, header or DTO: the body is exactly `toFp` + `envelope`, gated by the
-     * protocol carry core. Returns the emitted event so the caller that sealed
-     * the envelope can associate its file shas with this parcel's id.
+     * protocol carry core. The file [shas] learned while sealing the envelope are
+     * registered against the emitted event id immediately after `emit` and BEFORE
+     * `fanout`, so a synchronous OK can publish `handed` for them. Returns the
+     * emitted event so the caller can associate it with the parcel.
      */
-    internal suspend fun postParcel(toFp: String, envelopeB64: String): CircleEvent? {
+    internal suspend fun postParcel(
+        toFp: String,
+        envelopeB64: String,
+        shas: List<String> = emptyList(),
+    ): CircleEvent? {
         val target = circleFp(toFp)
         val body = circleParcelBody(target, envelopeB64)
         if (!circleBodyValid(CircleEvent.PARCEL, body)) {
@@ -614,6 +620,10 @@ object FlitCircleSync {
         }
         val state = storedState() ?: return null
         val event = emit(context(), state, CircleEvent.PARCEL, body) ?: return null
+        // Register before any dial: a peer can answer OK synchronously during
+        // fanout, and concludeHandoff needs the id → shas mapping in place to
+        // publish `handed` for those files.
+        courierTrack(event.id, shas)
         fanout(state, listOf(event))
         return event
     }
@@ -648,10 +658,20 @@ object FlitCircleSync {
         // a peer may re-offer one whose event is already in the signed log after
         // a bag loss. Carry's evaluate dedups by id, so re-folding is inert while
         // a missing bag row is restored.
+        // The carrier cannot read the sealed envelope, so the only trustworthy
+        // signal for who minted a parcel is the signer of the outer event. Only
+        // a CURRENT roster member may inject a bag row — a departed or never-
+        // member must be refused even with a valid signature over the right
+        // circle and body. Fingerprints are normalised on both sides.
+        val authors = state.members.map { circleFp(it.fp) }.toSet()
         parcels.forEach { event ->
             if (event.circleId != state.id) return@forEach
             if (!circleBodyValid(CircleEvent.PARCEL, event.body)) return@forEach
             if (!CircleCore.verify(event)) return@forEach
+            if (circleFp(event.authorFp) !in authors) {
+                log("courier: refused parcel from non-member ${event.authorFp.take(12)}")
+                return@forEach
+            }
             CourierCarryCore.parcelOf(event)?.let { foldParcel(it) }
         }
     }

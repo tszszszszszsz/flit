@@ -55,12 +55,12 @@ Constants:
 | `PARCEL` / `PARCEL_BODY_KEYS` | `"parcel"` / `{"toFp","envelope"}` | Defined here; consumed by the carry core |
 | `MAX_ENVELOPE_CHARS` | `12 * 1024` | Base64 cap; body stays under `16 KiB` |
 | `MAX_FIELD_CHARS` / `MAX_SIG_CHARS` / `MAX_CERT_CHARS` | `256` / `1024` / `8 * 1024` | Reused from `CircleCore` |
-| `REPLAY_WINDOW_MS` / `CLOCK_SKEW_MS` | `6 h` / `5 min` | Reused from `CircleCore` |
+| Courier replay window (`MAX_PARCEL_TTL_MS`) / `CLOCK_SKEW_MS` | `24 h` / `5 min` | `open` uses the 24 h parcel TTL as its bounded replay window, not `CircleCore.REPLAY_WINDOW_MS` (6 h); skew reused from `CircleCore` |
 | `MAX_SEEN` / `MAX_PARCELS` / `MAX_PARCEL_TTL_MS` | `4096` / `256` / `24 h` | Carry core bounds; not redefined here |
 | `KEY_BYTES` / `IV_BYTES` | `32` / `12` | AES-256-GCM |
 | `ALG` | `"AESGCM+RSAOAEP256"` | Closed value set |
 
-Window and replay. `open` refuses `createdMs` older than `REPLAY_WINDOW_MS` or more than `CLOCK_SKEW_MS` ahead. Id dedup on the Circle path is the carry core's `evaluate` over its bounded `seen` set after `parcelOf` and `CircleCore.verify`; the envelope codec adds no second set and never calls `CircleCore.evaluate`/`accept` on an envelope id.
+Window and replay. `open` refuses `createdMs` older than the 24 h courier replay window (`MAX_PARCEL_TTL_MS`) or more than `CLOCK_SKEW_MS` ahead. This is a longer bounded window than `CircleCore.REPLAY_WINDOW_MS` (6 h) and is the one used for courier envelopes and parcels. Id dedup on the Circle path is the carry core's `evaluate` over its bounded `seen` set after `parcelOf` and `CircleCore.verify`; the envelope codec adds no second set and never calls `CircleCore.evaluate`/`accept` on an envelope id.
 
 State ownership. The sender owns the content key during `seal` only. The carrier holds the opaque bytes in `CarryState`, whose durable row is owned by the caller (`courierBag` on `CircleState` in the app, `courier-bag/` in the CLI). `TlsIdentity`'s pin cache, bounded at `MAX_PINS = 512`, gains the sender's certificate only after `verify` succeeds. The envelope codec is stateless; the carry core owns the bounded `seen` set, as `CircleCore` owns its replay set.
 
@@ -75,7 +75,7 @@ Seams to later layers: the CLI carrier on 2026-11-30 drives `select`/`ack` over 
 5. A parcel body's key set is exactly `{"toFp","envelope"}`; an extra key is refused before any id is reserved.
 6. The Base64 envelope is at most `MAX_ENVELOPE_CHARS`; the framed body stays under `CircleCore.MAX_BODY_CHARS`.
 7. The envelope has no `expiresMs`; `MAX_PARCEL_TTL_MS` derived by `parcelOf` is the only expiry.
-8. `open` applies `REPLAY_WINDOW_MS` and `CLOCK_SKEW_MS` to `createdMs` and owns no replay set; `evaluate` is the carry core's id guard.
+8. `open` applies the 24 h courier replay window (`MAX_PARCEL_TTL_MS`) and `CLOCK_SKEW_MS` to `createdMs` and owns no replay set; `evaluate` is the carry core's id guard.
 9. Decrypted events pass `CircleCore.validShape` and have a type in `CircleEvent.TYPES`; the envelope layer does not assert authorship, which is `CircleCore.verify` at fold time.
 10. The envelope `cert` is the same signer as the `parcel` event's `authorFp`; no second trust anchor is created.
 11. No plaintext event, content key or recipient private material is written to disk or logged by this layer; logs carry counts, ids and fingerprints only.
@@ -89,7 +89,7 @@ Seams to later layers: the CLI carrier on 2026-11-30 drives `select`/`ack` over 
 | Tampered ciphertext, IV, wrapped key or algorithm tag | `verify` false; carrier logs before explicit `ack`/`expire` | Held bytes until removal | Envelope on removal | CODE; PURE `CourierEnvelopeTest` |
 | Certificate does not hash to `fromFp` or differs from `authorFp` | `verify` false, no pin written | Nothing | Envelope | CODE; PURE `CourierEnvelopeTest` |
 | `circleId` or `toFp` differs from the recipient's values | `open` refused, no events folded | Envelope stays in the bag | Nothing | CODE; PURE `CourierEnvelopeTest` |
-| `createdMs` older than `REPLAY_WINDOW_MS` or future beyond `CLOCK_SKEW_MS` | `open` refused | Existing bag unchanged | Envelope on `expire` | CODE; PURE `CourierEnvelopeTest` |
+| `createdMs` older than the 24 h courier replay window or future beyond `CLOCK_SKEW_MS` | `open` refused | Existing bag unchanged | Envelope on `expire` | CODE; PURE `CourierEnvelopeTest` |
 | Envelope id already reserved by `evaluate` | `Duplicate`; not held again | The first copy | The repeat | CODE; PURE (carry core test) |
 | Bag at `MAX_PARCELS` | `Full`; no id reserved | All held parcels | The new offer | CODE; PURE (carry core test) |
 | `nowMs >= expiresMs` from `parcelOf` | `Expired`; `expire` removes and logs | Existing bag unchanged | Expired parcel | CODE; PURE (carry core test) |
@@ -105,7 +105,7 @@ Pure tests first, in `protocol/src/test/kotlin/app/flit/share/protocol/CourierEn
 
 - Canonical bytes are domain-tagged and length-prefixed; a change to each covered field changes them; `sig` and `cert` are excluded.
 - `seal`/`open` round-trips a signed event array through AES-GCM and RSA wrap; the returned events are byte-equal to the input.
-- `verify` rejects a substituted certificate, a certificate whose digest is not `fromFp`, a certificate that differs from the event's `authorFp`, a forged signature, a tampered ciphertext/IV/wrapped key, a wrong `alg`, a wrong `circleId`, a wrong `toFp` and a `createdMs` outside the window; rejections never write a pin.
+- `verify` rejects a substituted certificate, a certificate whose digest is not `fromFp`, a certificate that differs from the event's `authorFp`, a forged signature, a tampered ciphertext/IV/wrapped key, a wrong `alg`, a wrong `circleId`, a wrong `toFp` and a `createdMs` outside the 24 h courier replay window; rejections never write a pin.
 - `encode` output Base64 fits `MAX_ENVELOPE_CHARS` and is accepted by `validParcelBody` with keys exactly `{toFp, envelope}`; `decode` returns null on truncated, oversized or unknown-field bytes.
 - `open` refuses a wrapped key that cannot be unwrapped and a plaintext array that is not bounded JSON; no envelope id is reserved by this layer.
 

@@ -6,8 +6,8 @@ Circle sync worker, persists a bounded carrier bag in
 `FlitEngine`, and renders a carry line on the Circle file card from a typed,
 Android-free projection. The only new wire kind is the `PARCEL` verb with a
 closed body `{toFp, envelope}`. Envelope sealing, verification, opening and the
-carry reducers stay in `protocol/` and are called, not redefined. The code is
-built ahead of the scheduled commit date; the commit stays on 2026-12-01.
+carry reducers stay in `protocol/` and are called, not redefined. The layer is
+dated 2026-12-01.
 
 Counts below come from a green `--rerun-tasks` run of the CI-standard rig. No
 device evidence is claimed for the courier UI at this layer: the three-node
@@ -63,7 +63,9 @@ gate, accepting only the closed key set `{toFp, envelope}`. `fresh()` applies
 that gate before `CircleCore.verify`; accepted parcels are folded through
 `persistEvents()` → `FlitCircleStore.upsert`. The worker path appends selected
 signed events to `CircleRequest.events`, deduplicated by id and capped at
-`CircleCore.MAX_EVENTS_PER_REQUEST`, and calls `ack` only on an OK answer.
+`CircleCore.MAX_EVENTS_PER_REQUEST`, and calls `ack` only on an OK answer. An
+OK answer means the peer accepted the offer; it is not proof that the envelope
+was opened or that bytes landed, and no remote receipt is inferred.
 
 `FlitEngine` adds process-local state and one drop entry point:
 
@@ -170,8 +172,9 @@ ignored, because it is never gossiped.
 | Other member | any | `<courier> is carrying a copy for <to>` |
 
 `<to>` and `<courier>` resolve through `aliasOf`. No carry line is drawn for a
-card with no handoff entry. A carry line never claims bytes landed: only
-`openAffordance(...) == LANDED` offers `Open file`; `RESOLVING` gives the
+card with no handoff entry. `HANDED` means the peer accepted the offer, not
+that bytes arrived or were opened there. A carry line never claims bytes
+landed: only `openAffordance(...) == LANDED` offers `Open file`; `RESOLVING` gives the
 disabled `Opening…` button and `ABSENT` gives
 `Not here yet · no local copy to open`. Delivery counts come only from
 `CircleDelivery.statuses`; a handoff never increments a sent count.
@@ -249,5 +252,4 @@ recipient after bytes arrive.
 
 All counts are from a green `--rerun-tasks` run of the CI-standard rig after all
 sixteen files in the layer were present: 396 total (136 protocol + 228 app +
-32 harness). No placeholder counts remain. The DEVICE row stays unclaimed for
-the courier UI on this date.
+32 harness). The DEVICE row stays unclaimed for the courier UI on this date.

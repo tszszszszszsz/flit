@@ -261,6 +261,25 @@ The cost is qualitative and bounded by frame count, not by any captured figure:
 
 The 768 × 768 size and EC `M` are CLI-side constants shared with `Qr.encode`, not a measured minimum or a captured frame budget; EC `M` trades redundancy for module density at that fixed raster. No wall-clock timing, throughput figure, CPU or heap sample, frame-time capture or device byte count has been recorded for rendering or reading a frame, and no camera capture belongs to this layer. The §8.5 caps remain structural bounds, not measured working sets.
 
+### 8.7 QR parcel app: frame cadence and on-screen render
+
+The 2026-12-07 App layer ([qr-parcel-app.md](roadmap/qr-parcel-app.md)) turns the codec frames of §8.5 into a screen sequence and folds camera reads back into one verified payload. It adds no new frame grammar and no second render format: the opaque strings come from `ParcelCodec.encodeParcel` and go straight to `Qr.encode`, which already fixes EC level `M`, UTF-8 and margin 2 (`Qr.kt:143-150`). The app-side numbers below are structural constants, not measured render times, frame times, camera throughput or power figures.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `PARCEL_FRAME_INTERVAL_MS` | `400L` | Dwell on one frame before advancing to the next or wrapping to index zero. |
+| `PARCEL_FRAME_SIZE_PX` | `240` | Side passed to `Qr.encode` for an on-screen parcel frame (square raster). |
+| `MAX_PARCEL_FRAMES` | `64` | App display/assembly cap, set equal to the codec's `MAX_FRAMES` so every emitted sequence is displayable (§8.5). |
+| `PARCEL_PASTE_MAX_CHARS` | `16_000` | Cap on newline-separated frame text typed into the paste field when camera permission is denied. |
+
+On the show side, `ParcelUi.kt` holds the immutable list of frame strings and a display index in a Compose `remember`, discarded on close. A timer advances the index by one every `PARCEL_FRAME_INTERVAL_MS = 400 ms`, wrapping from the last frame back to index zero; next/back controls move it manually. Each frame is rendered with `Qr.encode(frame, PARCEL_FRAME_SIZE_PX)` at the same EC `M`/margin 2 hints the codec and CLI use. At 400 ms dwell, a full 64-frame sequence nominally cycles in `64 × 400 ms = 25.6 s` before returning to frame 1, with no extra dwell on the wrap. That figure is duty-cycle arithmetic from two constants, the same kind of derivation as the BLE window in §2.2, not a captured cycle time; the real cadence on a device is not measured here.
+
+`PARCEL_FRAME_SIZE_PX = 240` is the on-screen raster side, deliberately smaller than the CLI's 768 × 768 PNG in §8.6 because it is drawn into a Compose canvas rather than written to a file. Both paths call `Qr.encode` with identical hints (EC `M`, UTF-8, margin 2), so the module grid is the same and only the raster resolution differs. The 240 px value is a chosen size, not a measured legibility minimum or a captured frame budget, and no pixel-level scan study accompanies it.
+
+On the scan side, the camera preview feeds the existing `CameraQrView` analyzer in `QrUi.kt:265-308`: a single-thread executor gated to one decode attempt per `120_000_000L` ns (~8 fps), Y-plane only through `Qr.decodeYPlane` with the plane's row/pixel strides and a rotation step. Each decoded string is offered to `ParcelScanState`, which parses with `ParcelCodec.parse`, dedups by `(parcelId, seq)`, reports progress from the descriptor's `seq` and `count`, and closes with `ParcelCodec.complete(frames, recipientFp, identity)`. Bytes are written through an injected `(ByteArray) -> Unit` callback; the save name is local and no file name travels in a frame. With camera permission denied, a paste field feeds the same state holder up to `PARCEL_PASTE_MAX_CHARS`. These are structural paths and caps: no decode rate, reassembly time, byte count or current draw has been captured for them.
+
+No frame-time capture, render wall-clock, camera-decode throughput, reassembly timing, battery/current sample or device scan result belongs to this layer. Real-camera capture is the 2026-12-08 air-gap walk; until then camera decode and end-to-end frame delivery stay unverified, consistent with §8.5, §8.6 and §10.
+
 ---
 
 ## 9. Tradeoffs, stated
@@ -294,7 +313,7 @@ The 768 × 768 size and EC `M` are CLI-side constants shared with `Qr.encode`, n
 - **Sweep beyond one subnet**: the hardware walk was a `/24`; the 1024-host cap is a pure admission rule, not a measured worst case.
 - **Wire-byte totals** for Circle repair beyond the structural caps (1024 events/request, 8 MiB request body, 16 KiB event body); no traffic capture was published.
 - **Courier CLI one-shot and bag copy**: no wall-clock timing, invocation count or byte count was captured. The one-shot read / whole-file-write shape and the directory-copy handoff in §8.4 are structural descriptions, not measured costs.
-- **QR air-gap frames**: the `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512` and `MAX_AIR_GAP_PARCEL_BYTES = 131072` limits in §8.5 are structural caps, not measured sizes or costs. The 32 KiB reachable maximum is arithmetic from the first two caps. No frame-render, PNG read, camera-scan, CRC or reassembly timing, throughput or device byte count has been captured; the 768 × 768 / EC `M` PNG render and read cost in §8.6 is described qualitatively only, and real-camera decode is not verified by this layer.
+- **QR air-gap frames**: the `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512` and `MAX_AIR_GAP_PARCEL_BYTES = 131072` limits in §8.5 are structural caps, not measured sizes or costs. The 32 KiB reachable maximum is arithmetic from the first two caps. No frame-render, PNG read, camera-scan, CRC or reassembly timing, throughput or device byte count has been captured; the 768 × 768 / EC `M` PNG render and read cost in §8.6 is described qualitatively only, and real-camera decode is not verified by this layer. The app-layer `PARCEL_FRAME_INTERVAL_MS = 400L` dwell, `PARCEL_FRAME_SIZE_PX = 240` raster, `MAX_PARCEL_FRAMES = 64` display cap and `PARCEL_PASTE_MAX_CHARS = 16_000` paste cap in §8.7 are likewise structural: the 25.6 s full-cycle figure is arithmetic from the dwell and frame cap, and no render, cadence, camera-decode or reassembly timing was captured.
 
 ---
 
@@ -305,3 +324,4 @@ The 768 × 768 size and EC `M` are CLI-side constants shared with `Qr.encode`, n
 3. **README/Play "four parallel streams"** matches the client (`TURBO_MAX_STREAMS = 4`); the server's `MAX_TURBO_STREAMS = 6` is unused headroom from the shipped client's perspective.
 4. **Circle delivery backoff** in `FlitEngine` starts at an effective 20 s (`10s << attempt`, attempt = 1), not 10 s; the Circle *sync* backoff starts at 10 s (`5s << 1`). The two schedules are different by design and are both stated exactly in §3/§4.3.
 5. **QR frame cap vs app display cap**: the wire `MAX_FRAMES = 64` and the app's `MAX_PARCEL_FRAMES = 64` are the same number by design (§8.5). The frame-layer `MAX_AIR_GAP_PARCEL_BYTES = 131072` is named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`, so the air-gap byte ceiling and the envelope character ceiling are not conflated.
+6. **App render side vs CLI PNG raster**: the app draws a frame at `PARCEL_FRAME_SIZE_PX = 240` into a Compose canvas while the CLI writes 768 × 768 PNGs (§8.6/§8.7). Both go through `Qr.encode` at EC `M`, UTF-8 and margin 2, so the module grid is identical and only the raster resolution differs — two sizes for two surfaces, not a conflict.

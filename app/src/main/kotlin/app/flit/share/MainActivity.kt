@@ -2,8 +2,11 @@ package app.flit.share
 
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.parcel.ParcelCodec
+import app.flit.share.protocol.tls.TlsIdentity
 import android.Manifest
 import android.content.ClipData
+import android.content.ContentValues
 import android.content.Context
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
@@ -11,6 +14,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -143,9 +147,13 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import java.io.File
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import java.text.SimpleDateFormat
+import java.util.Base64
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -223,6 +231,25 @@ class MainActivity : ComponentActivity() {
     /** Circle attach: pick one file, spool it grant-proof, post its manifest. */
     private val pickCircleFile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) circleAttach(uri)
+    }
+
+    // ==== QR parcel show inputs (all local; no name or cert travels in a frame) ====
+    private val parcelRecipientFp = mutableStateOf("")
+    private val parcelCertText = mutableStateOf("")
+    private val parcelPayloadUri = mutableStateOf<Uri?>(null)
+    private val parcelFrames = mutableStateOf<List<String>>(emptyList())
+    private var parcelPickKind = ""
+
+    /** One picker for the two local show inputs: the file bytes and the recipient cert. */
+    private val pickParcelInput = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        when (parcelPickKind) {
+            "cert" -> parcelCertText.value = runCatching {
+                contentResolver.openInputStream(uri)?.use { it.bufferedReader().readText() } ?: ""
+            }.getOrDefault("")
+            else -> parcelPayloadUri.value = uri
+        }
+        parcelPickKind = ""
     }
 
     private val pickDest = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
@@ -556,6 +583,9 @@ class MainActivity : ComponentActivity() {
         var showThemeDialog by rememberSaveable { mutableStateOf(false) }
         var showBatteryDialog by rememberSaveable { mutableStateOf(false) }
         var showRelayDialog by rememberSaveable { mutableStateOf(false) }
+        // QR parcel is a Home action + a full-screen modal, never a dock tab.
+        var showParcel by rememberSaveable { mutableStateOf(false) }
+        var parcelTab by rememberSaveable { mutableStateOf(0) } // 0 = scan, 1 = show
         // Circle is a Home action + a full-screen feed, never a dock tab.
         var showCircle by rememberSaveable { mutableStateOf(false) }
         var showCircleStart by rememberSaveable { mutableStateOf(false) }
@@ -661,12 +691,13 @@ class MainActivity : ComponentActivity() {
         val overlayOpen = pendingCircleOpen || showAddDialog || showNoteDialog ||
             showQrDialog || showScanDialog || showKnownDialog || showPanicDialog ||
             showRenameDialog || showThemeDialog || showBatteryDialog || showRelayDialog ||
-            showCircleStart || showCircleJoin || showCircleScan || showCircleInvite ||
+            showParcel || showCircleStart || showCircleJoin || showCircleScan || showCircleInvite ||
             peerMenuFor != null
         BackHandler(enabled = showCircle) { showCircle = false } // Circle owns back while up
         BackHandler(enabled = !showCircle && overlayOpen) {
             // Dismiss only — never finish the activity out of a modal state.
             when {
+                showParcel -> showParcel = false
                 pendingCircleOpen -> pendingCircleOpen = false
                 peerMenuFor != null -> peerMenuFor = null
                 showBatteryDialog -> showBatteryDialog = false
@@ -1172,6 +1203,65 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
 
+                                    // ---- QR parcel entry ---------------------------------------
+                                    // Additive Home action. The parcel screen owns both its
+                                    // show and scan modes; Circle and transfer stay untouched.
+                                    Surface(
+                                        shape = RoundedCornerShape(FlitCorner.large),
+                                        color = MaterialTheme.colorScheme.surfaceContainer,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                // Both modes need the local identity; no screen
+                                                // opens and nothing is staged when it is absent.
+                                                if (FlitEngine.parcelIdentity() == null) {
+                                                    FlitEngine.toast("identity not ready — start sharing first")
+                                                } else {
+                                                    showParcel = true
+                                                }
+                                            },
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(36.dp)
+                                                    .background(
+                                                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f),
+                                                        CircleShape,
+                                                    ),
+                                                contentAlignment = Alignment.Center,
+                                            ) {
+                                                Text(
+                                                    "Q",
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    "QR parcel",
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                )
+                                                Text(
+                                                    "show frames or scan them — no radio link",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                            Text(
+                                                "Open",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = MaterialTheme.colorScheme.primary,
+                                            )
+                                        }
+                                    }
+
                                     // ---- nearby devices ----------------------------------------
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
@@ -1466,10 +1556,166 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // QR parcel: a modal full-surface window like the Circle feed.
+                    // Both modes need the local identity; scan gets the injected
+                    // writer and show gets frames sealed from local inputs.
+                    if (showParcel) {
+                        Dialog(
+                            onDismissRequest = { showParcel = false },
+                            properties = DialogProperties(
+                                usePlatformDefaultWidth = false,
+                                dismissOnBackPress = false, // MainActivity's BackHandler owns back
+                            ),
+                        ) {
+                            MaterialTheme(colorScheme = FlitThemeColors(theme)) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.colorScheme.background),
+                                ) {
+                                    val idf = FlitEngine.parcelIdentity()
+                                    if (idf == null) {
+                                        // Defensive: the gate at entry already refused to open.
+                                        LaunchedEffect(Unit) {
+                                            FlitEngine.toast("identity not ready — start sharing first")
+                                            showParcel = false
+                                        }
+                                    } else {
+                                        Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                OutlinedButton(
+                                                    onClick = { parcelTab = 0 },
+                                                    enabled = parcelTab != 0,
+                                                ) { Text("Scan") }
+                                                OutlinedButton(
+                                                    onClick = { parcelTab = 1 },
+                                                    enabled = parcelTab != 1,
+                                                ) { Text("Show") }
+                                                Spacer(Modifier.weight(1f))
+                                                TextButton(onClick = {
+                                                    showParcel = false
+                                                    parcelFrames.value = emptyList()
+                                                }) { Text("Close") }
+                                            }
+                                            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                                                if (parcelTab == 0) {
+                                                    ParcelScanCard(
+                                                        identity = idf,
+                                                        onBytes = ::writeParcelReceived,
+                                                        onClose = { showParcel = false },
+                                                    )
+                                                } else {
+                                                    val frames by parcelFrames
+                                                    if (frames.isEmpty()) {
+                                                        Column(
+                                                            modifier = Modifier
+                                                                .fillMaxSize()
+                                                                .verticalScroll(rememberScrollState())
+                                                                .padding(20.dp),
+                                                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                                                        ) {
+                                                            Text(
+                                                                "Show a parcel",
+                                                                style = MaterialTheme.typography.titleMedium,
+                                                            )
+                                                            val fp by parcelRecipientFp
+                                                            OutlinedTextField(
+                                                                value = fp,
+                                                                onValueChange = { parcelRecipientFp.value = it },
+                                                                label = { Text("recipient fingerprint") },
+                                                                singleLine = true,
+                                                                modifier = Modifier.fillMaxWidth(),
+                                                            )
+                                                            val certText by parcelCertText
+                                                            OutlinedTextField(
+                                                                value = certText,
+                                                                onValueChange = { parcelCertText.value = it },
+                                                                label = { Text("recipient certificate (Base64 DER)") },
+                                                                minLines = 3,
+                                                                modifier = Modifier.fillMaxWidth(),
+                                                            )
+                                                            Row(
+                                                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                                            ) {
+                                                                OutlinedButton(onClick = {
+                                                                    parcelPickKind = "cert"
+                                                                    pickParcelInput.launch(arrayOf("*/*"))
+                                                                }) { Text("Pick certificate") }
+                                                                OutlinedButton(onClick = {
+                                                                    parcelPickKind = "payload"
+                                                                    pickParcelInput.launch(arrayOf("*/*"))
+                                                                }) { Text("Pick file") }
+                                                            }
+                                                            val payloadUri by parcelPayloadUri
+                                                            Text(
+                                                                if (payloadUri == null) {
+                                                                    "no file picked yet"
+                                                                } else {
+                                                                    "file picked — ready to seal"
+                                                                },
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            )
+                                                            Button(
+                                                                onClick = {
+                                                                    val uri = parcelPayloadUri.value
+                                                                    if (uri == null) {
+                                                                        FlitEngine.toast("pick a file first")
+                                                                    } else {
+                                                                        val payload = runCatching {
+                                                                            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                                                                        }.getOrNull()
+                                                                        if (payload == null) {
+                                                                            FlitEngine.toast("could not read that file")
+                                                                        } else {
+                                                                            val made = makeParcelFrames(
+                                                                                idf,
+                                                                                parcelRecipientFp.value,
+                                                                                parcelCertText.value,
+                                                                                payload,
+                                                                            )
+                                                                            if (made != null) parcelFrames.value = made
+                                                                        }
+                                                                    }
+                                                                },
+                                                                modifier = Modifier.fillMaxWidth(),
+                                                            ) { Text("Make frames") }
+                                                        }
+                                                    } else {
+                                                        ParcelShowCard(
+                                                            frames = frames,
+                                                            onClose = {
+                                                                showParcel = false
+                                                                parcelFrames.value = emptyList()
+                                                            },
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    snackbarHost(
+                                        Modifier
+                                            .align(Alignment.BottomCenter)
+                                            .navigationBarsPadding()
+                                            .padding(bottom = 16.dp)
+                                            .padding(horizontal = 16.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     // Engine feedback hovers above the dock (dock = nav bars +
-                    // 16 gap + 56 FAB; snackbar sits 8 above that). The Circle
-                    // modal window has its own host while this one is hidden.
-                    if (!showCircle) {
+                    // 16 gap + 56 FAB; snackbar sits 8 above that). Each modal
+                    // window carries its own host while this one is hidden.
+                    if (!showCircle && !showParcel) {
                         snackbarHost(
                             Modifier
                                 .align(Alignment.BottomCenter)
@@ -2335,6 +2581,90 @@ class MainActivity : ComponentActivity() {
             FlitEngine.circlePostFile(name, size, sha, dest.absolutePath)
         } catch (_: Exception) {
             FlitEngine.toast("could not attach that file")
+        }
+    }
+
+    /**
+     * Show input: seal a locally picked file for a locally supplied recipient
+     * certificate/fingerprint. The signer is the app's own identity; no frame
+     * carries a file name or a certificate.
+     */
+    private fun makeParcelFrames(
+        identity: TlsIdentity,
+        recipientFp: String,
+        certText: String,
+        payload: ByteArray,
+    ): List<String>? {
+        val fp = recipientFp.trim().uppercase(Locale.ROOT)
+        if (fp.isBlank()) {
+            FlitEngine.toast("enter the recipient fingerprint")
+            return null
+        }
+        if (payload.isEmpty() || payload.size > ParcelCodec.MAX_AIR_GAP_PARCEL_BYTES) {
+            FlitEngine.toast("pick a file within the parcel size limit")
+            return null
+        }
+        val cert = runCatching {
+            val der = Base64.getDecoder().decode(certText.filterNot { it.isWhitespace() })
+            CertificateFactory.getInstance("X.509").generateCertificate(der.inputStream()) as X509Certificate
+        }.getOrNull()
+        if (cert == null) {
+            FlitEngine.toast("could not read the recipient certificate")
+            return null
+        }
+        val certFp = runCatching { TlsIdentity.fingerprintOf(cert) }.getOrNull()
+        if (certFp == null || !certFp.equals(fp, ignoreCase = true)) {
+            FlitEngine.toast("certificate does not match that fingerprint")
+            return null
+        }
+        val frames = ParcelCodec.encodeParcel(
+            payload,
+            UUID.randomUUID().toString().replace("-", ""),
+            fp,
+            cert,
+            identity.fingerprint,
+            identity,
+        )
+        if (frames.isEmpty()) {
+            FlitEngine.toast("could not seal a parcel — nothing to show")
+            return null
+        }
+        return frames
+    }
+
+    /**
+     * Writer injected into the QR parcel screen. Verified bytes land in the
+     * same received bucket the engine's receive path uses: MediaStore
+     * Downloads/Flit. No file name travels in a frame, so the name is local.
+     */
+    private fun writeParcelReceived(bytes: ByteArray) {
+        val name = "parcel-${System.currentTimeMillis()}.bin"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Flit")
+        }
+        val uri = runCatching {
+            contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        }.getOrNull()
+        if (uri == null) {
+            FlitEngine.logLine("parcel: could not create Downloads/Flit/$name")
+            FlitEngine.toast("could not save the parcel")
+            return
+        }
+        val written = runCatching {
+            val out = contentResolver.openOutputStream(uri) ?: return@runCatching false
+            out.use { it.write(bytes) }
+            true
+        }.getOrDefault(false)
+        if (written) {
+            FlitEngine.recordParcelReceived(name, bytes.size, uri.toString())
+            FlitEngine.logLine("parcel → Downloads/Flit/$name (${FlitEngine.fmtBytes(bytes.size.toLong())})")
+            FlitEngine.toast("parcel saved to Downloads/Flit")
+        } else {
+            runCatching { contentResolver.delete(uri, null, null) }
+            FlitEngine.logLine("parcel: could not write $name")
+            FlitEngine.toast("could not save the parcel")
         }
     }
 

@@ -29,6 +29,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- QR scan-to-pair reads the camera; never used anywhere else. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <!-- Album mirror (opt-in in Options): reading camera shots and clips. The
          ask happens only when mirroring is switched on; without it nothing is
          watched and nothing is sent. -->

@@ -98,12 +98,13 @@ class CourierCarryDecisionTest {
         )
         assertEquals(Decision.Invalid, CourierCarryCore.evaluate(extraKey, 0, NOW))
 
-        // A TTL-elapsed parcel is Expired even though it is also outside the
-        // shorter replay window. A stale non-expired parcel is OutsideWindow.
+        // A TTL-elapsed parcel is Expired at the createdMs + TTL boundary.
+        // A six-hour-old but TTL-live parcel is inside the full-TTL past window
+        // and is Accept; only a future-dated parcel is OutsideWindow here.
         val expired = parcel(lamport = 2, createdMs = NOW - MAX_PARCEL_TTL_MS)
         assertEquals(Decision.Expired, CourierCarryCore.evaluate(expired, 0, NOW))
-        val stale = parcel(lamport = 3, createdMs = NOW - CircleCore.REPLAY_WINDOW_MS - 1)
-        assertEquals(Decision.OutsideWindow, CourierCarryCore.evaluate(stale, 0, NOW))
+        val stillLive = parcel(lamport = 3, createdMs = NOW - CircleCore.REPLAY_WINDOW_MS - 1)
+        assertEquals(Decision.Accept, CourierCarryCore.evaluate(stillLive, 0, NOW))
         val future = parcel(lamport = 4, createdMs = NOW + CircleCore.CLOCK_SKEW_MS + 1)
         assertEquals(Decision.OutsideWindow, CourierCarryCore.evaluate(future, 0, NOW))
 
@@ -112,17 +113,17 @@ class CourierCarryDecisionTest {
         val editedExpiry = parcel(lamport = 5, createdMs = NOW, expiresMs = NOW + 1_000L)
         assertEquals(Decision.Invalid, CourierCarryCore.evaluate(editedExpiry, 0, NOW + 2_000L))
 
-        // Refusals above reserve nothing; the fresh id still passes, then the
-        // same id is Duplicate even when the bag is reported full.
+        // Refused ids above reserve nothing; the distinct fresh id still passes,
+        // then the same id is Duplicate even when the bag is reported full.
         assertEquals(Decision.Accept, CourierCarryCore.evaluate(good, 0, NOW))
         assertEquals(Decision.Duplicate, CourierCarryCore.evaluate(good, MAX_PARCELS, NOW))
     }
 
     @Test
-    fun `evaluate window rejects stale future and overflowing clocks`() {
+    fun `evaluate window accepts TTL-live past parcels and rejects far-future and overflowing clocks`() {
         val p = parcel(lamport = 5)
         assertEquals(
-            Decision.OutsideWindow,
+            Decision.Accept,
             CourierCarryCore.evaluate(parcel(lamport = 6, createdMs = NOW), 0, NOW + CircleCore.REPLAY_WINDOW_MS + 1),
         )
         assertEquals(Decision.Expired, CourierCarryCore.evaluate(p, 0, Long.MAX_VALUE))
@@ -130,8 +131,8 @@ class CourierCarryDecisionTest {
         assertEquals(Decision.OutsideWindow, CourierCarryCore.evaluate(parcel(lamport = 8), 0, 0L))
         assertEquals(Decision.OutsideWindow, CourierCarryCore.evaluate(parcel(lamport = 9), 0, -1L))
 
-        // A canonical TTL-expired row is reported Expired before the shorter
-        // replay window is consulted.
+        // At the TTL boundary the Expired check wins before the window check:
+        // nowMs == createdMs + MAX_PARCEL_TTL_MS is not live.
         assertEquals(
             Decision.Expired,
             CourierCarryCore.evaluate(

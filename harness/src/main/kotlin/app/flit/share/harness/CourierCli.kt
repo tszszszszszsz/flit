@@ -10,6 +10,7 @@ import app.flit.share.protocol.courier.PARCEL
 import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.tls.TlsIdentity
 import java.io.ByteArrayInputStream
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -347,10 +348,12 @@ object CourierCli {
     // ==== receive =============================================================
 
     /**
-     * Opens parcels addressed to the local identity, folds only events authored
-     * by a current local member (never JOIN or REKEY) into `circle.state`,
-     * quarantines refused opens, and keeps a thrown open or a parcel with no
-     * allowed event at its prior state.
+     * Opens parcels addressed to the local identity and folds events through the
+     * same gates as the app: a signature check, a circle-id match, the per-type
+     * body gate, and the member/JOIN/REKEY exclusion. No unverified event ever
+     * reaches `circle.state`. Both state files are committed before a single
+     * parcel is archived; a failed commit leaves rows, circle state and files
+     * exactly as they were.
      */
     private fun receive(args: ParsedArgs, nowMs: Long): Int {
         val dir = bagDir(args)
@@ -361,9 +364,21 @@ object CourierCli {
         val identity = loadOrCreateIdentity()
         val me = norm(identity.fingerprint) ?: return EXIT_BAD_ARGS
         val rows = loadRows(args).toMutableList()
+        // The pre-receive rows are the rollback image if the commit fails.
+        val originalRows = rows.toList()
         val receivedDir = harnessHome().resolve(RECEIVED_DIR)
         val rejectedDir = harnessHome().resolve(REJECTED_DIR)
         var refused = false
+
+        // Stage everything in memory: no circle.state write, no file move and
+        // no row conclusion happens until both state files are written.
+        val st = loadCliCircleState() ?: CircleCliState()
+        val foldedEvents = st.events.toMutableList()
+        var folded = false
+        val archive = mutableListOf<Path>()
+        val quarantine = mutableListOf<Path>()
+        val deliveredLogs = mutableListOf<Pair<String, Int>>()
+        val members = st.members.mapNotNull { norm(it) }.toSet()
 
         for (f in parcelFiles(dir)) {
             val id = f.fileName.toString().removeSuffix(PARCEL_SUFFIX)
@@ -388,7 +403,8 @@ object CourierCli {
             }.getOrNull() as? JsonPrimitive
             val envelope = CourierEnvelope.decode(envB64?.content)
             if (envelope == null) {
-                refusedRow(rows, row, id, nowMs, f, rejectedDir)
+                stageRefusal(rows, row, id, nowMs)
+                quarantine.add(f)
                 refused = true
                 continue
             }
@@ -401,71 +417,99 @@ object CourierCli {
                 null
             }
             if (threw) {
-                // The carrier never spoke: keep the file and the row for retry.
+                // The carrier never concluded: keep the file and the row for a
+                // later attempt, exactly as before.
                 println("${ts()}   ${id.take(8)} open threw, kept ${row.state} for retry")
                 continue
             }
             if (opened == null) {
-                refusedRow(rows, row, id, nowMs, f, rejectedDir)
+                stageRefusal(rows, row, id, nowMs)
+                quarantine.add(f)
                 refused = true
                 continue
             }
 
-            val st = loadCliCircleState() ?: CircleCliState()
-            // Only a current local member may contribute an event through a courier.
-            // JOIN and REKEY are governance events: a carrier never folds them.
-            val members = st.members.mapNotNull { norm(it) }.toSet()
+            // Fold-time gates mirror FlitCircleSync.openAtMe + fresh. The
+            // envelope is ciphertext to every carrier, yet once opened its
+            // author is untrusted: JOIN and REKEY are governance verbs, only a
+            // current local member may mint a foldable event, the circle must
+            // match, the type body must be well formed and the signature must
+            // verify before anything is staged for circle.state.
             val allowed = opened.filter { event ->
                 event.type != CircleEvent.JOIN &&
                     event.type != CircleEvent.REKEY &&
-                    norm(event.authorFp) in members
+                    norm(event.authorFp) in members &&
+                    event.circleId == st.circleId &&
+                    (event.type != CircleEvent.FILE || CircleCore.validFileBody(event.body)) &&
+                    (event.type != CircleEvent.PARCEL || CourierCarryCore.validParcelBody(event.body)) &&
+                    bodyReadable(event.body) &&
+                    CircleCore.verify(event)
             }
             if (allowed.isEmpty()) {
-                // Nothing authorised to fold: log it and leave the row and
-                // parcel as-is, so the carrier can retry or be inspected.
                 println("${ts()}   ${id.take(8)} no allowed event(s), kept ${row.state}")
                 continue
             }
             val refusedCount = opened.size - allowed.size
             if (refusedCount > 0) {
-                println("${ts()}   ${id.take(8)} refused $refusedCount event(s) outside the local roster")
+                println("${ts()}   ${id.take(8)} refused $refusedCount event(s) outside the local fold gates")
             }
-            st.events = CircleCore.order(CircleCore.dedup(st.events + allowed)).toMutableList()
-            saveCircleState(st)
-            val moved = runCatching {
-                Files.createDirectories(receivedDir)
-                Files.move(f, receivedDir.resolve(f.fileName), StandardCopyOption.REPLACE_EXISTING)
-            }.isSuccess
-            if (!moved) println("${ts()}   ${id.take(8)} folded but could not archive the envelope")
+            foldedEvents.clear()
+            foldedEvents.addAll(CircleCore.order(CircleCore.dedup(foldedEvents + allowed)))
+            folded = true
+            archive.add(f)
+            deliveredLogs.add(id.take(8) to allowed.size)
             val idx = rows.indexOfFirst { it.id == row.id }
             if (idx >= 0) rows[idx] = row.copy(state = nextState(row, Kind.RECEIVE_OK, nowMs))
-            println("${ts()}   ${id.take(8)} delivered ${allowed.size} event(s)")
         }
+
+        // Commit. saveRows is an atomic temp+move; circle.state is written only
+        // when an event actually folds. Archive/quarantine moves happen AFTER
+        // both writes succeed, so a failed commit has no archive to roll back
+        // and no row is left falsely delivered.
         if (!saveRows(args, rows)) {
-            println("!! could not save courier state — nothing delivered")
+            println("!! could not save courier state — nothing received")
             return EXIT_BAD_ARGS
+        }
+        if (folded) {
+            st.events = foldedEvents
+            if (!runCatching { saveCircleState(st) }.isSuccess) {
+                saveRows(args, originalRows)
+                println("!! could not save circle state — nothing received")
+                return EXIT_BAD_ARGS
+            }
+        }
+        moveAll(receivedDir, archive, "archive")
+        moveAll(rejectedDir, quarantine, "quarantine")
+        for ((shortId, count) in deliveredLogs) {
+            println("${ts()}   $shortId delivered $count event(s)")
         }
         println("${ts()} courier receive ${countLine(rows)}")
         return if (refused) EXIT_OPEN_REFUSED else 0
     }
 
-    private fun refusedRow(
-        rows: MutableList<Row>,
-        row: Row,
-        id: String,
-        nowMs: Long,
-        file: Path,
-        rejectedDir: Path,
-    ) {
-        val moved = runCatching {
-            Files.createDirectories(rejectedDir)
-            Files.move(file, rejectedDir.resolve(file.fileName), StandardCopyOption.REPLACE_EXISTING)
-        }.isSuccess
-        if (!moved) println("${ts()}   ${id.take(8)} could not quarantine the envelope")
+    /** Mark a row refused for a quarantined parcel without touching disk. */
+    private fun stageRefusal(rows: MutableList<Row>, row: Row, id: String, nowMs: Long) {
         val idx = rows.indexOfFirst { it.id == row.id }
         if (idx >= 0) rows[idx] = row.copy(state = nextState(row, Kind.RECEIVE_REFUSED, nowMs))
-        println("${ts()}   ${id.take(8)} refused and quarantined")
+        println("${ts()}   ${id.take(8)} refused")
     }
+
+    /** Move only committed envelopes into [dir]; one failure is reported, not fatal. */
+    private fun moveAll(dir: Path, files: List<Path>, label: String) {
+        if (files.isEmpty()) return
+        runCatching { Files.createDirectories(dir) }
+        files.forEach { f ->
+            val ok = runCatching {
+                Files.move(f, dir.resolve(f.fileName), StandardCopyOption.REPLACE_EXISTING)
+            }.isSuccess
+            if (!ok) println("${ts()}   ${f.fileName.toString().removeSuffix(PARCEL_SUFFIX).take(8)} could not $label the envelope")
+        }
+    }
+
+    /** Fold-time body gate: one bounded JSON object, as `circleBodyReadable` in the app. */
+    private fun bodyReadable(body: String): Boolean =
+        body.isNotBlank() && body.length <= CircleCore.MAX_BODY_CHARS &&
+            runCatching { WireJson.json.parseToJsonElement(body) as? JsonObject }.getOrNull() != null
 
     // ==== status ==============================================================
 
@@ -544,17 +588,27 @@ object CourierCli {
     }
 
     /**
-     * Persists the rows. Returns false only when the write itself failed; every
-     * caller treats that as fatal (non-zero exit, no success line). In [drop]
-     * the parcel file is rolled back so a failed commit leaves no orphan.
+     * Persists the rows via a temp file plus an atomic move, so a crashed or
+     * failed write never leaves a half-written ledger. Returns false only when
+     * the write itself failed; every caller treats that as fatal (non-zero exit,
+     * no success line). In [drop] the parcel file is rolled back, and in [receive]
+     * no archive or delivered mark survives, on a failed commit.
      */
     private fun saveRows(args: ParsedArgs, rows: List<Row>): Boolean {
         val f = statePath(args)
+        val tmp = f.resolveSibling("${f.fileName}.tmp-${UUID.randomUUID()}")
         return runCatching {
             Files.createDirectories(f.parent)
-            Files.write(f, encodeRows(rows).toByteArray(Charsets.UTF_8))
+            Files.write(tmp, encodeRows(rows).toByteArray(Charsets.UTF_8))
+            try {
+                Files.move(tmp, f, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: AtomicMoveNotSupportedException) {
+                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING)
+            }
             true
-        }.getOrDefault(false)
+        }.getOrDefault(false).also { ok ->
+            if (!ok) runCatching { Files.deleteIfExists(tmp) }
+        }
     }
 
     private fun parcelFiles(dir: Path): List<Path> =

@@ -20,6 +20,10 @@ The 2026-12-04 CLI layer is built ahead of its scheduled day. The parcel encode
 and decode code and tests are written now, but the commit stays on 2026-12-04;
 no earlier date carries it.
 
+The 2026-12-07 App layer is built ahead of its scheduled day. The parcel display
+and camera decode code and tests are written now, but the commit stays on
+2026-12-07; no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

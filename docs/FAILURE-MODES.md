@@ -79,9 +79,11 @@ shape.
 | panic hops / replay / skew / seen | 3 / 6 h / 5 min / 1024 | `PanicCore.kt:18-27` | forward budget and dedup |
 | `MAX_ENVELOPE_CHARS` | 12 288 (12 KiB) | `CourierEnvelope.kt` | Base64 envelope cap; the framed `parcel` body stays under `MAX_BODY_CHARS` |
 | `MAX_PARCELS` | 256 | `CourierCarryCore.kt` | Bag cap; a Full refusal reserves no id |
-| `MAX_PARCEL_TTL_MS` | 86 400 000 (24 h) | `CourierCarryCore.kt` | `expiresMs = createdMs + MAX_PARCEL_TTL_MS`; the only expiry |
+| `MAX_PARCEL_TTL_MS` | 86 400 000 (24 h) | `CourierCarryCore.kt` | `expiresMs = createdMs + MAX_PARCEL_TTL_MS`; also the courier replay window's past side — a parcel stays openable for its whole carried lifetime |
 | bag `MAX_SEEN` | 4096 | `CourierCarryCore.kt` | Bag id reservation shared by `evaluate` and `fresh`, separate from the Circle set |
-| courier `open` window / skew | 6 h / 5 min | `CourierEnvelope.kt` | Reuses the Circle replay bounds by subtraction; no second replay set |
+| courier `open` window / skew | 24 h / 5 min | `CourierEnvelope.kt`, `CourierCarryCore.kt` | Past side is the parcel TTL (`MAX_PARCEL_TTL_MS`), future side is `CircleCore.CLOCK_SKEW_MS`; compared by subtraction, no second replay set |
+| app parcel display / paste caps | `MAX_PARCEL_FRAMES` 64, `PARCEL_PASTE_MAX_CHARS` 16 000, `PARCEL_FRAME_INTERVAL_MS` 400L, `PARCEL_FRAME_SIZE_PX` 240 | `ParcelUi` (roadmap "Constants owned here") | Display cap equals codec `MAX_FRAMES`; cadence and render side are configured values, not measured timing |
+| QR parcel frame caps consumed unchanged | `MAX_FRAMES` 64, `MAX_CHUNK_BYTES` 512, `MAX_AIR_GAP_PARCEL_BYTES` 131072 | `ParcelCodec.kt:50`, `:56`, `:53` | 64 frames and 128 KiB are defensive wire caps; the effective ceiling is the 12 KiB sealed-envelope Base64 cap (about 24 frames, roughly 5 KiB payload); the app defines no second grammar |
 
 ---
 
@@ -115,7 +117,7 @@ Read this first; the sections below unfold each row.
 | Courier: verify fails or cert binding breaks | no | verify false; no pin written | held bytes until `ack` / `expire` | envelope on removal | CODE / PURE |
 | Courier: duplicate id or bag at 256 | a Full refusal can be offered again after space frees | `Duplicate` / `Full`; Full reserves nothing | held copy, or all 256 held parcels | incoming copy / offer | CODE / PURE |
 | Courier: outside window, expired, wrong `circleId` / `toFp` | no | `OutsideWindow` / `Expired` / `open` refused | existing bag unchanged | incoming or expired parcel | CODE / PURE |
-| Courier: pending until encounter, then ack | yes until the addressee is met | Delivered at `ack` | parcel until TTL; nothing after ack | acknowledged parcels | CODE / PURE |
+| Courier: pending until encounter, then ack | yes until the addressee is met | Peer accepted the offer at `ack`; no remote proof of opening | parcel until TTL; nothing after ack | acknowledged parcels | CODE / PURE |
 | Courier: corrupt bag row or carrier death | yes — persisted bag is re-offered | empty bounded state / no conclusion | unrelated Circle state; persisted `CarryState` | corrupt row / in-memory-only state | CODE / PURE |
 | Courier CLI: `--bag` missing or unreadable | no | exit `2`, no state change | nothing moved | nothing | CODE |
 | Courier CLI: cert fingerprint differs from `--to`, or bag at quota | no | drop refused, row not added | existing parcels kept | nothing | CODE / PURE |
@@ -126,7 +128,7 @@ Read this first; the sections below unfold each row.
 | Courier app: no recipient cert for the drop | yes — a later roster answer | no — no `parcel` posted | source events stay in the sender log | nothing | CODE / PURE |
 | Courier app: bad `parcel` body or failed signature in `fresh` | no | refused before the bag fold | bag unchanged | incoming event | CODE / PURE |
 | Courier app: addressee not met on a sync pass | yes — re-offered via `select` | no — held | bag and signed event stay | nothing | CODE / PURE |
-| Courier app: handoff answered OK | no | `ack`; outcome `handed` | opened copy on the recipient | acknowledged bag rows | CODE / PURE |
+| Courier app: peer accepted the offer | no | `ack`; outcome `handed` = offer accepted, no remote proof | recipient's copy is local and unobserved here | acknowledged bag rows | CODE / PURE |
 | Courier app: handoff refused or carrier throws | yes — re-offered on a later pass | outcome `failed`; no `ack` | bag held for retry | nothing | CODE / PURE |
 | Courier app: `open` fails at the addressee | held until the core sweep | no fold; no handoff entry or carry line | bag row stays | parsed parcel only | CODE / PURE |
 | Courier app: corrupt or absent `courierBag` row | no | empty bag; log line | unrelated Circle state stays | corrupt row | CODE / PURE |
@@ -457,14 +459,14 @@ by the caller; none is a silent fallback.
 | `decode` sees truncated, oversized or unknown-field envelope bytes | no | `decode` returns null | existing bag unchanged | malformed body | CODE `CourierEnvelope.decode`; PURE `CourierEnvelopeCodecTest` |
 | Tampered `cipherB64`, `ivB64`, `keyWrapB64`, `alg`, `circleId`, `toFp` or `createdMs` | no | `verify` false | held bytes until explicit `ack` / `expire` | envelope on removal | CODE `CourierEnvelope.verify`; PURE `CourierEnvelopeCryptoTest` |
 | `cert` digest is not `fromFp`, or cert differs from the `parcel` signer | no | `verify` false; no pin written | existing pin cache unchanged | envelope | CODE `CourierEnvelope.verify`; PURE `CourierEnvelopeCryptoTest` |
-| `createdMs` older than 6 h or more than 5 min ahead | no | `OutsideWindow` / `open` refused | existing bag unchanged | incoming event | CODE `CourierCarryCore.evaluate`, `CourierEnvelope.open`; PURE `CourierCarryDecisionTest`, `CourierEnvelopeCryptoTest` |
+| `createdMs` older than the 24 h parcel TTL (`MAX_PARCEL_TTL_MS`) or more than 5 min ahead | no | `OutsideWindow` / `open` refused | existing bag unchanged | incoming event | CODE `CourierCarryCore.evaluate`, `CourierEnvelope.open`; PURE `CourierCarryDecisionTest`, `CourierEnvelopeCryptoTest` |
 | `nowMs >= expiresMs` | no | `Expired`; `expire` removes and logs | existing bag unchanged | incoming or held parcel | CODE `CourierCarryCore.expire`; PURE `CourierCarryDecisionTest` |
 | Envelope id already reserved by `evaluate` | no | `Duplicate` | first copy | incoming copy | CODE `CourierCarryCore.evaluate`; PURE `CourierCarryDecisionTest` |
 | Bag at `MAX_PARCELS` | yes — Full reserves nothing, so a later offer can succeed | `Full` | all 256 held parcels | incoming offer | CODE `CourierCarryCore.evaluate`; PURE `CourierCarryDecisionTest` |
 | Corrupt wrapped key or undecodable plaintext after decrypt | no — any re-offer is a carrier concern | `open` returns null and logs | envelope bytes remain for retry or explicit removal | parsed array only | CODE `CourierEnvelope.open`; PURE `CourierEnvelopeCryptoTest` |
 | Event signature invalid after decrypt | no | event skipped by `CircleCore.verify` at fold time | envelope and the rest of the array | that event | CODE `CircleCore.verify`; PURE `CourierIntegrationTest` |
 | Parcel pending until the addressee is met | yes — next encounter / handoff | no — Pending | parcel in bag until TTL | nothing | CODE `CourierCarryCore.select`, `CourierCarryCore.expire`; PURE `CourierCarryDecisionTest` |
-| Addressee acknowledged the handoff | no | Delivered by `ack` | nothing for those parcels | acknowledged parcels | CODE `CourierCarryCore.ack`; PURE `CourierCarryDecisionTest` |
+| Addressee accepted the offer | no | Peer accepted the offer at `ack`; no remote proof of opening | nothing for those parcels | acknowledged parcels | CODE `CourierCarryCore.ack`; PURE `CourierCarryDecisionTest` |
 | Carrier restarts before an ack | yes — persisted bag is re-offered | no — addressee dedups by id | persisted `CarryState` | in-memory-only state | CODE `CourierCarryCore.encode`/`decode`; PURE `CourierCarryCodecTest` |
 | Corrupt `courier-bag/` or `courierBag` row | no | empty bounded state at decode | unrelated Circle state | corrupt row | CODE `CourierCarryCore.decode`; PURE `CourierCarryCodecTest` |
 
@@ -482,14 +484,17 @@ transport, route or header. Envelope bytes and parcel encoding are the
 The conditions below come from the CLI carrier roadmap. Evidence labels are
 CODE from `CourierCli.kt`, PURE from `CourierCliTest` and SIM-HARN from
 `CourierCarrierHarnessTest`. No row claims DEVICE: the bag moved between
-directories on one box, and the three-node courier walk is 2026-12-02.
+directories on one box, and the three-node courier walk is 2026-12-02. Here
+`delivered` is a local `courier.state` row state reached after `open` and a
+fold; it is not the app handoff outcome and asserts no remote end-to-end
+landing.
 
 | Condition | Conclusion | Keeps bytes | Drops | Evidence |
 | --- | --- | --- | --- | --- |
 | `--bag` path missing or unreadable | exit `2`, no state change | nothing moved | nothing | CODE `CourierCli.run` |
 | Recipient cert fingerprint differs from `--to` | drop refused before seal | nothing written | nothing | CODE / PURE `CourierCliTest` |
-| Bag at the courier-carry.md quota | drop refused, row not added | existing parcels kept | nothing | CODE / PURE `CourierCliTest` |
-| Parcel past TTL at `sweep` | row `expired` | opened records in `courier-received/` | envelope and row on the next sweep | PURE / SIM-HARN `CourierCarrierHarnessTest` |
+| Bag at the courier-carry.md quota | drop refused, row not added | existing parcels kept | nothing | CODE `CourierCli.hasRoom`; PURE `CourierCarryDecisionTest` |
+| Parcel past TTL at `sweep` | row `expired` | opened records in `courier-received/` | envelope and row on the next sweep | PURE `CourierCliTest`; SIM-HARN `CourierCarrierHarnessTest` |
 | Parcel addressed to another fingerprint | stays `pending`, re-exported | envelope kept in `courier-bag/` | nothing | CODE / SIM-HARN `CourierCarrierHarnessTest` |
 | `open` returns a refusal (forged or tampered envelope) | row `refused` | nothing in Circle state | envelope moved to `courier-rejected/`, payload dropped | SIM-HARN `CourierCarrierHarnessTest` |
 | `open` throws (carrier / IO fault) | stays `pending`, retried | envelope kept | nothing | CODE / SIM-HARN `CourierCarrierHarnessTest` |
@@ -515,6 +520,9 @@ older rows), written only under the `FlitCircleStore.update` lock.
 `waiting`, `handed` and `failed`; it is never signed, persisted or put in a
 `CircleRequest`. `CourierCardUi.kt` is Android-free and renders one carry line
 per SHA from that map; it never parses a `parcel` body or holds envelope text.
+An OK answer to `fanout`/`sync` proves only that the peer accepted the offer:
+`handed` is that local outcome, never a claim that the addressee opened the
+parcel. No remote proof of an end-to-end landing is available at this layer.
 
 | Condition | Retries? | Concludes? | Keeps bytes? | Drops? | Evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -525,7 +533,7 @@ per SHA from that map; it never parses a `parcel` body or holds envelope text.
 | Duplicate envelope id | no | `Duplicate`; no second fold | held copy stays | repeat copy | CODE `FlitCircleSync.foldParcel` via `CourierCarryCore.evaluate`; PURE `CourierCarryDecisionTest`, `CourierIntegrationTest` |
 | Bag at `MAX_PARCELS` | yes — `Full` reserves nothing, a later offer can succeed | `Full`; no id reserved | all 256 held parcels | incoming offer | CODE `FlitCircleSync.foldParcel` via `CourierCarryCore.evaluate`; PURE `CourierCarryDecisionTest` |
 | Addressee not met on a fanout/sync pass | yes — next encounter re-offers via `CourierCarryCore.select` | no — held | bag and signed event stay | nothing | CODE `FlitCircleSync.fanout/sync`; PURE `CourierCarryDecisionTest` |
-| Handoff answered OK | no | `CourierCarryCore.ack` removes offered ids; outcome `handed` | opened copy on the recipient | acknowledged bag rows | CODE `FlitCircleSync` OK path, `FlitEngine.courierHandoffs`; PURE `CourierCarryDecisionTest`, `CourierIntegrationTest` |
+| Handoff answered OK — peer accepted the offer | no | `CourierCarryCore.ack` removes offered ids; outcome `handed` means accepted, not opened | recipient's copy is local and unobserved here | acknowledged bag rows | CODE `FlitCircleSync` OK path, `FlitEngine.courierHandoffs`; PURE `CourierCarryDecisionTest`, `CourierIntegrationTest` |
 | Handoff refused or carrier throws | yes — the parcel is re-offered on a later pass | outcome `failed`; no `ack` | bag stays with the courier | nothing | CODE `FlitCircleSync`, `FlitEngine.courierHandoffs` |
 | `CourierEnvelope.open` fails at the addressee (expired, wrong `toFp`, bad wrapped key) | yes — held until the core sweep | no events folded; no handoff entry or carry line | bag row stays for expiry | parsed parcel only | CODE `FlitEngine` open path; PURE `CourierEnvelopeCryptoTest`, `CourierIntegrationTest` |
 | `courierBag` row corrupt, or absent on an older row | no | decodes as an empty bag with a log line | unrelated Circle state stays | corrupt row | CODE `FlitCircleStore.decode`; PURE `FlitCircleStoreTest` |
@@ -635,8 +643,43 @@ The rows above are CODE from the frozen CLI API and the adapter at the harness
 seam, PURE from the inherited codec tests and the flag/cert-gate tests, and
 SIM-HARN from the two harness test classes named in the roadmap. No row claims
 DEVICE: rendering, capture and the air-gap walk are a later layer dated
-2026-12-08. This wave records no Gradle run, so no new test total is claimed
-here; the inventory above stays as recorded until TESTING.md is updated.
+2026-12-08 and are not verified here. Test totals are recorded in TESTING.md,
+not in this table.
+
+### 3.9 QR parcel app — camera, decode and out-of-cap states
+
+The 2026-12-07 app layer wraps the 2026-12-03 frame codec and the 2026-12-04
+CLI in two surfaces: `ParcelShowCard` renders the opaque frame strings returned
+by `ParcelCodec.encodeParcel`, and `ParcelScanCard` folds camera or pasted
+frames into `ParcelScanState` and hands the verified `ParcelPayload.bytes` to
+the existing inbound path. It adds no frame grammar, no crypto path and no
+route. `ParcelScanState` is Android-free: it holds opaque frame strings, parses
+them with `ParcelCodec.parse`, dedups by `(parcelId, seq)` and closes through
+`ParcelCodec.complete(frames, recipientFp, identity)`. The receiving identity's
+fingerprint is the recipient gate and the identity supplies the private key for
+the codec's `CourierEnvelope.open` call. Frame text is opaque to the UI: it
+reads only `parcelId`, `seq` and `count` from the descriptor for gating and
+progress, never the payload bytes, CRC or magic. No file name travels in a
+frame; the save name is chosen locally.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| Camera permission denied or still in flight | Paste path stays available; no analyzer is bound and no frame is captured | nothing kept | no file written | CODE `QrUi.QrScanCard:196-209`, `:211-247` (the CAMERA ask and paste fallback reused by `ParcelUi`); PURE paste-parser case in `ParcelScanStateTest` |
+| `Qr.decodeYPlane` returns null on a skewed or noisy camera frame | Ignore that frame; the analyzer stays bound and the next frame is tried | previously accepted frames kept | the undecodable frame | CODE `QrUi.CameraQrView:274-307`, `Qr.decodeGray:219-229`; PURE `FlitQrTest` noise case |
+| Impossible Y-plane geometry — row/pixel stride shorter than the row stencil, or a short buffer | `decodeYPlane` rejects before decoding; the analyzer's catch leaves scanning running | previously accepted frames kept | the malformed frame | CODE `Qr.decodeYPlane:195-206`, `QrUi.CameraQrView:303-307` |
+| Duplicate `(parcelId, seq)` in one scan | Ignore the repeat; the first copy stays authoritative | first copy of the chunk | the duplicate | CODE `ParcelScanState.add` (dedup), `ParcelCodec.complete:203-209`; PURE `ParcelScanStateTest` duplicate case |
+| A frame with another `parcelId` arrives mid-scan | Ignore the foreign frame; the current assembly is not replaced | current assembly kept | the foreign frame | CODE `ParcelScanState.add`; PURE `ParcelScanStateTest` mixed-id case |
+| `ParcelCodec.parse` returns null — bad magic, version, field shape, CRC, count/size/total disagreement, or out-of-range `seq`/`count` | Ignore the frame; nothing is routed to the assembly | current assembly kept | the offending frame | CODE `ParcelCodec.parse:111-114`, `ParcelCodec.parseFull:242-281`; PURE `ParcelCodecTest`, `ParcelCodecTamperTest` cap and tamper cases |
+| A frame pushes the accepted set past `MAX_PARCEL_FRAMES` (64) | Refuse the frame; progress stays at the cap | the 64 accepted frames | the excess frame | CODE `ParcelScanState.add` (cap), `ParcelCodec.MAX_FRAMES:50`; PURE `ParcelScanStateTest` over-cap case |
+| Scan dialog closed before every `seq` in `1..count` is present | Conclude incomplete; in-memory frames are dropped and nothing is durable | nothing durable | all in-memory frames | CODE `ParcelScanState` per-dialog lifetime; PURE `ParcelScanStateTest` missing-`seq` case |
+| `ParcelCodec.complete` returns null — CRC, digest, signature, cert binding or recipient mismatch | Conclude not from the claimed signer; log the line; no bytes released | frames held for the dialog only, nothing durable | frames and payload on close | CODE `ParcelCodec.complete:183-239`, `CourierEnvelope.verify:215-225`; PURE `ParcelScanStateTest` complete-null case |
+| Complete verified payload | Hand `ParcelPayload.bytes` to the inbound callback exactly once; a second `complete()` returns null | landed file or feed row survives | transient frames | CODE `ParcelScanState.complete` (once), `ParcelCodec.complete:232-238`; PURE `ParcelScanStateTest` in-order and double-complete cases |
+
+The rows above are CODE from the frozen seams (`ParcelUi`, `ParcelScanState`,
+`Qr`, `ParcelCodec`) and PURE from the JVM-only app and protocol tests. No row
+claims DEVICE: a live-camera capture and the two-phone air-gap walk are dated
+2026-12-08 and are not claimed here. Test totals are recorded in TESTING.md,
+not in this table.
 
 ---
 
@@ -830,6 +873,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Courier app worker / card projection | `FlitEngine.circleCourierDrop/courierHandoffs`, `FlitCircleSync.postParcel/fresh/fanout/sync`, `FlitCircleStore.update/decode`, `CourierCardUi.kt`, `CircleUi.computeFeedData`, `MainActivity` | `FlitCircleSyncTest`, `FlitCircleStoreTest`, `CourierCardUiTest` | — | — |
 | QR parcel frame codec | `ParcelCodec.kt` (`parse`/`encodeParcel`/`complete`, CRC and caps) | `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
 | QR parcel CLI | `ParcelCli.kt` (`parcelEncode`/`parcelDecode`, cert gate, `--out` gate, exit codes) | `ParcelCodecTest`, `ParcelCodecTamperTest`, `ParcelCliTest` | `ParcelCliHarnessTest` | — |
+| QR parcel app camera / decode / caps | `ParcelUi` camera-and-paste seam, `ParcelScanState`, `Qr.decodeYPlane:187-216`, `ParcelCodec.parse/complete` | `ParcelScanStateTest`, `FlitQrTest`, `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -838,7 +882,9 @@ walk is dated 2026-12-02 and is not claimed here. The 2026-12-03 QR parcel frame
 codec row is CODE and PURE only; camera capture and the air-gap walk are later
 layers and are not claimed here. The 2026-12-04 QR parcel CLI row adds CODE,
 PURE and SIM-HARN from the one-shot adapter and its two-temp-home harness pair,
-with no DEVICE entry; the air-gap walk is 2026-12-08.
+with no DEVICE entry; the air-gap walk is 2026-12-08. The 2026-12-07 app camera
+row in §3.9 is CODE and PURE only; no live-camera capture or air-gap walk is
+claimed for it.
 
 ---
 
@@ -848,7 +894,7 @@ None changes a shipped contract.
 
 1. **Two-phone RFCOMM transfer is not verified.** The rig has one phone and the
    bench box has no Bluetooth adapter (`bluetoothctl list` empty). The carrier
-   is code-complete and sim-proven; a real phone-to-phone socket path has not
+   is CODE- and SIM-evidenced; a real phone-to-phone socket path has not
    been walked, and neither have two-phone panic hops. A 3-identity Circle
    (one phone host plus two CLI nodes) **was** walked on device at 2026-11-26 —
    join, post, poll/vote, file landing and kick/rekey
@@ -888,9 +934,12 @@ None changes a shipped contract.
    are CODE and PURE; the §3.5 CLI carrier rows add CODE, PURE and SIM-HARN
    from the 2026-11-30 one-shot command and its harness pair. The bag moved
    between directories on the bench box only. The three-node courier walk is
-   2026-12-02 and yields no claim in this document.
+   2026-12-02 and yields no claim here.
 10. **The 2026-12-01 app courier layer has no DEVICE walk here.** The §3.6 rows
     are CODE and PURE only: the sync worker, bag persistence, local handoff
     projection and file-card carry line are source- and unit-test-evidenced.
-    The three-node courier walk dated 2026-12-02 yields no claim in this
-    document.
+    The three-node courier walk dated 2026-12-02 yields no claim here.
+11. **The 2026-12-07 app QR parcel layer has no camera or device walk here.**
+    The §3.9 rows are CODE from the frozen seams and PURE from the JVM-only app
+    and protocol tests. Live camera capture from a sensor and the two-phone
+    air-gap walk are dated 2026-12-08 and yield no claim here.
