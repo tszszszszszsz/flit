@@ -91,6 +91,16 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   verified payload, and hands the bytes to the existing receive path. No file name travels in a
   frame; the save name is local. This is code and JVM-tested only, with no camera or device walk
   claimed.
+- **Signed delivery receipts (protocol layer):** a Circle member can acknowledge a named file
+  drop with a signed `receipt` event whose body is the closed set `{dropId, sha256, keyId}` —
+  the acknowledged drop's id, the landed plaintext digest, and the per-drop key identifier
+  (provenance only, with no second time field or local status). The protocol module gates that
+  body and rolls up the current members who signed a well-formed receipt for one drop, keeping
+  at most one per member by canonical order. A receipt proves that the bytes landed hash-exact
+  on the signing member's own side; it says nothing about delivery to other members and does
+  not replace the sender-local delivery record. It rides the existing signed Circle log with no
+  new route, header or DTO field. This is JVM-pure on 2026-12-11: code and pure-tested only, with
+  no device walk claimed.
 
 ## Documentation
 

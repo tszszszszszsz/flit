@@ -24,8 +24,8 @@ Rules applied here:
   378, 396) are snapshots of earlier layers, not the current inventory: 356
   after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer and
   396 after the 2026-12-01 App layer, 416 after the app QA fixes, 436 after the
-  QR codec layer, 448 after the QR CLI layer. The current green figure is 550
-  (216 protocol + 272 app + 62 harness) after a clean `--rerun-tasks` run.
+  QR codec layer, 448 after the QR CLI layer. The current green figure is 574
+  (240 protocol + 272 app + 62 harness) after a clean `--rerun-tasks` run.
 - The 2026-12-01 App layer added 18 courier cases in `app/src/test` (11 in
   `CourierCardUiTest`, 4 added to `FlitCircleStoreTest`, 3 added to
   `FlitCircleSyncTest`), recorded from a green `--rerun-tasks` run (§4.2).
@@ -36,19 +36,24 @@ Rules applied here:
   the harness (5 more in `CourierCliTest`, 2 more in
   `CourierCarrierHarnessTest`). They took the rig from 396 to 416. The two QR parcel protocol classes in §4.1
   added 20 more cases (14 + 6), taking the rig to 436; the QR CLI layer added 12
-  harness cases (9 + 3), taking it to 550. All counts come from the JUnit XML.
+  harness cases (9 + 3), taking it to 574. All counts come from the JUnit XML.
 - The 2026-12-04 QR parcel CLI layer added two harness classes, `ParcelCliTest`
   (9 cases) and `ParcelCliHarnessTest` (3 cases), recorded from a fresh
   `--rerun-tasks` run. Both are in-process, on one box, with no
   device evidence.
 - The QR parcel App layer added `ParcelScanStateTest` (18 cases) and the courier
-  hardening added further cases; all are included in the green 550 from a
+  hardening added further cases; all are included in the green 574 from a
   clean `--rerun-tasks` run. No device or camera claim is attached to them.
 - The 2026-12-10 per-drop parity Integration layer adds four test classes
   (`DropParityTest`, `FlitCircleSyncTest`, `FlitEngineTest`, `DropKeyCliTest`)
-  with 6 + 4 + 11 + 10 cases, included in the green 550 from a clean
+  with 6 + 4 + 11 + 10 cases, included in the green 574 from a clean
   `--rerun-tasks` run (§4.4). No device walk is claimed on this date:
   the receive side is test-evidenced only.
+- The 2026-12-11 delivery receipts protocol layer adds three JVM-pure protocol
+  test classes (`ReceiptBodyTest`, `ReceiptTallyTest`, `ReceiptCanonicalTest`,
+  §4.1) with 12 + 6 + 6 cases, included in the green 574 from a clean
+  `--rerun-tasks` run. No device walk, new route, header, DTO field or v2.2 status
+  is claimed.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -62,10 +67,10 @@ Rules applied here:
 | `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **210** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
 | `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **257** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
 | `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **52** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **550** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
+| **Total** | Three modules, three roles | **574** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
 
 The 2026-12-04 CLI layer's two harness classes added 12 cases, moving harness
-from 39 to 51 and the total from 436 to 550 in the last green `--rerun-tasks`
+from 39 to 51 and the total from 436 to 574 in the last green `--rerun-tasks`
 run. The 2026-12-07 QR parcel App layer adds `ParcelScanStateTest` with 18
 cases, counted from source `@Test` annotations rather than a fresh JUnit XML
 report; the table above stays the last green inventory until a fresh
@@ -73,14 +78,20 @@ report; the table above stays the last green inventory until a fresh
 
 The 2026-12-09 per-drop content key protocol layer added three JVM-pure classes
 (`DropKeyCoreTest` 15, `DropKeyBodyTest` 14, `DropKeyCryptoTest` 12), included
-in the green 550 from a clean `--rerun-tasks` run (§4.1).
+in the green 574 from a clean `--rerun-tasks` run (§4.1).
 
 The 2026-12-10 per-drop parity Integration layer adds four test classes (§4.4)
-included in the green 550 from a clean `--rerun-tasks` run. The module table
-above reflects 216 + 272 + 62 = 550. Two classes are new (`DropParityTest` in
+included in the green 574 from a clean `--rerun-tasks` run. The module table
+above reflects 240 + 272 + 62 = 574. Two classes are new (`DropParityTest` in
 `protocol/`, `DropKeyCliTest` in `harness/`) and two add cases to existing app
 classes (`FlitCircleSyncTest`, `FlitEngineTest`). No Gradle run was made for
 this doc edit, and no device observation is attached to these rows.
+
+The 2026-12-11 delivery receipts protocol layer adds three JVM-pure protocol
+classes (§4.1) are included in the green 574. The module table
+and the 240 + 272 + 62 = 574 figure stay at the last green run until a fresh
+`--rerun-tasks` run counts the new cases from the JUnit XML. No Gradle run,
+device observation or new wire surface is attached to this edit.
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -120,9 +131,9 @@ Two notes about these commands:
    (which includes the 10 harness tests) was realized by the CI command, or by
    adding `:harness:test` locally; that baseline's README line ran 292 tests
    (82 + 210). At the last green run the same README line ran 377 tests
-   (216 + 272) and the CI command ran 550 (216 + 272 + 62). The 2026-12-07
+   (240 + 272) and the CI command ran 574 (240 + 272 + 62). The 2026-12-07
    App layer's `ParcelScanStateTest` and the later QA cases are included in
-   the green 550.
+   the green 574.
 2. `assembleRelease` falls back to the debug key when the local-only, gitignored
    `keystore.properties` is absent (`.github/workflows/rig.yml:36-38`,
    `app/build.gradle.kts:15-33`). That is a build-integrity check, not a
@@ -136,13 +147,13 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **216 protocol + 272 app + 62 harness = 550 tests,
+Result: `BUILD SUCCESSFUL`, **240 protocol + 272 app + 62 harness = 574 tests,
 0 failures, 0 errors, 0 skipped**, read from the XML result files under each
 module's `build/test-results/test/`. Provenance: the 2026-11-25 date belongs to
 the earlier 302-test baseline and the stale-XML incident in §8, not to the
 courier counts. The fresh run after the 2026-11-30 CLI layer recorded
 136 + 210 + 32 = 378; the run after the 2026-12-01 App layer recorded 396; the
-latest fresh run, after the courier/QR hardening, recorded 550. The `--rerun-tasks`
+latest fresh run, after the courier/QR hardening, recorded 574. The `--rerun-tasks`
 flag was deliberate: an earlier invocation
 reported all test tasks `UP-TO-DATE` and left XML from an older class layout in
 place (see §8). The 302-test baseline was green at `72225f8`; the added cases
@@ -231,6 +242,22 @@ harness, camera or device claim is attached to these cases.
 | `DropKeyBodyTest` (new) | 14 | `CircleCore.validFileBody` accepts exactly the legacy `{name,size,sha256}` set or the keyed `{name,size,sha256,keyGen,cipherSha,iv,wraps}` set and refuses a partial, extra or mistyped field, a non-integer or negative `size`, a non-positive `keyGen`, an `iv` not decoding to 12 bytes, an empty or over-cap `wraps` map, a lowercase or blank fingerprint, a value over `MAX_WRAPPED_CHARS = 512` and a body over 16 KiB; `keyedFileBody(...)` emits a body that passes the gate, `parseFileKeyBody` returns the same typed fields and returns null for every body the gate refuses; on a signed keyed body, changing `cipherSha`, `iv` or any wrap fails `CircleCore.verify` before unwrap. |
 | `DropKeyCryptoTest` (new) | 12 | `wrap` emits one Base64 entry per uppercase fingerprint with a usable certificate, at most `MAX_WRAPS = 32`, each within `MAX_WRAPPED_CHARS`, and refuses a larger roster rather than trimming it, with no entry for a member lacking a usable certificate; `unwrap` returns the 32-byte key under the matching `TlsIdentity` and returns null without throwing or writing a pin for a wrong identity, an absent fingerprint, malformed Base64 or bad OAEP padding; `seal` emits exactly `IV || ciphertext || tag` and `open` round-trips byte-exactly for seeded 0, 1, 8192-byte and 3 MiB inputs; flipping an IV, ciphertext or tag byte, using another key or changing the `FLITDROP1` AAD returns null; a rebuilt drop whose plaintext digest differs is refused. |
 
+#### Delivery receipt additions — 24 cases
+
+The three classes below are the 2026-12-11 delivery receipts protocol layer.
+They are JVM-pure, live in `protocol/src/test/kotlin/app/flit/share/protocol/`
+and drive the real `CircleCore` and `CircleEvent` seams. Their case counts
+(12 + 6 + 6) come from a clean `--rerun-tasks` run and are included in the
+green 574. Receipt is an
+additive Circle event carried in `CircleRequest.events`; no route, header, DTO
+field or v2.2 status changes, and no device claim is attached to these cases.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `ReceiptBodyTest` (new) | 12 | `CircleCore.RECEIPT_BODY_KEYS` is exactly the closed set `{dropId,sha256,keyId}`; `validReceiptBody` accepts only non-blank bounded strings and refuses a partial, extra, mistyped, blank or over-cap field, including any `landedMs` key; `keyId` is provenance only and `createdMs` remains the event time; `CircleEvent.RECEIPT = "receipt"` is the eleventh verb in `TYPES` with the existing verb values unchanged. |
+| `ReceiptTallyTest` (new) | 6 | `CircleCore.receiptAuthors(events, dropId, sha256, members)` filters receipt events by exact body `dropId`/`sha256`, verifies the signature, keeps only current members and returns a deduplicated set of author fingerprints with at most one receipt per member (latest wins); a forged author, a non-member, a mismatched drop or digest and a failed signature contribute nobody; non-receipt events and the existing kick/vote tallies are unaffected. |
+| `ReceiptCanonicalTest` (new) | 6 | Canonical bytes stay byte-identical for the existing verbs and cover `dropId`, `sha256` and `keyId` for `RECEIPT` with `sig`/`cert` excluded, so changing any covered field changes the bytes; replay windows and the bounded seen set are unchanged, and the additive receipt event adds no route, header, DTO field or v2.2 status. |
+
 ### 4.2 App — 239 tests (210 baseline + 18 courier + 11 QA)
 
 All are JVM tests of Android-free seams: codecs, reducers, pure policy math and
@@ -279,7 +306,7 @@ a counted runtime case: an old-style call without it must still resolve.
 
 #### App QA additions — 11 cases
 
-The cases below are part of the current 257 app / 550 rig baseline, added after
+The cases below are part of the current 257 app / 574 rig baseline, added after
 the 2026-12-01 App layer. They are counted from the JUnit XML, not from a target
 figure, and carry no device evidence.
 
@@ -294,7 +321,7 @@ The class below belongs to the 2026-12-07 QR parcel App layer. It is a new
 Android-free JVM class in `app/src/test/kotlin/app/flit/share/`, driving the
 real `ParcelCodec.complete(frames, recipientFp, identity)` with a recipient
 fingerprint and the receiving `TlsIdentity`. Its 18 cases are included in the
-green 550 (257 app) from a clean `--rerun-tasks` run. The codec's own CRC,
+green 574 (257 app) from a clean `--rerun-tasks` run. The codec's own CRC,
 digest, signature and recipient cases stay in §4.1; no camera, Android
 framework, Robolectric or device claim is made here.
 
@@ -330,7 +357,7 @@ on one box.
 
 #### Harness QA additions — 7 cases
 
-The cases below are part of the current 52 harness / 550 rig baseline, added
+The cases below are part of the current 52 harness / 574 rig baseline, added
 after the 2026-11-30 CLI layer. They are counted from the JUnit XML and carry no
 device evidence — the bag moves between directories on one box.
 
@@ -344,7 +371,7 @@ device evidence — the bag moves between directories on one box.
 The two classes below belong to the 2026-12-04 QR parcel CLI layer. Both are
 in-process harness tests in `app.flit.share.harness`, driving the `ParcelCli`
 adapter through the protocol `ParcelCodec` with PNG frames rendered and read
-on one box. The 9 + 3 cases are included in the current 52 harness / 550 rig
+on one box. The 9 + 3 cases are included in the current 52 harness / 574 rig
 count from a `--rerun-tasks` run. No socket, app module or device walk is
 involved.
 
@@ -358,7 +385,7 @@ involved.
 The four classes below are the 2026-12-10 Integration layer that wires the
 2026-12-09 per-drop content keys into the app and the CLI. Two are new JVM-pure
 classes and two add cases to existing app classes. Counts come from a clean
-`--rerun-tasks` run and are included in the green 550. The receive side is
+`--rerun-tasks` run and are included in the green 574. The receive side is
 test-evidenced only and no device walk is claimed on this date.
 
 | Class | # | What it pins |
@@ -399,7 +426,9 @@ The per-class tables in §4 are the authority for counts.
   fan-out and host governance), `CircleHarnessTest` (two nodes over production
   routes). The file-drop event body is exactly `{name,size,sha256}` — no path,
   no queue token, no bytes — and delivery status is sender-local, never
-  gossiped.
+  gossiped. A `receipt` event carries `{dropId,sha256,keyId}` and is tallied by
+  `receiptAuthors` as verified current-member authors, with no `landedMs` field
+  and no new route.
 - **Discovery and routing.** `FlitQrTest`, `FlitKnownTest`, `FlitRouteTest`,
   `FlitBleTest`, `FlitSubnetTest` and `FlitEngineTest` cover QR codecs, QR-only
   and per-device route policy, BLE advertising/arbiter/duty cycle, the subnet
@@ -647,12 +676,15 @@ then 121, 126, 145, 183, 231, 286 and 302 at `72225f8`, 356 after the
 2026-11-27 protocol layer (136 + 210 + 10), 378 after the 2026-11-30 CLI layer
 (136 + 210 + 32), 396 after the 2026-12-01 App layer (136 + 228 + 32) and 416
 after the app QA fixes (138 + 239 + 39) and 436 after the 2026-12-03 QR codec
-layer (216 + 272 + 39). The CI header is updated to 158/239/32 as well. The CI workflow
+layer (240 + 272 + 39). The CI header is updated to 158/239/32 as well. The CI workflow
 header (`.github/workflows/rig.yml:1-3`) still quotes 36/67/4; that line is
 stale. The 2026-12-07 QR parcel App layer adds 18 source-counted cases in
-`ParcelScanStateTest` on top of 550; that figure is pending a fresh run and is
+`ParcelScanStateTest` on top of 574; that figure is pending a fresh run and is
 not asserted as green here. The 2026-12-09 per-drop content key protocol layer
 adds three classes in §4.1 (`DropKeyCoreTest`, `DropKeyBodyTest`,
-`DropKeyCryptoTest`) are included in the green 550 from a clean run.
+`DropKeyCryptoTest`) are included in the green 574 from a clean run.
 The 2026-12-10 per-drop parity Integration layer adds four classes in §4.4
-with 31 cases included in the green 550; no device observation is asserted.
+with 31 cases included in the green 574; no device observation is asserted.
+The 2026-12-11 delivery receipts protocol layer adds three classes in §4.1
+with 24 cases included in the green 574; no device observation is asserted
+for them.

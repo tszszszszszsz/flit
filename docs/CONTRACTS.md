@@ -533,7 +533,7 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 ### 7.3 Event kinds and closed body shapes (`circle/CircleEvent.kt`, `FlitCircleSync.kt:175-234`)
 
 `CircleEvent(id, circleId, authorFp, lamport, type, body, sig, createdMs, cert)`.
-`type` is one of ten verbs, including `parcel`; `body` is a small JSON object:
+`type` is one of eleven verbs, including `parcel` and `receipt`; `body` is a small JSON object:
 
 | Verb | Body shape (exact keys) |
 | --- | --- |
@@ -547,6 +547,7 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 | `role` | `{"targetFp":"...","role":"OWNER"|"ADMIN"|"MEMBER"}` |
 | `rekey` | `{"keyB64":"...","gen":<int>}` (app adds a `members` array; host-authority only) |
 | `parcel` | `{"toFp":"...","envelope":"..."}` — **exactly** `PARCEL_BODY_KEYS`, no extra key; closed gate and envelope in §13.3 |
+| `receipt` | `{"dropId":"...","sha256":"...","keyId":"..."}` — **exactly** `RECEIPT_BODY_KEYS`, no `landedMs`, path or status; closed gate and roll-up in §21 |
 
 `validFileBody()` enforces the exact key set and types: `name`/`sha256` non-blank
 bounded strings, `size` a JSON number (the string `"12"` is refused). That is
@@ -1805,3 +1806,152 @@ plaintext drop, and a repeat of identical bytes producing a different
 `cipherSha` and a different wrapped key. No device observation is made for this
 layer; the receive side is test-evidenced only. See
 [per-drop-parity.md](roadmap/per-drop-parity.md).
+
+## 21. Delivery receipt contract — event body, gate and tally (2026-12-11)
+
+### 21.1 Layer and ownership
+
+This is the Protocol layer for delivery receipts. A receipt is one signed
+`CircleEvent` in which a member acknowledges that a named file drop landed on
+that member's device. It lives in the JVM-pure package
+`app.flit.share.protocol.circle`: the eleventh verb in `CircleEvent.kt`, a new
+type-specific body gate and a pure roll-up in `CircleCore.kt`. No Android
+import, socket, file write, preference or wall-clock read is added. No route,
+header, DTO field, QR parameter, status code or v2.2 shape changes: the receipt
+is an additive event carried in `CircleRequest.events` on the existing
+`POST /api/flit/v1/circle/sync` route (§1, §7.3, §7.5), and a stock LocalSend
+v2.2 peer sees the same wire it saw before (§2, §4).
+
+`RECEIPT` is an event, not a delivery status. It does not change
+`CircleDelivery.statuses`, the sender's spool path or any reducer on this date.
+
+### 21.2 Frozen API
+
+```
+object CircleEvent {
+  const val RECEIPT = "receipt"      // eleventh verb
+  val TYPES: Set<String> = setOf(..., RECEIPT)
+}
+
+object CircleCore {
+  val RECEIPT_BODY_KEYS: Set<String> = setOf("dropId", "sha256", "keyId")
+  fun validReceiptBody(body: String): Boolean
+  fun receiptAuthors(events: Iterable<CircleEvent>, dropId: String,
+                     sha256: String, members: Iterable<String>): Set<String>
+}
+```
+
+`RECEIPT = "receipt"` joins `CircleEvent.TYPES` as the eleventh verb. Adding it
+does not change `CircleCore.canonical`, `validShape`, or the validity or
+acceptance of any existing verb.
+
+### 21.3 Receipt body
+
+The signed `body` is a JSON object with exactly the closed key set
+`RECEIPT_BODY_KEYS = {"dropId","sha256","keyId"}`:
+
+```
+receipt  {"dropId":"<id of the file announcement>","sha256":"<landed content digest>","keyId":"<per-drop key identifier>"}
+```
+
+| Field | Type | Contract |
+| --- | --- | --- |
+| `dropId` | String | The `id` of the `file` event being acknowledged, not the recipient's local delivery id. Non-blank, at most `MAX_FIELD_CHARS` (256). |
+| `sha256` | String | The plaintext digest carried by the `file` event (§19.3), read after `DropKeyCore.open` and the landing hash gate; `ProtocolClient.sendFiles` gates on the sealed `cipherSha` instead (§20.4). Non-blank, at most `MAX_FIELD_CHARS` (256). |
+| `keyId` | String | The per-drop key identifier published by `DropKeyCore.keyId` (§19.6). Provenance only: a receipt never invents one, and it is not a selection key (§21.5). Non-blank, at most `MAX_FIELD_CHARS` (256). |
+
+The whole body is at most `MAX_BODY_CHARS` (16 KiB). There is no second time
+field: `createdMs` on the event is the acknowledgement time. The body carries
+no `path`, `spoolPath`, `token`, `landedMs`, key material, file bytes or local
+status string. A rekey that changes a key identifier does not alter an earlier
+receipt for the same landed content.
+
+### 21.4 `CircleCore.validReceiptBody` gate
+
+`validReceiptBody(body)` is the type-specific gate for the receipt verb, in the
+shape of `validFileBody` (§19.5). It accepts a body when and only when:
+
+1. The body is non-blank and at most `MAX_BODY_CHARS` (16 KiB).
+2. `WireJson.json` parses it into a `JsonObject` whose keys are exactly
+   `RECEIPT_BODY_KEYS` — no missing, extra or renamed key.
+3. Each value is a JSON string primitive (a number or boolean is refused) that
+   is non-blank and within `MAX_FIELD_CHARS` (256).
+
+A blank, oversized, malformed, non-string-valued or extra-key body returns
+false. The gate is structural only: it signs nothing, pins nothing and reads no
+store. `validShape()` stays type-agnostic bounds (§7.4), so this gate never
+changes an existing event's signature or acceptance.
+
+### 21.5 `CircleCore.receiptAuthors` tally
+
+`receiptAuthors(events, dropId, sha256, members)` is a pure roll-up of the
+current members who signed a well-formed receipt for one landed drop:
+
+1. Normalise `members` with trim and uppercase, as in `CircleCore.tally` (§7.4).
+2. Iterate `CircleCore.order(events)`. Keep an event only when its `type` is
+   `receipt`, its author fingerprint is in the normalised member set, its body
+   passes `validReceiptBody`, both body `dropId` and `sha256` equal the two
+   arguments exactly, and `CircleCore.verify` passes. A departed/non-member, a
+   body for another drop, a malformed body or a forgery is ignored.
+3. Keep at most one receipt per author. Overwriting while iterating in `ORDER`
+   makes the greatest-by-`ORDER` receipt the winner ("latest wins"), so two
+   peers that received the same receipts in different orders return the same
+   set.
+4. Return the deduplicated set of author fingerprints; the caller counts it.
+
+`keyId` is recorded in the signed body but is not a selection key: a later
+rekey that changes the key identifier does not invalidate an earlier receipt
+for the same `(dropId, sha256)`. The function introduces no new cap and no replay
+state; it is a pure fold over the supplied events.
+
+### 21.6 Canonical, replay, wire and state boundary
+
+1. **Canonical bytes unchanged.** `CircleCore.canonical` covers the body as one
+   length-prefixed field (§7.4); the receipt reuses it with domain tag
+   `FLITCIRCLE1` and the existing `id`, `circleId`, `authorFp`, `lamport`,
+   `type`, `body`, `createdMs` field order. No delimiter can be smuggled through
+   the body, and no existing verb's bytes change.
+2. **Signature unchanged.** `CircleCore.create` mints the receipt with the
+   receiver's `TlsIdentity`, `CircleCore.sign` writes `sig`, and
+   `CircleCore.verify` binds the embedded certificate's own SHA-256 DER to
+   `authorFp` before verifying and pinning (§4.1). A sender cannot forge a
+   receiver's receipt: the certificate is checked against the claimed author
+   before the pin store is touched. There is no second signature primitive.
+3. **Replay and caps unchanged.** Receipts use `CircleCore.order`, `dedup`,
+   `evaluate`/`accept` and `fresh` exactly as the other verbs do: `6 h`
+   `REPLAY_WINDOW_MS`, `5 min` `CLOCK_SKEW_MS`, a bounded `4096`-id set,
+   `MAX_EVENTS_PER_REQUEST = 1024`, `MAX_REQUEST_BYTES = 8 MiB`,
+   `MAX_SIG_CHARS = 1024`, `MAX_CERT_CHARS = 8 KiB`, and precedence
+   `Invalid → OutsideWindow → Duplicate → Accept`. Callers verify before
+   `evaluate`, because `evaluate` reserves the id before crypto. No new cap is
+   introduced: the roster is bounded by `FlitCircleHost.MAX_MEMBERS = 500` and
+   the durable log by `FlitCircleStore.EVENT_CAP = 500`.
+4. **No route or v2.2 change.** No `PATH_*` constant, Ktor route, `LinkProvider`,
+   byte-transfer route, HTTP header, `CircleRequest`/`CircleResponse` field,
+   status code, QR key parameter or DTO default changes. The receipt rides in
+   `CircleRequest.events` on `POST /api/flit/v1/circle/sync` under the existing
+   `8 MiB` cap, or inside a courier/QR parcel payload that already carries
+   signed events (§13–§18). `/info`, `/register`, `/prepare-upload`, `/upload`
+   and `/cancel`, their DTO shapes and their status behaviour stay as in §2.
+5. **No new state.** The protocol module owns no durable receipt state; its only
+   mutable memory is the existing bounded `seen` id set in `CircleCore`. The
+   durable log is `FlitCircleStore.events`; `FlitCircleStore.reduce` already
+   appends unknown verbs as history, so a folded receipt enters that log without
+   a reducer change on this date. Sender-local `CircleDelivery.statuses`
+   (`pending`, `sent`, `refused`, `failed`) stay local-only and unchanged: a
+   receipt is not a gossiped status field and does not replace the delivery
+   record. The `FlitCircleSync.circleBodyValid` branch for the new verb (its
+   current `else -> false` refuses it) and the `FlitCircleHost` SYNC body gate,
+   as well as mapping a receipt to a local status, belong to 2026-12-14.
+
+### 21.7 Evidence boundary
+
+CODE establishes the verb, the closed `RECEIPT_BODY_KEYS` set, the
+`validReceiptBody` gate and the `receiptAuthors` roll-up. PURE JVM tests cover
+the exact key set and bounds, canonical bytes of the existing verbs unchanged,
+create/sign/verify round-trip and forged-author rejection, replay and dedup
+precedence, and roll-up convergence with wrong-drop, malformed, non-member and
+rekey-ignored events. No SIM-HARN or DEVICE evidence exists for receipts on this
+date, and no device claim is made: a receipt is one member's signed
+acknowledgement of a local, hash-exact landing, not proof of delivery to every
+member. See [delivery-receipts.md](roadmap/delivery-receipts.md).

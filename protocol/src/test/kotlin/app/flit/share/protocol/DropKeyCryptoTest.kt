@@ -234,7 +234,7 @@ class DropKeyCryptoTest {
 
     @Test
     fun `canonical vectors for every existing verb are byte-identical`() {
-        assertEquals(CircleEvent.TYPES, GOLDEN.keys, "goldens cover exactly the ten existing verbs")
+        assertEquals(CircleEvent.TYPES, GOLDEN.keys, "goldens cover exactly the eleven existing verbs")
         for ((type, expectedHex) in GOLDEN) {
             val event = CircleEvent(
                 id = "id-1",
@@ -268,6 +268,7 @@ class DropKeyCryptoTest {
             CircleEvent.ROLE to """{"targetFp":"ABCD","role":"ADMIN"}""",
             CircleEvent.REKEY to """{"keyB64":"a2V5","gen":1}""",
             CircleEvent.PARCEL to """{"toFp":"ABCD","envelope":"ZW52"}""",
+            CircleEvent.RECEIPT to """{"dropId":"d1","sha256":"abc","keyId":"d1:1"}""",
         )
 
         /** Golden canonical bytes, generated independently from the documented field rule. */
@@ -312,6 +313,10 @@ class DropKeyCryptoTest {
                 "0000000b464c4954434952434c45310000000469642d3100000008636972636c652d31" +
                 "000000044142434400000000000000070000000670617263656c000000217b22746f4670223a2241424344" +
                 "222c22656e76656c6f7065223a225a573532227d000001a3185c5000",
+            CircleEvent.RECEIPT to
+                "0000000b464c4954434952434c45310000000469642d3100000008636972636c652d31" +
+                "0000000441424344000000000000000700000007726563656970740000002d7b2264726f704964223a" +
+                "226431222c22736861323536223a22616263222c226b65794964223a2264313a31227d000001a3185c5000",
         )
     }
 }

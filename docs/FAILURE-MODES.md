@@ -792,6 +792,47 @@ The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN: no
 harness walk, camera capture or phone observation is attached to this layer,
 and the 2026-12-17 full-feature walk is not claimed here.
 
+### 3.12 Delivery receipts — the protocol conclusion table
+
+The 2026-12-11 Protocol layer
+([delivery-receipts.md](roadmap/delivery-receipts.md)) adds one signed Circle
+verb, one body gate and one pure roll-up. A receipt is an ordinary
+`CircleEvent` in which one member acknowledges that a named file drop landed on
+that member's device; it proves local landing, not global delivery, and no peer
+may read it as a claim about another member's copy. The exact additive API is:
+
+```
+CircleEvent.RECEIPT = "receipt"                       // eleventh verb in TYPES
+CircleCore.RECEIPT_BODY_KEYS = setOf("dropId","sha256","keyId")
+CircleCore.validReceiptBody(body: String): Boolean    // closed keys, non-blank bounded strings
+CircleCore.receiptAuthors(events, dropId, sha256, members): Set<String>
+```
+
+`validReceiptBody` parses with `WireJson.json`, requires `obj.keys ==
+RECEIPT_BODY_KEYS` and three non-blank string values within
+`MAX_FIELD_CHARS` (256); `keyId` is provenance only and there is no `landedMs`
+field — `createdMs` stays the acknowledgement time. `receiptAuthors` filters by
+exact `dropId`/`sha256`, the normalized current-member set and `verify`, and
+returns one author per member chosen by `CircleCore.ORDER`. Canonical bytes
+(`FLITCIRCLE1`), signature, dedup and the 6 h / 5 min / 4096 replay rules are
+unchanged; the protocol module holds no durable receipt state and adds no
+route, header or DTO field. A receipt is an event, not a gossiped
+`CircleDelivery` status.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| Malformed receipt body — a missing key, an extra key (including `landedMs`), a non-string value, a blank value or a value over `MAX_FIELD_CHARS` | `validReceiptBody` false; `receiptAuthors` ignores the event — never signed, folded or counted | yes — the acknowledged drop bytes are untouched | the malformed body | CODE `CircleCore.validReceiptBody:439-450`, `receiptAuthors:315-334`; PURE `ReceiptBodyTest` |
+| Signer is not in the supplied current-member set (departed or outsider fingerprint) | ignored by `receiptAuthors` — the same normalized member gate as `CircleCore.tally`; the author contributes no acknowledgement | yes | the non-member receipt from the tally | CODE `CircleCore.receiptAuthors:321-325`, `normalized:518-519`; PURE `ReceiptTallyTest` |
+| Forged signature — bad or blank `sig`, or a cert whose SHA-256 DER fingerprint is not `authorFp` | `verify` false; no pin is written and `receiptAuthors` does not count the receipt | yes | the forged receipt | CODE `CircleCore.verify:180-195`, `receiptAuthors:330`; PURE `ReceiptCanonicalTest` |
+| Duplicate acknowledgement — two receipts from one author for the same `(dropId, sha256)`, or the same id seen again | at most one vote per member: the greatest-by-`ORDER` receipt wins (latest wins, independent of arrival order); a repeated id returns `Decision.Duplicate` and does not reserve the id again | yes | the losing or replay copy from the tally | CODE `CircleCore.receiptAuthors:322-333`, `order:203-213`, `evaluate:467-482`; PURE `ReceiptTallyTest`, `ReceiptCanonicalTest` |
+
+The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN:
+receipts add no endpoint, carrier, camera or app state on this date. App
+minting, host/SYNC body gating, file-card display, CLI commands and the
+two-node receipt walk belong to 2026-12-14 and yield no claim here. A receipt
+stays a local-landing acknowledgement; it is never evidence that a drop
+reached every member.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -987,6 +1028,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | QR parcel app camera / decode / caps | `ParcelUi` camera-and-paste seam, `ParcelScanState`, `Qr.decodeYPlane:187-216`, `ParcelCodec.parse/complete` | `ParcelScanStateTest`, `FlitQrTest`, `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
 | Per-drop content keys (pure core) | `DropKeyCore.wrap/unwrap/seal/open`, `keyedFileBody`, `parseFileKeyBody`; `CircleCore.validFileBody/verify`; `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
 | Per-drop parity (app + CLI) | `FlitEngine.circlePostFile`, `FlitCircleSync.circleBodyValid/postFile`, `FlitCircleStore.CircleDelivery.NO_KEY`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish`, `DropKeyCore.wrap/unwrap/open` | `DropParityTest`, `FlitCircleSyncTest`, `FlitEngineTest`, `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
+| Delivery receipts (protocol, local landing) | `CircleEvent.RECEIPT`, `CircleCore.RECEIPT_BODY_KEYS` / `validReceiptBody` / `receiptAuthors` / `verify` | `ReceiptBodyTest`, `ReceiptTallyTest`, `ReceiptCanonicalTest` | — | no device walk; one member's landing is not global delivery |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -1002,7 +1044,10 @@ PURE only: the frozen pure protocol seams and their JVM tests. No harness,
 camera, CLI or device observation is attached to this layer. The 2026-12-10
 per-drop parity row in §3.11 is CODE and PURE only: its four refusal conclusions
 carry no harness, camera or device observation, and the 2026-12-17 full-feature
-walk is not claimed here.
+walk is not claimed here. The 2026-12-11 delivery-receipt row in §3.12 is CODE
+and PURE only: the four conclusions — malformed body, non-member signer, forged
+signature and duplicate acknowledgement — carry no harness, camera or device
+observation, and the 2026-12-14 two-node receipt walk is not claimed here.
 
 ---
 
@@ -1073,3 +1118,11 @@ None changes a shipped contract.
     cap, no wrap for the reader, and tag or plaintext digest mismatch — carry no
     DEVICE: no harness walk, camera capture or phone observation is attached to
     this layer, and the 2026-12-17 full-feature walk is not claimed here.
+14. **The 2026-12-11 delivery-receipt protocol layer has no device walk here.**
+    The §3.12 rows are CODE from the frozen `CircleEvent`/`CircleCore` seams and
+    PURE from the three JVM-only protocol test classes. The four conclusions —
+    malformed body, non-member signer, forged signature and duplicate
+    acknowledgement — carry no DEVICE or SIM/HARN: app minting, host/SYNC body
+    gating, file-card display, CLI commands and the two-node receipt walk belong
+    to 2026-12-14 and yield no claim here. A receipt proves local landing by one
+    member, not global delivery.

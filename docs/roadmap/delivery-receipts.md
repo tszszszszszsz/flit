@@ -33,8 +33,10 @@ Three additive protocol-layer items:
 2. `CircleCore.RECEIPT_BODY_KEYS` and `CircleCore.validReceiptBody(body)`, a
    type-specific gate in the shape of `validFileBody`
    (`CircleCore.kt:304-325`).
-3. `CircleCore.receiptAuthors(events, dropId, sha256, members)`, a pure roll-up
-   of the current members who signed a well-formed receipt for one drop.
+3. `CircleCore.receiptAuthors(events, dropId, sha256, members): Set<String>`, a
+   pure roll-up of the current members whose signature-verified, well-formed
+   receipt acknowledges one `(dropId, sha256)` pair. Each contributing member
+   appears at most once; the latest receipt per member wins.
 
 No new route, header, DTO field, frame, crypto path or persisted store is
 introduced. `CircleRequest`, `CircleResponse`, `Link` and `CircleWire.canonical`
@@ -56,16 +58,19 @@ recipient's local delivery id. `sha256` is the plaintext digest carried by the
 `file` event, read after `DropKeyCore.open` and the landing hash gate;
 `ProtocolClient.sendFiles` gates on the sealed `cipherSha` instead. `keyId` is
 provenance from the 2026-12-09/10 per-drop key layer. No `path`, `spoolPath`, `token`, key material, file bytes or local status
-string is present. `createdMs` on the event is the acknowledgement time; no
-second time field is added to the body. All three values are non-blank strings
-bounded by `CircleCore.MAX_FIELD_CHARS` (256); the body is bounded by
-`MAX_BODY_CHARS` (16 KiB).
+string is present. There is no `landedMs` field: `createdMs` on the event is
+the sole acknowledgement time and no second time field is added to the body.
+All three values are non-blank strings bounded by `CircleCore.MAX_FIELD_CHARS`
+(256); the body is bounded by `MAX_BODY_CHARS` (16 KiB). `keyId` is provenance
+only and is not a selection key in the roll-up.
 
-`validReceiptBody(body)` parses with `WireJson.json` into a `JsonObject`,
-requires `obj.keys == RECEIPT_BODY_KEYS`, requires each value to be a JSON
-string primitive that is non-blank and within `MAX_FIELD_CHARS`, and returns
-false for a blank, oversized, malformed or extra-key body. It is structural
-only: it signs nothing, pins nothing and reads no store.
+`CircleCore.validReceiptBody(body)` parses with `WireJson.json` into a
+`JsonObject`, requires `obj.keys == CircleCore.RECEIPT_BODY_KEYS`, requires each
+of `dropId`, `sha256` and `keyId` to be a JSON string primitive that is
+non-blank and within `MAX_FIELD_CHARS`, and returns false for a blank,
+oversized, malformed, missing-key or extra-key body. It is structural only: it
+signs nothing, pins nothing, verifies no signature and reads no store; a
+non-string value such as a numeric `size` is refused just as in the file gate.
 
 **Canonical and signature.** Receipts reuse `CircleCore.canonical(e)` unchanged:
 domain tag `FLITCIRCLE1`, then length-prefixed `id`, `circleId`, `authorFp`,
@@ -89,15 +94,19 @@ touched. There is no second signature primitive; this is the same
 introduced: a roster is already bounded by `FlitCircleHost.MAX_MEMBERS = 500`
 and the durable log by `FlitCircleStore.EVENT_CAP = 500`.
 
-**Roll-up.** `receiptAuthors(events, dropId, sha256, members)` filters to
-events whose `type` is `receipt`, whose body passes `validReceiptBody`, whose
-`dropId` and `sha256` equal the two arguments, and whose `authorFp` is in the
-normalised `members` set (trim, uppercase, as in `CircleCore.tally`). One
-author contributes at most one entry, chosen by `CircleCore.ORDER`, so two peers
-that received the same receipts in different orders return the same set.
-`keyId` is recorded in the signed body but is not a selection key: a later
-rekey that changes a key identifier does not invalidate an earlier receipt for
-the same landed content. The caller counts the returned set.
+**Roll-up.** `receiptAuthors(events, dropId, sha256, members)` returns a
+deduplicated `Set<String>` of author fingerprints. It filters to events whose
+`type` is `receipt`, whose body passes `validReceiptBody`, whose `dropId` and
+`sha256` equal the two arguments, whose signature verifies (the same
+cert-to-`authorFp` binding as `CircleCore.verify`), and whose `authorFp` is in
+the normalised `members` set (trim, uppercase, as in `CircleCore.tally`). Each
+member contributes at most one fingerprint; among that member's receipts the
+latest by deterministic `CircleCore.ORDER` wins, so two peers that received the
+same receipts in different orders return the same set. `keyId` is recorded in
+the signed body but is not a selection key: a later rekey that changes a key
+identifier does not invalidate an earlier receipt for the same landed content.
+The caller counts the returned set; the roll-up itself reserves no id in the
+replay set and reads no delivery status.
 
 **Wire and state ownership.** No new frame on `Link`, no new field on
 `CircleRequest`/`CircleResponse`. A receipt travels in `CircleRequest.events`
@@ -127,10 +136,12 @@ the `FlitCircleSync.circleBodyValid` branch for the new verb (its current
    or delivery status.
 4. Signature bytes cover every event field except `sig` and `cert`; `verify`
    checks a first-seen cert against `authorFp` before pinning it.
-5. A receipt counts only when both `dropId` and `sha256` match the drop being
-   read and its author is in the supplied current-member set.
-6. At most one receipt per author per drop contributes to the roll-up; the
-   winner is chosen by `CircleCore.ORDER`, independent of arrival order.
+5. A receipt counts only when its body is well formed, its signature verifies
+   against the claimed `authorFp`, both `dropId` and `sha256` match the drop
+   being read, and its author is in the supplied current-member set.
+6. At most one receipt per author per drop contributes to the roll-up; among
+   that author's receipts the latest by `CircleCore.ORDER` wins, independent of
+   arrival order, and the returned value is a set of author fingerprints.
 7. Receipts obey the 6 h replay window, 5 min clock skew, bounded 4096-id set
    and `Invalid → OutsideWindow → Duplicate → Accept` precedence; `verify`
    precedes `evaluate`.
@@ -147,21 +158,22 @@ the `FlitCircleSync.circleBodyValid` branch for the new verb (its current
 
 | Condition | Conclusion | Keeps bytes | Drops | Evidence |
 | --- | --- | --- | --- | --- |
-| Receipt body missing a key, with an extra key, or oversized | `validReceiptBody` false; never signed, folded or counted | yes — the drop bytes are untouched | the malformed body only | CODE `CircleCore.kt:304-325`; PURE test on 2026-12-11 |
-| Bad signature, blank `sig`, or cert fingerprint not equal to `authorFp` | `verify` false; no pin is written and the receipt is not counted | yes | the forged receipt | CODE `CircleCore.kt:165-187`; PURE test on 2026-12-11 |
+| Receipt body missing a key, with an extra key, or oversized | `validReceiptBody` false; never signed, folded or counted by `receiptAuthors` | yes — the drop bytes are untouched | the malformed body only | CODE `CircleCore.validReceiptBody`; PURE test on 2026-12-11 |
+| Bad signature, blank `sig`, or cert fingerprint not equal to `authorFp` | `verify` false; no pin is written and `receiptAuthors` leaves the author out of the set | yes | the forged receipt | CODE `CircleCore.verify`; PURE test on 2026-12-11 |
 | `createdMs` older than 6 h or more than 5 min ahead | `Decision.OutsideWindow`; id not reserved | yes | the stale receipt from the tally | CODE `CircleCore.kt:342-360`; PURE test on 2026-12-11 |
 | Same id seen again | `Decision.Duplicate`; quiet answer, counted once | yes | the second copy | CODE `CircleCore.kt:342-370`; PURE test on 2026-12-11 |
-| `dropId` or `sha256` does not match the drop read | ignored by `receiptAuthors` | yes | the mismatched receipt from the tally | CODE, new roll-up; PURE test on 2026-12-11 |
-| Author not in the current-member set | ignored by `receiptAuthors` | yes | the departed/outsider receipt from the tally | CODE, same member gate as `CircleCore.tally`; PURE test on 2026-12-11 |
+| `dropId` or `sha256` does not match the drop read | ignored by `receiptAuthors` | yes | the mismatched receipt from the tally | CODE `CircleCore.receiptAuthors`; PURE test on 2026-12-11 |
+| Author not in the current-member set | ignored by `receiptAuthors` | yes | the departed/outsider receipt from the tally | CODE `CircleCore.receiptAuthors` (same member gate as `CircleCore.tally`); PURE test on 2026-12-11 |
 | Bytes did not land hash-exact at the receiver | no receipt is minted; sender-local delivery status is unchanged | yes — the part/sidecar rules from `ServerCore` still decide | nothing | CODE `ServerCore.kt:594-596,607-625` |
 | Carrier dies while a receipt is in a courier or QR parcel | the receipt stays in the bounded signed log and is re-offered by fan-out delta or calm repair | yes | nothing | CODE `FlitCircleSync.kt:461-515,673-716`; earlier courier/QR layers |
 
 ## Tests
 
-Pure tests come first, in a new `ReceiptCoreTest` under
-`protocol/src/test/kotlin/app/flit/share/protocol/`, using
-`TlsIdentity.generate()` and explicit `createdMs`. No socket, Android class or
-clock sleep:
+Pure tests come first, in three classes under
+`protocol/src/test/kotlin/app/flit/share/protocol/` — `ReceiptBodyTest` for the
+gate, `ReceiptTallyTest` for the roll-up and `ReceiptCanonicalTest` for the byte
+vectors — using `TlsIdentity.generate()` and explicit `createdMs`. No socket,
+Android class or clock sleep:
 
 - exact body key set and bounds, including non-string `size`-style values and
   oversized fields;
@@ -170,10 +182,10 @@ clock sleep:
 - replay-window edges (`now - REPLAY_WINDOW_MS - margin`, `now + CLOCK_SKEW_MS +
   margin`) with the id reservation left untouched outside the window;
 - duplicate id precedence and `accept`/`fresh` sharing one bounded set;
-- one receipt per author chosen by `CircleCore.ORDER` under two different
+- one receipt per author, latest by `CircleCore.ORDER` under two different
   delivery orders;
-- roll-up ignores wrong `dropId`, wrong `sha256`, malformed bodies and
-  non-members, and ignores `keyId` changes for the same content;
+- roll-up ignores wrong `dropId`, wrong `sha256`, malformed bodies, bad
+  signatures and non-members, and ignores `keyId` changes for the same content;
 - canonical vectors for all existing verbs are unchanged after `RECEIPT`
   joins `TYPES`.
 
@@ -187,8 +199,8 @@ Device walk: none on 2026-12-11. The 2026-12-14 day records the observation in
 ## Evidence for this day
 
 When the layer lands, `docs/completions/2026-12-11-delivery-receipts.md`
-records CODE references to `CircleEvent.kt` and `CircleCore.kt`, the pure test
-class and the `:protocol:test` result from a fresh run:
+records CODE references to `CircleEvent.kt` and `CircleCore.kt`, the three pure
+test classes and the `:protocol:test` result from a fresh run:
 
 ```bash
 source env.sh && ./gradlew --no-daemon --rerun-tasks :protocol:test

@@ -979,6 +979,65 @@ claimed here.
 The keyed body shape is in [CONTRACTS.md](CONTRACTS.md) and the refusal
 conclusions in [FAILURE-MODES.md](FAILURE-MODES.md).
 
+### 10.2 Delivery receipts (operator limits)
+
+A delivery receipt is one signed Circle event in which a member acknowledges
+that a named file drop landed in that member's own receive path. The statement
+is local to its author. It is not a delivery guarantee for the drop: a count
+of N means N current members each reported the same `(dropId, sha256)`, and it
+says nothing about members who did not report. The 2026-12-11 layer defines
+the event and the roll-up only. There is no CLI receipt command, app card,
+confirmation count or receipt-specific log line on this date, and no device
+observation of receipts is recorded; the app's `circleBodyValid` branch and
+the CLI command are wired on 2026-12-14
+([receipts-parity.md](roadmap/receipts-parity.md)).
+
+- **A receipt is one member's evidence, not a group result.**
+  `CircleCore.receiptAuthors(events, dropId, sha256, members)` returns a set of
+  author fingerprints, not a per-recipient status list and not a statement
+  that the whole Circle holds the bytes. A missing receipt is not a refusal
+  and is not proof that a landing failed elsewhere: the event may still be in
+  a courier bag or QR frame sequence, may not have synced yet, may have been
+  refused at sync as stale, malformed or forged, or its author may have left
+  the current-member set.
+
+- **A receipt takes no remote action.** It moves no bytes, opens no file,
+  deletes or revokes no copy, sends no command and pushes no status to another
+  member. Its only effect on another member is one more signed event in the
+  bounded Circle log. Sender-local `CircleDelivery.statuses`
+  (`pending`, `sent`, `refused`, `failed`) stay local-only and unchanged here;
+  mapping a receipt to one of them belongs to 2026-12-14. A hash mismatch at
+  the landing mints no receipt, so a failed transfer produces silence, not a
+  negative acknowledgement.
+
+- **The count has a narrow, bounded definition.** A receipt counts only when
+  its body is exactly `{dropId, sha256, keyId}`, every value a non-blank
+  bounded string, its signature verifies with the certificate fingerprint
+  bound to `authorFp`, and its author is in the normalised current-member set.
+  `dropId` is the `id` of the `file` event and `sha256` its plaintext digest;
+  both must match the drop being read. There is no `landedMs`: `createdMs` on
+  the event is the acknowledgement time. At most one receipt per author
+  counts, chosen by `CircleCore.ORDER`, so arrival order cannot change the
+  result. `keyId` is provenance only: a later rekey does not invalidate an
+  earlier acknowledgement of the same content. No `path`, spool path, token,
+  key material, file bytes or local status string is present in the body.
+
+- **The usual Circle bounds still apply.** Receipts are ordinary events in
+  `CircleRequest.events` on the existing `/circle/sync` route, or inside a
+  courier or QR parcel that already carries signed events. No new route,
+  header, DTO field, frame or v2.2 status is added. They share the 6 h replay
+  window, 5 min clock skew, 4096-id seen set, 1024-event request cap, 8 MiB
+  request cap and 500-event log cap with every other verb; no new cap is
+  introduced. Old receipts can age out of the bounded log, and a receipt still
+  in a bag or frame sequence has not been folded yet.
+
+- **Evidence is structural only on this date.** The body gate, signature path
+  and roll-up are CODE and PURE (protocol tests). No harness, SIM-HARN or
+  device walk records a receipt on 2026-12-11, and no timing, throughput or
+  confirmed-count figure is claimed here. See [CONTRACTS.md](CONTRACTS.md)
+  for the body shape, [SECURITY.md](SECURITY.md) for the signature and pinning
+  rules, and [FAILURE-MODES.md](FAILURE-MODES.md) for refusals.
+
 ## 11. Manual air-gap carry (QR parcel)
 
 A parcel moves one small named payload between two identities as an ordered

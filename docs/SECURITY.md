@@ -1167,6 +1167,79 @@ crypto and body tests, and SIM-HARN for the CLI keyed-drop round-trip and refusa
 cases recorded in the integration completion. No device walk is claimed for this
 layer; a keyed drop landing on the phone belongs to the later feature walk.
 
+## Delivery receipts: local-landing acknowledgement, not global delivery proof (2026-12-11)
+
+A receipt is an ordinary signed `CircleEvent` — the new `CircleEvent.RECEIPT =
+"receipt"` verb — in which one member acknowledges that a named file drop landed
+on that member's device. The statement is a local fact about the signing device.
+It is **not global delivery proof**: it says nothing about whether any other
+member landed the bytes, and no peer can read a receipt as evidence that the
+whole Circle received the drop. It does not replace the sender-local
+`CircleDelivery.statuses` (`pending`, `sent`, `refused`, `failed`) or the file
+announcement; those rules in "File announcements" stay unchanged
+(`docs/roadmap/delivery-receipts.md`).
+
+### What the signed body carries
+
+A receipt body is a bounded JSON object with exactly the closed key set
+`CircleCore.RECEIPT_BODY_KEYS = {dropId, sha256, keyId}`:
+
+```
+receipt  {"dropId":"<id of the file event>","sha256":"<landed plaintext digest>","keyId":"<per-drop key identifier>"}
+```
+
+`dropId` is the `id` of the `file` event being acknowledged, not a local delivery
+id. `sha256` is the plaintext digest read after `DropKeyCore.open` and the
+landing hash gate. `keyId` is provenance copied from the per-drop key layer: it
+is an identifier, **not key material**. The body carries no private key, content
+key, wrapped key, file bytes, `path`, `spoolPath`, `token` or local status string,
+and there is no second time field — `createdMs` on the event is the
+acknowledgement time. `validReceiptBody` parses with `WireJson.json`, requires
+the exact key set, and requires every value to be a non-blank string within
+`MAX_FIELD_CHARS` (256) with the body within `MAX_BODY_CHARS` (16 KiB). It signs
+nothing, pins nothing and reads no store.
+
+### Signed, verified and counted like other Circle events
+
+Receipts reuse `CircleCore.canonical` unchanged: domain tag `FLITCIRCLE1`, then
+length-prefixed `id`, `circleId`, `authorFp`, `lamport`, `type`, `body` and
+`createdMs`. The body is one length-prefixed field, so no delimiter can be
+smuggled through it. `CircleCore.sign` writes `sig`, and `CircleCore.verify`
+binds the embedded certificate's own SHA-256 DER to `authorFp` before verifying
+and pinning — the pin-after-verify rule in "Signatures and cert-in-event". A
+sender therefore cannot mint a receipt for another member. This is the same
+`TlsIdentity.sign` / `verify` path used by panic, Circle and courier events; no
+second crypto primitive is introduced.
+
+Replay and membership use the shared gates: `REPLAY_WINDOW_MS = 6 h`,
+`CLOCK_SKEW_MS = 5 min`, `MAX_SEEN = 4096`, `MAX_EVENTS_PER_REQUEST = 1024`,
+`MAX_REQUEST_BYTES = 8 MiB`, with precedence
+`Invalid → OutsideWindow → Duplicate → Accept` and verify before `evaluate`.
+`CircleCore.receiptAuthors(events, dropId, sha256, members)` counts a receipt
+only when its body is well formed, both `dropId` and `sha256` match the drop
+being read, its signature verifies and its author is in the supplied normalised
+current-member set. At most one receipt per author counts, chosen by
+`CircleCore.ORDER` independent of arrival order. `keyId` is not a selection key:
+a later rekey that changes the identifier does not invalidate an earlier
+acknowledgement of the same landed content.
+
+### No new wire surface or durable receipt state
+
+No new route, header, DTO field, frame, QR parameter or v2.2 status is added. A
+receipt travels in `CircleRequest.events` on the existing
+`POST /api/flit/v1/circle/sync` under the `8 MiB` cap, or inside a courier or QR
+parcel that already carries signed events. The protocol module holds no durable receipt
+state; `FlitCircleStore.reduce` appends the new verb as history under the
+existing 500-event log cap. Receipts are signed events, not gossiped status: the
+process-local courier `handed` outcome in "App handoff projection" and the
+sender-only delivery record in "File announcements" are unchanged. App minting,
+file-card display and CLI receipt commands belong to the 2026-12-14 integration,
+not this layer.
+
+Evidence: CODE for the verb, body gate and roll-up, and PURE for the protocol
+tests on 2026-12-11. No harness or device observation of receipts exists on this
+date.
+
 ## Storage and permissions
 
 The app asks for the minimum local capabilities and exposes almost nothing:
@@ -1268,6 +1341,12 @@ The app asks for the minimum local capabilities and exposes almost nothing:
     device that kept a wrap can reopen an old drop. There is no escrow, no
     group-key fallback and no remote action that deletes or invalidates a copy
     already held elsewhere.
+15. **A receipt proves local landing only.** It is a signed acknowledgement by
+    one member that a named drop landed on that member's device, not global
+    delivery proof, and it says nothing about other members. The body is exactly
+    `{dropId, sha256, keyId}` — no key material, file bytes, path or local status
+    — and `keyId` is provenance, not a key. No harness or device receipt walk is
+    recorded on this date.
 
 ## Evidence status at a glance
 
@@ -1281,6 +1360,7 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | File no-path / local status | `CircleCore.validFileBody`, `FlitEngine` delivery loop | `CircleCoreTest`, `CircleHardeningTest`, `FlitSpoolTest` | `CircleHarnessTest` | 35 B drop landed hash-exact; Open-file walk |
 | Per-drop content keys | `DropKeyCore.kt`, `CircleCore.validFileBody`, `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` (counts at integration) | not added on this date | no device walk |
 | Keyed drops app + CLI receive gate | `FlitEngine.onUploadFinish`, `FlitCircleSync.postFile(body)` / `circleBodyValid`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish` | core body/crypto tests, `FlitCircleSyncTest`, `FlitEngineTest`, `DropParityTest` | CLI keyed-drop round-trip and refusals (`DropKeyCliTest`, `CircleHarnessTest`) | no device walk |
+| Delivery receipts (local landing) | `CircleEvent.RECEIPT`, `CircleCore.RECEIPT_BODY_KEYS` / `validReceiptBody` / `receiptAuthors` | `ReceiptBodyTest`, `ReceiptTallyTest`, `ReceiptCanonicalTest` (counts at integration) | not added on this date | no device walk; one member's landing is not global delivery |
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
 | Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | SIM via CLI carrier below | no device walk |
 | App courier handoff UI | `CourierCardUi.kt`, `FlitEngine.courierHandoffs`, `FlitCircleSync.postParcel` | `CourierCardUiTest` (counts recorded at integration) | consumed CLI carrier outcomes | no device walk; peer acceptance is not end-to-end delivery |

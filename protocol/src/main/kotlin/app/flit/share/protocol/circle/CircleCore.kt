@@ -39,6 +39,9 @@ object CircleCore {
         "name", "size", "sha256", "keyGen", "cipherSha", "iv", "wraps",
     )
 
+    /** The exact, closed key set of a delivery [CircleEvent.RECEIPT] body. */
+    val RECEIPT_BODY_KEYS: Set<String> = setOf("dropId", "sha256", "keyId")
+
     /** Largest accepted id / circleId / authorFp / type string. */
     const val MAX_FIELD_CHARS = 256
 
@@ -294,6 +297,43 @@ object CircleCore {
     }
 
     /**
+     * Current members who signed a well-formed receipt for one landed drop.
+     * An event contributes only when its type is [CircleEvent.RECEIPT], its
+     * body passes [validReceiptBody], its `dropId` and `sha256` match the two
+     * arguments exactly, its author is in the normalised [members] set (as in
+     * [tally]), and its signature passes [verify]. A departed/non-member, a
+     * body for a different drop, a malformed body or a forgery is ignored.
+     *
+     * At most one receipt per author counts, chosen by [ORDER] so two peers
+     * that received the same receipts in different orders return the same
+     * set. Iterating in [order] and overwriting makes the greatest-by-ORDER
+     * receipt the winner ("latest wins"). `keyId` is provenance only: a later
+     * rekey that changes it does not invalidate an earlier receipt for the
+     * same landed content. No new cap or replay state is introduced; this is
+     * a pure fold over the supplied events.
+     */
+    fun receiptAuthors(
+        events: Iterable<CircleEvent>,
+        dropId: String,
+        sha256: String,
+        members: Iterable<String>,
+    ): Set<String> {
+        val allowed = members.normalized()
+        val latest = LinkedHashMap<String, CircleEvent>()
+        for (e in order(events)) {
+            if (e.type != CircleEvent.RECEIPT) continue
+            if (e.authorFp !in allowed) continue
+            if (!validReceiptBody(e.body)) continue
+            val obj = bodyObject(e.body) ?: continue
+            if (text(obj, "dropId") != dropId) continue
+            if (text(obj, "sha256") != sha256) continue
+            if (!verify(e)) continue
+            latest[e.authorFp] = e
+        }
+        return latest.keys.toSet()
+    }
+
+    /**
      * Pure structural gate shared by the route, [verify], [sign] and [evaluate].
      * No replay state, no crypto: just the bounds a well-formed event obeys.
      */
@@ -379,6 +419,35 @@ object CircleCore {
     private fun decodedSize(value: String): Int = runCatching {
         Base64.getDecoder().decode(value).size
     }.getOrDefault(-1)
+
+    /**
+     * Additive, type-specific gate for a [CircleEvent.RECEIPT] body: a bounded
+     * JSON object whose keys are EXACTLY [RECEIPT_BODY_KEYS] — `dropId`,
+     * `sha256` and `keyId`. Each value must be a JSON string primitive that is
+     * non-blank and within [MAX_FIELD_CHARS]; the whole body stays within
+     * [MAX_BODY_CHARS]. A blank, oversized, malformed, partial or extra-key
+     * body, or a non-string value (e.g. a `size`-style number), is refused.
+     *
+     * `keyId` is provenance from the per-drop key layer: it is signed and
+     * bounded here but is not a selection key in [receiptAuthors]. There is no
+     * `landedMs` field — [CircleEvent.createdMs] is the acknowledgement time.
+     * The gate is structural only: it signs nothing, pins nothing and reads no
+     * store. [validShape] stays type-agnostic (bounds only), so this never
+     * changes an existing event's signature or acceptance, and neither
+     * [canonical] nor replay handling is altered.
+     */
+    fun validReceiptBody(body: String): Boolean {
+        if (body.isBlank() || body.length > MAX_BODY_CHARS) return false
+        val obj = bodyObject(body) ?: return false
+        if (obj.keys != RECEIPT_BODY_KEYS) return false
+        for (key in RECEIPT_BODY_KEYS) {
+            val value = obj[key] as? JsonPrimitive ?: return false
+            if (!value.isString) return false // a number/bool/null is not a string field
+            val content = value.content
+            if (content.isBlank() || content.length > MAX_FIELD_CHARS) return false
+        }
+        return true
+    }
 
     /**
      * Production replay guard: atomic check-and-record over ONE bounded id
