@@ -102,11 +102,12 @@ Known compatible in the shipped build, read from the files named:
 
 Still unresolved:
 
-- The CMP line was revised from 1.9.x: BOM `2026.06.00` resolves Compose
-  `1.11.3`, while CMP `1.9.3` maps to Compose `1.9.4`. The `1.11.x` family is
-  the nearest published match. The exact patch, its Kotlin requirement and the
-  KMP-plugin envelope against Gradle `8.14.3` / AGP `8.13.2` are still unresolved
-  and must be proven by a configuration run before extraction starts.
+- The aligned set is Kotlin `2.4.21` (KMP and Compose compiler plugins at the
+  same version), CMP `1.12.2` and Compose BOM `2026.09.00`. That BOM resolves
+  Compose `1.12.1`, the version CMP `1.12.2` expects; Kotlin `2.4.21` covers
+  Gradle `8.14.3` and AGP `8.13.2`. The future `ui-common` Android target
+  follows the Kotlin 2.3+ plugin and `android` DSL. The set is conditional on
+  changing the repo-wide pins and is closed only by a configuration run.
 - One Compose/Material 3 version set for Android and desktop. The Android BOM
   2026.06.00 is pinned for `app`; whether `ui-common` consumes that BOM, the CMP
   published set, or a single aligned set is not established. A mismatch breaks

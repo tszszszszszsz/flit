@@ -8,7 +8,7 @@ that must be closed before implementation starts.
 ## Decisions
 
 - **Stack.** Compose Multiplatform desktop with a single `jvm("desktop")`
-  target, Kotlin 2.2.0, JDK 21 and AGP-managed Android targets. JavaFX and Swing
+  target, JDK 21 and AGP-managed Android targets, with Kotlin and Compose pins set by Gate 0. JavaFX and Swing
   discard the existing Compose presentation code; Electron and Tauri add a
   second ecosystem and need a structured CLI contract that does not exist.
 - **Modules.** A JVM `:core` shared by app, CLI and desktop; a KMP `ui-common`
@@ -23,15 +23,23 @@ that must be closed before implementation starts.
 
 ## Gate 0 — dependencies before code
 
-The earlier CMP 1.9.x suggestion does not align with the current Android BOM.
-`composeBom = "2026.06.00"` resolves Compose `1.11.3`; CMP `1.9.3` maps to
-Compose `1.9.4`. The `1.11.x` family is the nearest published match. The KMP
-plugin envelope published for Kotlin `2.2.0` ends at Gradle `8.14` and AGP
-`8.10.0`, while this repo pins Gradle `8.14.3` and AGP `8.13.2`. Gate 0 is a
-configuration run that proves the plugin matrix and a dependency report that
-shows one resolved Compose set. No screen or module move starts before it.
-Test tasks are named `:core:test`, `:ui-common:desktopTest` and
-`:desktop:desktopTest`; `:common:test` was a label error and is removed.
+Gate 0 cannot close on the shipped pins. BOM `2026.06.00` resolves AndroidX
+Compose `1.11.3`, but no published CMP release maps to that version: CMP
+`1.11.1` maps to Compose `1.11.2` and CMP `1.12.2` maps to Compose `1.12.1`.
+Kotlin `2.2.0` also has no published KMP-plugin envelope for AGP `8.13.2`
+(the range ends at `8.10.0`, with Gradle capped at `8.14`). The aligned set is
+the conditional upgrade to Kotlin `2.4.21` (KMP and Compose compiler plugins
+both `2.4.21`), CMP `1.12.2` and Compose BOM `2026.09.00`, which resolves
+Compose `1.12.1` — the version CMP `1.12.2` expects. Kotlin `2.4.21` covers
+Gradle `8.14.3` and AGP `8.13.2`. The condition is that the repo-wide Kotlin
+and BOM pins change and the future `ui-common` Android target follows the
+Kotlin 2.3+ `com.android.kotlin.multiplatform.library` plugin and `android`
+DSL; if that upgrade is not taken, Gate 0 stays open rather than adopting a
+nearest-match pin. Gate 0 closes only after a configuration run proves the
+plugin matrix and a dependency report shows one resolved Compose set. No screen
+or module move starts before it. Test tasks are named `:core:test`,
+`:ui-common:desktopTest` and `:desktop:desktopTest`; `:common:test` was a label
+error and is removed.
 
 ## Extraction order
 

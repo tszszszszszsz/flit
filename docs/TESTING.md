@@ -446,7 +446,7 @@ a counted runtime case: an old-style call without it must still resolve.
 
 #### App QA additions — 11 cases
 
-The cases below are part of the current 257 app / 588 rig baseline, added after
+The cases below are part of the historical 257 app / 588 rig baseline, added after
 the 2026-12-01 App layer. They are counted from the JUnit XML, not from a target
 figure, and carry no device evidence.
 
@@ -497,7 +497,7 @@ on one box.
 
 #### Harness QA additions — 7 cases
 
-The cases below are part of the current 52 harness / 588 rig baseline, added
+The cases below are part of the historical 52 harness / 588 rig baseline, added
 after the 2026-11-30 CLI layer. They are counted from the JUnit XML and carry no
 device evidence — the bag moves between directories on one box.
 
@@ -511,7 +511,7 @@ device evidence — the bag moves between directories on one box.
 The two classes below belong to the 2026-12-04 QR parcel CLI layer. Both are
 in-process harness tests in `app.flit.share.harness`, driving the `ParcelCli`
 adapter through the protocol `ParcelCodec` with PNG frames rendered and read
-on one box. The 9 + 3 cases are included in the current 52 harness / 588 rig
+on one box. The 9 + 3 cases are included in the historical 52 harness / 588 rig
 count from a `--rerun-tasks` run. No socket, app module or device walk is
 involved.
 
@@ -661,7 +661,8 @@ temp files and mtimes. The reaper rule is a pure `stale` computation over paths,
 ages and queue tokens, and the test sets mtimes on a temporary root directly;
 that runs on a JVM with no Android class and no Robolectric, so the source and
 test both moved. The `:core` source also carries Kotlin serialization because
-`FlitRoute.Route` is `@Serializable` (`core/src/main/kotlin/app/flit/share/FlitRoute.kt:15,19`);
+`FlitRoute.Kind` and `FlitRoute.Route` are both `@Serializable`
+(`core/src/main/kotlin/app/flit/share/FlitRoute.kt:15,19`);
 `core/build.gradle.kts:3` applies `alias(libs.plugins.kotlin.serialization)`
 for those annotations, as `app/build.gradle.kts:8` already does. Neither note
 changes a case count.
