@@ -60,6 +60,10 @@ The 2026-12-22, 2026-12-23, 2026-12-24 and 2026-12-28 layers are built ahead of
 their dates. The JOIN proof, Circle authority gate, replay guard, CLI parity and
 the associated documentation are written now; the commits stay on those dates.
 
+The 2026-12-31 and 2027-01-04 layers are built ahead. The relay hunt gate, the
+verified key-wrap seam, the device-walk plan and the trust-gate design record are
+written now; the commits stay on those dates.
+
 ## Dates
 
 | Date | Layer | Commit scope |
@@ -87,6 +91,8 @@ the associated documentation are written now; the commits stay on those dates.
 | 2026-12-23 | Integration | JOIN proof and authority enforcement in app and CLI, tests |
 | 2026-12-24 | Docs | Security disclosure update, final rig record, completion notes |
 | 2026-12-28 | Release | v0.3.1 tag and release notes |
+| 2026-12-31 | Integration | Relay hunt opt-in gate and verified key wrap, tests |
+| 2027-01-04 | Docs | Device-walk plan, trust-gate design record, rig inventory |
 
 ## Rules for a day
 

@@ -81,6 +81,8 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2026-12-23 | Integration | 16 tasks across app sync/store/host, CLI host and commands, courier and harness tests |
 | 2026-12-24 | Docs | 16 tasks across security disclosure, contracts, failure modes, test inventory and completion notes |
 | 2026-12-28 | Release | 16 tasks across release notes, tag checks and final rig record |
+| 2026-12-31 | Integration | Relay hunt opt-in gate, verified key wrap, pure tests |
+| 2027-01-04 | Docs | Device-walk plan, trust-gate design review, rig inventory |
 
 ## Integration gate
 

@@ -21,13 +21,14 @@ Rules applied here:
   2026-11-26 three-node walk **is** on-device evidence for a three-identity
   Circle; it does not prove a larger mesh (§6).
 - Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302, 356,
-  378, 396) are snapshots of earlier layers, not the current inventory: 356
-  after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer and
-  396 after the 2026-12-01 App layer, 416 after the app QA fixes, 436 after the
-  QR codec layer, 448 after the QR CLI layer and 714 at the pre-JOIN-proof
-  layer. The current green figure is 769 (359 protocol + 323 app + 87 harness)
-  after a clean `--rerun-tasks` run with zero failures, zero errors and zero
-  skipped tests; all assemblies were green in the same run.
+  378, 396, 769) are snapshots of earlier layers, not the current inventory:
+  356 after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer
+  and 396 after the 2026-12-01 App layer, 416 after the app QA fixes, 436 after
+  the QR codec layer, 448 after the QR CLI layer, 714 at the pre-JOIN-proof
+  layer and 769 as the snapshot before the relay-hunt and `wrapVerified` cases.
+  The current green figure is 773 (362 protocol + 324 app + 87 harness) after a
+  clean `--rerun-tasks` run with zero failures, zero errors and zero skipped
+  tests; all assemblies were green in the same run.
 - The 2026-12-01 App layer added 18 courier cases in `app/src/test` (11 in
   `CourierCardUiTest`, 4 added to `FlitCircleStoreTest`, 3 added to
   `FlitCircleSyncTest`), recorded from a green `--rerun-tasks` run (§4.2).
@@ -65,22 +66,27 @@ Rules applied here:
   classes (`PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest`,
   §4.1) with 16 + 9 + 11 + 7 = 43 cases, recorded from the JUnit XML, taking
   the protocol module from 240 to 283 at that layer. The module totals at that
-  layer were 330 + 309 + 75 = 714; the current totals are 359 + 323 + 87 = 769
-  (§2). No app, CLI, harness, device walk, new route,
-  header, DTO field, store field or v2.2 status is attached to this layer.
+  layer were 330 + 309 + 75 = 714; the 359 + 323 + 87 = 769 snapshot and the
+  current 362 + 324 + 87 = 773 totals are recorded in §2. No app, CLI, harness,
+  device walk, new route, header, DTO field, store field or v2.2 status is
+  attached to this layer.
 - The 2026-12-16 circle pad app + CLI Integration layer adds two test classes:
   `PadUiTest` (app, Android-free JVM, 15 cases) and `PadCliTest` (harness,
   in-process, 8 cases), recorded from the JUnit XML. At that layer the app
   module stood at 296 cases and the harness at 75; the module totals at that
-  layer were 330 + 309 + 75 = 714, against the current 359 + 323 + 87 = 769
-  (§2). No device walk, new route, header, DTO field, store field or v2.2 status
-  is attached to this layer.
+  layer were 330 + 309 + 75 = 714, against the 359 + 323 + 87 = 769 snapshot
+  and the current 362 + 324 + 87 = 773 (§2). No device walk, new route, header,
+  DTO field, store field or v2.2 status is attached to this layer.
 - The signed JOIN proof / shared Circle authority wave adds two JVM-pure protocol
   classes (`JoinProofTest` 14, `CircleAuthorityTest` 12) and changes seven more
   across all three modules (§4.8), from the JUnit XML of the final green
   `--rerun-tasks` run. All are JVM-pure or in-process, with no device walk, no
   new route, header, DTO field or v2.2 status; pre-proof JOIN clients are
   refused.
+- A later, smaller layer adds three `wrapVerified` cases to `DropKeyCoreTest`
+  and one relay-hunt case to `FlitEngineTest` (§4.8), taking the inventory from
+  the 769 snapshot to 773. Both classes stay JVM-pure, with no device walk, new
+  route, header, DTO field or v2.2 status.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -91,10 +97,10 @@ Rules applied here:
 
 | Module | Role | Test count | Test task | Where it runs |
 | --- | --- | --- | --- | --- |
-| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **359** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
-| `app/` | Android shell (Compose), `app.flit.share`, version 0.3.1, minSdk 26, compile/targetSdk 36 | **323** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
+| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **362** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
+| `app/` | Android shell (Compose), `app.flit.share`, version 0.3.1, minSdk 26, compile/targetSdk 36 | **324** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
 | `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **87** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **769** | see §3 | 0 failures, 0 errors, 0 skipped at last green; all assemblies green |
+| **Total** | Three modules, three roles | **773** | see §3 | 0 failures, 0 errors, 0 skipped at last green; all assemblies green |
 
 The 2026-12-04 CLI layer's two harness classes added 12 cases, moving harness
 from 39 to 51 and the total from 436 to 448 at that layer's green
@@ -130,9 +136,10 @@ device claim is attached to these rows.
 
 The JOIN-proof/authority layer adds `JoinProofTest` (14) and
 `CircleAuthorityTest` (12) in `protocol/`, with the changed classes listed in
-§4.8, and accounts for the move from the earlier 714 inventory to the current
-769. It claims no device walk and adds no route, header, DTO field or v2.2
-status; a pre-proof JOIN is refused at admission.
+§4.8, and accounts for the move from the earlier 714 inventory to 769, a
+historical snapshot. The later `wrapVerified` and relay-hunt cases add four
+cases to reach the current 773. Neither claims a device walk or adds a route,
+header, DTO field or v2.2 status; a pre-proof JOIN is refused at admission.
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -170,7 +177,8 @@ Two notes about these commands:
 
 1. Both commands now run the same test set: the README line includes
    `:harness:test` and the CI command adds `--no-daemon --stacktrace`, so each
-   ran 769 tests (359 + 323 + 87) at the last green run. The older 302-test
+   ran 773 tests (362 + 324 + 87) at the last green run; 769 (359 + 323 + 87)
+   is the earlier snapshot. The older 302-test
    figure (which included the 10 harness tests) came from the CI command, or
    from adding `:harness:test` locally when the README line omitted it; that
    baseline's README line ran 292 tests (82 + 210). Earlier per-layer figures,
@@ -188,7 +196,7 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **359 protocol + 323 app + 87 harness = 769 tests,
+Result: `BUILD SUCCESSFUL`, **362 protocol + 324 app + 87 harness = 773 tests,
 0 failures, 0 errors, 0 skipped**, read from the XML result files under each
 module's `build/test-results/test/`. Debug and release assemblies and the CLI
 distribution were green in the same rig run (§2). Provenance: the 2026-11-25
@@ -196,19 +204,23 @@ date belongs to the earlier 302-test baseline and the stale-XML incident in §8,
 not to the courier counts. Earlier fresh runs recorded 136 + 210 + 32 = 378
 after the 2026-11-30 CLI layer, 396 after the 2026-12-01 App layer and 588
 after the courier/QR hardening; the JOIN-proof/authority layer raised the
-totals to the current 359 + 323 + 87 = 769 (§4.8). The `--rerun-tasks` flag was
-deliberate: an earlier invocation reported all test tasks `UP-TO-DATE` and left
-XML from an older class layout in place (see §8). The 302-test baseline was
-green at `72225f8`; the added cases are listed in §4.1, §4.2, §4.3 and §4.8.
-The 2026-12-14 receipts parity layer's three test-class rows (§4.5) are part
-of the current inventory.
+totals to the 359 + 323 + 87 = 769 snapshot (§4.8), and the `wrapVerified` and
+relay-hunt cases raised them to the current 362 + 324 + 87 = 773. The
+`--rerun-tasks` flag was deliberate: an earlier invocation reported all test
+tasks `UP-TO-DATE` and left XML from an older class layout in place (see §8).
+The 302-test baseline was green at `72225f8`; the added cases are listed in
+§4.1, §4.2, §4.3 and §4.8. The final layer adds three cases to `DropKeyCoreTest`
+(now 18) and one to `FlitEngineTest` (now 31), counted from the same XML. The
+2026-12-14 receipts parity layer's three test-class rows (§4.5) are part of the
+current inventory.
 
 ## 4. Test inventory by module and class
 
 Counts are from the JUnit XML reports after the final fresh run; they agree with
-a source-level `@Test` count. Layer notes that quote 588, 52 harness or 302 are
-snapshots at those layers, not the current inventory (§2). The JOIN-proof /
-authority classes are grouped in §4.8. File names and class names differ in two
+a source-level `@Test` count. Layer notes that quote 588, 52 harness, 302 or 769
+are snapshots at those layers, not the current inventory (§2). The JOIN-proof /
+authority classes and the later `wrapVerified` / relay-hunt cases are grouped in
+§4.8. File names and class names differ in two
 places, so
 the report is grouped by **class**: `DtoParityTest.kt` contains both
 `DtoParityTest` and `TlsIdentityTest` (`protocol/src/test/kotlin/app/flit/share/protocol/DtoParityTest.kt:22,142`),
@@ -216,7 +228,7 @@ and `TlsIdentityTest.kt` contains the class `PinCacheTest`
 (`.../TlsIdentityTest.kt:16`). Do not "fix" these by renaming without updating
 this table.
 
-### 4.1 Protocol — 359 tests in the final green XML
+### 4.1 Protocol — 362 tests in the final green XML
 
 | Class | # | What it pins |
 | --- | --- | --- |
@@ -236,9 +248,9 @@ this table.
 | `StreamTlsTest` | 4 | `SSLEngine` shim handshake closes the loop both directions, multi-megabyte duplex round-trip byte-exact, half-open close yields a clean end, idempotent close and single bytes. |
 | `TurboProgressTest` | 1 | Multi-socket progress is non-decreasing, bounded by total and ends exactly at total. |
 
-The two JOIN-proof/authority protocol classes added by the final layer,
-`JoinProofTest` and `CircleAuthorityTest`, are listed with the rest of that wave
-in §4.8.
+The two JOIN-proof/authority protocol classes added by that layer,
+`JoinProofTest` and `CircleAuthorityTest`, are listed with the rest of the wave
+in §4.8, together with the later `wrapVerified` cases.
 
 #### Courier additions — counts recorded at integration
 
@@ -278,17 +290,19 @@ socket or persistence claim is made here.
 | `ParcelCodecTest` (new) | 21 | Frame grammar of one opaque UTF-8 `String` per QR frame with `FRAME_MAGIC = "FLITPARCEL1"`, CRC32 per frame and caps `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`; `parse` yields a `FrameDescriptor(parcelId, seq, count, totalBytes, crc)` on framed input and `null` on malformed input; `encodeParcel` uses `CourierEnvelope.seal`, `complete` verifies frames/CRC/sequence/count/digest/recipient and opens through `CourierEnvelope.open`, returning the exact `ParcelPayload(parcelId, recipientFp, signerFp, sha256, bytes)`; round-trips over single-frame and multi-frame payloads with scrambled frame order. |
 | `ParcelCodecTamperTest` (new) | 10 | Refusals at the frame seam: a changed byte under the per-frame CRC, bad magic or scheme, out-of-range `seq`/`count`/chunk and byte caps, a missing frame, a whole-parcel digest mismatch, a forged envelope signature and a wrong recipient fingerprint all return `null` from `parse`/`complete` with no bytes released; a pairing-code string is never accepted as a parcel. |
 
-#### Per-drop key additions — 41 cases
+#### Per-drop key additions — 44 cases in the final XML
 
 The three classes below are the 2026-12-09 per-drop content key protocol layer.
 They are JVM-pure, live in `protocol/src/test/kotlin/app/flit/share/protocol/`
 and drive the real `DropKeyCore`, `CircleCore` and `TlsIdentity` seams. Their
-case counts (15 + 14 + 12) come from a clean `--rerun-tasks` run. No app, CLI,
-harness, camera or device claim is attached to these cases.
+final XML case counts are 18 + 14 + 12; the three added `wrapVerified` cases in
+`DropKeyCoreTest` are named in §4.8. At the 2026-12-09 layer the counts stood at
+15 + 14 + 12 = 41. No app, CLI, harness, camera or device claim is attached to
+these cases.
 
 | Class | # | What it pins |
 | --- | --- | --- |
-| `DropKeyCoreTest` (new) | 15 | Seeded `mint()` yields distinct 32-byte keys and 12-byte IVs independent of the group key, invite and file hash; `keyId(dropId, keyGen)` is `"$dropId:$keyGen"`, stable for one signed event and changed by a new generation; canonical bytes for the existing event verbs stay byte-identical; a keyed `file` event create/sign/verify, duplicate and out-of-window id refusal with an injected clock, oversized-body id accounting, and a `rekey` fold leaving old drop bodies unchanged. |
+| `DropKeyCoreTest` (new) | 18 | Seeded `mint()` yields distinct 32-byte keys and 12-byte IVs independent of the group key, invite and file hash; `keyId(dropId, keyGen)` is `"$dropId:$keyGen"`, stable for one signed event and changed by a new generation; canonical bytes for the existing event verbs stay byte-identical; a keyed `file` event create/sign/verify, duplicate and out-of-window id refusal with an injected clock, oversized-body id accounting, and a `rekey` fold leaving old drop bodies unchanged. The three added cases pin `wrapVerified` fingerprint/certificate binding and are named in §4.8. |
 | `DropKeyBodyTest` (new) | 14 | `CircleCore.validFileBody` accepts exactly the legacy `{name,size,sha256}` set or the keyed `{name,size,sha256,keyGen,cipherSha,iv,wraps}` set and refuses a partial, extra or mistyped field, a non-integer or negative `size`, a non-positive `keyGen`, an `iv` not decoding to 12 bytes, an empty or over-cap `wraps` map, a lowercase or blank fingerprint, a value over `MAX_WRAPPED_CHARS = 512` and a body over 16 KiB; `keyedFileBody(...)` emits a body that passes the gate, `parseFileKeyBody` returns the same typed fields and returns null for every body the gate refuses; on a signed keyed body, changing `cipherSha`, `iv` or any wrap fails `CircleCore.verify` before unwrap. |
 | `DropKeyCryptoTest` (new) | 12 | `wrap` emits one Base64 entry per uppercase fingerprint with a usable certificate, at most `MAX_WRAPS = 32`, each within `MAX_WRAPPED_CHARS`, and refuses a larger roster rather than trimming it, with no entry for a member lacking a usable certificate; `unwrap` returns the 32-byte key under the matching `TlsIdentity` and returns null without throwing or writing a pin for a wrong identity, an absent fingerprint, malformed Base64 or bad OAEP padding; `seal` emits exactly `IV || ciphertext || tag` and `open` round-trips byte-exactly for seeded 0, 1, 8192-byte and 3 MiB inputs; flipping an IV, ciphertext or tag byte, using another key or changing the `FLITDROP1` AAD returns null; a rebuilt drop whose plaintext digest differs is refused. |
 
@@ -326,7 +340,7 @@ status is attached to these rows.
 | `PadMergeTest` (new) | 11 | `PadCore.merge` applies the same per-key greatest-order-key rule to views already derived from separate event sets, so `view(a + b) == merge(view(a), view(b))` for disjoint and overlapping sets and for either merge order; a tombstone in one view wins over an older put in the other, re-merging a view is idempotent and a merged view never grows past `MAX_LINES`. |
 | `PadCanonicalTest` (new) | 7 | `CircleEvent.PAD = "pad"` is the twelfth verb in `TYPES` with the existing verb values unchanged; `CircleCore.canonical` covers the same seven fields except `sig`/`cert` for `pad`, so a `pad` event minted by `CircleCore.create` verifies and a forged `authorFp` or a changed covered field fails `verify`, while canonical bytes, replay order, `dedup` and `accept` for the existing verbs stay byte-identical and no route, header, DTO field or v2.2 status is added. |
 
-### 4.2 App — 323 tests in the final green XML
+### 4.2 App — 324 tests in the final green XML
 
 All are JVM tests of Android-free seams: codecs, reducers, pure policy math and
 rendered QR pixels. They never start the Android framework, an engine or a
