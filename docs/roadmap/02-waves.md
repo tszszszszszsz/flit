@@ -22,6 +22,9 @@ The 2026-12-07 App wave is built ahead. Parcel display and camera decode
 implementation runs now, but the commit stays on 2026-12-07; no earlier wave
 carries it.
 
+The 2026-12-09 Protocol wave is built ahead. Per-drop content keys implementation
+runs now, but the commit stays on 2026-12-09; no earlier wave carries it.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator

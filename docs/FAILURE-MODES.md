@@ -112,6 +112,10 @@ Read this first; the sections below unfold each row.
 | Circle drop: spool file gone | no | record dropped | nothing | delivery record + card status | CODE |
 | Circle log: replay / wrong circle / forged cert | no | event skipped | log unchanged | event | CODE / PURE / SIM |
 | Circle leave/kick | no | membership removed, generation bumped, key rotated | local earlier log stays plaintext | roster entry + old key material | CODE / PURE / SIM / DEVICE |
+| Drop key: no usable recipient cert, or no wrap for the reader | no | no wrap entry / `unwrap` null; no plaintext | source or caller's sealed bytes stay | that entry or the plaintext | CODE / PURE |
+| Drop key: roster above `MAX_WRAPS` (32), or wrap over `MAX_WRAPPED_CHARS` (512) | no | `wrap` refuses the whole map; body gate false | source bytes stay with the caller | over-cap map / over-cap body | CODE / PURE |
+| Drop key: partial, extra or mistyped keyed body | no | `validFileBody` false; `parseFileKeyBody` null | caller keeps the bytes | the malformed body | CODE / PURE |
+| Drop key: tampered `wraps` / `iv` / `cipherSha`, or flipped IV / ciphertext / tag | no | `verify` fails before unwrap, or `open` null | event log / caller's sealed bytes stay | modified event or plaintext | CODE / PURE |
 | Courier: no recipient cert in log or roster | yes — a later roster answer | no — `seal` refuses | events stay in the sender's own log | nothing | CODE / PURE |
 | Courier: bad body keys, oversized envelope, malformed bytes | no | `Invalid` / `decode` null | existing bag unchanged | incoming event or bad row | CODE / PURE |
 | Courier: verify fails or cert binding breaks | no | verify false; no pin written | held bytes until `ack` / `expire` | envelope on removal | CODE / PURE |
@@ -681,6 +685,64 @@ claims DEVICE: a live-camera capture and the two-phone air-gap walk are dated
 2026-12-08 and are not claimed here. Test totals are recorded in TESTING.md,
 not in this table.
 
+### 3.10 Per-drop content keys — the pure conclusion table
+
+The 2026-12-09 Protocol layer ([per-drop-keys.md](roadmap/per-drop-keys.md))
+adds `DropKeyCore`, a JVM-pure object under `protocol/.../circle/`. It mints one
+fresh 32-byte key and 12-byte IV per file drop, wraps the key to current
+members' certificates with RSA-OAEP/SHA-256, seals the bytes with AES-256-GCM
+emitting `IV || ciphertext || tag`, and publishes one wrapped entry per member
+in the signed `file` body. The exact API is:
+
+```
+object DropKeyCore {
+  const val KEY_BYTES = 32, IV_BYTES = 12, TAG_BYTES = 16
+  const val MAX_WRAPS = 32, MAX_WRAPPED_CHARS = 512
+  const val DOMAIN = "FLITDROP1"
+  data class Key(val bytes: ByteArray, val iv: ByteArray)
+  data class KeyedFile(val name: String, val size: Long, val sha256: String,
+                       val keyGen: Int, val cipherSha: String, val iv: String,
+                       val wraps: Map<String, String>)
+  fun mint(): Key
+  fun wrap(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String>
+  fun unwrap(wrapped: Map<String, String>, identity: TlsIdentity): ByteArray?
+  fun seal(key: Key, plaintext: ByteArray): ByteArray   // IV || ciphertext || tag
+  fun open(key: ByteArray, sealed: ByteArray): ByteArray?
+  fun keyedFileBody(v: KeyedFile): String
+  fun parseFileKeyBody(body: String): KeyedFile?
+  fun keyId(dropId: String, keyGen: Int): String = "$dropId:$keyGen"
+}
+```
+
+AAD is `field("FLITDROP1")` under the `CircleCore.canonical` 4-byte big-endian
+UTF-8 field rule. `CircleCore.validFileBody` accepts exactly the legacy
+`{name,size,sha256}` set or the keyed `{name,size,sha256,keyGen,cipherSha,iv,wraps}`
+set; every other key set is refused. `TlsIdentity` gains one additive instance
+method `decryptOaepSha256(cipher: ByteArray): ByteArray?`, backed by the
+existing private key, null on any failure, with no pin writes; `unwrap` calls
+it and no other method here reads or writes the pin map. The protocol core
+holds no key cache, no sealed bytes and no drop state and persists no plaintext
+key.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| No usable certificate for a member at wrap time | That fingerprint gets no `wraps` entry; no group-key fallback and no escrow | Source bytes stay with the caller | That member's wrapped key | CODE `DropKeyCore.wrap`; PURE `DropKeyCryptoTest` (wrap omits the fingerprint with no pinned cert) |
+| No wrap for the reader, or `unwrap` under the wrong identity | `unwrap` returns null; no plaintext is released and no pin is written | The caller's sealed bytes stay; the core holds none | No plaintext | CODE `DropKeyCore.unwrap`, `TlsIdentity.decryptOaepSha256`; PURE `DropKeyCryptoTest` (wrong identity and absent fingerprint return null, pin map unchanged) |
+| Roster above `MAX_WRAPS = 32` | `wrap` refuses the whole map; it is never silently trimmed and no event is minted | Source bytes stay with the caller | The over-cap map; nothing published | CODE `DropKeyCore.wrap` (`MAX_WRAPS`); PURE `DropKeyCryptoTest` (a map larger than 32 is refused, not trimmed) |
+| Wrapped value over `MAX_WRAPPED_CHARS = 512`, or body over `MAX_BODY_CHARS` (16 KiB) | Gate false; `parseFileKeyBody` null; no event minted | The caller keeps the bytes | The over-cap body | CODE `CircleCore.validFileBody`, `DropKeyCore.parseFileKeyBody`; PURE `DropKeyBodyTest` |
+| Partial, extra or mistyped keyed body — string `size`, non-positive `keyGen`, `iv` not decoding to 12 bytes, blank or lowercase fingerprint | `validFileBody` false; no event minted or folded | The caller keeps the bytes | The malformed body | CODE `CircleCore.validFileBody`; PURE `DropKeyBodyTest` (exact key sets and value types) |
+| Malformed Base64 or bad OAEP padding in a wrap | `decryptOaepSha256` returns null and `unwrap` returns null; no exception reaches the caller and no pin is written | The caller's sealed bytes stay | The malformed wrap; no plaintext | CODE `TlsIdentity.decryptOaepSha256`, `DropKeyCore.unwrap`; PURE `DropKeyCryptoTest` (junk strings return null) |
+| Modified `wraps`, `iv` or `cipherSha` on the signed event | `CircleCore.verify` fails before any unwrap; the event is skipped | Event log unchanged | The modified event | CODE `CircleCore.verify`, `CircleCore.canonical`; PURE `DropKeyBodyTest` (signed body then tampered copy) |
+| Flipped IV, ciphertext or tag byte, a different key, or a changed `FLITDROP1` AAD | GCM authentication fails; `open` returns null; no plaintext | The caller's sealed bytes stay; the core holds none | The plaintext | CODE `DropKeyCore.open`; PURE `DropKeyCryptoTest` (one-byte flips, wrong key, AAD change) |
+| Plaintext digest differs from the announced `sha256` | Drop refused before content is shown; the announced plaintext digest is inside the signed body | The caller's sealed bytes and signed body stay | The substituted plaintext | CODE `CircleCore.canonical` (plaintext `sha256` signed in the body); PURE `DropKeyCryptoTest` (digest gate refuses a rebuilt drop) |
+| Duplicate or out-of-window `file` id | `evaluate` returns `Duplicate` / `OutsideWindow`; the drop is not re-accepted | Unchanged | The replayed event | CODE `CircleCore.evaluate`; PURE `DropKeyCoreTest` (injected clock) |
+| Departure, group `rekey`, or a `keyGen` bump on another drop | Old drop bodies unchanged; no wrap backfill and no remote revocation | Old drops and wraps stay | Nothing | CODE `CircleCore.canonical`/`verify` (body binding is generation-independent); PURE `DropKeyCoreTest` (fold a `rekey`, old bodies unchanged) |
+
+The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN: this
+layer adds no endpoint, carrier, camera or app state. App and CLI parity,
+harness walks and any keyed-drop device observation belong to later layers and
+yield no claim here.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -874,6 +936,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | QR parcel frame codec | `ParcelCodec.kt` (`parse`/`encodeParcel`/`complete`, CRC and caps) | `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
 | QR parcel CLI | `ParcelCli.kt` (`parcelEncode`/`parcelDecode`, cert gate, `--out` gate, exit codes) | `ParcelCodecTest`, `ParcelCodecTamperTest`, `ParcelCliTest` | `ParcelCliHarnessTest` | — |
 | QR parcel app camera / decode / caps | `ParcelUi` camera-and-paste seam, `ParcelScanState`, `Qr.decodeYPlane:187-216`, `ParcelCodec.parse/complete` | `ParcelScanStateTest`, `FlitQrTest`, `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
+| Per-drop content keys (pure core) | `DropKeyCore.wrap/unwrap/seal/open`, `keyedFileBody`, `parseFileKeyBody`; `CircleCore.validFileBody/verify`; `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -884,7 +947,9 @@ layers and are not claimed here. The 2026-12-04 QR parcel CLI row adds CODE,
 PURE and SIM-HARN from the one-shot adapter and its two-temp-home harness pair,
 with no DEVICE entry; the air-gap walk is 2026-12-08. The 2026-12-07 app camera
 row in §3.9 is CODE and PURE only; no live-camera capture or air-gap walk is
-claimed for it.
+claimed for it. The 2026-12-09 per-drop content key row in §3.10 is CODE and
+PURE only: the frozen pure protocol seams and their JVM tests. No harness,
+camera, CLI or device observation is attached to this layer.
 
 ---
 
@@ -943,3 +1008,9 @@ None changes a shipped contract.
     The §3.9 rows are CODE from the frozen seams and PURE from the JVM-only app
     and protocol tests. Live camera capture from a sensor and the two-phone
     air-gap walk are dated 2026-12-08 and yield no claim here.
+12. **The 2026-12-09 per-drop content key layer has no device walk here.** The
+    §3.10 rows are CODE from the frozen `DropKeyCore`, `CircleCore` and
+    `TlsIdentity` seams and PURE from the three JVM-only protocol test classes.
+    This layer adds no endpoint, carrier, camera or app state; app and CLI
+    parity, harness walks and any keyed-drop device observation belong to later
+    layers and yield no claim here.

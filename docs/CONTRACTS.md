@@ -1506,3 +1506,165 @@ rotation step. No DEVICE evidence is claimed for this layer: capturing a real
 multi-frame sequence from a second phone's screen is the 2026-12-08 air-gap
 walk. See [qr-parcel-app.md](roadmap/qr-parcel-app.md), and §16–§17 for the
 codec and CLI that produce the frames used here.
+
+## 19. Per-drop content key contract — keyed file body (2026-12-09)
+
+### 19.1 Layer and ownership
+
+This is the Protocol layer that gives each Circle `file` drop a fresh symmetric
+key. It lives in the JVM-pure package `app.flit.share.protocol.circle`, object
+`DropKeyCore`. The only changes outside that new file are one additive instance
+method on `TlsIdentity` (§19.2) and an extension of `CircleCore.validFileBody`
+(§19.5). The module gains no Android import, socket, file write, preference or
+wall-clock read. No route, header, DTO field, status code or v2.2 shape changes:
+the key material travels inside the body of the existing signed `file` event on
+the existing `POST /api/flit/v1/circle/sync` route (§7.3, §7.5), and a stock
+LocalSend v2.2 peer sees the same wire it saw before (§2, §4). An older Flit
+build keeps parsing the legacy three-key body unchanged.
+
+### 19.2 Frozen API (`DropKeyCore.kt`)
+
+```
+object DropKeyCore {
+  const val KEY_BYTES = 32, IV_BYTES = 12, TAG_BYTES = 16
+  const val MAX_WRAPS = 32, MAX_WRAPPED_CHARS = 512
+  const val DOMAIN = "FLITDROP1"
+  data class Key(val bytes: ByteArray, val iv: ByteArray)
+  data class KeyedFile(val name: String, val size: Long, val sha256: String,
+                       val keyGen: Int, val cipherSha: String, val iv: String,
+                       val wraps: Map<String, String>)
+  fun mint(): Key
+  fun wrap(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String>
+  fun unwrap(wrapped: Map<String, String>, identity: TlsIdentity): ByteArray?
+  fun seal(key: Key, plaintext: ByteArray): ByteArray   // IV || ciphertext || tag
+  fun open(key: ByteArray, sealed: ByteArray): ByteArray?
+  fun keyedFileBody(v: KeyedFile): String
+  fun parseFileKeyBody(body: String): KeyedFile?
+  fun keyId(dropId: String, keyGen: Int): String = "$dropId:$keyGen"
+}
+```
+
+`TlsIdentity` gains exactly one additive instance method,
+`decryptOaepSha256(cipher: ByteArray): ByteArray?`, backed by the existing
+private key. It returns null on malformed Base64, padding or provider failure
+and never writes to the pin map. No new signature algorithm is introduced;
+signing and verification stay with `TlsIdentity.sign` / `CircleCore.verify`
+(§4.1, §7.4).
+
+### 19.3 Exact key sets
+
+The signed `file` body has one of two closed key sets; anything else is refused
+by the gate in §19.5.
+
+| Form | Key set |
+| --- | --- |
+| Legacy (unchanged) | `FILE_BODY_KEYS = {name, size, sha256}` |
+| Keyed | `KEYED_FILE_BODY_KEYS = {name, size, sha256, keyGen, cipherSha, iv, wraps}` |
+
+Keyed body JSON shape:
+
+```
+{"name":"...","size":N,"sha256":"<plaintext sha>",
+ "keyGen":1,"cipherSha":"<sha256 of sealed bytes>",
+ "iv":"<base64 12 bytes>","wraps":{"<UPPERCASE FP>":"<base64 wrapped key>"}}
+```
+
+`sha256` is the plaintext digest; `cipherSha` is the digest of the sealed
+bytes. `keyGen` is an integer generation counter starting at 1 and bumped when a
+fresh key is minted for the same drop. `wraps` is a JSON object keyed by
+uppercase recipient fingerprint. `keyedFileBody(v)` builds exactly this map and
+never emits a `token`, `path` or `spoolPath` key. The legacy form has no key
+material and keeps its byte-identical canonical form.
+
+### 19.4 Bounds
+
+| Constant | Value | Applies to |
+| --- | --- | --- |
+| `MAX_BODY_CHARS` | `16 * 1024` (16 KiB) | Whole body string (`CircleCore.MAX_BODY_CHARS`, §1.6) |
+| `MAX_FIELD_CHARS` | `256` | `name`, `sha256`, `cipherSha`, the `iv` string, and each fingerprint key |
+| `MAX_WRAPPED_CHARS` | `512` | Each value in `wraps`; a 2048-bit RSA-OAEP wrap is 256 bytes, about 344 Base64 chars, so `MAX_FIELD_CHARS` would refuse a valid wrap |
+| `MAX_WRAPS` | `32` | Entry count in `wraps` |
+| `KEY_BYTES` | `32` | Content key length |
+| `IV_BYTES` | `12` | IV length; the decoded `iv` must be exactly 12 bytes |
+| `TAG_BYTES` | `16` | GCM tag length (128-bit) |
+
+Every string is non-blank and bounded as above. `size` is a non-negative integer
+number; the string `"12"` is refused. `keyGen` is a positive integer. `wraps`
+holds `1..MAX_WRAPS` entries, each with a non-blank uppercase fingerprint key
+and a non-blank Base64 value no longer than `MAX_WRAPPED_CHARS`. With 32 entries
+at 344 chars each plus the other fields, the body stays under 16 KiB.
+
+### 19.5 `CircleCore.validFileBody` gate
+
+`validFileBody(body)` accepts a body when and only when its keys equal one of
+the two sets in §19.3 and every value in that form passes the bounds in §19.4:
+
+1. The body is non-blank and at most `MAX_BODY_CHARS`.
+2. The parsed value is a JSON object whose key set is exactly `FILE_BODY_KEYS`
+   or exactly `KEYED_FILE_BODY_KEYS`.
+3. Legacy form: `name` and `sha256` are non-blank strings within
+   `MAX_FIELD_CHARS`; `size` is a non-negative integer number, not a string.
+4. Keyed form: the legacy field checks, plus `keyGen` a positive integer;
+   `cipherSha` a non-blank string within `MAX_FIELD_CHARS`; `iv` a non-blank
+   string decoding to exactly `IV_BYTES` (12) bytes; and `wraps` a JSON object
+   with `1..MAX_WRAPS` non-blank uppercase fingerprint keys, each value a
+   non-blank Base64 string within `MAX_WRAPPED_CHARS`.
+
+A partial key set, an extra field, a lowercase or blank fingerprint, a string
+`size`, a non-positive `keyGen`, an `iv` that does not decode to 12 bytes and an
+empty or over-cap `wraps` map are all refused. `parseFileKeyBody(body)` returns
+a typed `KeyedFile` only when this gate passes and the body is the keyed form;
+it returns null for every body the gate refuses. `validShape()` stays
+type-agnostic bounds (§7.4), so this extension never changes an existing
+event's signature or acceptance.
+
+### 19.6 Crypto primitives
+
+`mint()` draws a fresh 32-byte key and 12-byte IV from `SecureRandom`,
+independent of the group key, the invite and the file hash. `seal(key, plaintext)`
+uses `AES/GCM/NoPadding` with a 128-bit tag and emits
+`IV || ciphertext || tag`; the AAD is the length-prefixed domain tag
+`field("FLITDROP1")` written with `CircleCore.canonical`'s 4-byte big-endian
+UTF-8 field rule. `open` refuses a value shorter than
+`IV_BYTES + TAG_BYTES` and returns null on any tag failure. `wrap` encrypts the
+key with each recipient certificate's RSA public key using
+`RSA/ECB/OAEPWithSHA-256AndMGF1Padding` with an explicit `OAEPParameterSpec`
+(`"SHA-256"`, `"MGF1"`, `MGF1ParameterSpec.SHA256`,
+`PSource.PSpecified.DEFAULT`), Base64-encodes it, and returns one entry per
+uppercase fingerprint with a usable certificate; a roster above `MAX_WRAPS` is
+refused, never silently trimmed. `unwrap` returns null for a fingerprint with
+no entry, a wrong identity or a malformed blob.
+`keyId(dropId, keyGen) = "$dropId:$keyGen"` is the identifier published for the
+drop: `dropId` is the signed `file` event id, `keyGen` is the body's counter,
+and the value is bounded by `MAX_FIELD_CHARS` and treated as provenance only.
+
+### 19.7 Canonical, wire and state boundary
+
+1. **Canonical bytes unchanged.** `CircleCore.canonical` covers the body as one
+   length-prefixed field (§7.4), so the sender's signature binds `cipherSha`,
+   `iv` and every wrap. A courier or relay carrying the event cannot alter them;
+   `CircleCore.verify` fails on a modified body before any unwrap. No canonical
+   field order changes for any existing verb.
+2. **No route or v2.2 change.** The keyed body is carried in the existing `file`
+   event on `POST /api/flit/v1/circle/sync`. No `PATH_*` constant, Ktor route,
+   `LinkProvider`, HTTP header, DTO field or status code is added (§1, §2, §4,
+   §7.5). `/info`, `/register`, `/prepare-upload`, `/upload` and `/cancel`, their
+   DTO shapes and their status behaviour stay as in §2.
+3. **Wire and digest ownership.** The sealed copy is named
+   `dropId + DROP_WIRE_SUFFIX` with `DROP_WIRE_SUFFIX = ".flitdrop"`. The sender
+   pushes those sealed bytes with the existing `sendFiles` call, so
+   `FileInfo.sha256` equals `cipherSha` and the receiver's landing gate checks
+   the sealed bytes; `sha256` on the card stays the plaintext digest, checked
+   after `open`. The protocol core holds no key cache, no sealed bytes and no
+   drop state.
+4. **No remote revocation or backfill.** A departure, a group `rekey` or a
+   `keyGen` bump on another drop does not change a published keyed body. There
+   is no wrap backfill for a later joiner and no remote deletion: a device that
+   kept a wrap can still open an old drop. Mint, wrap, unwrap, seal and open
+   leave the `TlsIdentity` pin map unchanged (§13.6, §15.4).
+5. **Evidence boundary.** CODE establishes the constants, the two key sets, the
+   byte layout and the gate; PURE JVM tests cover the existing verbs' canonical
+   bytes unchanged, the exact key sets, the bounds, tamper rejection and
+   round-trip behavior. This date adds no harness or device observation and
+   makes no device claim for this layer. See
+   [per-drop-keys.md](roadmap/per-drop-keys.md).

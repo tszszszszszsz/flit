@@ -23,9 +23,13 @@ import java.security.PrivateKey
 import java.security.Signature
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.security.spec.MGF1ParameterSpec
 import java.util.Base64
 import java.util.Date
 import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.OAEPParameterSpec
+import javax.crypto.spec.PSource
 import javax.net.ssl.KeyManager
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLEngine
@@ -62,6 +66,25 @@ class TlsIdentity private constructor(
         signer.initSign(privateKey)
         signer.update(bytes)
         return Base64.getEncoder().encodeToString(signer.sign())
+    }
+
+    /**
+     * Decrypts one RSA-OAEP/SHA-256 ciphertext with this device's private key.
+     * Digest and MGF1 are both pinned to SHA-256 via an explicit [OAEPParameterSpec].
+     * Returns null on any failure and never reads or writes the pin store.
+     */
+    fun decryptOaepSha256(cipher: ByteArray): ByteArray? = try {
+        val params = OAEPParameterSpec(
+            "SHA-256",
+            "MGF1",
+            MGF1ParameterSpec.SHA256,
+            PSource.PSpecified.DEFAULT,
+        )
+        val dec = Cipher.getInstance("RSA/ECB/OAEPPadding")
+        dec.init(Cipher.DECRYPT_MODE, privateKey, params)
+        dec.doFinal(cipher)
+    } catch (_: Exception) {
+        null
     }
 
     /** Instance form of the fingerprint-pinned signature check (see companion). */

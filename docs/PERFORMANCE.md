@@ -139,6 +139,27 @@ A file announcement is signed and fanned out like any other event. The bytes are
 
 [circle.md](circle.md) §"Event log (the only new core)" says that **every** `SYNC` — pull, outbound post or calm tick — "posts the full bounded local log" and that "the whole log travels each time". The code does not do that for posts: `fanout` uses per-peer watermark deltas (§4.2 above), and only the calm repair tick re-offers the full bounded log. The document's "store-and-forward ... a lost one-shot is repaired by the next post or tick" is true of the **tick**, not of every post.
 
+### 4.5 Per-drop content keys: wrap, seal and open cost
+
+The 2026-12-09 Protocol layer ([per-drop-keys.md](roadmap/per-drop-keys.md)) adds `DropKeyCore`, a JVM-pure object that mints one fresh content key per Circle file drop, wraps it to the current members, seals the file bytes and publishes one wrapped entry per member in the signed `file` body. The app and CLI consume it at 2026-12-10 ([per-drop-parity.md](roadmap/per-drop-parity.md)); this layer adds no socket, route, persistence or device path. Every number below is a structural constant or a bound derived from those constants, not a captured timing, throughput, CPU, heap or byte measurement.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `KEY_BYTES` | 32 | AES-256 key minted by `mint()` from `SecureRandom`; not derived from the group key, invite or file hash. |
+| `IV_BYTES` | 12 | Fresh GCM IV per drop, prefixed to the sealed bytes. |
+| `TAG_BYTES` | 16 | 128-bit GCM authentication tag, appended to the sealed bytes. |
+| `MAX_WRAPS` | 32 | Cap on entries in the `wraps` map; an over-cap roster is refused, not trimmed. |
+| `MAX_WRAPPED_CHARS` | 512 | Cap on each Base64 wrapped value; a 2048-bit RSA-OAEP wrap is 256 bytes, or 344 Base64 chars. |
+| `MAX_BODY_CHARS` | 16 KiB | Whole keyed `file` body, inherited from `CircleCore` (§4.1). |
+| `MAX_FIELD_CHARS` | 256 | Other body strings; wrap values use the 512 cap instead. |
+| `DOMAIN` | `FLITDROP1` | AAD tag, carried as `field("FLITDROP1")` — a 4-byte big-endian UTF-8 byte length then the bytes — so the sealed bytes are bound to this protocol. |
+
+`wrap` pays one RSA-OAEP/SHA-256 public-key encryption per recipient certificate, with an explicit `OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT)`, then one Base64 encode. Its cost grows with the number of members holding a usable certificate, bounded by `MAX_WRAPS = 32`; a member with no pinned certificate gets no entry and there is no group-key fallback or escrow. At `MAX_WRAPPED_CHARS = 512` the 32 wrap values fit inside the 16 KiB body budget alongside the name, digests and `iv`. `unwrap` pays one RSA-OAEP private-key operation on the local identity, through the one additive `TlsIdentity.decryptOaepSha256(cipher: ByteArray): ByteArray?` method; it reads only the caller's own entry and returns null for a missing fingerprint, a wrong identity, malformed Base64 or bad padding, without throwing or writing a pin.
+
+`seal` and `open` each pay one AES-GCM pass with `Cipher.getInstance("AES/GCM/NoPadding")` and `GCMParameterSpec(TAG_BYTES * 8, iv)`. The output is `IV || ciphertext || tag`, so the sealed bytes are exactly the plaintext length plus `IV_BYTES + TAG_BYTES = 28` bytes; the work is linear in the plaintext length, one pass to seal and one to open. The 28-byte figure is arithmetic from two constants, not a measured overhead. `open` refuses any value shorter than `IV_BYTES + TAG_BYTES` and returns null on a tag failure. Two drops of identical bytes get different IVs, different sealed bytes and a different `cipherSha`, so a repeated drop is a new event and a new send, not a dedup hit.
+
+At this layer the API takes byte arrays, so the cost described is one cipher pass over the supplied array; no whole-file memory figure is implied. The 2026-12-10 integration streams through the same JCE cipher so large drops are not held whole in memory, and pushes the sealed spool through the existing `sendFiles(..., multi = false)` path of §4.3 — one sealed copy and one send per current recipient, with the sealed bytes' digest checked as `cipherSha` on landing and the announced plaintext `sha256` checked after `open`. No wall-clock timing, throughput, CPU, heap, allocation or device byte figure has been captured for `mint`, `wrap`, `unwrap`, `seal` or `open`, and no device observation belongs to this Protocol layer.
+
 ---
 
 ## 5. Concurrency caps
@@ -314,6 +335,7 @@ No frame-time capture, render wall-clock, camera-decode throughput, reassembly t
 - **Wire-byte totals** for Circle repair beyond the structural caps (1024 events/request, 8 MiB request body, 16 KiB event body); no traffic capture was published.
 - **Courier CLI one-shot and bag copy**: no wall-clock timing, invocation count or byte count was captured. The one-shot read / whole-file-write shape and the directory-copy handoff in §8.4 are structural descriptions, not measured costs.
 - **QR air-gap frames**: the `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512` and `MAX_AIR_GAP_PARCEL_BYTES = 131072` limits in §8.5 are structural caps, not measured sizes or costs. The 32 KiB reachable maximum is arithmetic from the first two caps. No frame-render, PNG read, camera-scan, CRC or reassembly timing, throughput or device byte count has been captured; the 768 × 768 / EC `M` PNG render and read cost in §8.6 is described qualitatively only, and real-camera decode is not verified by this layer. The app-layer `PARCEL_FRAME_INTERVAL_MS = 400L` dwell, `PARCEL_FRAME_SIZE_PX = 240` raster, `MAX_PARCEL_FRAMES = 64` display cap and `PARCEL_PASTE_MAX_CHARS = 16_000` paste cap in §8.7 are likewise structural: the 25.6 s full-cycle figure is arithmetic from the dwell and frame cap, and no render, cadence, camera-decode or reassembly timing was captured.
+- **Per-drop content keys**: the `KEY_BYTES`, `IV_BYTES`, `TAG_BYTES`, `MAX_WRAPS`, `MAX_WRAPPED_CHARS`, body and field caps in §4.5 are structural constants; the 28-byte seal overhead and the 32-wrap body fit are arithmetic from them, not measured sizes. No timing, throughput, CPU, heap, allocation or device byte figure has been captured for `mint`, `wrap`, `unwrap`, `seal` or `open`; the 2026-12-09 layer is JVM-pure with no device observation.
 
 ---
 

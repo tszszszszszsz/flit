@@ -932,6 +932,44 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
 - Manual air-gap carry by QR frames is an operator procedure with its own size,
   acknowledgement and evidence limits (§11); no device walk is part of it.
 
+### 10.1 Keyed Circle drops (operator limits)
+
+A file drop can carry a per-drop content key: a fresh 32-byte key and 12-byte IV
+seal the file bytes with AES-GCM, and the key is wrapped once per current member
+under that member's certificate. The signed `file` body binds the ciphertext
+digest, IV and every wrap, so a carrier cannot alter them. The limits below come
+from that design and describe layer behaviour, not a device observation.
+
+- **A keyed drop needs a current certificate for each member it is meant to
+  reach.** Wrapping uses the certificate held for a member at post time
+  (`TlsIdentity.pinned(fp)` or the member's certificate in the folded log). A
+  member with no usable certificate gets no wrap and no fallback: there is no
+  group-key path, no escrow and no later backfill. When no recipient has key
+  material, the sender keeps the source spool and posts no event — the app logs
+  `circle drop: no recipient key material — not posted` and the CLI prints
+  `!! no recipient key material — nothing posted`. A member who joined after the
+  drop sees the card but no bytes; a member who left before the drop has no wrap
+  in that drop.
+
+- **An over-cap roster is refused, never trimmed.** `MAX_WRAPS` is 32. A member
+  list above the cap is refused at post time with no event — the app logs
+  `circle drop: N recipients exceeds key wrap cap`, the CLI prints the cap
+  reason — and the source spool is kept. Wraps are not silently dropped to fit.
+
+- **A published drop cannot be revoked on another device.** Leaving the circle,
+  a group rekey, or a fresh key generation for another drop does not change an
+  already-signed drop body. A member who kept a wrap can still open that old
+  drop after leaving; there is no remote revocation, remote delete or wipe, and
+  no wrap backfill for a later joiner. Removing the drop locally, or deleting
+  `circle.state`, affects only the local copy and the local key material — it
+  does not withdraw bytes already landed elsewhere. On the receive side a
+  missing wrap, a GCM tag failure or a plaintext digest mismatch yields no
+  ledger entry and a refusal (`NO_KEY` / `drop-refused <name>: no wrap`, or
+  `drop-refused <name>: open failed`), leaving no plaintext.
+
+The keyed body shape is in [CONTRACTS.md](CONTRACTS.md) and the refusal
+conclusions in [FAILURE-MODES.md](FAILURE-MODES.md).
+
 ## 11. Manual air-gap carry (QR parcel)
 
 A parcel moves one small named payload between two identities as an ordered

@@ -24,6 +24,10 @@ The 2026-12-07 App layer is built ahead of its scheduled day. The parcel display
 and camera decode code and tests are written now, but the commit stays on
 2026-12-07; no earlier date carries it.
 
+The 2026-12-09 Protocol layer is built ahead of its scheduled day. The per-drop
+content keys code and tests are written now, but the commit stays on 2026-12-09;
+no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

@@ -18,7 +18,29 @@ The app's Circle drop path and the CLI's `circle file` path each mint one fresh 
 
 ### Pure core consumed from 2026-12-09
 
-`DropKeyCore` in `protocol/src/main/kotlin/app/flit/share/protocol/circle/` exposes: `KEY_BYTES = 32`, `IV_BYTES = 12`, `TAG_BYTES = 16`, `MAX_WRAPS = 32`, `MAX_WRAPPED_CHARS = 512`, domain tag `FLITDROP1`; `mint()` (random key plus random 12-byte IV), `wrap(key, recipients: Map<String, X509Certificate>)` (RSA-OAEP with SHA-256, Base64, one entry per uppercase fingerprint), `unwrap(wrapped, identity)`, `seal(key, plaintext)` (`AES/GCM/NoPadding`, output `IV || ciphertext || tag`), `open(keyBytes, sealed)`, and the body codec `keyedFileBody(...)` / `parseFileKeyBody(body)`. `CircleCore` accepts either the legacy `FILE_BODY_KEYS = {name, size, sha256}` or the keyed set below. All bounds live in the protocol core; the app and CLI call them rather than redefining them.
+`DropKeyCore` in `protocol/src/main/kotlin/app/flit/share/protocol/circle/` exposes this exact API:
+
+```
+object DropKeyCore {
+  const val KEY_BYTES = 32, IV_BYTES = 12, TAG_BYTES = 16
+  const val MAX_WRAPS = 32, MAX_WRAPPED_CHARS = 512
+  const val DOMAIN = "FLITDROP1"
+  data class Key(val bytes: ByteArray, val iv: ByteArray)
+  data class KeyedFile(val name: String, val size: Long, val sha256: String,
+                       val keyGen: Int, val cipherSha: String, val iv: String,
+                       val wraps: Map<String, String>)
+  fun mint(): Key
+  fun wrap(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String>
+  fun unwrap(wrapped: Map<String, String>, identity: TlsIdentity): ByteArray?
+  fun seal(key: Key, plaintext: ByteArray): ByteArray   // IV || ciphertext || tag
+  fun open(key: ByteArray, sealed: ByteArray): ByteArray?
+  fun keyedFileBody(v: KeyedFile): String
+  fun parseFileKeyBody(body: String): KeyedFile?
+  fun keyId(dropId: String, keyGen: Int): String = "$dropId:$keyGen"
+}
+```
+
+`mint()` returns a fresh `Key(bytes, iv)`; `seal` takes that `Key`, while `open` and `wrap` take the bare key byte array. `wrap` uses RSA-OAEP with SHA-256 and an explicit `OAEPParameterSpec`, Base64, one entry per uppercase fingerprint; `unwrap` uses the receiving identity's own private key. `keyId(dropId, keyGen)` names the key generation for receipts. `CircleCore` accepts either the legacy `FILE_BODY_KEYS = {name, size, sha256}` or the keyed set below. All bounds live in the protocol core; the app and CLI call them rather than redefining them.
 
 ### Event shape
 

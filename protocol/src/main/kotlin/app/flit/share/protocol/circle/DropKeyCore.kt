@@ -1,0 +1,215 @@
+package app.flit.share.protocol.circle
+
+import app.flit.share.protocol.model.WireJson
+import app.flit.share.protocol.tls.TlsIdentity
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.security.spec.MGF1ParameterSpec
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.OAEPParameterSpec
+import javax.crypto.spec.PSource
+import javax.crypto.spec.SecretKeySpec
+
+/**
+ * Pure JVM core for one content key per Circle file drop. The core mints a
+ * fresh symmetric key and IV, wraps the key to each current member's RSA
+ * certificate, seals bytes with AES-GCM and encodes the keyed `file`
+ * announcement body. It holds no key cache, no sealed bytes and no drop
+ * state, and never writes to the [TlsIdentity] pin map.
+ *
+ * The sealed bytes are opaque to the courier envelope and the QR frame
+ * codec; this object adds no route, frame, carrier or signature primitive.
+ */
+object DropKeyCore {
+    /** Length of a freshly minted AES-256 content key. */
+    const val KEY_BYTES = 32
+
+    /** GCM nonce length; the sealed form carries this prefix verbatim. */
+    const val IV_BYTES = 12
+
+    /** GCM authentication tag length, in bytes (128-bit tag). */
+    const val TAG_BYTES = 16
+
+    /** Hard cap on wrapped entries in one keyed body. */
+    const val MAX_WRAPS = 32
+
+    /** Base64 cap per wrapped value (a 2048-bit RSA wrap is 344 chars). */
+    const val MAX_WRAPPED_CHARS = 512
+
+    /** AAD domain tag, length-prefixed by the [CircleCore.canonical] field rule. */
+    const val DOMAIN = "FLITDROP1"
+
+    /** One minted drop key and its sealing IV. Neither is derived from group state. */
+    data class Key(val bytes: ByteArray, val iv: ByteArray)
+
+    /** Typed form of the keyed `file` announcement body. */
+    data class KeyedFile(
+        val name: String,
+        val size: Long,
+        val sha256: String,
+        val keyGen: Int,
+        val cipherSha: String,
+        val iv: String,
+        val wraps: Map<String, String>,
+    )
+
+    private val random = SecureRandom()
+
+    /**
+     * Draws a fresh key and IV from [SecureRandom]. Neither value comes from
+     * the group key, the QR invite or the file hash, so two mints never match.
+     */
+    fun mint(): Key {
+        val bytes = ByteArray(KEY_BYTES)
+        val iv = ByteArray(IV_BYTES)
+        random.nextBytes(bytes)
+        random.nextBytes(iv)
+        return Key(bytes, iv)
+    }
+
+    /**
+     * Wraps [key] once per recipient with RSA-OAEP/SHA-256 and returns the
+     * Base64 blobs keyed by uppercase certificate fingerprint. A roster above
+     * [MAX_WRAPS] is refused rather than trimmed. A fingerprint whose
+     * certificate cannot encrypt (for example a non-RSA key) gets no entry;
+     * there is no group-key fallback or escrow.
+     */
+    fun wrap(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String> {
+        require(recipients.size <= MAX_WRAPS) { "recipient roster exceeds MAX_WRAPS" }
+        val out = LinkedHashMap<String, String>()
+        for ((fingerprint, cert) in recipients) {
+            val fp = fingerprint.trim().uppercase()
+            val wrapped = runCatching {
+                val cipher = Cipher.getInstance("RSA/ECB/OAEPPadding")
+                cipher.init(Cipher.ENCRYPT_MODE, cert.publicKey, oaepSpec())
+                Base64.getEncoder().encodeToString(cipher.doFinal(key))
+            }.getOrNull() ?: continue
+            out[fp] = wrapped
+        }
+        return out
+    }
+
+    /**
+     * Decrypts the blob stored for this device's fingerprint with the local
+     * private key. A missing fingerprint, a wrong identity or a malformed blob
+     * returns null without throwing and leaves the pin map untouched.
+     */
+    fun unwrap(wrapped: Map<String, String>, identity: TlsIdentity): ByteArray? {
+        val blob = wrapped[identity.fingerprint] ?: wrapped[identity.fingerprint.lowercase()]
+            ?: return null
+        val cipher = runCatching { Base64.getDecoder().decode(blob) }.getOrNull() ?: return null
+        return identity.decryptOaepSha256(cipher)
+    }
+
+    /**
+     * AES-256-GCM seal with the key's IV and a length-prefixed [DOMAIN] AAD.
+     * The result is exactly `IV || ciphertext || tag`.
+     */
+    fun seal(key: Key, plaintext: ByteArray): ByteArray {
+        require(key.bytes.size == KEY_BYTES) { "content key must be $KEY_BYTES bytes" }
+        require(key.iv.size == IV_BYTES) { "IV must be $IV_BYTES bytes" }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key.bytes, "AES"), gcmSpec(key.iv))
+        cipher.updateAAD(aad())
+        val body = cipher.doFinal(plaintext)
+        val out = ByteArray(IV_BYTES + body.size)
+        System.arraycopy(key.iv, 0, out, 0, IV_BYTES)
+        System.arraycopy(body, 0, out, IV_BYTES, body.size)
+        return out
+    }
+
+    /**
+     * Opens an `IV || ciphertext || tag` value. A short value, a bad key or any
+     * GCM authentication failure returns null; the caller keeps the sealed
+     * bytes for inspection.
+     */
+    fun open(key: ByteArray, sealed: ByteArray): ByteArray? {
+        if (sealed.size < IV_BYTES + TAG_BYTES) return null
+        val iv = sealed.copyOfRange(0, IV_BYTES)
+        val body = sealed.copyOfRange(IV_BYTES, sealed.size)
+        return runCatching {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), gcmSpec(iv))
+            cipher.updateAAD(aad())
+            cipher.doFinal(body)
+        }.getOrNull()
+    }
+
+    /** Builds the exact keyed `file` body accepted by [CircleCore.validFileBody]. */
+    fun keyedFileBody(v: KeyedFile): String = buildJsonObject {
+        put("name", JsonPrimitive(v.name))
+        put("size", JsonPrimitive(v.size))
+        put("sha256", JsonPrimitive(v.sha256))
+        put("keyGen", JsonPrimitive(v.keyGen))
+        put("cipherSha", JsonPrimitive(v.cipherSha))
+        put("iv", JsonPrimitive(v.iv))
+        put("wraps", buildJsonObject {
+            v.wraps.forEach { (fp, wrapped) -> put(fp, JsonPrimitive(wrapped)) }
+        })
+    }.toString()
+
+    /**
+     * Parses a keyed `file` body, or returns null when [CircleCore.validFileBody]
+     * refuses it or when it is not the keyed form. No partial value is returned.
+     */
+    fun parseFileKeyBody(body: String): KeyedFile? {
+        if (!CircleCore.validFileBody(body)) return null
+        return runCatching {
+            val obj = parseBody(body) ?: return null
+            if (obj.keys != CircleCore.KEYED_FILE_BODY_KEYS) return null
+            val name = obj.string("name") ?: return null
+            val sha256 = obj.string("sha256") ?: return null
+            val size = obj.number("size")?.toLongOrNull() ?: return null
+            val keyGen = obj.number("keyGen")?.toIntOrNull() ?: return null
+            val cipherSha = obj.string("cipherSha") ?: return null
+            val iv = obj.string("iv") ?: return null
+            val wrapsObj = obj["wraps"] as? JsonObject ?: return null
+            val wraps = LinkedHashMap<String, String>()
+            for ((fp, value) in wrapsObj) {
+                val b64 = (value as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return null
+                wraps[fp] = b64
+            }
+            KeyedFile(name, size, sha256, keyGen, cipherSha, iv, wraps)
+        }.getOrNull()
+    }
+
+    /** Provenance identifier published for one signed `file` event generation. */
+    fun keyId(dropId: String, keyGen: Int): String = "$dropId:$keyGen"
+
+    private fun gcmSpec(iv: ByteArray) = GCMParameterSpec(TAG_BYTES * 8, iv)
+
+    /** The single OAEP configuration, shared by wrap and the identity decrypt. */
+    private fun oaepSpec() = OAEPParameterSpec(
+        "SHA-256",
+        "MGF1",
+        MGF1ParameterSpec.SHA256,
+        PSource.PSpecified.DEFAULT,
+    )
+
+    /** Four-byte big-endian UTF-8 field, the same rule as [CircleCore.canonical]. */
+    private fun aad(): ByteArray {
+        val bytes = ByteArrayOutputStream()
+        val out = DataOutputStream(bytes)
+        val raw = DOMAIN.toByteArray(Charsets.UTF_8)
+        out.writeInt(raw.size)
+        out.write(raw)
+        out.flush()
+        return bytes.toByteArray()
+    }
+
+    private fun parseBody(body: String): JsonObject? =
+        runCatching { WireJson.json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+
+    private fun JsonObject.string(key: String): String? =
+        (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf { it.isNotBlank() }
+
+    private fun JsonObject.number(key: String): String? =
+        (this[key] as? JsonPrimitive)?.takeIf { !it.isString }?.content
+}

@@ -31,8 +31,13 @@ object CircleCore {
     /** Largest accepted event body (a chat line / file-metadata JSON object). */
     const val MAX_BODY_CHARS = 16 * 1024
 
-    /** The exact, closed key set of a [CircleEvent.FILE] announcement body. */
+    /** The exact, closed key set of a legacy [CircleEvent.FILE] announcement body. */
     val FILE_BODY_KEYS: Set<String> = setOf("name", "size", "sha256")
+
+    /** The exact, closed key set of a keyed [CircleEvent.FILE] announcement body. */
+    val KEYED_FILE_BODY_KEYS: Set<String> = setOf(
+        "name", "size", "sha256", "keyGen", "cipherSha", "iv", "wraps",
+    )
 
     /** Largest accepted id / circleId / authorFp / type string. */
     const val MAX_FIELD_CHARS = 256
@@ -303,19 +308,37 @@ object CircleCore {
 
     /**
      * Additive, type-specific gate for a [CircleEvent.FILE] body: a bounded
-     * JSON object with EXACTLY [FILE_BODY_KEYS] — non-blank `name` and `sha256`
-     * strings and a non-negative integer `size`. [validShape] deliberately
-     * stays type-agnostic (bounds only), so this never changes an existing
-     * event's signature or acceptance; callers minting or accepting a file
-     * announcement use this to refuse `token`, `path`, `spoolPath` or any
-     * other extra key. That is what keeps a sender's local spool path off the
-     * wire: sha256 only correlates a landed file with its card locally; bytes
-     * are pushed by the sender with `sendFiles`, not pulled from a bulk queue.
+     * JSON object whose keys are EXACTLY [FILE_BODY_KEYS] (legacy) or
+     * [KEYED_FILE_BODY_KEYS] (per-drop content key). Both forms require
+     * non-blank `name` and plaintext `sha256` within [MAX_FIELD_CHARS] and a
+     * non-negative integer `size`. The keyed form additionally requires a
+     * positive integer `keyGen`, a non-blank `cipherSha`, an `iv` that decodes
+     * to exactly [DropKeyCore.IV_BYTES] bytes, and a `wraps` object with
+     * 1..[DropKeyCore.MAX_WRAPS] entries keyed by non-blank uppercase
+     * fingerprints whose Base64 values are non-blank and at most
+     * [DropKeyCore.MAX_WRAPPED_CHARS] characters. Every other string stays
+     * within [MAX_FIELD_CHARS]; the whole body stays within [MAX_BODY_CHARS].
+     *
+     * [validShape] deliberately stays type-agnostic (bounds only), so this
+     * never changes an existing event's signature or acceptance, and neither
+     * [canonical] nor [CircleEvent.TYPES] is altered by the second key set.
+     * Callers use this gate to refuse `token`, `path`, `spoolPath`, a partial
+     * key set or any other extra key. That is what keeps a sender's local
+     * spool path off the wire: sha256 only correlates a landed file with its
+     * card locally; bytes are pushed by the sender with `sendFiles`.
      */
     fun validFileBody(body: String): Boolean {
         if (body.isBlank() || body.length > MAX_BODY_CHARS) return false
         val obj = bodyObject(body) ?: return false
-        if (obj.keys != FILE_BODY_KEYS) return false
+        return when (obj.keys) {
+            FILE_BODY_KEYS -> validFileFields(obj)
+            KEYED_FILE_BODY_KEYS -> validFileFields(obj) && validKeyedFields(obj)
+            else -> false // partial, extra or renamed keys
+        }
+    }
+
+    /** The bounds shared by the legacy and the keyed file body. */
+    private fun validFileFields(obj: JsonObject): Boolean {
         val name = text(obj, "name") ?: return false
         val sha = text(obj, "sha256") ?: return false
         val sizeValue = obj["size"] as? JsonPrimitive ?: return false
@@ -323,6 +346,39 @@ object CircleCore {
         val size = sizeValue.content.toLongOrNull() ?: return false
         return name.length <= MAX_FIELD_CHARS && sha.length <= MAX_FIELD_CHARS && size >= 0L
     }
+
+    /** The extra bounds carried only by a keyed file body. */
+    private fun validKeyedFields(obj: JsonObject): Boolean {
+        val cipherSha = text(obj, "cipherSha") ?: return false
+        if (cipherSha.length > MAX_FIELD_CHARS) return false
+
+        val keyGenValue = obj["keyGen"] as? JsonPrimitive ?: return false
+        if (keyGenValue.isString) return false // "1" is not the integer 1
+        val keyGen = keyGenValue.content.toIntOrNull() ?: return false
+        if (keyGen <= 0) return false
+
+        val iv = text(obj, "iv") ?: return false
+        if (iv.length > MAX_FIELD_CHARS) return false
+        if (decodedSize(iv) != DropKeyCore.IV_BYTES) return false
+
+        val wraps = obj["wraps"] as? JsonObject ?: return false
+        if (wraps.isEmpty() || wraps.size > DropKeyCore.MAX_WRAPS) return false
+        for ((fp, wrapped) in wraps) {
+            if (fp.isBlank() || fp.length > MAX_FIELD_CHARS) return false
+            if (fp != fp.trim() || fp != fp.uppercase()) return false
+            val value = wrapped as? JsonPrimitive ?: return false
+            if (!value.isString) return false
+            val b64 = value.content
+            if (b64.isBlank() || b64.length > DropKeyCore.MAX_WRAPPED_CHARS) return false
+            if (decodedSize(b64) <= 0) return false // strict Base64; junk is not a wrapped key
+        }
+        return true
+    }
+
+    /** Strict Base64 decoded byte count, or -1 when [value] is not Base64. */
+    private fun decodedSize(value: String): Int = runCatching {
+        Base64.getDecoder().decode(value).size
+    }.getOrDefault(-1)
 
     /**
      * Production replay guard: atomic check-and-record over ONE bounded id

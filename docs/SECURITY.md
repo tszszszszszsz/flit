@@ -26,8 +26,8 @@ unrun path are marked "not verified".
 
 Assets worth protecting: the device's TLS private key (`TlsIdentity`), the
 fingerprint that names it, received file bytes, the sender's local spool, Circle
-event bodies and group key, the invite token, the relay token, and the QR codes
-that carry all of the above indirectly.
+event bodies and group key, per-drop content keys and their wraps, the invite
+token, the relay token, and the QR codes that carry all of the above indirectly.
 
 Boundaries where untrusted input crosses into a decision:
 
@@ -972,6 +972,114 @@ hash-exact, the card offered Open, the chooser opened without a crash, back
 returned to the feed, and `am force-stop` + relaunch restored sharing silently
 from the persisted desired flag (`docs/open-file-and-sharing-restore.md:247-259`).
 
+The keyed form added at 2026-12-09 keeps the signed `file` verb but carries
+wrapped key material instead of content bytes; see "Per-drop content keys:
+confidentiality for file drops". The no-path rule, the hash gate on the bytes and
+the sender-local status rule above apply unchanged to both the legacy and the
+keyed form.
+
+## Per-drop content keys: confidentiality for file drops (2026-12-09)
+
+The 2026-12-09 protocol layer gives each Circle file drop a fresh symmetric key.
+It is a JVM-pure object at
+`protocol/src/main/kotlin/app/flit/share/protocol/circle/DropKeyCore.kt`, with no
+socket, no Android import and no persistence. A drop's bytes are sealed before
+they are announced and sent, and the key travels only as one RSA-wrapped entry
+per current member inside the signed `file` announcement. The exact API is:
+
+```
+object DropKeyCore {
+  const val KEY_BYTES = 32, IV_BYTES = 12, TAG_BYTES = 16
+  const val MAX_WRAPS = 32, MAX_WRAPPED_CHARS = 512
+  const val DOMAIN = "FLITDROP1"
+  data class Key(val bytes: ByteArray, val iv: ByteArray)
+  data class KeyedFile(val name: String, val size: Long, val sha256: String,
+                       val keyGen: Int, val cipherSha: String, val iv: String,
+                       val wraps: Map<String, String>)
+  fun mint(): Key
+  fun wrap(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String>
+  fun unwrap(wrapped: Map<String, String>, identity: TlsIdentity): ByteArray?
+  fun seal(key: Key, plaintext: ByteArray): ByteArray   // IV || ciphertext || tag
+  fun open(key: ByteArray, sealed: ByteArray): ByteArray?
+  fun keyedFileBody(v: KeyedFile): String
+  fun parseFileKeyBody(body: String): KeyedFile?
+  fun keyId(dropId: String, keyGen: Int): String = "$dropId:$keyGen"
+}
+```
+
+### A fresh key per drop, sealed before announcement
+
+`mint()` draws a 32-byte key and a 12-byte IV from `SecureRandom`; neither value
+is derived from the Circle group key, the invite token or the file hash. Two
+drops of identical bytes therefore carry different IVs, different sealed bytes
+and different `cipherSha` digests. `seal(key, plaintext)` uses
+`Cipher.getInstance("AES/GCM/NoPadding")` with
+`GCMParameterSpec(TAG_BYTES * 8, iv)` and emits `IV || ciphertext || tag`: the
+12-byte IV prefix, the AES-GCM body and a 128-bit tag. The additional
+authenticated data is the length-prefixed domain tag `field("FLITDROP1")`, using
+the same 4-byte big-endian UTF-8 field rule as `CircleCore.canonical`. The file
+event id is not in the AAD because the bytes are sealed before the event is
+minted. `open(keyBytes, sealed)` refuses a value shorter than
+`IV_BYTES + TAG_BYTES`, splits the prefix and returns plaintext or null on any
+tag failure. Flipping one IV, ciphertext or tag byte, using another key or
+changing the AAD yields null.
+
+### Wraps go to current members, with no fallback and no escrow
+
+`wrap(key, recipients)` encrypts the 32-byte key with each recipient
+certificate's RSA public key using `RSA/ECB/OAEPWithSHA-256AndMGF1Padding` and an
+explicit `OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256,
+PSource.PSpecified.DEFAULT)`, Base64-encodes the result and returns a map keyed
+by uppercase fingerprint. There is one entry per current member with a usable
+certificate, capped at `MAX_WRAPS = 32`; an over-cap roster is refused, never
+silently trimmed. A member with no usable certificate gets no entry, and there
+is no group-key fallback and no escrow: no copy of the content key is written,
+logged or handed to a third party. The group key stays membership/rekey material
+and is not a content cipher, as stated in "Circle wire authority, roles and
+rekey". `unwrap(wrapped, identity)` decrypts with the local private key through
+the one additive instance method on `TlsIdentity`,
+`decryptOaepSha256(cipher: ByteArray): ByteArray?`, which returns null on
+malformed Base64, padding or provider failure and never reads or writes the pin
+map. A fingerprint absent from `wraps`, a wrong identity or a malformed blob
+yields no key.
+
+### The keyed file body and its gate
+
+A keyed `file` body has exactly `KEYED_FILE_BODY_KEYS = {name, size, sha256,
+keyGen, cipherSha, iv, wraps}`; the legacy `{name, size, sha256}` set is
+unchanged and stays valid for old drops. `CircleCore.validFileBody` accepts
+either set and refuses a partial or extra key set, a string or negative `size`,
+a non-positive `keyGen`, an `iv` that does not decode to exactly 12 bytes, a
+blank or lowercase fingerprint key, an empty or over-cap `wraps` map, and a wrap
+value over `MAX_WRAPPED_CHARS = 512` (a 2048-bit RSA-OAEP wrap is about 344
+Base64 chars, so `MAX_FIELD_CHARS = 256` would refuse a valid wrap). Every other
+string stays within `MAX_FIELD_CHARS` and the body within `MAX_BODY_CHARS`
+(16 KiB). `keyedFileBody(...)` builds exactly this map and `parseFileKeyBody(body)`
+returns a typed `KeyedFile` only when the gate passes, otherwise null. Canonical
+bytes and signatures are unchanged: `CircleCore.canonical` covers the body as
+one length-prefixed field, so the signature binds `cipherSha`, `iv` and every
+wrap; a courier or relay carrying the event cannot alter them.
+`keyId(dropId, keyGen) = "$dropId:$keyGen"` is the identifier a future delivery
+receipt can name as provenance, bounded by `MAX_FIELD_CHARS`.
+
+### No remote revocation of a past drop
+
+A departure, a group `rekey`, or a bumped `keyGen` on another drop does not change
+a published drop body. There is no wrap backfill for a later joiner and no remote
+revocation: a device that kept a wrap can still open an old drop, and removing a
+member from the roster cannot unwrap or delete a copy another device already
+holds. The protocol core holds no key cache, no sealed bytes and no drop state;
+the unwrapped key is an in-memory value owned by the caller for one decrypt pass.
+This matches the courier rule in "Courier: recipient-cert encryption and carrier
+blindness" — expiry ends a held parcel, not one an addressee already decrypted —
+and the at-post-time delivery rule in "File announcements".
+
+Evidence: CODE for the object, byte rules, gate and constants, and PURE for the
+protocol tests (`DropKeyCoreTest.kt`, `DropKeyBodyTest.kt`,
+`DropKeyCryptoTest.kt`). No harness walk and no device observation are made for
+this layer; the sealed drop is opaque payload to the courier and QR frame codecs,
+and the app and CLI receive path is a later integration.
+
 ## Storage and permissions
 
 The app asks for the minimum local capabilities and exposes almost nothing:
@@ -1067,6 +1175,12 @@ The app asks for the minimum local capabilities and exposes almost nothing:
     the carry. The codec is pure and local — it opens no file, sends no message
     and takes no remote action. Real-camera capture and an end-to-end air-gap
     walk are not device-verified.
+14. **Per-drop keys do not revoke past drops.** A fresh key seals each drop and a
+    wrap reaches only current members with a usable certificate; a later joiner
+    gets no backfill and a departure or rekey does not change a published body. A
+    device that kept a wrap can reopen an old drop. There is no escrow, no
+    group-key fallback and no remote action that deletes or invalidates a copy
+    already held elsewhere.
 
 ## Evidence status at a glance
 
@@ -1078,6 +1192,7 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | QR authority / invite | `Qr.kt`, `FlitEngine.kt`, `FlitCircleSync.kt` | `FlitQrTest` | invite text/HTML pushed to Downloads | QR v3 join, full leave discards key |
 | Relay blindness / opt-in | `RelayCore.kt`, `RelayEndpoints.kt`, `FlitEngine.kt` | `RelayCoreTest` (11) | `RelayServerTest` over production endpoints | 200 MiB cross + 300 MiB kill/resume |
 | File no-path / local status | `CircleCore.validFileBody`, `FlitEngine` delivery loop | `CircleCoreTest`, `CircleHardeningTest`, `FlitSpoolTest` | `CircleHarnessTest` | 35 B drop landed hash-exact; Open-file walk |
+| Per-drop content keys | `DropKeyCore.kt`, `CircleCore.validFileBody`, `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` (counts at integration) | not added on this date | no device walk |
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
 | Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | SIM via CLI carrier below | no device walk |
 | App courier handoff UI | `CourierCardUi.kt`, `FlitEngine.courierHandoffs`, `FlitCircleSync.postParcel` | `CourierCardUiTest` (counts recorded at integration) | consumed CLI carrier outcomes | no device walk; peer acceptance is not end-to-end delivery |
