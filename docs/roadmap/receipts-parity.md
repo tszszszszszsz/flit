@@ -6,6 +6,10 @@ Wires the signed receipt event core into the app's Circle delivery records and t
 
 2026-12-14, Integration. Commit scope: receipts in app and CLI, device walk, doc.
 
+This layer is built ahead of its scheduled day. The delivery receipts code in
+the app and CLI and its tests are written now, but the commit stays on 2026-12-14;
+no earlier date carries it.
+
 ## Depends on
 
 - 2026-12-11 Protocol — `docs/roadmap/delivery-receipts.md`: `CircleEvent.RECEIPT = "receipt"`, `CircleCore.RECEIPT_BODY_KEYS = setOf("dropId","sha256","keyId")`, `validReceiptBody`, `receiptAuthors(events, dropId, sha256, members)` and the existing `CircleCore.canonical` domain tag `FLITCIRCLE1`. Those artifacts are consumed here, not redefined.

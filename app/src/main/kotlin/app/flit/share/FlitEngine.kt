@@ -388,12 +388,17 @@ val share: StateFlow<ShareIntake?> = _share
      * The announced material of one keyed drop, read from a signed `file` body.
      * The content key is never held here — only its wrapped form and the two
      * digests, so a restart leaves nothing but the wrapped key in the log.
+     * [dropId] is the id of the signed `file` event and [keyGen] its announced
+     * generation: together they name the receipt's provenance `keyId` without
+     * inventing anything on the receive side.
      */
     internal data class DropKeyMaterial(
         val name: String,
         val sha256: String,
         val cipherSha: String,
         val wraps: Map<String, String>,
+        val dropId: String,
+        val keyGen: Int,
     )
 
     /** Sealed-bytes digest → keyed drop announced in the bounded folded log. */
@@ -410,8 +415,23 @@ val share: StateFlow<ShareIntake?> = _share
             sha256 = keyed.sha256.trim().lowercase(Locale.ROOT),
             cipherSha = cipher,
             wraps = keyed.wraps,
+            dropId = event.id,
+            keyGen = keyed.keyGen,
         )
     }
+
+    /**
+     * The exact, closed receipt body for one landed keyed drop: `dropId` and
+     * `keyId` come from the signed `file` event folded into [dropKeyIndex],
+     * `sha256` from the plaintext digest that passed the open gate. Nothing
+     * else enters the body — no landed time, path, status or key material.
+     */
+    internal fun receiptBody(dropId: String, sha256: String, keyId: String): String =
+        buildJsonObject {
+            put("dropId", JsonPrimitive(dropId))
+            put("sha256", JsonPrimitive(sha256))
+            put("keyId", JsonPrimitive(keyId))
+        }.toString()
 
     /** Rebuild the in-memory index from the bounded, already-verified event log. */
     internal fun rebuildDropKeyIndex(events: List<CircleEvent>) {
@@ -1018,6 +1038,25 @@ val share: StateFlow<ShareIntake?> = _share
     }
 
     /**
+     * Sign and publish one delivery receipt through the existing Circle post
+     * path. [dropId] and [keyId] are read from the folded keyed `file` event;
+     * [sha] is the plaintext digest that just passed the landing gate. The
+     * body carries exactly those three strings — no landed time, path, status
+     * or key material. `FlitCircleSync.post` signs it with `CircleCore.create`
+     * and fans it out on the same `/circle/sync` route as every other verb.
+     * A malformed body or a carrier failure leaves no event behind.
+     */
+    internal fun postReceipt(dropId: String, sha: String, keyId: String) {
+        if (dropId.isBlank() || sha.isBlank() || keyId.isBlank()) return
+        val body = receiptBody(dropId, sha, keyId)
+        if (!CircleCore.validReceiptBody(body)) return
+        scope.launch(Dispatchers.IO) {
+            runCatching { FlitCircleSync.post(CircleEvent.RECEIPT, body) }
+                .onFailure { logLine("circle receipt: publish failed (${it.message ?: it.javaClass.simpleName})") }
+        }
+    }
+
+    /**
      * Receive hook for a landed file. Returns true when this file was a keyed
      * drop and was handled either way — released as plaintext or refused with
      * its ciphertext deleted and no ledger row. False means "not keyed", so
@@ -1046,6 +1085,15 @@ val share: StateFlow<ShareIntake?> = _share
             plainFile,
             file.copy(fileName = good.name, size = good.plaintext.size.toLong(), sha256 = good.sha256),
             senderFp,
+        )
+        // Only here — after unwrap, open and the plaintext digest gate — does a
+        // keyed drop earn an acknowledgement. A sealed/plaintext mismatch, no
+        // wrap for this identity (NO_KEY) or a legacy file never reaches this
+        // line, so none of them can mint a receipt.
+        postReceipt(
+            dropId = material.dropId,
+            sha = good.sha256,
+            keyId = DropKeyCore.keyId(material.dropId, material.keyGen),
         )
         return true
     }

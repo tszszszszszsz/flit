@@ -8,6 +8,7 @@ import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import java.io.File
 import java.security.MessageDigest
@@ -382,6 +383,269 @@ class FlitEngineTest {
         // no new field that could smuggle the local spool onto the wire.
         assertFalse(
             circleBodyValid(CircleEvent.FILE, """{"name":"notes.gflit","size":12,"sha256":"sha","wraps":{}}"""),
+        )
+    }
+
+    // ==== delivery receipts: mint and confirmation seams =======================
+    //
+    // Mirrors of the app's receipt seams. They depend only on the frozen
+    // protocol API and the engine's existing pure keyed-drop helpers, so the
+    // cases stay runnable while the mint/count wiring lands in the engine and
+    // the UI. Each case names the exact step it pins: the landed keyed `file`
+    // event, the closed body, one signed event, and the pure confirmation fold.
+
+    /** The closed `{dropId,sha256,keyId}` body — no other field is signed. */
+    private fun receiptBody(dropId: String, sha256: String, keyId: String): String = buildJsonObject {
+        put("dropId", JsonPrimitive(dropId))
+        put("sha256", JsonPrimitive(sha256))
+        put("keyId", JsonPrimitive(keyId))
+    }.toString()
+
+    private fun bodyObject(body: String): JsonObject? =
+        runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull()
+
+    private fun text(obj: JsonObject, key: String): String? =
+        (obj[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+
+    /** The drop index the engine rebuilds from its bounded, verified event log. */
+    private fun keyedIndex(event: CircleEvent): Map<String, FlitEngine.DropKeyMaterial> {
+        val material = FlitEngine.keyedDropMaterial(event) ?: return emptyMap()
+        return mapOf(material.cipherSha to material)
+    }
+
+    /**
+     * Mirror of `onUploadFinish` → `openKeyedDropIfAny`: index the landed sealed
+     * bytes by their digest, open them with the receiving identity, require the
+     * announced plaintext digest to match, then mint ONE signed receipt from
+     * the landed keyed `file` event's id, plaintext digest and keyGen-derived
+     * key id. Every refusal (no index hit, NO_KEY/no wrap, wrong identity,
+     * mismatch or legacy) returns null — the engine publishes nothing.
+     */
+    private fun mintReceiptOnLanding(
+        fileEvent: CircleEvent,
+        sealed: ByteArray,
+        receiver: TlsIdentity,
+        index: Map<String, FlitEngine.DropKeyMaterial>,
+    ): CircleEvent? {
+        val material = index[sha256Hex(sealed)] ?: return null
+        val opened = FlitEngine.openKeyedDrop(sealed, material, receiver)
+        if (opened !is FlitEngine.KeyedDropOpen.Opened) return null
+        val keyed = DropKeyCore.parseFileKeyBody(fileEvent.body) ?: return null
+        return CircleCore.create(
+            circleId = fileEvent.circleId,
+            authorFp = receiver.fingerprint,
+            identity = receiver,
+            type = CircleEvent.RECEIPT,
+            body = receiptBody(
+                fileEvent.id,
+                opened.sha256,
+                DropKeyCore.keyId(fileEvent.id, keyed.keyGen),
+            ),
+            lamport = fileEvent.lamport + 1L,
+            createdMs = fileEvent.createdMs + 1_000L,
+        )
+    }
+
+    /** A signed receipt, as the engine's `post` path publishes it. */
+    private fun signedReceipt(
+        signer: TlsIdentity,
+        circleId: String,
+        dropId: String,
+        sha: String,
+        keyGen: Int,
+        lamport: Long,
+    ): CircleEvent = CircleCore.create(
+        circleId, signer.fingerprint, signer, CircleEvent.RECEIPT,
+        receiptBody(dropId, sha, DropKeyCore.keyId(dropId, keyGen)), lamport,
+        1_800_000_100_000L + lamport,
+    )
+
+    /**
+     * Mirror of the file card's confirmed fold: collect the ids of `file`
+     * events whose body sha matches the delivery, then union
+     * `CircleCore.receiptAuthors` over those ids with the current roster.
+     */
+    private fun confirmedAuthors(
+        events: List<CircleEvent>,
+        members: List<String>,
+        delivery: FlitCircleStore.CircleDelivery,
+    ): Set<String> {
+        val dropIds = events.mapNotNull { event ->
+            if (event.type != CircleEvent.FILE) return@mapNotNull null
+            val sha = bodyObject(event.body)?.let { text(it, "sha256") } ?: return@mapNotNull null
+            if (sha.equals(delivery.sha256, ignoreCase = true)) event.id else null
+        }
+        return dropIds.flatMap { CircleCore.receiptAuthors(events, it, delivery.sha256, members) }.toSet()
+    }
+
+    @Test
+    fun `a valid keyed landing mints one receipt with the exact closed body`() {
+        val sender = TlsIdentity.generate()
+        val receiver = TlsIdentity.generate()
+        val d = dropMaterial(recipients = mapOf(receiver.fingerprint to receiver.certificate))
+        val fileEvent = keyedEvent(d, author = sender)
+        assertTrue(CircleCore.verify(fileEvent), "only a verified file event feeds the drop index")
+        val index = keyedIndex(fileEvent)
+        assertEquals(setOf(sha256Hex(d.sealed)), index.keys, "the engine indexes the landed sealed digest")
+
+        val receipt = assertNotNull(mintReceiptOnLanding(fileEvent, d.sealed, receiver, index))
+
+        assertEquals(CircleEvent.RECEIPT, receipt.type)
+        assertEquals(fileEvent.circleId, receipt.circleId)
+        assertEquals(receiver.fingerprint, receipt.authorFp, "the lander, not the sender, acknowledges")
+        assertTrue(CircleCore.verify(receipt), "the minted receipt verifies with its own cert")
+        assertTrue(CircleCore.validReceiptBody(receipt.body))
+        val fields = assertNotNull(bodyObject(receipt.body))
+        assertEquals(CircleCore.RECEIPT_BODY_KEYS, fields.keys, "the body is exactly dropId sha256 keyId")
+        assertEquals(fileEvent.id, text(fields, "dropId"))
+        assertEquals(sha256Hex(d.plaintext), text(fields, "sha256"), "the plaintext digest from the file event")
+        assertEquals(DropKeyCore.keyId(fileEvent.id, 1), text(fields, "keyId"))
+        assertFalse(fields.keys.any { it in setOf("landedMs", "path", "status", "key", "cipherSha", "spoolPath") })
+        assertFalse(receipt.body.contains(".flitdrop"), "no local spool path on the wire")
+    }
+
+    @Test
+    fun `a plaintext digest mismatch mints no receipt`() {
+        val receiver = TlsIdentity.generate()
+        val d = dropMaterial(
+            recipients = mapOf(receiver.fingerprint to receiver.certificate),
+            announcedPlainSha = "0".repeat(64),
+        )
+        val fileEvent = keyedEvent(d, author = TlsIdentity.generate())
+        val index = keyedIndex(fileEvent)
+        val material = assertNotNull(index[sha256Hex(d.sealed)])
+        assertTrue(circleBodyValid(CircleEvent.FILE, fileEvent.body), "the forged digest is still gate-valid")
+
+        val refused = assertNotNull(FlitEngine.openKeyedDrop(d.sealed, material, receiver) as? FlitEngine.KeyedDropOpen.Refused)
+        assertEquals("plaintext digest mismatch", refused.reason, "the gate catches it after the bytes open")
+        assertNull(mintReceiptOnLanding(fileEvent, d.sealed, receiver, index), "no receipt for bytes that fail the digest")
+    }
+
+    @Test
+    fun `a sealed digest mismatch mints no receipt before the key is opened`() {
+        val receiver = TlsIdentity.generate()
+        val d = dropMaterial(
+            recipients = mapOf(receiver.fingerprint to receiver.certificate),
+            announcedCipherSha = "0".repeat(64),
+        )
+        val fileEvent = keyedEvent(d, author = TlsIdentity.generate())
+        val index = keyedIndex(fileEvent)
+
+        assertEquals(setOf("0".repeat(64)), index.keys, "the engine indexes the announced cipherSha")
+        assertNull(index[sha256Hex(d.sealed)], "the landed bytes do not hash to the announced digest")
+        assertNull(mintReceiptOnLanding(fileEvent, d.sealed, receiver, index), "not hash-exact — nothing minted")
+    }
+
+    @Test
+    fun `a NO_KEY landing with no wrap for the local identity mints no receipt`() {
+        // NO_KEY is the terminal local outcome for a member the drop's key was
+        // not wrapped to; it must never become a signed acknowledgement.
+        val receiver = TlsIdentity.generate()
+        val stranger = TlsIdentity.generate()
+        val d = dropMaterial(recipients = mapOf(stranger.fingerprint to stranger.certificate))
+        val fileEvent = keyedEvent(d, author = TlsIdentity.generate())
+        val index = keyedIndex(fileEvent)
+        val material = assertNotNull(index[sha256Hex(d.sealed)])
+        assertEquals(setOf(stranger.fingerprint), material.wraps.keys)
+        assertFalse(receiver.fingerprint in material.wraps.keys)
+
+        val refused = assertNotNull(FlitEngine.openKeyedDrop(d.sealed, material, receiver) as? FlitEngine.KeyedDropOpen.Refused)
+        assertEquals("no wrap for this device", refused.reason)
+        assertNull(mintReceiptOnLanding(fileEvent, d.sealed, receiver, index))
+    }
+
+    @Test
+    fun `a legacy plaintext drop mints no receipt`() {
+        val sender = TlsIdentity.generate()
+        val receiver = TlsIdentity.generate()
+        val legacyBody = circleFileBody("notes.gflit", 12L, "legacy-sha")
+        assertTrue(circleBodyValid(CircleEvent.FILE, legacyBody))
+        val legacy = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.FILE, legacyBody, 1L, 1_800_000_000_000L,
+        )
+        assertTrue(CircleCore.verify(legacy))
+        assertNull(DropKeyCore.parseFileKeyBody(legacy.body), "legacy has no keyGen or wraps")
+        assertTrue(keyedIndex(legacy).isEmpty(), "legacy is never indexed as a keyed drop")
+
+        assertNull(
+            mintReceiptOnLanding(legacy, "plain bytes".toByteArray(), receiver, keyedIndex(legacy)),
+            "a plaintext drop keeps its send-report status and gets no receipt",
+        )
+    }
+
+    @Test
+    fun `receiptAuthors folds into the file card confirmation count`() {
+        val sender = TlsIdentity.generate()
+        val alice = TlsIdentity.generate()
+        val bob = TlsIdentity.generate()
+        val stranger = TlsIdentity.generate()
+        val attacker = TlsIdentity.generate()
+        val d = dropMaterial(recipients = mapOf(
+            sender.fingerprint to sender.certificate,
+            alice.fingerprint to alice.certificate,
+            bob.fingerprint to bob.certificate,
+        ))
+        val fileEvent = keyedEvent(d, author = sender)
+        val sha = sha256Hex(d.plaintext)
+        val dropId = fileEvent.id
+        val a1 = signedReceipt(alice, fileEvent.circleId, dropId, sha, 1, 2L)
+        val b1 = signedReceipt(bob, fileEvent.circleId, dropId, sha, 1, 3L)
+        // A later rekey changes only provenance: keyId is never a selection key.
+        val a2 = signedReceipt(alice, fileEvent.circleId, dropId, sha, 9, 4L)
+        val outsider = signedReceipt(stranger, fileEvent.circleId, dropId, sha, 1, 5L)
+        val otherDrop = signedReceipt(alice, fileEvent.circleId, "another-drop", sha, 1, 6L)
+        val forged = CircleCore.create(
+            fileEvent.circleId, alice.fingerprint, attacker, CircleEvent.RECEIPT,
+            receiptBody(dropId, sha, DropKeyCore.keyId(dropId, 1)), 7L, 1_800_000_100_007L,
+        )
+        assertFalse(CircleCore.verify(forged), "a cert that does not match authorFp is refused")
+
+        val events = listOf(fileEvent, a1, b1, a2, outsider, otherDrop, forged)
+        val members = listOf(sender.fingerprint, alice.fingerprint, bob.fingerprint)
+        val delivery = FlitCircleStore.CircleDelivery(
+            id = "delivery-1", name = d.keyed.name, size = d.plaintext.size.toLong(),
+            sha256 = sha, spoolPath = "/local/notes.gflit.flitdrop",
+            statuses = mapOf(
+                alice.fingerprint to FlitCircleStore.CircleDelivery.REFUSED,
+                bob.fingerprint to FlitCircleStore.CircleDelivery.PENDING,
+            ),
+        )
+        val state = FlitCircleStore.CircleState(
+            id = fileEvent.circleId, keyB64 = "circle-key", role = FlitCircleStore.Role.OWNER,
+            members = members.map { FlitCircleStore.Member(it, "alias") },
+            events = events, deliveries = mapOf(sha to delivery),
+        )
+
+        val confirmed = confirmedAuthors(state.events, members, delivery)
+
+        assertEquals(setOf(alice.fingerprint, bob.fingerprint), confirmed)
+        assertEquals(2, confirmed.size, "one entry per author, not per receipt")
+        assertEquals(
+            confirmed,
+            confirmedAuthors(listOf(a2, forged, outsider, b1, otherDrop, a1, fileEvent), members, delivery),
+            "arrival order must not change the confirmation count",
+        )
+        assertEquals(
+            setOf(alice.fingerprint),
+            CircleCore.receiptAuthors(listOf(a1, a2), dropId, sha, members),
+            "a rekeyed keyId does not invalidate the earlier receipt",
+        )
+        // The count is a pure read: local sender-side statuses do not move.
+        assertEquals(
+            FlitCircleStore.CircleDelivery.REFUSED,
+            state.deliveries.getValue(sha).statuses[alice.fingerprint],
+        )
+        var updated = state
+        for (fp in confirmed) {
+            updated = FlitCircleStore.setDeliveryStatus(updated, sha, fp, FlitCircleStore.CircleDelivery.SENT)
+        }
+        assertEquals(1, updated.deliveries.size, "no phantom delivery row")
+        assertEquals(FlitCircleStore.CircleDelivery.SENT, updated.deliveries.getValue(sha).statuses[alice.fingerprint])
+        assertEquals(FlitCircleStore.CircleDelivery.SENT, updated.deliveries.getValue(sha).statuses[bob.fingerprint])
+        assertEquals(
+            updated.deliveries,
+            FlitCircleStore.setDeliveryStatus(updated, "unknown-sha", stranger.fingerprint, FlitCircleStore.CircleDelivery.SENT).deliveries,
+            "an unknown sha creates no confirmation row",
         )
     }
 }

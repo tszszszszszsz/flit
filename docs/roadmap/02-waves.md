@@ -32,6 +32,10 @@ carries it.
 The 2026-12-11 Protocol wave is built ahead. Delivery receipts implementation runs
 now, but the commit stays on 2026-12-11; no earlier wave carries it.
 
+The 2026-12-14 Integration wave is built ahead. Delivery receipts implementation in
+the app and CLI runs now, but the commit stays on 2026-12-14; no earlier wave carries
+it.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator

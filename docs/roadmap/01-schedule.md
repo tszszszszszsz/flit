@@ -36,6 +36,10 @@ The 2026-12-11 Protocol layer is built ahead of its scheduled day. The delivery
 receipts body gate and author tally code and tests are written now, but the commit
 stays on 2026-12-11; no earlier date carries it.
 
+The 2026-12-14 Integration layer is built ahead of its scheduled day. The delivery
+receipts code in the app and CLI and its tests are written now, but the commit stays
+on 2026-12-14; no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

@@ -1454,4 +1454,123 @@ class FlitCircleSyncTest {
             "a roster above the wrap cap must be refused, never trimmed",
         )
     }
+
+    // ==== delivery receipts: app body gate and host SYNC filter ==================
+
+    /** The exact three-string body a receipt mints; no landedMs, path or status. */
+    private fun receiptBody(
+        dropId: String = "file-event-1",
+        sha: String = "a".repeat(64),
+        keyId: String = "b".repeat(32),
+    ): String = JsonObject(
+        mapOf(
+            "dropId" to JsonPrimitive(dropId),
+            "sha256" to JsonPrimitive(sha),
+            "keyId" to JsonPrimitive(keyId),
+        ),
+    ).toString()
+
+    /** Replace one receipt field with a non-string primitive so the gate's type check is hit. */
+    private fun receiptBodyPrimitive(field: String, value: JsonPrimitive): String =
+        JsonObject(obj(receiptBody()).toMutableMap().apply { put(field, value) }).toString()
+
+    @Test
+    fun `receipt body gate accepts only the exact dropId sha256 keyId set`() {
+        assertEquals(setOf("dropId", "sha256", "keyId"), CircleCore.RECEIPT_BODY_KEYS)
+        val body = receiptBody()
+        assertEquals(CircleCore.RECEIPT_BODY_KEYS, obj(body).keys)
+        assertTrue(CircleCore.validReceiptBody(body))
+        assertTrue(circleBodyValid(CircleEvent.RECEIPT, body), "the app gate delegates to the core gate")
+        assertTrue(circleBodyValid(" RECEIPT ", body), "the verb is trimmed and lowered as for every other type")
+
+        // Bounds are the shared field cap; no other field is required or allowed.
+        assertTrue(circleBodyValid(CircleEvent.RECEIPT, receiptBody(sha = "c".repeat(CircleCore.MAX_FIELD_CHARS))))
+        assertTrue(CircleCore.validReceiptBody(receiptBody(keyId = "d".repeat(CircleCore.MAX_FIELD_CHARS))))
+        assertTrue(circleBodyValid(CircleEvent.RECEIPT, receiptBody(dropId = "d", sha = "s", keyId = "k")))
+    }
+
+    @Test
+    fun `receipt body gate refuses missing extra mistyped blank and oversized fields`() {
+        val body = receiptBody()
+        assertTrue(circleBodyValid(CircleEvent.RECEIPT, body)) // the refusal vectors below all start valid
+
+        CircleCore.RECEIPT_BODY_KEYS.forEach { field ->
+            val missing = mutatedKeyedBody(body, drop = field)
+            assertFalse(circleBodyValid(CircleEvent.RECEIPT, missing), "missing $field")
+            assertFalse(CircleCore.validReceiptBody(missing), "the core gate agrees on missing $field")
+
+            listOf("", " ", "x".repeat(CircleCore.MAX_FIELD_CHARS + 1)).forEach { value ->
+                val bad = mutatedKeyedBody(body, set = mapOf(field to value))
+                assertFalse(circleBodyValid(CircleEvent.RECEIPT, bad), "blank or over-cap $field")
+                assertFalse(CircleCore.validReceiptBody(bad))
+            }
+            listOf(JsonPrimitive(42), JsonPrimitive(true)).forEach { value ->
+                val bad = receiptBodyPrimitive(field, value)
+                assertFalse(circleBodyValid(CircleEvent.RECEIPT, bad), "non-string $field")
+                assertFalse(CircleCore.validReceiptBody(bad))
+            }
+        }
+
+        listOf("landedMs", "path", "spoolPath", "token", "status", "key", "data", "bytes").forEach { extra ->
+            val bad = mutatedKeyedBody(body, set = mapOf(extra to "x"))
+            assertFalse(circleBodyValid(CircleEvent.RECEIPT, bad), "extra key $extra")
+            assertFalse(CircleCore.validReceiptBody(bad))
+        }
+        val numericExtra = JsonObject(obj(body).toMutableMap().apply { put("landedMs", JsonPrimitive(1)) }).toString()
+        assertFalse(circleBodyValid(CircleEvent.RECEIPT, numericExtra))
+        assertFalse(CircleCore.validReceiptBody(numericExtra))
+
+        listOf("", "not json", """["dropId","sha256","keyId"]""", "x".repeat(CircleCore.MAX_BODY_CHARS + 1))
+            .forEach { bad ->
+                assertFalse(circleBodyValid(CircleEvent.RECEIPT, bad))
+                assertFalse(CircleCore.validReceiptBody(bad))
+            }
+        assertFalse(circleBodyValid("unknown", body), "the gate stays per verb")
+        assertFalse(circleBodyValid(CircleEvent.FILE, body), "a receipt body is not a file body")
+    }
+
+    @Test
+    fun `host SYNC folds a signed receipt with a valid body and skips malformed foreign or forged ones`() {
+        val hostId = TlsIdentity.generate()
+        val sender = TlsIdentity.generate()
+        val outsider = TlsIdentity.generate()
+        val st = state(hostId.fingerprint, sender.fingerprint, outsider.fingerprint)
+        val host = FlitCircleHost(hostId, "invite", st.keyB64)
+        val body = receiptBody()
+        val sha = obj(body).getValue("sha256").jsonPrimitive.content
+        val dropId = obj(body).getValue("dropId").jsonPrimitive.content
+
+        val good = CircleCore.create(st.id, sender.fingerprint, sender, CircleEvent.RECEIPT, body, 1L)
+        val malformed = CircleCore.create(
+            st.id, sender.fingerprint, sender, CircleEvent.RECEIPT,
+            mutatedKeyedBody(body, set = mapOf("landedMs" to "1")), 2L,
+        )
+        val forged = good.copy(id = "forged-${good.id}", sig = "not-a-signature")
+        val foreign = CircleCore.create(st.id, outsider.fingerprint, outsider, CircleEvent.RECEIPT, body, 3L)
+
+        assertTrue(circleBodyValid(CircleEvent.RECEIPT, good.body))
+        assertFalse(circleBodyValid(CircleEvent.RECEIPT, malformed.body))
+        assertTrue(CircleCore.verify(good))
+        assertTrue(CircleCore.verify(foreign), "the outsider's receipt is genuine, but not from the requester")
+
+        val req = CircleRequest(
+            action = CircleRequest.ACTION_SYNC,
+            circleId = st.id,
+            memberFp = sender.fingerprint,
+            events = listOf(malformed, foreign, forged, good),
+        )
+        val result = host.onRequest(req, st)
+        assertTrue(result.ok)
+        assertEquals(listOf(good.id), result.events.map { it.id })
+        assertEquals("", result.key, "a SYNC answer never carries the group key")
+
+        val folded = host.accept(result, st)
+        assertEquals(listOf(good.id), folded.events.map { it.id })
+        assertTrue(st.events.isEmpty(), "the host state is never mutated in place")
+        assertEquals(
+            setOf(sender.fingerprint),
+            CircleCore.receiptAuthors(folded.events, dropId, sha, listOf(sender.fingerprint)),
+            "the folded receipt confirms exactly its author for this drop",
+        )
+    }
 }

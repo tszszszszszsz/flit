@@ -172,6 +172,12 @@ internal fun circleBodyValid(type: String, body: String): Boolean {
         // field bounds and envelope cap belong to the protocol carry core;
         // this gate delegates to it and never restates those rules.
         CircleEvent.PARCEL -> CourierCarryCore.validParcelBody(body)
+        // A delivery receipt carries ONLY the exact {dropId, sha256, keyId}
+        // set landed from a keyed file event — no landedMs, path, status or
+        // key material. The closed key set, string-primitive and field/body
+        // bounds belong to CircleCore; this gate delegates to it and never
+        // restates those rules.
+        CircleEvent.RECEIPT -> CircleCore.validReceiptBody(body)
         else -> false
     }
 }

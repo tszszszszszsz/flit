@@ -1240,6 +1240,83 @@ Evidence: CODE for the verb, body gate and roll-up, and PURE for the protocol
 tests on 2026-12-11. No harness or device observation of receipts exists on this
 date.
 
+## Delivery receipts in app and CLI: local landing, no remote action (2026-12-14)
+
+The 2026-12-14 integration puts the 2026-12-11 receipt verb on both surfaces.
+The app mints a receipt in `FlitEngine.onUploadFinish` after a keyed drop's
+plaintext digest matches the signed `file` event, and publishes it through
+`FlitCircleSync.postReceipt` on the existing fan-out path. The CLI mints one with
+`circle receipt --sha SHA [--drop-id ID] [--host ip[:port]]`, resolving the
+`file` event by its plaintext sha and deriving `keyId` from that event's signed
+`keyGen`. Both surfaces consume `CircleCore.receiptAuthors` for the confirmed
+count. The trust properties below are properties of that one signed event; the
+integration adds no new trust anchor.
+
+### A receipt is a local landing acknowledgement
+
+A receipt states one fact about the signing device: a named drop landed there
+hash-exact. It is not a claim about any other member and not global delivery
+proof. The app mints nothing on a digest mismatch, an `Error`, a carrier throw,
+a drop without `keyGen` and `wraps`, or a legacy plaintext drop; the CLI exits
+without an event when the sha lookup or the keyed body is missing. Neither
+surface fabricates a `dropId` or a `keyId`. A receipt does not replace the
+sender-local `CircleDelivery.statuses` and does not create a delivery row that
+never existed; it only maps a confirmed author to `SENT` through the existing
+`setDeliveryStatus` reducer inside one `FlitCircleStore.update` call. The
+sender-local status rules in "File announcements" still apply.
+
+### No remote action
+
+Minting or publishing a receipt does not act at a distance. It does not dial a
+peer, open a file, set a status on another device, join a Circle, wipe or lock
+anything, or command a recipient. The event travels only in
+`CircleRequest.events` on `POST /api/flit/v1/circle/sync` or inside a courier or
+QR parcel that already carries signed events; no route, header, DTO field, QR
+parameter or v2.2 status is added. A confirmed count is a local fold over the
+bounded signed log, not a message sent to anyone. This is the same "no remote
+action" rule as the parcel surfaces above: the durable effect is a signed event
+in the local log and a local status write, and no peer can be made to change by
+receiving it.
+
+### No key material
+
+The body is exactly `CircleCore.RECEIPT_BODY_KEYS = {dropId, sha256, keyId}`.
+`keyId` is provenance derived from `keyGen`, an identifier, not a private key,
+content key, wrapped key or shared secret. There is no per-recipient wrap, no
+file bytes, no `path` or `spoolPath`, no token, no status string and no extra
+time field — `CircleEvent.createdMs` is the acknowledgement time. The closed
+body gate `CircleCore.validReceiptBody` accepts only three non-blank strings
+within `MAX_FIELD_CHARS` (256) in a body within `MAX_BODY_CHARS` (16 KiB), so
+extra, blank, non-string or oversized fields are refused at both app gates
+(`FlitCircleSync.circleBodyValid` and the `FlitCircleHost` SYNC filter). The
+whole body is one length-prefixed field in `CircleCore.canonical`, so the sender
+signature binds every value and a carrier cannot rewrite the `sha256` or the
+`keyId` without failing verification. Per-drop content keys stay on the drop
+path described in "Per-drop content keys" and "Keyed drops in app and CLI"; no
+key is added to the receipt.
+
+### The tally is member-gated
+
+`CircleCore.receiptAuthors(events, dropId, sha256, members)` counts a receipt
+only when its author fingerprint is in the supplied **normalized current-member
+set**, its body is well formed, both `dropId` and `sha256` match the drop being
+read, and `CircleCore.verify` passes with the cert bound to `authorFp`. A
+departed member, a non-member, a forged receipt and a body for another drop
+produce no confirmation. At most one entry per author counts, chosen by
+`CircleCore.ORDER` independent of arrival order; `keyId` is not a selection key,
+so a later rekey does not invalidate an earlier acknowledgement. Entries enter
+the local log through the roster-gated SYNC filter, and replay uses the shared
+`6 h` window, `5 min` skew, `MAX_SEEN = 4096` and verify-before-evaluate order,
+so a replayed or stale id leaves the count unchanged. The confirmed set is
+folded by the app's pure helper and by the CLI's `circle sync` / `circle file`
+display, never gossiped as a status, and a non-member author never reaches a
+card or a delivery row.
+
+Evidence: CODE for the app mint/publish seams, the CLI command, the two app
+gates and the member-gated roll-up; PURE for the body, tally and canonical tests
+and the app confirmation helper; SIM-HARN for the two-bot confirm walk and its
+forgery/refusal cases. No device receipt walk is claimed.
+
 ## Storage and permissions
 
 The app asks for the minimum local capabilities and exposes almost nothing:
@@ -1345,8 +1422,10 @@ The app asks for the minimum local capabilities and exposes almost nothing:
     one member that a named drop landed on that member's device, not global
     delivery proof, and it says nothing about other members. The body is exactly
     `{dropId, sha256, keyId}` — no key material, file bytes, path or local status
-    — and `keyId` is provenance, not a key. No harness or device receipt walk is
-    recorded on this date.
+    — and `keyId` is provenance, not a key. Minting or publishing one takes no
+    remote action, and the confirmed tally is gated on the current-member roster:
+    a departed or unknown author is not counted. The 2026-12-14 app and CLI
+    integration adds no device receipt walk claim.
 
 ## Evidence status at a glance
 

@@ -1955,3 +1955,156 @@ rekey-ignored events. No SIM-HARN or DEVICE evidence exists for receipts on this
 date, and no device claim is made: a receipt is one member's signed
 acknowledgement of a local, hash-exact landing, not proof of delivery to every
 member. See [delivery-receipts.md](roadmap/delivery-receipts.md).
+
+## 22. Delivery receipts parity — app and CLI mint, gates and tally (2026-12-14)
+
+### 22.1 Layer and ownership
+
+This is the Integration layer over §21 (the JVM-pure delivery receipt core). It
+wires `CircleCore.validReceiptBody` and `CircleCore.receiptAuthors` into the
+app's Circle delivery records and the CLI's Circle commands. It lives in
+`app/src/main/kotlin/app/flit/share/` (`FlitEngine.kt`, `FlitCircleSync.kt`,
+`FlitCircleHost.kt`, `CircleUi.kt`) and
+`harness/src/main/kotlin/app/flit/share/harness/Harness.kt`. No protocol
+constant, canonical byte layout, event type or body key set is redefined: both
+surfaces call the §21.2 API and read their bounds from §21.3 and §21.4. No route,
+header, DTO field, QR parameter or v2.2 status code changes: a receipt is still
+the one signed `CircleEvent` of §21 carried in `CircleRequest.events` on
+`POST /api/flit/v1/circle/sync` (§7.3, §7.5) or inside a courier/QR parcel that
+already carries signed events (§13–§18). A stock LocalSend v2.2 peer sees the
+same wire it saw before (§2, §4).
+
+There is no new status value and no new schema field on `CircleDelivery` (app)
+or `CircleFileDelivery` (CLI). The per-drop key fields added in §20.2 and §20.3
+stay as they are. The community log cap `EVENT_CAP = 500`, the per-request cap
+`MAX_EVENTS_PER_REQUEST = 1024` and the request cap `MAX_REQUEST_BYTES = 8 MiB`
+still bound where receipts can appear.
+
+### 22.2 App gates
+
+Two app-side admission points that currently refuse the receipt verb are opened
+through the protocol core. Neither restates the body rules.
+
+| Gate | Contract |
+| --- | --- |
+| `FlitCircleSync.circleBodyValid(type, body)`, `RECEIPT` branch | Delegates to `CircleCore.validReceiptBody(body)` (§21.4) beside the `FILE` branch. The exact key set `{"dropId","sha256","keyId"}`, non-blank string values within `MAX_FIELD_CHARS` and a body within `MAX_BODY_CHARS` are accepted; a partial, extra-key, blank, non-string or oversized body is refused before it can be signed. This is also the mint-side gate: `emit` signs, persists and fans out nothing when this gate is false (§7.3). |
+| `FlitCircleHost.kt` SYNC admission filter | Adds the matching condition beside `CircleEvent.FILE || CircleCore.validFileBody(...)`: a receipt event is admitted only when `CircleCore.validReceiptBody(it.body)` is true. The `circleId == current.id`, `type in CircleEvent.TYPES`, body length, `normalized(authorFp) == requester`, JOIN/REKEY restrictions, non-blank `cert`, `CircleCore.verify`, local id dedup and `CircleCore.accept == Accept` steps are unchanged. Verify still runs before `accept`, so a forged receipt cannot reserve an id. |
+
+`FlitCircleStore.reduce` already appends unrecognised verbs as history, so an
+admitted receipt enters `CircleState.events` without a reducer change and stays
+under `EVENT_CAP = 500`. A duplicate id, a `createdMs` outside the replay
+window, a bad signature or a certificate whose own fingerprint differs from
+`authorFp` is refused by the existing §7.4 / §21.6 path and changes neither the
+confirmed count nor any delivery row.
+
+### 22.3 App mint path
+
+`ServerDelegate.onUploadFinish` still fires once per landed file (§3.4). For a
+keyed drop it runs after the per-drop key layer has unwrapped and opened the
+bytes and checked the plaintext SHA-256 against the announced `file` event
+(§20.4). At that point the engine reads the `id` of that `file` event as
+`dropId`, derives `keyId` with `DropKeyCore.keyId(dropId, keyGen)` from the
+event's `keyGen`, and mints a body that is exactly `{dropId, sha256, keyId}`
+using `CircleCore.create(..., CircleEvent.RECEIPT, body)`. The `sha256` is the
+plaintext digest carried by the keyed `file` body, not the sealed `cipherSha`
+that `sendFiles` gates on, so the sender's read side and the receiver's mint
+side name the same content.
+
+A new `postReceipt(dropId, sha, keyId)` helper, beside `FlitCircleSync.postFile`
+(§20.2), publishes the event through the existing signed `post()` / `emit` /
+fan-out path. It signs nothing that `circleBodyValid` refuses (§22.2) and adds
+no route of its own.
+
+Nothing is minted when the plaintext digest gate fails, on `UploadResult.Mismatch`
+or `UploadResult.Error`, when `keyGen` or `wraps` is absent from the `file` body
+(a legacy plaintext drop), on a wrong identity or `NO_KEY`, or when the carrier
+throws. No `landedMs`, path, spool path, token, key material, file bytes or local
+status string enters the body; `CircleEvent.createdMs` is the acknowledgement
+time. `circle post --file`, `circle file` delivery and
+`ConsoleDelegate.onUploadFinish` keep their existing behaviour (§20.3, §20.4).
+
+### 22.4 Tally and UI
+
+A pure confirmation helper takes the folded `CircleState` and one
+`CircleDelivery`. It collects the `id`s of `file` events whose body `sha256`
+matches the delivery's `sha256`, calls
+`CircleCore.receiptAuthors(state.events, dropId, sha, currentMembers)` (§21.5)
+for each candidate id, and unions the returned author fingerprints into one set.
+The count is the size of that set. `CircleCore.ORDER` picks one entry per author
+so arrival order cannot change the count, and the union keeps one entry per
+fingerprint across re-announcements of the same content. `keyId` is read only as
+signed provenance and never selects a receipt, so a later rekey does not change
+the count. The helper has no Compose dependency and is unit-tested directly.
+
+`CircleUi.computeFeedData` folds this `confirmed` count into the file-card data
+with `remember` memoization, so the tally is recomputed from the folded events
+and member roster rather than stored as a new event field. The status line
+reports the sent count and the confirmed count as plain text. No receipt is
+rendered as a chat row, no emoji is added and no chat-bubble treatment is
+introduced.
+
+A confirmed author may be recorded through the existing `setDeliveryStatus`
+reducer as `SENT`, overriding an earlier `REFUSED` or `FAILED` inference, inside
+one `FlitCircleStore.update(ctx)` call; no phantom delivery row is created.
+`FlitEngine.refreshCircle()` publishes the updated deliveries through
+`_circleDeliveries` as it does for the other status writes. Sender-local
+`CircleDelivery.statuses` keep their existing vocabulary and remain local-only:
+no status string is added and no status is gossiped. Retry-worker and Circle
+sync timing constants are unchanged.
+
+### 22.5 CLI receipt contract
+
+`circleUsage()` gains the command `circle receipt --sha SHA [--drop-id ID]
+[--host ip[:port]]`. It requires a joined circle (`circleId`, `key`, `host`).
+The event is resolved by matching the plaintext `sha256` in the signed `file`
+body: with no `--drop-id`, that event's `id` becomes `dropId`; with `--drop-id`,
+the supplied id is used. The command then requires `keyGen` and `wraps` in that
+`file` body and derives `keyId` with `DropKeyCore.keyId(dropId, keyGen)`. If no
+`file` event matches the sha, or the keyed fields are absent (a legacy drop),
+it prints `!! no key id for drop — receipts are for keyed drops` and exits
+without an event. No value is fabricated.
+
+The minted body is exactly `{dropId, sha256, keyId}`. The event is appended to
+`st.events` and sent with `pushCircleEvent` through the existing `circleEvent`
+helper, using the joined identity. `circle sync` and `circle file` print a
+confirmed count from `CircleCore.receiptAuthors(st.events, dropId, sha,
+st.members)` over the same candidate drop ids. `CircleFileDelivery` needs no new
+field: the confirmed set is derived from the log. The existing
+"status is local-only, never gossiped" wording stays for the other statuses;
+the hint to run `circle receipt` lives in the reproduction recipe, not in the
+receive log.
+
+### 22.6 No-new-route and v2.2 boundary
+
+1. **Existing wire home only.** A receipt rides in `CircleRequest.events` on
+   `POST /api/flit/v1/circle/sync` (`Protocol.PATH_CIRCLE_SYNC`, §1, §7.5) or in
+   a courier/QR parcel payload that already carries signed events (§13–§18). No
+   `PATH_*` constant, Ktor route, `LinkProvider`, byte-transfer route, HTTP
+   header, `CircleRequest`/`CircleResponse` field, status code or QR key
+   parameter is added.
+2. **v2.2 untouched.** `/info`, `/register`, `/prepare-upload`, `/upload` and
+   `/cancel`, their DTO shapes and their status behaviour stay as in §2. The
+   earlier courier, relay and parcel contracts (§5, §13–§18) keep their byte
+   shapes.
+3. **No second crypto or replay path.** Minting uses `CircleCore.create` with
+   the existing identity and §21.3 body; the `FLITCIRCLE1` canonical bytes,
+   signature, `6 h` replay window, `5 min` skew, dedup and caps of §21.6 are
+   reused unchanged. No new status code or response shape is introduced.
+4. **No schema change.** No field is added to `CircleDelivery` or
+   `CircleFileDelivery`; the 500-event log cap and the 1024-event per-request
+   cap still bound receipt state.
+
+### 22.7 Evidence boundary
+
+CODE establishes the app gates, the app and CLI mint seams, the CLI command and
+the tally fold. PURE JVM tests pin the `RECEIPT` branch of `circleBodyValid`, the
+host SYNC admission of a valid receipt and the skip of a malformed one, the pure
+confirmation helper (sha correlation, one author per fingerprint under reversed
+order and reversed re-announcements, a changed `keyId` leaving the count intact,
+non-member authors ignored), the `setDeliveryStatus` promotion to `SENT` and the
+unchanged store row schema. SIM-HARN evidence covers the two-bot keyed-drop walk
+in which a receipt is minted after the plaintext digest gate, the next sync
+shows one confirmed author, a forged receipt is refused at the host gate and a
+replayed id leaves the count at one. No device claim is made in this contract;
+any phone↔bot observation belongs in the completion document and records only
+what the logs show. See [receipts-parity.md](roadmap/receipts-parity.md).

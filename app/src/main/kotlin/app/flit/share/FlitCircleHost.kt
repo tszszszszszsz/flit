@@ -166,6 +166,11 @@ class FlitCircleHost(
             .filter { it.type.trim().lowercase(Locale.ROOT) in CircleEvent.TYPES }
             .filter { it.body.length <= MAX_BODY_CHARS }
             .filter { it.type != CircleEvent.FILE || CircleCore.validFileBody(it.body) }
+            // A receipt is a signed assertion with an exact, closed body of
+            // {dropId, sha256, keyId}. CircleCore owns that key set and its
+            // bounds; route the verb there so a malformed receipt cannot enter
+            // the log through SYNC. No other gate or verb changes.
+            .filter { it.type != CircleEvent.RECEIPT || CircleCore.validReceiptBody(it.body) }
             // The cert header binds the REQUESTER to fp; every event it
             // contributes must be authored by that same fingerprint. A
             // self-signed sockpuppet cannot enter through SYNC.

@@ -833,6 +833,50 @@ two-node receipt walk belong to 2026-12-14 and yield no claim here. A receipt
 stays a local-landing acknowledgement; it is never evidence that a drop
 reached every member.
 
+### 3.13 Delivery receipts in app and CLI — the four conclusion rows
+
+The 2026-12-14 Integration layer
+([receipts-parity.md](roadmap/receipts-parity.md)) puts the 2026-12-11 receipt
+verb on the app's keyed-drop landing path and the CLI's Circle commands. The
+app mints in `FlitEngine.onUploadFinish` only after a keyed drop lands
+hash-exact and the opened plaintext digest matches the signed `file` event,
+then publishes through `FlitCircleSync.postReceipt` on the existing `post()`
+fan-out. Both app gates accept the verb only through
+`CircleCore.validReceiptBody`; `CircleUi.computeFeedData` folds
+`CircleCore.receiptAuthors` into the confirmation count with `remember`
+memoization, and sender-local delivery statuses stay unchanged. The CLI command
+`circle receipt --sha SHA [--drop-id ID] [--host ip[:port]]` requires a joined
+circle, resolves the `file` event by plaintext `sha256` or the given
+`--drop-id`, derives `keyId` from that event's signed `keyGen`, and posts the
+receipt; `circle sync` and `console` print the count from `receiptAuthors`.
+The body is exactly `{dropId,sha256,keyId}` with no `landedMs`, path, status or
+key material. No route, header, DTO field, QR parameter or v2.2 status is
+added. The frozen seams named below are:
+
+```
+CircleCore.RECEIPT_BODY_KEYS = setOf("dropId","sha256","keyId")
+CircleCore.validReceiptBody(body: String): Boolean
+CircleCore.receiptAuthors(events, dropId, sha256, members): Set<String>
+FlitEngine.onUploadFinish(...)                 // mint after keyed hash-exact landing + plaintext digest gate
+FlitCircleSync.postReceipt(dropId, sha, keyId)  // existing post() fan-out
+FlitCircleSync.circleBodyValid: RECEIPT -> CircleCore.validReceiptBody(body)
+FlitCircleHost SYNC filter: RECEIPT || validReceiptBody
+CircleUi.computeFeedData: CircleCore.receiptAuthors(...) with remember
+Harness circle receipt --sha SHA [--drop-id ID] [--host ip[:port]]
+```
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| No drop: the `--sha` lookup finds no `file` event, and `--drop-id` is absent or names no event; on the read side a receipt names an unknown `dropId`/`sha256` | CLI prints `!! no key id for drop — receipts are for keyed drops` and exits without an event; no `dropId` or `keyId` is fabricated. `receiptAuthors` ignores the unmatched receipt, so no status changes | landed file bytes and the sealed spool follow the existing delivery rules; the bounded signed log is unchanged | the unmatched lookup or the mismatched receipt from the confirm set | CODE `Harness circle receipt` sha/`--drop-id` lookup, `CircleCore.receiptAuthors`; PURE `ReceiptCliTest`, `ReceiptTallyTest` |
+| No key: the matched `file` body has no `keyGen`/`wraps` (legacy plaintext drop), or the reader has no wrap for its fingerprint (`NO_KEY`/wrong identity) | CLI exits before minting; the app mints nothing and leaves the sender-local send-report status; a `NO_KEY` receiver contributes no acknowledgement. No key id is invented | sealed spool until the existing terminal logic concludes it; landed ciphertext until cleanup | nothing — no receipt event is minted | CODE `Harness circle receipt` keyed-body gate, `FlitEngine.onUploadFinish`, `FlitCircleStore.CircleDelivery.NO_KEY`, `DropKeyCore.unwrap`; PURE `ReceiptCliTest`, `FlitEngineTest`, `DropParityTest` |
+| Digest mismatch: `DropKeyCore.open` fails, the opened plaintext `sha256` differs from the one signed in the `file` event, `UploadResult.Mismatch`/`Error` is returned, or the carrier throws | No receipt minted; the card stays on its local status and no author is promoted to `SENT`. The plaintext `sha256` is inside the signed body, so a substituted drop cannot be renamed as the announced one | landed ciphertext and its temp, or the sealed spool, follow the per-drop key layer's rules | the substituted plaintext and the failed mint | CODE `FlitEngine.onUploadFinish` mint gate, `DropKeyCore.open`, `CircleCore.canonical` (binds the plaintext `sha256`); PURE `FlitEngineTest`, `DropKeyCryptoTest`, `DropParityTest` |
+| Malformed body: a receipt body with a missing key, an extra key (including `landedMs`), a non-string or blank value, or a value over `MAX_FIELD_CHARS` (256) | `validReceiptBody` is false at both app gates: `FlitCircleSync.circleBodyValid` refuses the RECEIPT body and the `FlitCircleHost` SYNC filter refuses the event before fold. It is never minted, folded or counted | acknowledged drop bytes untouched; the bounded signed log unchanged | the malformed body or the incoming event | CODE `CircleCore.validReceiptBody`, `FlitCircleSync.circleBodyValid`, `FlitCircleHost` SYNC filter; PURE `FlitCircleSyncTest`, `ReceiptBodyTest` |
+
+The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN: the
+two-node confirm walk in the roadmap is not claimed here, and a receipt proves
+a local landing by one member, not delivery to the whole Circle. Test counts
+are recorded in TESTING.md, not in this table.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -1029,6 +1073,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Per-drop content keys (pure core) | `DropKeyCore.wrap/unwrap/seal/open`, `keyedFileBody`, `parseFileKeyBody`; `CircleCore.validFileBody/verify`; `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
 | Per-drop parity (app + CLI) | `FlitEngine.circlePostFile`, `FlitCircleSync.circleBodyValid/postFile`, `FlitCircleStore.CircleDelivery.NO_KEY`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish`, `DropKeyCore.wrap/unwrap/open` | `DropParityTest`, `FlitCircleSyncTest`, `FlitEngineTest`, `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
 | Delivery receipts (protocol, local landing) | `CircleEvent.RECEIPT`, `CircleCore.RECEIPT_BODY_KEYS` / `validReceiptBody` / `receiptAuthors` / `verify` | `ReceiptBodyTest`, `ReceiptTallyTest`, `ReceiptCanonicalTest` | — | no device walk; one member's landing is not global delivery |
+| Delivery receipts (app + CLI, four conclusions) | `FlitEngine.onUploadFinish` / `postReceipt`, `FlitCircleSync.circleBodyValid`, `FlitCircleHost` SYNC filter, `CircleUi.computeFeedData`, `Harness circle receipt`, `DropKeyCore.open`, `FlitCircleStore.CircleDelivery.NO_KEY` | `FlitCircleSyncTest`, `FlitEngineTest`, `ReceiptCliTest`, `ReceiptBodyTest`, `ReceiptTallyTest`, `DropKeyCryptoTest`, `DropParityTest` | — | no device walk; one member's landing is not global delivery |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -1047,7 +1092,10 @@ carry no harness, camera or device observation, and the 2026-12-17 full-feature
 walk is not claimed here. The 2026-12-11 delivery-receipt row in §3.12 is CODE
 and PURE only: the four conclusions — malformed body, non-member signer, forged
 signature and duplicate acknowledgement — carry no harness, camera or device
-observation, and the 2026-12-14 two-node receipt walk is not claimed here.
+observation, and the 2026-12-14 two-node receipt walk is not claimed here. The
+2026-12-14 integration row in §3.13 is CODE and PURE only: its four conclusions
+— no drop, no key, digest mismatch and malformed body — carry no device claim;
+the two-node confirm walk is not claimed here.
 
 ---
 
@@ -1126,3 +1174,10 @@ None changes a shipped contract.
     gating, file-card display, CLI commands and the two-node receipt walk belong
     to 2026-12-14 and yield no claim here. A receipt proves local landing by one
     member, not global delivery.
+15. **The 2026-12-14 delivery-receipt integration layer has no device walk
+    here.** The §3.13 rows are CODE from the frozen app, CLI and per-drop-key
+    seams and PURE from the JVM-only app, harness and protocol test classes.
+    The four conclusions — no drop, no key, digest mismatch and malformed body —
+    carry no DEVICE or SIM/HARN: the two-node confirm walk in the roadmap is not
+    claimed here. A receipt proves local landing by one member, not global
+    delivery.

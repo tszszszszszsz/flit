@@ -63,11 +63,12 @@ bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pi
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
-circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--invite TOKEN]
+circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt> [--circle ID] [--invite TOKEN]
        [--text TEXT] [--file PATH] [--target FP] [--role ADMIN|MEMBER] [--option N]
-       [--host ip[:port]] -- accountless group coordination over the production Circle routes
+       [--sha SHA] [--drop-id ID] [--host ip[:port]] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
+       receipt --sha SHA [--drop-id ID] publishes a signed receipt for a keyed drop
 courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
 parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs back into bytes, offline
 ```
@@ -77,11 +78,12 @@ The `courier` surface is detailed in §2.4 and `parcel` in §11.
 Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:73-78):
 `--alias --port --dir --dest --udp-port --wait --pin --parallel --announce-to
 --bytes --sender --token --park-timeout --relay --text --circle --invite --file
---target --option --host --role --bag --to --cert --ttl --out`. Everything else
-is a presence flag. Defaults come from `Protocol.DEFAULT_PORT = 53317` and
-`MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay default is
-`DEFAULT_PORT + 1 = 53318` (Harness.kt:706). `--bag --to --cert --ttl` belong to
-`courier` (§2.4) and `--out` to `parcel` (§11). A relative `--bag` is rooted at
+--target --option --host --role --bag --to --cert --ttl --out --sha --drop-id`.
+Everything else is a presence flag. Defaults come from `Protocol.DEFAULT_PORT
+= 53317` and `MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay
+default is `DEFAULT_PORT + 1 = 53318` (Harness.kt:706). `--bag --to --cert
+--ttl` belong to `courier` (§2.4), `--out` to `parcel` (§11), and `--sha
+--drop-id` to `circle receipt` (§2.1). A relative `--bag` is rooted at
 `<identity home>` (`harnessHome()`); an absolute path is used as given. With no
 `--bag` the bag is `<identity home>/courier-bag`.
 
@@ -190,7 +192,8 @@ host, members, events JSON, rekeyGen). Subcommands:
 | `role` | `--target FP`, `--role ADMIN\|MEMBER` | OWNER-only appointment; nobody appoints a second OWNER |
 | `kick` | `--target FP` | OWNER/ADMIN kick executes now; a MEMBER opens a vote-kick |
 | `leave` | — | publishes leave then discards the local key and deletes `circle.state` |
-| `sync` | a joined `--host` | pulls the full bounded log, prints feed and poll tally |
+| `sync` | a joined `--host` | pulls the full bounded log, prints feed, poll tally and confirmed count for keyed drops |
+| `receipt` | `--sha SHA`; optional `--drop-id ID`, `--host ip[:port]` | publishes a signed receipt for a keyed drop |
 
 `file --file` is deliberately different from `post --file`: a plain post never
 moves bytes. The announcement body is the closed `{name,size,sha256}` shape with
@@ -198,6 +201,28 @@ no spool path and no queue token (Harness.kt:906-911). Delivery statuses are
 `pending → sent|refused|failed`, are local-only and never gossiped; a thrown
 carrier leaves the recipient `pending` for retry (Harness.kt:913-1009). Full
 semantics and evidence live in [Circle](circle.md#file-delivery-as-built).
+
+`circle receipt` is an explicit publish step, not an automatic landing report.
+It needs a joined `circle.state` (`circleId`, `key`, `host`); `--host ip[:port]`
+overrides the stored host for this one command. `--sha SHA` is the plaintext
+digest of a keyed `file` event in the local log. With no `--drop-id`, the CLI
+finds the `file` event whose body `sha256` equals `--sha` and uses that event's
+`id` as `dropId`. That `file` body must carry `keyGen` and `wraps`; `keyId` is
+derived as `DropKeyCore.keyId(dropId, keyGen)` and is never taken from the
+operator. If either lookup is missing the CLI prints `!! no key id for drop —
+receipts are for keyed drops` and mints nothing. The body is exactly
+`{dropId,sha256,keyId}`; the event is appended to `st.events` and posted with
+the existing `circleEvent` / `pushCircleEvent` fan-out, so no route, header,
+DTO field or v2.2 status changes. There is no `landedMs`: `createdMs` is the
+acknowledgement time, and landings are not auto-detected by the CLI.
+
+`circle sync` and `circle file` print a confirmed count beside the file entry.
+It is the size of `CircleCore.receiptAuthors(st.events, dropId, sha256,
+st.members)` over the same candidate drop ids: a set of current-member
+fingerprints, one per author, not a per-recipient status list. The existing
+`status is local-only, never gossiped` wording stays on the send statuses; the
+count is derived from the signed log and does not change them. The limits on
+what can be counted are in §10.2.
 
 ### 2.2 Identity, environment and exit codes
 
@@ -483,6 +508,8 @@ otherwise emits no log lines.
 | `recv-ok <name> → <path> (<bytes> bytes)` / `recv-ok … streamed` | hash-exact landing (classic two-step / direct-to-storage) |
 | `recv-BAD <name> checksum mismatch` / `recv-ERR <name>` | hash gate failed / write error |
 | `session <id8> finished|cancelled` | transfer session ended; cancelled is an explicit end, not a crash |
+| `HH:mm:ss receipt <id8> → … event(s), … member(s), gen=…` | signed receipt published through the same `pushCircleEvent` line every other Circle verb uses |
+| confirmed count on `circle sync` / `circle file` | confirmed-author set size from `CircleCore.receiptAuthors` for a keyed drop; local send statuses stay unchanged |
 | `panic from <fp12> (ip): <text> [hops=N]` | signed alert arrived; `hops` is inside the signed canonical body |
 | `relaying on 0.0.0.0:<port> token=set|none` | relay listening; token gate on/off |
 | `pair c3 + c4` / `pair c3 + c4 closed` | opaque pairing ticket ids only — deliberately no fingerprint/byte count/content |
@@ -730,6 +757,11 @@ so the direction remains test-evidenced only
 ([circle.md](circle.md#known-limitations)). A file drop from the CLI uses
 `circle file --file PATH` (bytes via `sendFiles`); `circle post --file PATH`
 announces only.
+
+Delivery receipts are not part of this walk. `circle receipt` is published from
+the CLI and read back as a confirmed count from the signed log; neither the
+command nor the count was observed on the phone, so receipts carry harness
+evidence only (§10.2). A confirmed count is not a phone-side landing claim.
 
 ### 6.9 Panic alert (on-device evidence)
 
@@ -985,12 +1017,14 @@ A delivery receipt is one signed Circle event in which a member acknowledges
 that a named file drop landed in that member's own receive path. The statement
 is local to its author. It is not a delivery guarantee for the drop: a count
 of N means N current members each reported the same `(dropId, sha256)`, and it
-says nothing about members who did not report. The 2026-12-11 layer defines
-the event and the roll-up only. There is no CLI receipt command, app card,
-confirmation count or receipt-specific log line on this date, and no device
-observation of receipts is recorded; the app's `circleBodyValid` branch and
-the CLI command are wired on 2026-12-14
-([receipts-parity.md](roadmap/receipts-parity.md)).
+says nothing about members who did not report. The 2026-12-11 protocol layer
+defines the event and the roll-up; the 2026-12-14 integration wires the app's
+`FlitCircleSync.circleBodyValid` RECEIPT branch and a `confirmed` value in
+`CircleUi.computeFeedData`, mints the receipt after a keyed landing through
+`postReceipt`, and adds the `circle receipt` CLI command
+([receipts-parity.md](roadmap/receipts-parity.md)). No device walk of receipts
+is recorded on either date: the command and the count are CODE, PURE and
+harness-evidenced, not a phone observation.
 
 - **A receipt is one member's evidence, not a group result.**
   `CircleCore.receiptAuthors(events, dropId, sha256, members)` returns a set of
@@ -1005,10 +1039,11 @@ the CLI command are wired on 2026-12-14
   deletes or revokes no copy, sends no command and pushes no status to another
   member. Its only effect on another member is one more signed event in the
   bounded Circle log. Sender-local `CircleDelivery.statuses`
-  (`pending`, `sent`, `refused`, `failed`) stay local-only and unchanged here;
-  mapping a receipt to one of them belongs to 2026-12-14. A hash mismatch at
-  the landing mints no receipt, so a failed transfer produces silence, not a
-  negative acknowledgement.
+  (`pending`, `sent`, `refused`, `failed`) stay local-only and never gossiped;
+  on 2026-12-14 a confirmed author is folded to `SENT` with the existing
+  `setDeliveryStatus` reducer, and no phantom delivery row is created. A hash
+  mismatch at the landing mints no receipt, so a failed transfer produces
+  silence, not a negative acknowledgement.
 
 - **The count has a narrow, bounded definition.** A receipt counts only when
   its body is exactly `{dropId, sha256, keyId}`, every value a non-blank
@@ -1017,26 +1052,42 @@ the CLI command are wired on 2026-12-14
   `dropId` is the `id` of the `file` event and `sha256` its plaintext digest;
   both must match the drop being read. There is no `landedMs`: `createdMs` on
   the event is the acknowledgement time. At most one receipt per author
-  counts, chosen by `CircleCore.ORDER`, so arrival order cannot change the
-  result. `keyId` is provenance only: a later rekey does not invalidate an
-  earlier acknowledgement of the same content. No `path`, spool path, token,
-  key material, file bytes or local status string is present in the body.
+  counts, chosen by `CircleCore.ORDER` (latest wins), so arrival order cannot
+  change the result. `keyId` is provenance only: a later rekey does not
+  invalidate an earlier acknowledgement of the same content. No `path`, spool
+  path, token, key material, file bytes or local status string is present in
+  the body.
+
+- **Confirmation-count limits.** The count is the size of a deduplicated set,
+  so it never exceeds the number of current members and cannot be raised by
+  repeating a receipt: one author contributes at most one entry, and a
+  departed or non-member author contributes none. A receipt for an unknown
+  `sha256`, a mismatched `dropId`, a duplicate id or a `createdMs` outside the
+  replay window leaves the count unchanged. Each of the three body values is
+  bounded by `MAX_FIELD_CHARS = 256` and the whole body by `MAX_BODY_CHARS =
+  16 KiB`; the shared bounds are `REPLAY_WINDOW_MS = 6 h`, `CLOCK_SKEW_MS =
+  5 min`, `MAX_SEEN = 4096`, `MAX_EVENTS_PER_REQUEST = 1024`,
+  `MAX_REQUEST_BYTES = 8 MiB` and the app's `EVENT_CAP = 500`. No new cap is
+  introduced. Membership is read at fold time and the log is bounded, so the
+  count can fall when a member leaves or an old receipt ages out; it is a
+  snapshot of signed events currently in hand, not a durable total.
 
 - **The usual Circle bounds still apply.** Receipts are ordinary events in
   `CircleRequest.events` on the existing `/circle/sync` route, or inside a
   courier or QR parcel that already carries signed events. No new route,
-  header, DTO field, frame or v2.2 status is added. They share the 6 h replay
-  window, 5 min clock skew, 4096-id seen set, 1024-event request cap, 8 MiB
-  request cap and 500-event log cap with every other verb; no new cap is
-  introduced. Old receipts can age out of the bounded log, and a receipt still
-  in a bag or frame sequence has not been folded yet.
+  header, DTO field, frame or v2.2 status is added. They share the replay
+  window, skew, seen set, request caps and log cap with every other verb. Old
+  receipts can age out of the bounded log, and a receipt still in a bag or
+  frame sequence has not been folded yet.
 
-- **Evidence is structural only on this date.** The body gate, signature path
-  and roll-up are CODE and PURE (protocol tests). No harness, SIM-HARN or
-  device walk records a receipt on 2026-12-11, and no timing, throughput or
-  confirmed-count figure is claimed here. See [CONTRACTS.md](CONTRACTS.md)
-  for the body shape, [SECURITY.md](SECURITY.md) for the signature and pinning
-  rules, and [FAILURE-MODES.md](FAILURE-MODES.md) for refusals.
+- **Evidence is structural, with harness coverage and no device claim.** The
+  body gate, signature path and roll-up are CODE and PURE (protocol tests).
+  The 2026-12-14 app gate, card count and CLI `circle receipt` path are covered
+  by unit and harness tests; no phone walk, confirmed-count figure from
+  hardware, timing or throughput number is claimed here. See
+  [CONTRACTS.md](CONTRACTS.md) for the body shape, [SECURITY.md](SECURITY.md)
+  for the signature and pinning rules, and
+  [FAILURE-MODES.md](FAILURE-MODES.md) for refusals.
 
 ## 11. Manual air-gap carry (QR parcel)
 

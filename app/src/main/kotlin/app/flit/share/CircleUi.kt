@@ -69,6 +69,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -173,11 +174,13 @@ fun CircleScreen(
     val handoffs = remember(courierHandoffs) {
         courierHandoffs.mapKeys { (sha, _) -> sha.trim().lowercase(Locale.ROOT) }
     }
-    // Every poll and kick card used to walk the whole log once per member and
-    // re-parse each vote body on the main thread. Do the work once here for the
-    // whole screen: one JSON parse per event body, then derive every tally from
-    // that memoized array. Remembered keys use value equality, so a refresh
-    // that republishes an unchanged log does not redo any of this.
+    // Every poll, kick and file card used to walk the whole log once per
+    // member and re-parse each body on the main thread. Do the work once here
+    // for the whole screen: one JSON parse per event body, then derive every
+    // tally and receipt confirmation from that memoized pass. Remembered keys
+    // use value equality, so a refresh that republishes an unchanged log does
+    // not redo any of this. A confirmation is keyed by its file event's
+    // (dropId, sha256) against the current member roster; keyId never selects.
     val feedData = remember(events, members, selfFp) {
         computeFeedData(events, members, selfFp)
     }
@@ -298,6 +301,7 @@ fun CircleScreen(
                         handoffs = handoffs,
                         tallies = feedData.tallies,
                         deliveries = deliveries,
+                        confirmed = feedData.confirmed,
                         // Resolve the three-state affordance through the shared
                         // Android-free helper. It folds case and space exactly
                         // as the old inline checks did, so the card renders the
@@ -496,6 +500,7 @@ private fun FeedRow(
     handoffs: Map<String, CourierCardUi.CourierHandoff>,
     tallies: CircleTallies,
     deliveries: Map<String, FlitCircleStore.CircleDelivery>,
+    confirmed: Map<String, Int>,
     affordance: CourierCardUi.OpenAffordance,
     onVote: (String, Int) -> Unit,
     onVoteKick: (String, Boolean) -> Unit,
@@ -524,6 +529,7 @@ private fun FeedRow(
                     size = body.size,
                     sha256 = body.sha256,
                     delivery = body.sha256.takeIf { it.isNotBlank() }?.let { deliveries[it] },
+                    confirmed = confirmed[body.sha256] ?: 0,
                     carryLine = CourierCardUi.courierLine(
                         handoffs[body.sha256.trim().lowercase(Locale.ROOT)],
                         meFp,
@@ -576,6 +582,10 @@ private fun FileCard(
     size: Long,
     sha256: String,
     delivery: FlitCircleStore.CircleDelivery?,
+    /** Current members who signed a valid receipt for this card's drop. Kept
+     *  separate from the local status counts: a receipt is a signed assertion,
+     *  not a gossiped delivery status, and never creates a delivery row. */
+    confirmed: Int,
     /** Courier-local carry line, drawn above the status line; null means no handoff. */
     carryLine: String? = null,
     /** Three-state Open affordance resolved by [CourierCardUi.openAffordance]. */
@@ -584,9 +594,11 @@ private fun FileCard(
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
-    // Counts come only from this device's delivery record; the announcement
-    // alone never implies that any bytes landed. Unknown states are not
-    // silently folded into a success bucket.
+    // Local counts come only from this device's delivery record; the
+    // announcement alone never implies that any bytes landed. Unknown states
+    // are not silently folded into a success bucket. [confirmed] is a separate
+    // roll-up of signed receipts from the bounded log and does not change any
+    // of these sender-local statuses.
     val counts = remember(delivery) {
         val buckets = intArrayOf(0, 0, 0, 0)
         delivery?.statuses?.values?.forEach { raw ->
@@ -650,7 +662,10 @@ private fun FileCard(
                         append(counts[2].toString())
                         append(" refused · ")
                         append(counts[3].toString())
-                        append(" failed")
+                        append(" failed · ")
+                        // Plain text: a signed receipt count, not a local status.
+                        append(confirmed.toString())
+                        append(" confirmed")
                     },
                     style = typ.labelSmall,
                     color = cs.onSurfaceVariant,
@@ -1121,6 +1136,9 @@ private data class CircleFeedData(
     val events: List<CircleEvent>,
     val parsed: Array<ParsedEvent>,
     val tallies: CircleTallies,
+    /** Count of current members with a verified receipt, keyed by the file
+     *  event's trimmed body sha256. A separate roll-up from local statuses. */
+    val confirmed: Map<String, Int>,
 )
 
 private fun JsonObject.text(key: String, fallback: String = ""): String =
@@ -1215,6 +1233,10 @@ private fun isParcel(event: CircleEvent): Boolean =
  * Vote identity rules are preserved exactly: raw (non-lowercased) event types,
  * `lamport >=` tie-breaking so later events win, option >= 0 for polls, and an
  * open/admin kick with no explicit answer counting as the author's yes.
+ *
+ * Receipts are folded into the same pass: for each file card the current
+ * members who signed a verified receipt are counted and keyed by that card's
+ * sha256. This is a roll-up of the bounded signed log, not a delivery status.
  */
 private fun computeFeedData(
     events: List<CircleEvent>,
@@ -1226,6 +1248,29 @@ private fun computeFeedData(
     // list is returned so the LazyColumn indices stay aligned with parsed.
     val visible = events.filterNot(::isParcel)
     val parsed = Array(visible.size) { index -> parseEvent(visible[index]) }
+
+    // A receipt is a signed, current-member acknowledgement of one landed drop.
+    // Fold it into this same memoized pass so every file card gets its count
+    // from one walk of the bounded log. Correlation is by the file event's
+    // sha256: every event with that sha is a candidate drop id and their
+    // confirmed author sets are unioned, so one fingerprint counts once even
+    // across re-announcements. CircleCore.receiptAuthors keeps the latest
+    // receipt per author by ORDER and gates on the closed body shape, current
+    // membership and signature; keyId is provenance only and never selects a
+    // receipt. Sender-local statuses are not read or written here.
+    val memberFps = members.map { it.fp }
+    val confirmedAuthors = HashMap<String, LinkedHashSet<String>>()
+    for (p in parsed) {
+        if (p.body.kind != CircleCard.FILE) continue
+        val sha = p.body.sha256
+        if (sha.isBlank()) continue
+        // The core compares the signed body value exactly; the card keys by
+        // the trimmed sha used everywhere else in this file.
+        val signedSha = p.obj?.text("sha256")?.takeIf { it.isNotBlank() } ?: sha
+        confirmedAuthors.getOrPut(sha) { LinkedHashSet() }
+            .addAll(CircleCore.receiptAuthors(events, p.event.id, signedSha, memberFps))
+    }
+    val confirmed = confirmedAuthors.mapValues { (_, authors) -> authors.size }
 
     // Latest vote per subject per author. Maps keep insertion order irrelevant:
     // only the highest lamport for an author is kept, ties going to the later
@@ -1308,7 +1353,7 @@ private fun computeFeedData(
         kickResults[kickId] = yes to no
     }
 
-    return CircleFeedData(visible, parsed, CircleTallies(pollResults, kickResults))
+    return CircleFeedData(visible, parsed, CircleTallies(pollResults, kickResults), confirmed)
 }
 
 private fun timeOf(atMs: Long): String =

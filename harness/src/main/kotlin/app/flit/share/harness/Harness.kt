@@ -76,7 +76,7 @@ internal class ParsedArgs(argv: Array<String>) {
             "--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin",
             "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
             "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host", "--role",
-            "--bag", "--to", "--cert", "--ttl", "--out",
+            "--bag", "--to", "--cert", "--ttl", "--out", "--sha", "--drop-id",
         )
     }
 }
@@ -157,11 +157,12 @@ bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pi
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
-circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--invite TOKEN]
+circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt> [--circle ID] [--invite TOKEN]
        [--text TEXT] [--file PATH] [--target FP] [--role ADMIN|MEMBER] [--option N]
        [--host ip[:port]] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
+       receipt --sha SHA [--drop-id ID] [--host ip[:port]] — signed acknowledgement of a keyed drop
 courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
 parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs back into bytes, offline
 """
@@ -170,7 +171,7 @@ parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs bac
 
 private fun circleUsage() {
     println(
-        """circle <create|join|post|poll|vote|role|kick|leave|sync|file>
+        """circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt>
   create          mint a circle id + invite token; print the host command
   join            --host ip[:port] --circle ID --invite TOKEN — fetch the group key
   post            --text NOTE — signed message; --file PATH — file-drop ANNOUNCEMENT only
@@ -184,7 +185,9 @@ private fun circleUsage() {
   kick            --target FP — OWNER/ADMIN kick executes now; a MEMBER opens a vote-kick.
                   The key rotates only when the member actually departs.
   leave           publish a leave event, then discard the local key
-  sync            pull the shared log and print the feed + poll tally
+  sync            pull the shared log and print the feed + poll tally + confirmed counts
+  receipt         --sha SHA [--drop-id ID] [--host ip[:port]] — signed ack of a keyed drop
+                  resolves dropId and keyId from the signed keyed file event; no key, no event
 """
     )
 }
@@ -356,6 +359,11 @@ internal class CircleHostState {
             // gate that keeps a sender's local spool path (or a queue token)
             // off the signed, fanned-out wire — recipients locate bytes by hash.
             .filter { it.type != CircleEvent.FILE || CircleCore.validFileBody(it.body) }
+            // A receipt is EXACTLY {dropId,sha256,keyId}. The same closed body
+            // gate the app's SYNC filter uses keeps a malformed assertion out
+            // of the signed log; the signature check below remains the gate
+            // for a forged author.
+            .filter { it.type != CircleEvent.RECEIPT || CircleCore.validReceiptBody(it.body) }
             .filter { it.cert.isNotBlank() && CircleCore.verify(it) }
             // Local id dedup first, then the production replay/window guard:
             // an old signed join/role/kick/rekey is history, not governance.
@@ -944,6 +952,90 @@ private fun circleEvent(
     lamport = circleNextLamport(st),
 )
 
+// ==== Circle delivery receipt: signed ack of one keyed drop ==================
+
+/** The exact, closed receipt body. No `landedMs`, path, status or key material. */
+internal fun circleReceiptBody(dropId: String, sha256: String, keyId: String): String =
+    buildJsonObject {
+        put("dropId", JsonPrimitive(dropId))
+        put("sha256", JsonPrimitive(sha256))
+        put("keyId", JsonPrimitive(keyId))
+    }.toString()
+
+/**
+ * What the CLI needs to mint one receipt. [dropId] is the `id` of the signed
+ * keyed `file` event, [sha256] its plaintext digest and [keyId] provenance from
+ * that event's `keyGen` — never a value invented by the receipt command.
+ */
+internal data class CircleReceiptTarget(
+    val dropId: String,
+    val sha256: String,
+    val keyId: String,
+)
+
+/**
+ * Resolve a keyed `file` event in a local log. With [dropId] set the event is
+ * found by id, otherwise by the plaintext sha of its keyed body. Either way the
+ * body must be the keyed form and carry the same sha: a legacy plaintext drop
+ * or an unknown id yields null and the caller mints nothing.
+ */
+internal fun circleReceiptTarget(
+    events: Iterable<CircleEvent>,
+    sha256: String,
+    dropId: String? = null,
+): CircleReceiptTarget? {
+    val files = events.filter { it.type == CircleEvent.FILE }
+    val file = if (dropId != null) {
+        files.firstOrNull { it.id == dropId }
+    } else {
+        files.firstOrNull { e ->
+            DropKeyCore.parseFileKeyBody(e.body)?.sha256?.equals(sha256, ignoreCase = true) == true
+        }
+    } ?: return null
+    val keyed = DropKeyCore.parseFileKeyBody(file.body) ?: return null
+    if (!keyed.sha256.equals(sha256, ignoreCase = true)) return null
+    return CircleReceiptTarget(file.id, keyed.sha256, DropKeyCore.keyId(file.id, keyed.keyGen))
+}
+
+/** Alias used by callers that read the resolution as a lookup. */
+internal fun circleReceiptLookup(
+    events: Iterable<CircleEvent>,
+    sha256: String,
+    dropId: String? = null,
+): CircleReceiptTarget? = circleReceiptTarget(events, sha256, dropId)
+
+/** Confirmed authors for one known drop id and sha, from the local signed log. */
+internal fun circleConfirmedAuthors(
+    st: CircleCliState,
+    dropId: String,
+    sha256: String,
+): Set<String> = CircleCore.receiptAuthors(st.events, dropId, sha256, st.members)
+
+/**
+ * Confirmed authors for one plaintext sha across all candidate drop ids in the
+ * local log. A re-announcement of the same content can carry a different id, so
+ * the union keeps one entry per author fingerprint.
+ */
+internal fun circleConfirmedAuthors(
+    events: Iterable<CircleEvent>,
+    members: Iterable<String>,
+    sha256: String,
+): Set<String> {
+    val ids = events.filter { e ->
+        e.type == CircleEvent.FILE &&
+            DropKeyCore.parseFileKeyBody(e.body)?.sha256?.equals(sha256, ignoreCase = true) == true
+    }.map { it.id }
+    return ids.flatMap { id -> CircleCore.receiptAuthors(events, id, sha256, members) }.toSet()
+}
+
+/** Confirmed authors for one plaintext sha in a joined CLI's local log. */
+internal fun circleConfirmedAuthors(st: CircleCliState, sha256: String): Set<String> =
+    circleConfirmedAuthors(st.events, st.members, sha256)
+
+/** Plain count of confirmed authors, never a per-recipient status list. */
+internal fun circleConfirmedCount(st: CircleCliState, sha256: String): Int =
+    circleConfirmedAuthors(st, sha256).size
+
 // ==== Circle file drop: real bytes over sendFiles, local-only status =========
 
 /**
@@ -1278,6 +1370,7 @@ private suspend fun circle(args: ParsedArgs) {
             )
             val tally = delivery.statuses.values.groupingBy { it }.eachCount()
             println("${ts()} file $sha: ${tally.entries.sortedBy { it.key }} (status is local-only, never gossiped)")
+            printCircleConfirmation(st, sha)
         }
         "poll" -> {
             if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
@@ -1373,6 +1466,28 @@ private suspend fun circle(args: ParsedArgs) {
             mergeCircleAnswer(st, resp)
             saveCircleState(st)
             printCircleFeed(st)
+            printCircleConfirmations(st)
+        }
+        "receipt" -> {
+            if (st.circleId.isBlank() || st.key.isBlank()) {
+                println("!! no circle — join or create first")
+                return
+            }
+            val host = args.opt("--host") ?: st.host
+            if (host.isBlank()) { println("!! receipt needs --host ip[:port]"); return }
+            val sha = args.opt("--sha") ?: run { println("!! receipt needs --sha SHA"); return }
+            val target = circleReceiptTarget(st.events, sha, args.opt("--drop-id"))
+            if (target == null) {
+                println("!! no key id for drop — receipts are for keyed drops")
+                return
+            }
+            // The command publishes an assertion, not a remote action: the
+            // body is exactly the three signed provenance fields.
+            st.host = host
+            val body = circleReceiptBody(target.dropId, target.sha256, target.keyId)
+            val ev = circleEvent(st, identity, CircleEvent.RECEIPT, body)
+            st.events.add(ev)
+            pushCircleEvent(st, identity, ev)
         }
         else -> circleUsage()
     }
@@ -1406,4 +1521,17 @@ private fun printCircleFeed(st: CircleCliState) {
         val tally = CircleCore.tally(st.events, pid, st.members)
         println("  tally $pid: ${tally.entries.sortedBy { it.key }}")
     }
+}
+
+/** One count line for one drop; the authors are derived from the signed log. */
+private fun printCircleConfirmation(st: CircleCliState, sha256: String) {
+    val authors = circleConfirmedAuthors(st, sha256)
+    println("${ts()} confirmed ${sha256.take(12)}: ${authors.size} author(s)")
+}
+
+/** Sync prints one count per distinct keyed drop in the log. */
+private fun printCircleConfirmations(st: CircleCliState) {
+    st.events.mapNotNull { e ->
+        if (e.type == CircleEvent.FILE) DropKeyCore.parseFileKeyBody(e.body)?.sha256 else null
+    }.distinct().forEach { sha -> printCircleConfirmation(st, sha) }
 }
