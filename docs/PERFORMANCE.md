@@ -5,7 +5,7 @@
 > [Open-file / sharing restore](open-file-and-sharing-restore.md) ·
 > [README](../README.md).
 
-Current rig state: **330 protocol + 309 app + 75 harness = 714 tests, 0 failures** after a green `--rerun-tasks` run. Older docs quote older counts (76, 86, 115, 302) from the era in which they were written — those are historical, not current, figures.
+Module/count inventory (projected): **362 protocol + 112 core + 212 app + 92 harness = 778 tests**. Ten Android-free seams moved from :app into a JVM :core module in wave 1; that changes module ownership only, and wire behavior and every timing claim in this document are unchanged. The split above is a projection, not a confirmed result: it is an inventory figure until a JUnit XML exists for the relocated layout, so no pass or failure count is asserted here. No benchmark was run for this documentation update, and the rig result is not known from this layer. Older docs quote older counts (76, 86, 115, 302) from the era in which they were written — those are historical, not current, figures.
 
 There is **no power monitor, battery-current sample, profiler trace or frame-time capture anywhere in this repo**. Every energy statement below is duty-cycle arithmetic plus design intent, or an on-device observation (an idle soak, a log line), never a measured mAh or watt figure.
 
@@ -374,7 +374,7 @@ No frame-time capture, render wall-clock, camera-decode throughput, reassembly t
 ## 11. Consistency notes
 
 1. **circle.md "every SYNC posts the full bounded log"** conflicts with `FlitCircleSync.fanout`, which posts per-peer watermark deltas; only the calm `sync()` repair tick posts the full bounded log. Documented in §4.4.
-2. **Historical test counts** in the milestone docs (76 / 86 / 115 / 302) are from their respective eras and do not match the current 714-test rig; they are not contradictions, but a docs index that states a single current number should say which era each older figure belongs to.
+2. **Historical test counts** in the milestone docs (76 / 86 / 115 / 302) are from their respective eras and do not match the projected 778-test inventory; they are not contradictions, but a docs index that states a single current number should say which era each older figure belongs to.
 3. **README/Play "four parallel streams"** matches the client (`TURBO_MAX_STREAMS = 4`); the server's `MAX_TURBO_STREAMS = 6` is unused headroom from the shipped client's perspective.
 4. **Circle delivery backoff** in `FlitEngine` starts at an effective 20 s (`10s << attempt`, attempt = 1), not 10 s; the Circle *sync* backoff starts at 10 s (`5s << 1`). The two schedules are different by design and are both stated exactly in §3/§4.3.
 5. **QR frame cap vs app display cap**: the wire `MAX_FRAMES = 64` and the app's `MAX_PARCEL_FRAMES = 64` are the same number by design (§8.5). The frame-layer `MAX_AIR_GAP_PARCEL_BYTES = 131072` is named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`, so the air-gap byte ceiling and the envelope character ceiling are not conflated.

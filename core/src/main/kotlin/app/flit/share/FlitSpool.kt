@@ -19,7 +19,7 @@ import java.io.File
  *
  * Pure JVM: the caller lists candidates; this decides.
  */
-internal object FlitSpool {
+public object FlitSpool {
 
     /**
      * The staging window. Anything younger than this may be a live intake; the

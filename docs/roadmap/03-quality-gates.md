@@ -22,6 +22,22 @@ A day's layer is accepted only when every rule below holds.
 - No existing v2.2 route, DTO shape or status code changes. New behavior is
   additive.
 
+## Re-baseline
+
+When a test-bearing seam moves into `:core`, the rig task list and the module
+count tables are updated in the same commit as the move. A relocation changes
+where a case runs, not what it covers: every moved test keeps its assertions
+and its evidence level, and no case is dropped to make a per-module figure
+read cleanly. The rig task list and the counts are one change, not a follow-up
+to the source move.
+
+A new module count is a result only once green JUnit XML exists for the
+extended rig, with zero failures, zero errors and zero skipped cases. Until
+that XML exists, every `:core` figure is a projection and no green result is
+claimed for the relocated tests. The 778 figure (362 protocol + 324 app +
+92 harness) stays historical until a new green inventory replaces it; a move
+between modules does not by itself discard or reassign that baseline.
+
 ## Failure stories
 
 Every new path states: what retries, what concludes, what keeps bytes, what

@@ -18,3 +18,4 @@ rootProject.name = "flit"
 include(":protocol")
 include(":harness")
 include(":app")
+include(":core")

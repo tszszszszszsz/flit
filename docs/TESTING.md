@@ -21,14 +21,20 @@ Rules applied here:
   2026-11-26 three-node walk **is** on-device evidence for a three-identity
   Circle; it does not prove a larger mesh (§6).
 - Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302, 356,
-  378, 396, 769, 773) are snapshots of earlier layers, not the current inventory:
+  378, 396, 769, 773) are snapshots of earlier layers, not the present inventory:
   356 after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer
   and 396 after the 2026-12-01 App layer, 416 after the app QA fixes, 436 after
   the QR codec layer, 448 after the QR CLI layer, 714 at the pre-JOIN-proof
   layer, 769 as the snapshot before the relay-hunt and `wrapVerified` cases and
-  773 after those cases. The current green figure is 778 (362 protocol + 324
-  app + 92 harness) after a clean `--rerun-tasks` run with zero failures, zero
-  errors and zero skipped tests; all assemblies were green in the same run.
+  773 after those cases. The three-module split of 362 protocol + 324 app + 92
+  harness = 778 is the historical green figure, recorded after a clean
+  `--rerun-tasks` run with zero failures, zero errors and zero skipped tests;
+  all assemblies were green in the same run. After ten Android-free classes
+  were relocated from `app/` into a JVM `:core` module, the projected split is
+  362 protocol + 112 core + 212 app + 92 harness = 778. Those four-module
+  counts come from source-level `@Test` annotations and stay projections until
+  a JUnit XML for the new layout is recorded here; no green result is claimed
+  for that layout in this doc.
 - The 2026-12-01 App layer added 18 courier cases in `app/src/test` (11 in
   `CourierCardUiTest`, 4 added to `FlitCircleStoreTest`, 3 added to
   `FlitCircleSyncTest`), recorded from a green `--rerun-tasks` run (§4.2).
@@ -67,21 +73,22 @@ Rules applied here:
   §4.1) with 16 + 9 + 11 + 7 = 43 cases, recorded from the JUnit XML, taking
   the protocol module from 240 to 283 at that layer. The module totals at that
   layer were 330 + 309 + 75 = 714; the 359 + 323 + 87 = 769 and 362 + 324 +
-  87 = 773 snapshots and the current 362 + 324 + 92 = 778 totals are recorded
-  in §2. No app, CLI, harness, device walk, new route, header, DTO field, store
-  field or v2.2 status is attached to this layer.
+  87 = 773 snapshots and the historical 362 + 324 + 92 = 778 three-module
+  total are recorded in §2, alongside the projected four-module split. No app,
+  CLI, harness, device walk, new route, header, DTO field, store field or v2.2
+  status is attached to this layer.
 - The 2026-12-16 circle pad app + CLI Integration layer adds two test classes:
   `PadUiTest` (app, Android-free JVM, 15 cases) and `PadCliTest` (harness,
   in-process, 8 cases), recorded from the JUnit XML. At that layer the app
   module stood at 296 cases and the harness at 75; the module totals at that
   layer were 330 + 309 + 75 = 714, against the 359 + 323 + 87 = 769 and
-  362 + 324 + 87 = 773 snapshots and the current 362 + 324 + 92 = 778 (§2). No
-  device walk, new route, header, DTO field, store field or v2.2 status is
-  attached to this layer.
+  362 + 324 + 87 = 773 snapshots and the historical 362 + 324 + 92 = 778
+  three-module total (§2). No device walk, new route, header, DTO field, store
+  field or v2.2 status is attached to this layer.
 - The signed JOIN proof / shared Circle authority wave adds two JVM-pure protocol
   classes (`JoinProofTest` 14, `CircleAuthorityTest` 12) and changes seven more
-  across all three modules (§4.8), from the JUnit XML of the final green
-  `--rerun-tasks` run. All are JVM-pure or in-process, with no device walk, no
+  across all three modules (§4.8), from the JUnit XML of the last recorded
+  green `--rerun-tasks` run. All are JVM-pure or in-process, with no device walk, no
   new route, header, DTO field or v2.2 status; pre-proof JOIN clients are
   refused.
 - A later, smaller layer adds three `wrapVerified` cases to `DropKeyCoreTest`
@@ -89,36 +96,44 @@ Rules applied here:
   the 769 snapshot to the historical 773 snapshot. Both classes stay JVM-pure,
   with no device walk, new route, header, DTO field or v2.2 status.
 - The 2027-01-05 CLI parity layer adds four cases to `CircleHarnessTest` and one
-  to `RelayServerTest` (§4.8), taking the rig from the historical 773 snapshot to
-  778. The four cases pin
+  to `RelayServerTest` (§4.8), taking the rig from the historical 773 snapshot
+  to the historical three-module 778. The four cases pin
   the CLI `circleFreshEvents` gate, the ignored departed-officer hand-off, the
   stale `--host-fp` guard across circles and at join, and a byte-wise read of the
   relay OK reply; `ParcelCliTest` stays at 11 and `ParcelCliHarnessTest` at 3. The
   QR reader in `ParcelCliHarnessTest` was hardened with decode hints and integer
   scales without adding a case. No device walk is claimed; the layer is
   CODE/PURE/SIM-HARN only.
-- The protocol module is JVM-pure by hard rule. The app module's unit tests are
-  JVM tests of Android-free seams; they import no Android framework class and
-  use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
-  says so explicitly). The harness is a Linux CLI (`flit-cli`), which doubles as
-  the interop rig.
+- The protocol module is JVM-pure by hard rule. The core module is JVM-only as
+  well and holds ten relocated Android-free seams. The app module's remaining
+  unit tests are JVM tests of Android-free seams; they import no Android
+  framework class and use no Robolectric (the note that used to sit in app now
+  reads at `core/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`). The
+  harness is a Linux CLI (`flit-cli`), which doubles as the interop rig.
 
 ## 2. The rig at a glance
+
+Counts in this table are projections after the relocation of ten Android-free
+classes from `app/` to `:core`. They are taken from source-level `@Test`
+annotations and are not yet a green result; the historical three-module split
+is recorded below and in §3.
 
 | Module | Role | Test count | Test task | Where it runs |
 | --- | --- | --- | --- | --- |
 | `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **362** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
-| `app/` | Android shell (Compose), `app.flit.share`, version 0.3.1, minSdk 26, compile/targetSdk 36 | **324** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
+| `core/` | JVM shared seams: BLE policy, QR and parcel frames, route, speed, spool and subnet reducers, mirror and sheet helpers | **112** | `:core:test` | JVM only (JDK 21 toolchain, `core/build.gradle.kts:6-8`) |
+| `app/` | Android shell (Compose), `app.flit.share`, version 0.3.1, minSdk 26, compile/targetSdk 36 | **212** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
 | `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **92** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **778** | see §3 | 0 failures, 0 errors, 0 skipped at last green; all assemblies green |
+| **Total** | Four modules, four roles | **778** | see §3 | projected split; no green claim until a four-module JUnit XML is recorded |
 
 The 2026-12-04 CLI layer's two harness classes added 12 cases, moving harness
 from 39 to 51 and the total from 436 to 448 at that layer's green
 `--rerun-tasks` run. The 2026-12-07 QR parcel App layer added
 `ParcelScanStateTest` with 18 cases, first counted from source `@Test`
 annotations and later confirmed by a fresh JUnit XML run. The table above is
-the current inventory from the final green `--rerun-tasks` run (§3), not an
-earlier per-layer figure.
+the projected four-module inventory after the relocation, not a layer figure
+and not a green result; it stays a projection until a JUnit XML for that
+layout is recorded here (§3).
 
 The 2026-12-09 per-drop content key protocol layer added three JVM-pure classes
 (`DropKeyCoreTest` 15, `DropKeyBodyTest` 14, `DropKeyCryptoTest` 12), included
@@ -141,8 +156,9 @@ them.
 The 2026-12-15 circle pad protocol layer added four JVM-pure protocol classes
 (§4.1) with 16 + 9 + 11 + 7 = 43 cases on top of the then-green 588. The
 240 + 281 + 67 = 588 figure is that layer's snapshot; the module table above
-records the current inventory from the final green run. No app, CLI, harness or
-device claim is attached to these rows.
+records the projected four-module split, and the 362 + 324 + 92 figures quoted
+in this section are historical. No app, CLI, harness or device claim is
+attached to these rows.
 
 The JOIN-proof/authority layer adds `JoinProofTest` (14) and
 `CircleAuthorityTest` (12) in `protocol/`, with the changed classes listed in
@@ -150,15 +166,18 @@ The JOIN-proof/authority layer adds `JoinProofTest` (14) and
 historical snapshot. The later `wrapVerified` and relay-hunt cases add four
 cases to reach the historical 773 snapshot. The 2027-01-05 CLI parity layer
 adds four `CircleHarnessTest` cases and one `RelayServerTest` case to reach the
-current 778; the QR decoder helper change adds no case. None of these claims a
-device walk or adds a route, header, DTO field or v2.2 status; a pre-proof JOIN
-is refused at admission.
+historical three-module 778; the QR decoder helper change adds no case. None of
+these claims a device walk or adds a route, header, DTO field or v2.2 status;
+a pre-proof JOIN is refused at admission. The relocation of ten classes into
+`:core` leaves the total at 778 but changes the split to the projected figures
+in the table above.
 
-Each module declares `testImplementation(kotlin("test"))` plus the JUnit
-Platform launcher (`protocol/build.gradle.kts:23-24`,
-`harness/build.gradle.kts:16-17`, `app/build.gradle.kts:108`) and configures
-`useJUnitPlatform()` (`protocol/build.gradle.kts:27-29`,
-`harness/build.gradle.kts:20-22`). The app has no separate release-unit-test
+Each of the four modules declares `testImplementation(kotlin("test"))` plus the
+JUnit Platform launcher (`protocol/build.gradle.kts:23-24`,
+`harness/build.gradle.kts:16-17`, `app/build.gradle.kts:108`,
+`core/build.gradle.kts:14-15`) and configures `useJUnitPlatform()`
+(`protocol/build.gradle.kts:27-29`, `harness/build.gradle.kts:20-22`,
+`core/build.gradle.kts:18-20`). The app has no separate release-unit-test
 task in the rig; debug and release are only *assembled*.
 
 Toolchain: JDK 21 lives at `~/.local/jdks/temurin-21` and `env.sh` puts it first
@@ -172,7 +191,7 @@ The reference peer for interop is the official `localsend-cli` v1.18.2 at
 **Local pre-commit standard** — README "Dev quickstart" (README:164-167):
 
 ```bash
-source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :harness:test \
+source env.sh && ./gradlew :protocol:test :core:test :app:testDebugUnitTest :harness:test \
     :app:assembleDebug :app:assembleRelease :harness:installDist :harness:distZip
 ```
 
@@ -181,46 +200,63 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :harness:test \
 
 ```bash
 ./gradlew --no-daemon --stacktrace \
-  :protocol:test :app:testDebugUnitTest :harness:test \
+  :protocol:test :core:test :app:testDebugUnitTest :harness:test \
   :app:assembleDebug :app:assembleRelease \
   :harness:installDist :harness:distZip
 ```
 
 Two notes about these commands:
 
-1. Both commands now run the same test set: the README line includes
-   `:harness:test` and the CI command adds `--no-daemon --stacktrace`, so each
-   ran 778 tests (362 + 324 + 92) at the last green run; 773 (362 + 324 + 87)
-   and 769 (359 + 323 + 87) are earlier snapshots. The older 302-test
-   figure (which included the 10 harness tests) came from the CI command, or
-   from adding `:harness:test` locally when the README line omitted it; that
-   baseline's README line ran 292 tests (82 + 210). Earlier per-layer figures,
-   including 588, are historical snapshots.
+1. Both commands now run the same four test tasks, including `:core:test`; the
+   CI command adds `--no-daemon --stacktrace`. The historical three-module
+   split ran 778 tests (362 + 324 + 92) at the last recorded green run; 773
+   (362 + 324 + 87) and 769 (359 + 323 + 87) are earlier snapshots. The
+   projected four-module split is 778 tests (362 + 112 + 212 + 92) and is not
+   yet a green result here. The older 302-test figure (which included the 10
+   harness tests) came from the CI command, or from adding `:harness:test`
+   locally when the README line omitted it; that baseline's README line ran
+   292 tests (82 + 210). Earlier per-layer figures, including 588, are
+   historical snapshots.
 2. `assembleRelease` falls back to the debug key when the local-only, gitignored
    `keystore.properties` is absent (`.github/workflows/rig.yml:36-38`,
    `app/build.gradle.kts:15-33`). That is a build-integrity check, not a
    release-signing verification.
 
-**Verification record.** The three test tasks were run fresh with
-`--rerun-tasks` in `/home/szszszs/flit` (JDK 21.0.13, Gradle 8.14.3):
+**Verification record.** The historical three-module split was verified fresh
+with `--rerun-tasks` in `/home/szszszs/flit` (JDK 21.0.13, Gradle 8.14.3), using
+the command in use before the relocation:
 
 ```bash
 source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **362 protocol + 324 app + 92 harness = 778 tests,
-0 failures, 0 errors, 0 skipped**, read from the XML result files under each
-module's `build/test-results/test/`. Debug and release assemblies and the CLI
-distribution were green in the same rig run (§2). Provenance: the 2026-11-25
+That run recorded `BUILD SUCCESSFUL`, **362 protocol + 324 app + 92 harness =
+778 tests, 0 failures, 0 errors, 0 skipped**, read from the XML result files
+under each module's `build/test-results/test/`. Debug and release assemblies
+and the CLI distribution were green in the same rig run (§2). That record is
+historical: it predates the move of ten classes into `:core`. With the new
+module in the task set, the command is:
+
+```bash
+source env.sh && ./gradlew --no-daemon --rerun-tasks \
+  :protocol:test :core:test :app:testDebugUnitTest :harness:test
+```
+
+The projected four-module split is **362 protocol + 112 core + 212 app + 92
+harness = 778**. No green result is recorded here for that split: the counts
+come from source-level `@Test` annotations and remain projections until a
+four-module JUnit XML is recorded (§2, §4.9).
+
+Provenance: the 2026-11-25
 date belongs to the earlier 302-test baseline and the stale-XML incident in §8,
 not to the courier counts. Earlier fresh runs recorded 136 + 210 + 32 = 378
 after the 2026-11-30 CLI layer, 396 after the 2026-12-01 App layer and 588
 after the courier/QR hardening; the JOIN-proof/authority layer raised the
 totals to the 359 + 323 + 87 = 769 snapshot (§4.8), and the `wrapVerified` and
 relay-hunt cases raised them to the historical 362 + 324 + 87 = 773 snapshot.
-The 2027-01-05 CLI parity cases raised them to the current 362 + 324 + 92 =
-778. The `--rerun-tasks` flag was deliberate: an earlier invocation reported all test
+The 2027-01-05 CLI parity cases raised them to the historical three-module
+362 + 324 + 92 = 778. The `--rerun-tasks` flag was deliberate: an earlier invocation reported all test
 tasks `UP-TO-DATE` and left XML from an older class layout in place (see §8).
 The 302-test baseline was green at `72225f8`; the added cases are listed in
 §4.1, §4.2, §4.3 and §4.8. The earlier `wrapVerified` layer added three cases
@@ -232,18 +268,21 @@ test-class rows (§4.5) are part of the current inventory.
 
 ## 4. Test inventory by module and class
 
-Counts are from the JUnit XML reports after the final fresh run; they agree with
-a source-level `@Test` count. Layer notes that quote 588, 52 harness, 302, 769
-or 773 are snapshots at those layers, not the current inventory (§2). The
-JOIN-proof / authority classes, the later `wrapVerified` / relay-hunt cases and
-the 2027-01-05 CLI parity cases are grouped in §4.8. File names and class names
-differ in two places, so the report is grouped by **class**: `DtoParityTest.kt` contains both
+Counts in §4.1, §4.2 and §4.3 are from the JUnit XML reports of the last
+recorded fresh run under the three-module layout; they agree with a source-level
+`@Test` count and are historical after the relocation (§2). The ten classes
+moved into `:core` are listed in §4.9 with projected counts from source.
+Layer notes that quote 588, 52 harness, 302, 769 or 773 are snapshots at those
+layers, not the present inventory (§2). The JOIN-proof / authority classes, the
+later `wrapVerified` / relay-hunt cases and the 2027-01-05 CLI parity cases are
+grouped in §4.8. File names and class names differ in two places, so the report
+is grouped by **class**: `DtoParityTest.kt` contains both
 `DtoParityTest` and `TlsIdentityTest` (`protocol/src/test/kotlin/app/flit/share/protocol/DtoParityTest.kt:22,142`),
 and `TlsIdentityTest.kt` contains the class `PinCacheTest`
 (`.../TlsIdentityTest.kt:16`). Do not "fix" these by renaming without updating
 this table.
 
-### 4.1 Protocol — 362 tests in the final green XML
+### 4.1 Protocol — 362 tests in the last recorded green XML (historical)
 
 | Class | # | What it pins |
 | --- | --- | --- |
@@ -355,7 +394,7 @@ status is attached to these rows.
 | `PadMergeTest` (new) | 11 | `PadCore.merge` applies the same per-key greatest-order-key rule to views already derived from separate event sets, so `view(a + b) == merge(view(a), view(b))` for disjoint and overlapping sets and for either merge order; a tombstone in one view wins over an older put in the other, re-merging a view is idempotent and a merged view never grows past `MAX_LINES`. |
 | `PadCanonicalTest` (new) | 7 | `CircleEvent.PAD = "pad"` is the twelfth verb in `TYPES` with the existing verb values unchanged; `CircleCore.canonical` covers the same seven fields except `sig`/`cert` for `pad`, so a `pad` event minted by `CircleCore.create` verifies and a forged `authorFp` or a changed covered field fails `verify`, while canonical bytes, replay order, `dedup` and `accept` for the existing verbs stay byte-identical and no route, header, DTO field or v2.2 status is added. |
 
-### 4.2 App — 324 tests in the final green XML
+### 4.2 App — 324 tests in the last recorded green XML (historical, pre-relocation)
 
 All are JVM tests of Android-free seams: codecs, reducers, pure policy math and
 rendered QR pixels. They never start the Android framework, an engine or a
@@ -426,7 +465,7 @@ framework, Robolectric or device claim is made here.
 | --- | --- | --- |
 | `ParcelScanStateTest` (new) | 18 | Android-free JVM reducer cases in `app/src/test/kotlin/app/flit/share/`: in-order and out-of-order assembly, duplicate `(parcelId, seq)` ignored with the first copy kept, a missing frame leaving `complete()` null, a mixed `parcelId` frame ignored, count mismatch and sequence past `MAX_PARCEL_FRAMES = 64` refused, and a second `complete()` returning null after a verified payload. Each case asserts the exact accepted frame set and whether `complete()` yields a `ParcelPayload`; CRC/digest/signature/recipient failures stay null through the real `ParcelCodec.complete(frames, recipientFp, identity)` seam, with the codec's own tamper cases left in §4.1. No Android import, no Robolectric, no camera or device evidence. |
 
-### 4.3 Harness — 92 tests in the final green XML
+### 4.3 Harness — 92 tests in the last recorded green XML (historical)
 
 The two baseline classes run the **production** endpoints in one JVM. `CircleHarnessTest`
 hosts through `ConsoleDelegate.circleHost` behind a real TLS `ProtocolServer`

@@ -1,6 +1,6 @@
 # The rig standard, green before any commit merges:
-# 362 protocol tests + 324 app tests + 92 harness tests + debug/release
-# assemblies + the CLI dist.
+# Projected until green XML: 362 protocol + 112 core + 212 app + 92 harness = 778
+# tests + debug/release assemblies + the CLI dist.
 name: rig
 
 on:
@@ -38,7 +38,7 @@ jobs:
         # gitignored) keystore.properties fall back to the debug key.
         run: >
           ./gradlew --no-daemon --stacktrace
-          :protocol:test :app:testDebugUnitTest :harness:test
+          :protocol:test :core:test :app:testDebugUnitTest :harness:test
           :app:assembleDebug :app:assembleRelease
           :harness:installDist :harness:distZip
 

@@ -3,25 +3,38 @@
 > Part of the Flit design set. [Transport ladder and index](transport-bluetooth.md) ·
 > [README](../README.md).
 
-The rig's final green standard is **769 tests, 0 failures** (359 protocol + 323
-app + 87 harness), from a green `--rerun-tasks` run with zero errors, zero
-skipped tests and all assemblies green. Earlier docs quote older counts (76,
-115, 302, 396, 588, 714); those are historical snapshots of the same suite at
-earlier layers, not the current inventory. The CI workflow comment now quotes
-359 + 323 + 87. The current inventory is in [TESTING.md](TESTING.md).
+The historical full-suite count was **778 tests** split as 362 protocol + 324
+app + 92 harness. A JVM `:core` module now holds ten Android-free seams relocated
+from `:app`; with that move the projected split is 362 protocol + 112 core + 212
+app + 92 harness, still 778. These post-move numbers are a projection, not a
+measured result: a full rig run is in progress and no green run or failure count
+is claimed from this layer. Earlier docs quote smaller counts (76, 115, 302,
+396, 588, 714, 769); those are historical snapshots of the same suite at earlier
+layers, not the current inventory. The current inventory is in
+[TESTING.md](TESTING.md).
 The v0.2.0 baseline was `72225f8` (Open-file crash + sharing restore), preceded
 by `2034fa6` (Circle file delivery + quality pass); later layers are recorded
 under `docs/completions/`.
 
 ## 1. Rig at a glance
 
-Three modules, three roles ([README](../README.md#repo-layout)):
+Four modules, four roles ([README](../README.md#repo-layout)):
 
 | Module | Role | Runs on |
 | --- | --- | --- |
 | `protocol/` | JVM-pure wire engine (JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client, relay core) | JVM only; no Android dependency |
+| `core/` | JVM module holding the ten Android-free seams moved out of `:app`; projected 112 tests | JVM only; no Android dependency |
 | `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.3.1` (code 4), minSdk 26, compile/targetSdk 36 | Phone |
 | `harness/` | Desktop companion shipped as `flit-cli`; doubles as the interop and device-walk rig | Linux box with JDK 21 |
+
+The `:core` move was a relocation of source and tests, not a behaviour change.
+The ten seams are the Android-free models, codecs, reducers and policy helpers
+that had no Android dependency; their platform adapters, radio and camera code
+and Compose rendering stay in `:app`. Wire behaviour is unchanged: the routes,
+headers, DTO fields and v2.2 statuses are the same, and nothing on the wire is
+renamed or added. The `flit-cli` surface is unchanged: command names, flags,
+help text, output lines and exit codes stay as described in §2. The seams moved
+to a different module; the protocol and the CLI contract did not move with them.
 
 Toolchain lives outside the repo in `~/.local/`; `env.sh` pins JDK 21
 (`JAVA_HOME="$HOME/.local/jdks/temurin-21"`), and CI instead uses
@@ -33,7 +46,7 @@ The pre-commit rig command (README "Dev quickstart", and the same task set in
 CI, rig.yml:35-49):
 
 ```bash
-source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDebug \
+source env.sh && ./gradlew :protocol:test :core:test :app:testDebugUnitTest :app:assembleDebug \
     :app:assembleRelease :harness:installDist
 # CI additionally runs :harness:test and :harness:distZip, with --no-daemon --stacktrace
 ```
@@ -624,15 +637,16 @@ rig used; substitute addresses/ports for a different network.
 ### 6.1 Green rig before a commit
 
 ```bash
-source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDebug \
+source env.sh && ./gradlew :protocol:test :core:test :app:testDebugUnitTest :app:assembleDebug \
     :app:assembleRelease :harness:installDist
 ```
 
-Expected: 769 tests, 0 failures (359 protocol + 323 app + 87 harness) at the
-final green `--rerun-tasks` run, with zero errors, zero skipped tests and debug
-and release APKs plus the CLI distribution produced. CI runs the same task set
-at .github/workflows/rig.yml:35-49 and uploads the CLI zip as artifact
-`flit-cli`.
+Projected inventory: 778 tests (362 protocol + 112 core + 212 app + 92 harness)
+after the relocation. The historical split was 362 protocol + 324 app + 92
+harness, also 778. These are projections: the full `--rerun-tasks` rig is still
+running and no green result, failure count or assembly result is claimed here.
+CI runs the same task set at .github/workflows/rig.yml:35-49 and uploads the CLI
+zip as artifact `flit-cli`.
 
 ### 6.2 Box serve + discover + send (interop baseline, harness evidence)
 

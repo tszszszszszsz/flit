@@ -147,7 +147,8 @@ Milestone status is in the [design index](docs/transport-bluetooth.md). Engineer
 
 ```
 protocol/   wire protocol engine (pure Kotlin; JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client)
-app/        Android shell (Jetpack Compose) — the phone app
+core/       JVM module, present in the build — Android-free seams extracted from the app; 112 projected tests
+app/        Android shell (Jetpack Compose) — the phone app; 212 projected tests
 harness/    the desktop companion, shipped as flit-cli (doubles as the rig that verifies interop with official LocalSend)
 ```
 
@@ -169,7 +170,7 @@ the sender is the production protocol client riding the simulated Bluetooth pipe
 used before every commit:
 
 ```bash
-source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :harness:test \
+source env.sh && ./gradlew :protocol:test :core:test :app:testDebugUnitTest :harness:test \
     :app:assembleDebug :app:assembleRelease :harness:installDist :harness:distZip
 ```
 

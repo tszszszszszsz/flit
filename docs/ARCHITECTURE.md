@@ -28,28 +28,49 @@ protocol/   JVM-pure wire engine
   discovery/  UdpDiscovery — multicast/unicast announce and register probing.
   model/      Wire DTOs, WireJson, Relay/Panic/Circle request-response envelopes.
 
+core/       JVM module, present in the build
+  FlitBle       BLE announcement codec, arbiter, rank rule, contextual ask book,
+                duty-cycle constants.
+  FlitCrush     gzip crush/unpack rules for "name.ext.gflit" wire files.
+  FlitMirror    album-mirror diff offer and ledger rules.
+  FlitRoute     route model, candidate ordering, relay address parsing, hunt backoff.
+  FlitSpeed     smoothed bytes-per-second estimator; sampling, not painting.
+  FlitSpool     spool reaper sweep, queue whitelist and staging-window rules.
+  FlitSubnet    subnet host walk and prefix bounds for the discovery fallback.
+  ParcelScanState  Android-free frame-assembly reducer for QR parcels.
+  Qr            pairing-code URI round-trips, order/duplicate resolution, frame shapes.
+  SheetUi       initials, deterministic hue and count-phrasing helpers.
+  These ten Android-free seams were relocated here from app/, each with its
+  unit-test class. No android.* import enters core/. They keep the app.flit.share
+  package they had in app/, so that same package spans core/ and app/, alongside
+  the protocol subpackages. core/ depends on protocol/ and is consumed by both
+  app/ and harness/.
+
 app/        Android shell
   FlitEngine      single in-process coordinator: server + clients + queue + hunter +
                   mirror + relay + Circle + panic + sharing-desired restore.
   FlitService     foreground service wrapper; FGS types/timeouts and process liveness.
   MainActivity    Compose UI, intents, file open/chooser, dialog state, permission asks.
   FlitRoster      persistent routing/trust/queue/mirror/Circle-local state.
-  FlitRoute       pure candidate ordering and relay address parsing.
   FlitBluetooth   RFCOMM dialer + accept loop on the Link seam.
-  FlitBle*        pure announce wire + duty-cycle stance + Android BLE radio adapter.
-  FlitSpool       grant-proof cache copies for share-sheet intake.
+  FlitBleRadio    Android BLE radio adapter; the pure discovery model lives in core/.
   CircleUi        M3 activity feed; FileCard, PollCard, member sheet; tallies memoized.
   FlitNotify      transfer and panic notifications.
 
 harness/    flit-cli: the same protocol engine as a Linux tool and interop rig.
   serve/send/discover/info/relay/panic/parse-qr/circle/bt-sim.
-```
+  Depends on protocol/ and core/.
 
-Proposed future modules are planned but not built, so no build files are claimed
-for them: `:core` (JVM) for shared, Android-free logic and `:desktop` (Compose
-Multiplatform) for a desktop GUI on top of `:core`. See
-[docs/roadmap/desktop-app.md](roadmap/desktop-app.md). The non-profit constraints
-apply to both unchanged.
+`:core` is present as a JVM module depending on `:protocol` and consumed by
+`:app` and `:harness`. The planned modules `:ui-common` (shared Compose
+helpers) and `:desktop` (a Compose Multiplatform GUI on top of `:core`) are not
+built, and no build files are claimed for them. See
+[docs/roadmap/desktop-app.md](roadmap/desktop-app.md) for the design target. The
+non-profit constraints apply unchanged.
+
+The ten seams in `core/` arrived as production/test pairs from `app/`; their
+unit-test classes moved with them. This map records the relocation and makes no
+claim about a test result.
 
 ## 3. The transport seam: one brain, many pipes
 
@@ -167,7 +188,7 @@ Host authority lives in `FlitCircleHost`; the app host and the box CLI host shar
 
 **CLI parcel seam.** The `parcel` subcommand of `flit-cli` (`ParcelCli.kt` in `harness/`, object `ParcelCli` with `parcelEncode`/`parcelDecode` behind `run(args)`) is a one-shot, offline driver over that same `ParcelCodec`: `Harness.kt` gains a `"parcel"` dispatch, a `parcelUsage()` line and `--out` in `ParsedArgs.VALUE_FLAGS` (`--dir`, `--to` and `--cert` already exist), and no other command changes. `parcel encode <file> --dir DIR --to FP --cert PATH` reads one file, generates a `parcelId` per encode, takes the signer from `loadOrCreateIdentity()` (`signerFp = identity.fingerprint`) and renders the ordered strings from `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, cert, signerFp, identity)` as `frame-%04d.png` files (1-based, so lexicographic order equals codec order) into an empty `--dir`, using zxing `QRCodeWriter` at 768 × 768 px, EC `M`, a two-module margin and UTF-8 — the same image constants `Qr.encode` uses. The recipient certificate is supplied **out of band**: `--cert PATH` holds its Base64 DER, parsed with `CertificateFactory` and bound to `--to` by `TlsIdentity.fingerprintOf` after normalisation, and the X.509 object itself is handed to `encodeParcel`, where `CourierEnvelope.seal` binds it to `recipientFp` by its own SHA-256 DER; there is no pin lookup and no self-addressed fallback, and the certificate lives only for that invocation and is never copied into `--dir`. `parcel decode --dir DIR --out PATH` reads the numbered PNGs back with zxing `MultiFormatReader`, keeps every frame string opaque, calls `ParcelCodec.complete(frames, identity.fingerprint, identity)` with the local identity, and writes `ParcelPayload.bytes` to `--out` only on a verified result, printing signer, recipient, SHA-256 and byte counts; no file name travels in a frame, so the operator names the landed bytes with `--out`. Frame grammar, CRC, sequence, count, digest and crypto stay in `ParcelCodec` and the `CourierEnvelope` it calls — the adapter adds no second crypto path, no socket, `Link`, route, header or v2.2 DTO field — and the only on-disk state is the numbered PNGs and the identity file, so a killed process leaves no output file and no progress record. Exit codes are 2 for bad arguments or a missing cert, dir or out, 3 for a verification failure and 0 on success.
 
-**App QR screen seam.** The Android surface is three additive files with no protocol or wire change: `ParcelScanState.kt`, `ParcelUi.kt` and `MainActivity.kt`. `ParcelScanState` is Android-free where possible: it holds captured frame strings opaquely, offers each to `ParcelCodec.parse(frame)` for the small `FrameDescriptor` (`parcelId`, `seq`, `count`, `totalBytes`, `crc`), dedups by `(parcelId, seq)`, tracks progress from `seq`/`count`, and completes through `ParcelCodec.complete(frames, recipientFp, identity): ParcelPayload?` with the receiving app's `TlsIdentity`. Its caps are read only from the codec (`MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`), and it exposes one small pure reducer so the folding logic is tested without Compose. `ParcelUi` is a Compose screen with two modes. Show renders the ordered strings from `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, recipientCert, signerFp, identity)` as bitmaps through `Qr.encode` at error-correction level M, margin `2`, `PARCEL_FRAME_SIZE_PX = 240`, advancing one frame every `PARCEL_FRAME_INTERVAL_MS = 400L` with next/back controls; the recipient certificate is supplied out of band as in the CLI, and no frame carries a file name. Scan feeds the camera preview's Y plane through `Qr.decodeYPlane`, offers each decoded string to `ParcelScanState`, shows progress from the descriptor's `seq`/`count`, and on a verified result shows the signer fingerprint, SHA-256 and byte count before writing `ParcelPayload.bytes` through an injected `(ByteArray) -> Unit` callback. `MainActivity` gains an additive entry point to that screen and supplies the injected writer that lands the bytes in the app's received bucket through the existing receive path (`FlitEngine.publishReceived`) under a locally chosen save name; Circle and transfer behavior are untouched. Verification stays in `ParcelCodec` and the `CourierEnvelope` it calls; the app owns only rendering, camera intake, progress and file landing and adds no second crypto or digest path.
+**App QR screen seam.** The Android surface is three additive files with no protocol or wire change: `ParcelScanState.kt` (now in `core/`), `ParcelUi.kt` and `MainActivity.kt`. `ParcelScanState` is Android-free where possible: it holds captured frame strings opaquely, offers each to `ParcelCodec.parse(frame)` for the small `FrameDescriptor` (`parcelId`, `seq`, `count`, `totalBytes`, `crc`), dedups by `(parcelId, seq)`, tracks progress from `seq`/`count`, and completes through `ParcelCodec.complete(frames, recipientFp, identity): ParcelPayload?` with the receiving app's `TlsIdentity`. Its caps are read only from the codec (`MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`), and it exposes one small pure reducer so the folding logic is tested without Compose. `ParcelUi` is a Compose screen with two modes. Show renders the ordered strings from `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, recipientCert, signerFp, identity)` as bitmaps through `Qr.encode` at error-correction level M, margin `2`, `PARCEL_FRAME_SIZE_PX = 240`, advancing one frame every `PARCEL_FRAME_INTERVAL_MS = 400L` with next/back controls; the recipient certificate is supplied out of band as in the CLI, and no frame carries a file name. Scan feeds the camera preview's Y plane through `Qr.decodeYPlane`, offers each decoded string to `ParcelScanState`, shows progress from the descriptor's `seq`/`count`, and on a verified result shows the signer fingerprint, SHA-256 and byte count before writing `ParcelPayload.bytes` through an injected `(ByteArray) -> Unit` callback. `MainActivity` gains an additive entry point to that screen and supplies the injected writer that lands the bytes in the app's received bucket through the existing receive path (`FlitEngine.publishReceived`) under a locally chosen save name; Circle and transfer behavior are untouched. Verification stays in `ParcelCodec` and the `CourierEnvelope` it calls; the app owns only rendering, camera intake, progress and file landing and adds no second crypto or digest path.
 
 ## 9. Lifecycle, FGS and sharing restore
 

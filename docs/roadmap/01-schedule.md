@@ -68,6 +68,11 @@ The 2027-01-05 and 2027-01-06 layers are built ahead. The CLI parity fixes, the
 relay pairing read and the rig inventory update are written now; the commits
 stay on those dates.
 
+The 2027-01-11 Integration layer is built ahead of its scheduled day. The JVM
+`:core` extraction moves ten Android-free seams and their tests out of `:app`;
+112 tests are projected to land in `:core`. The code is written now, but the
+commit stays on 2027-01-11; no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |
@@ -103,6 +108,7 @@ stay on those dates.
 | 2027-01-08 | Device | Partial feature walk with one phone and one CLI peer |
 | 2027-01-09 | Docs | Confidence assessment, desktop plan and remaining verification plan |
 | 2027-01-10 | Docs | Desktop planning wave summary and gated extraction order |
+| 2027-01-11 | Integration | JVM :core extraction: ten moved seams and 112 tests |
 
 ## Rules for a day
 

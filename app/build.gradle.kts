@@ -104,6 +104,7 @@ dependencies {
     implementation(libs.androidx.camera.view)
 
     implementation(project(":protocol"))
+    implementation(project(":core"))
 
     testImplementation(kotlin("test"))
 }

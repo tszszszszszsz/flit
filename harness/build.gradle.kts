@@ -9,6 +9,7 @@ kotlin {
 
 dependencies {
     implementation(project(":protocol"))
+    implementation(project(":core"))
     implementation(libs.slf4j.simple)
     // Dev bench: decode pairing codes out of app screenshots (parse-qr).
     implementation(libs.zxing.core)

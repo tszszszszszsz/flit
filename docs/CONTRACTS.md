@@ -2607,3 +2607,85 @@ nor any wire field.
 any finding to the supplied log sink only. The arbiter and the radio controls
 never read that result, so carrier behaviour is unchanged: no route, header,
 advertising record or advertise/scan stance is altered by the audit.
+
+## 25. JVM `:core` seam boundary — relocation of Android-free seams (2027-01-11)
+
+### 25.1 Layer and ownership
+
+This section records a module boundary, not a new wire feature. The layer moves
+ten Android-free seams — production classes that were already free of platform
+APIs — out of `:app` into a JVM-only `:core` module, together with their test
+classes. It is a relocation: the declarations, case bodies and package names
+are unchanged, and no case is rewritten, merged, retired or replaced. `:protocol`
+and `:harness` are untouched. The Android shell in `:app` keeps the code that
+needs Android: the service, activities, radio adapters, camera capture,
+notification wiring and Compose surfaces. None of that platform code moved into
+`:core`.
+
+### 25.2 The ten seams
+
+The relocated seams are `FlitBle` (BLE record codec, arbiter, rank rule, ask
+book and duty constants), `Qr` (v2/v3 invite codes, gray decode and frame
+helpers), `ParcelScanState` (the Android-free frame-assembly reducer),
+`FlitSubnet` (host walks and prefix bounds), `FlitRoute` (route decode,
+candidate order and hunt backoff), `FlitMirror` (diff offer and ledger rules),
+`FlitSpool` (sweep, queue whitelist and crush-litter rules), `FlitSpeed` (the
+rate estimator, with its complementary edge cases), and `SheetUi` (initials,
+hue and count phrasing). `FlitCrush`, the gzip crush-and-send helper, moves as a
+source file alongside these; it is pinned through the `FlitSpool` sweep cases
+rather than a test class of its own. Every one of these was already JVM-pure,
+which is why each could leave the Android module without a rewrite.
+
+The test classes move with their subjects: `FlitBleTest`, `FlitQrTest`,
+`ParcelScanStateTest`, `FlitSubnetTest`, `FlitRouteTest`, `FlitMirrorTest`,
+`FlitSpoolTest`, `FlitSpeedTest`, `FlitSpeedEdgeTest` and `SheetUiTest`. Their
+cases total 112. That figure is a projection from the file inventory: it is
+counted from the `@Test` annotations in the moved files, not from a JUnit XML.
+The historical inventory is 362 protocol + 324 app + 92 harness = 778. After
+relocation the projected split is 362 protocol + 112 core + 212 app + 92
+harness = 778. Only the module column changes; the total is unchanged because
+this is a move rather than an addition or a removal.
+
+### 25.3 Same-package declarations across modules
+
+All ten production declarations keep `package app.flit.share`, and all ten test
+classes keep that same package. `:protocol` continues to own
+`app.flit.share.protocol` and its subpackages, including the `client`, `model`,
+`circle`, `parcel`, `tls`, `transport` and `ideas` types the seams call into. The
+result is one package name declared in two modules: `app.flit.share` is declared
+in both `:app` and `:core`, while `app.flit.share.protocol.*` is declared only in
+`:protocol`. Kotlin and the JVM resolve these from the classpath, so the
+unchanged names mean the imports that refer to these classes need no edit. The
+relocation renames no package and introduces no new one, and the protocol types
+are not duplicated into `:core`.
+
+### 25.4 Wire boundary
+
+No value in §1 changes. No route string, header name, JSON DTO field, QR
+parameter, persisted store field, schema field, signature primitive or status
+value is added, removed or re-typed by this layer. The seams keep calling the
+protocol types that remain in `:protocol`; they do not redefine them in
+`:core`. `Qr` still produces the invite text handled in §8, `ParcelScanState`
+still consumes the `ParcelCodec` frames of §16–§18, and `FlitBle` still reads
+the same `NoiseBudget` rules. `FlitRoute` adds no route and `FlitSubnet` adds no
+header. No field is added to `CircleRequest`, `CircleResponse` or any LocalSend
+DTO, and `FlitMirror` and `FlitSpool` introduce no new carrier or wire shape. A
+stock LocalSend v2.2 peer sees the same bytes it saw before the move (§2, §4).
+
+### 25.5 Evidence boundary
+
+No green claim is made here. The full rig covering all four modules had not
+produced a result available to this layer when this section was written, so the
+112 core and 212 app figures stay projections from the file inventory. A result
+may be published only after the JUnit XML for the completed run is read: confirm
+that the core and app case totals match 112 and 212, then record the failures,
+errors and skipped values from those XML files. No claim of zero failures, zero
+errors or zero skipped is made for any module, and earlier green totals are
+historical and are not carried forward by this wave.
+
+CODE covers the source-level facts: the JVM-only module in the build, the ten
+production classes and ten test classes under `core/src/main` and `core/src/test`,
+the retained `app.flit.share` package, and the absence of those classes from the
+`:app` tree. PURE covers the JVM-only character of the moved cases: no Android
+runtime, emulator, camera or radio enters them. There is no DEVICE label for
+this layer; no phone, radio or camera walk is recorded.
