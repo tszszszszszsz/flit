@@ -12,7 +12,7 @@ A day's layer is accepted only when every rule below holds.
 
 ## Code and tests
 
-- Full rig is green: `protocol:test`, `app:testDebugUnitTest`, `harness:test`,
+- Full rig is green: `protocol:test`, `core:test`, `app:testDebugUnitTest`, `harness:test`,
   `assembleDebug`, `assembleRelease`, `installDist`, `distZip`.
 - New behavior has pure tests first. Harness tests cover production endpoints.
   Device claims require a log and an observation; a passing test is not a

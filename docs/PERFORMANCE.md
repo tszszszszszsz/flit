@@ -30,7 +30,7 @@ That is one file, one link, one phone, one day. It is **not** a throughput matri
 
 The old estimator sampled on every progress callback but reset its clock only when the notification was repainted (every 350 ms). Each callback re-divided the *same* elapsed time against a growing byte count, so a healthy 30 MB/s transfer showed as KB/s and then spiked into the gigabits when the window closed.
 
-`FlitSpeed` (`app/.../FlitSpeed.kt:19-56`) separates counting from painting:
+`FlitSpeed` (`core/src/main/kotlin/app/flit/share/FlitSpeed.kt:19-56`) separates counting from painting:
 
 - samples closer than `minSampleMs = 80 ms` are ignored;
 - a single sample cannot exceed `4×` the current estimate;

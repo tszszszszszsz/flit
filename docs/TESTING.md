@@ -264,7 +264,7 @@ to `DropKeyCoreTest` (now 18) and one to `FlitEngineTest` (now 31), counted from
 the same XML. The latest layer adds four cases to `CircleHarnessTest` (now 18)
 and one to `RelayServerTest` (now 6); `ParcelCliTest` stays at 11 and
 `ParcelCliHarnessTest` at 3. The 2026-12-14 receipts parity layer's three
-test-class rows (§4.5) are part of the current inventory.
+test-class rows (§4.5) are part of that historical three-module inventory.
 
 ## 4. Test inventory by module and class
 
@@ -396,9 +396,13 @@ status is attached to these rows.
 
 ### 4.2 App — 324 tests in the last recorded green XML (historical, pre-relocation)
 
-All are JVM tests of Android-free seams: codecs, reducers, pure policy math and
-rendered QR pixels. They never start the Android framework, an engine or a
-radio.
+This is the historical pre-relocation inventory, kept intact as the record of
+the last green three-module XML. All are JVM tests of Android-free seams:
+codecs, reducers, pure policy math and rendered QR pixels. They never start the
+Android framework, an engine or a radio. Ten of these classes have since moved
+to `:core` and now live in §4.9; the ten that remain in `app/` sum to 212 in
+the projected split. The `FlitSpoolTest` row here is the pre-move record: the
+class and its source were promoted to `:core`, see §4.9.
 
 | Class | # | What it pins |
 | --- | --- | --- |
@@ -454,7 +458,7 @@ figure, and carry no device evidence.
 #### QR parcel app additions — 18 cases (source-counted)
 
 The class below belongs to the 2026-12-07 QR parcel App layer. It is a new
-Android-free JVM class in `app/src/test/kotlin/app/flit/share/`, driving the
+Android-free JVM class now under `core/src/test/kotlin/app/flit/share/`, driving the
 real `ParcelCodec.complete(frames, recipientFp, identity)` with a recipient
 fingerprint and the receiving `TlsIdentity`. Its 18 cases are included in the
 green 588 (257 app) from a clean `--rerun-tasks` run. The codec's own CRC,
@@ -553,9 +557,9 @@ The two rows below belong to the 2026-12-16 Integration layer that wires the
 Android-free JVM class in `app/src/test` and one is a new in-process harness
 class in `harness/src/test`. Their counts from the JUnit XML are 15 and 8;
 the module totals at that layer were 330 + 309 + 75 = 714, against the
-359 + 323 + 87 = 769 and 362 + 324 + 87 = 773 snapshots and the current
-362 + 324 + 92 = 778 (§2). No device walk, new route, header, DTO field, store
-field or v2.2 status is attached to these rows.
+359 + 323 + 87 = 769 and 362 + 324 + 87 = 773 snapshots and the historical
+three-module 362 + 324 + 92 = 778 (§2). No device walk, new route, header,
+DTO field, store field or v2.2 status is attached to these rows.
 
 | Class | # | What it pins |
 | --- | --- | --- |
@@ -596,7 +600,7 @@ owner or admin, ordinary verbs fold only inside their own circle, and the rule
 is total on hostile input. The app ingress replay guard verifies before
 reserving an id, and the CLI pins host answers to `--host-fp` and learns
 rotations only from host-signed REKEY events. All cases are JVM-pure or
-in-process from the final green `--rerun-tasks` run. No device walk, new route,
+in-process from the last recorded green `--rerun-tasks` run. No device walk, new route,
 header, DTO field or v2.2 status is claimed, and a pre-proof JOIN is refused at
 admission.
 
@@ -605,7 +609,7 @@ relay-hunt case in `app/`, moving the inventory from the 769 snapshot to the
 historical 773 snapshot. The 2027-01-05 CLI parity layer adds four cases in
 `CircleHarnessTest` and one in `RelayServerTest`, and hardens the QR reader in
 `ParcelCliHarnessTest` without adding a case, moving the inventory to the
-current 778. Evidence here is CODE/PURE/SIM-HARN only: CODE for source-level
+historical three-module 778. Evidence here is CODE/PURE/SIM-HARN only: CODE for source-level
 gate wiring, PURE for JVM-only rules, SIM-HARN for in-process runs over
 production endpoints. No DEVICE observation is claimed. The last rows below
 name them.
@@ -627,9 +631,46 @@ name them.
 | `PadCliTest` | 8 | `harness/` | Unchanged at 8: `circle pad put|del|show` bodies come from `PadCore`, `show` prints the folded view, and blank or over-cap fields are refused with no event posted. |
 | `DropKeyCoreTest` / `FlitEngineTest` (added cases) | +3 / +1 | `protocol/` / `app/` | `wrapVerified` binds every wrap to the fingerprint of the certificate it holds, refuses a fingerprint misbound to a foreign certificate, keeps only correctly bound entries in a mixed roster and refuses an over-cap roster; the relay hunt is a last resort needing an explicit `relayFor` opt-in with `AUTO` or `RELAY_ONLY`, and fails closed for a missing Known entry, an opted-out device or a `WIFI_ONLY`/`BLUETOOTH_ONLY` policy. |
 
+### 4.9 JVM `:core` — 112 projected tests in ten moved classes
+
+Wave 1 of the desktop split added a JVM `:core` module and relocated ten
+Android-free source/test pairs out of `app/`. The classes and their case counts
+are unchanged by the move: no case was dropped and no new case was written for
+it. The counts below are from source-level `@Test` annotations and stay
+projections here; this document records no green result for the four-module
+layout, and the ten historical `app/` rows in §4.2 remain the record of the
+last green three-module XML. The `:core:test` task is added to the rig in §3.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `FlitBleTest` | 36 | BLE record codec (extended/legacy, fingerprint and alias, codepoint-safe clipping, garbage refused, both self-ghost kinds), stance arbiter, rank rule, contextual ask book, duty constants with injectable phase, live-peer stop rule. |
+| `FlitMirrorTest` | 5 | Diff offers only ledger-unmarked files, zero-length write-in-progress excluded, size change mirrors again, token survives round-trip, re-notice quiet. |
+| `FlitQrTest` | 22 | v2/v3 URI round-trips including relay-only codes and v3 with no key on the wire, order/dupe resolution, junk refused, on-screen and camera-shaped frames decoded (canvas-gray, RGB, y-plane with strides, rotation), skewed non-code stays calm, unicode alias. |
+| `FlitRouteTest` | 7 | Bluetooth MAC route distinct from TCP twin, legacy TCP route decode, typed relay parse, candidate priority order and dedup, calm hunt backoff, fingerprint-only accept rule. |
+| `FlitSpeedEdgeTest` | 4 | First huge sample only seeds baseline, irregular intervals, decreasing/repeated counts never negative, 100× jump limited. |
+| `FlitSpeedTest` | 4 | Repeated samples in one paint window do not inflate rate, no negative/gigabit spike, reset forgets prior baseline. |
+| `FlitSpoolTest` | 5 | Start sweep reclaims killed-session copies only; young staging kept; queue whitelist wins; crush copies are litter; look-alikes and directories ignored. Real mtimes on a temp root, no Robolectric. |
+| `FlitSubnetTest` | 8 | /24 and /30 host walks, self/network/broadcast excluded, /31-/32 and out-of-range prefixes refused, IPv6 not walked, /16 over the 1024-knock cap refused, boundary at 253/252, labels. |
+| `ParcelScanStateTest` | 18 | Frame holder and reducer driven by real `ParcelCodec.complete` frames: in-order and out-of-order assembly, duplicate `(parcelId, seq)` ignored, missing frame leaving `complete()` null, mixed parcel id ignored, count and sequence caps refused, second `complete()` null after a verified payload, and CRC/digest/signature/recipient failures staying null. |
+| `SheetUiTest` | 3 | Initials from first two words, stable in-range hue per fingerprint, count phrasing rule of one. |
+| **Total** | **112** | Ten classes, all JVM-pure; no Android framework import, no emulator, no device claim. |
+
+Two notes on the new module. `FlitSpool` was promoted into `:core` even though
+the migration plan listed its test as staying in `app/` on the grounds of real
+temp files and mtimes. The reaper rule is a pure `stale` computation over paths,
+ages and queue tokens, and the test sets mtimes on a temporary root directly;
+that runs on a JVM with no Android class and no Robolectric, so the source and
+test both moved. The `:core` source also carries Kotlin serialization because
+`FlitRoute.Route` is `@Serializable` (`core/src/main/kotlin/app/flit/share/FlitRoute.kt:15,19`);
+`core/build.gradle.kts:3` applies `alias(libs.plugins.kotlin.serialization)`
+for those annotations, as `app/build.gradle.kts:8` already does. Neither note
+changes a case count.
+
 ## 5. What the suites establish, by flow
 
-The per-class tables in §4 are the authority for counts.
+The per-class tables in §4 are the authority for counts: §4.1-§4.3 record the
+last green three-module XML and §4.9 lists the ten `:core` classes with
+projected counts pending a four-module XML.
 
 - **Wire parity.** `DtoParityTest`, `LinkServerParityTest` and the CLI `bt-sim`
   run one unchanged v2.2 brain over three pipes: TCP/Netty, an in-memory duplex
@@ -896,11 +937,13 @@ the mitigation each test uses.
    The commit message records the new module counts, as `72225f8` and `2034fa6`
    do.
 7. **Run the rig before claiming green.** Local test subset first:
-   `source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :harness:test`,
+   `source env.sh && ./gradlew :protocol:test :core:test :app:testDebugUnitTest :harness:test`,
    then the full local or CI command from §3 including both assemblies and
    `installDist`. Only then call it green, and only at the level the tests
-   actually cover (§1). If the behavior needs hardware, add the reproduction
-   recipe from §7.5 and mark the observation "not verified" until walked.
+   actually cover (§1). A source-level count such as the §4.9 table is not a
+   green result; wait for the XML. If the behavior needs hardware, add the
+   reproduction recipe from §7.5 and mark the observation "not verified" until
+   walked.
 
 ## 10. Cross-links and historical note
 
@@ -925,10 +968,10 @@ after the app QA fixes (138 + 239 + 39), 436 after the 2026-12-03 QR codec
 layer (240 + 272 + 39), 588 after the receipts and pad layers, 714 at the
 pre-JOIN-proof layer (330 + 309 + 75), 769 (359 + 323 + 87) as the snapshot
 before the relay-hunt and `wrapVerified` cases and 773 (362 + 324 + 87) after
-them. The CI workflow header (`.github/workflows/rig.yml:1-3`) now quotes the
-current 362 + 324 + 92. The
+them. The CI workflow header (`.github/workflows/rig.yml:1-3`) quotes the
+historical three-module 362 + 324 + 92. The
 2026-12-07 QR parcel App layer added 18 cases in `ParcelScanStateTest`, later
-confirmed by JUnit XML. The 2026-12-09 per-drop content key protocol layer
+confirmed by JUnit XML; that class is now in §4.9 under `:core`. The 2026-12-09 per-drop content key protocol layer
 added three classes in §4.1 (`DropKeyCoreTest`, `DropKeyBodyTest`,
 `DropKeyCryptoTest`), included in the green 588 at that layer. The 2026-12-10
 per-drop parity Integration layer added four classes in §4.4 with 31 cases at
@@ -942,7 +985,9 @@ is recorded in §4.8 and brought the inventory to the 769 snapshot
 (359 + 323 + 87), with no device walk claimed. The relay-hunt and
 `wrapVerified` cases in §4.8 add four cases to reach the historical
 362 + 324 + 87 = 773. The 2027-01-05 CLI parity layer adds four
-`CircleHarnessTest` cases and one `RelayServerTest` case to reach the current
-362 + 324 + 92 = 778; its QR decoder hardening adds no case. Neither layer
-claims a device walk. The layer record is
-`docs/completions/2027-01-05-cli-parity.md`.
+`CircleHarnessTest` cases and one `RelayServerTest` case to reach the
+historical three-module 362 + 324 + 92 = 778; its QR decoder hardening adds no
+case. Neither layer claims a device walk. The layer record is
+`docs/completions/2027-01-05-cli-parity.md`. The relocation of ten classes into
+`:core` leaves the total at 778 with the projected split 362 + 112 + 212 + 92
+recorded in §2 and §4.9; it is not a green result here.

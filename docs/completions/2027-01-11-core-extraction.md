@@ -3,17 +3,18 @@
 Layer: 2027-01-11 Extraction. This wave adds a JVM-only `:core` module to the
 build and moves ten Android-free source/test pairs out of `:app` into it. The
 move is a relocation of existing code together with its tests, not a change in
-behaviour: each production class carries its unit-test class with it, the
+behaviour: nine production classes carry their unit-test classes with them,
+`FlitCrush` moves without a test because none existed in the app module, the
 `app.flit.share` package is kept, and no case is rewritten, merged or retired.
 No route, header, JSON DTO field, QR parameter, persisted store field, schema
 field, signature primitive or status value changes at this layer. The protocol
 and harness modules are untouched, and the Android shell keeps only code that
 needs Android.
 
-The ten pairs, with the case count carried by each test class, are `FlitBle`
-36, `FlitQr` 22, `ParcelScanState` 18, `FlitSubnet` 8, `FlitRoute` 7,
-`FlitMirror` 5, `FlitSpool` 5, `FlitSpeed` 4, `FlitSpeedEdge` 4 and `SheetUi`
-3. They sum to 112 cases. `FlitBle` covers the BLE record codec, the arbiter,
+The nine test classes, with their case counts, are `FlitBle` 36, `FlitQr` 22,
+`ParcelScanState` 18, `FlitSubnet` 8, `FlitRoute` 7, `FlitMirror` 5,
+`FlitSpool` 5, `FlitSpeed` 4, `FlitSpeedEdge` 4 and `SheetUi` 3. `FlitSpeed`
+has two test classes; `FlitCrush` has none. They sum to 112 cases. `FlitBle` covers the BLE record codec, the arbiter,
 the rank rule, the contextual ask book and the duty-cycle constants;
 `FlitQr` covers the v2/v3 URI round-trips, order and duplicate resolution,
 junk refusal and the frame shapes; `ParcelScanState` covers the Android-free
@@ -23,7 +24,7 @@ frame-assembly reducer; `FlitSubnet` covers the host walks and prefix bounds;
 sweep, queue whitelist and crush-litter rules; `FlitSpeed` and `FlitSpeedEdge`
 cover the rate samples and their boundary cases; `SheetUi` covers the initials,
 hue and count-phrasing helpers. Every one of these was already JVM-pure, which
-is why the pair could leave the Android module without a rewrite. The package
+is why the cases could leave the Android module without a rewrite. The package
 name is retained, so the relocation does not change the imports that name
 these classes.
 

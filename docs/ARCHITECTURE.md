@@ -194,7 +194,7 @@ Host authority lives in `FlitCircleHost`; the app host and the box CLI host shar
 
 `FlitEngine.start()` is asynchronous and seq-guarded: a stop/restart invalidates every worker. `FlitService` wraps it as a foreground service. On API 34+ `connectedDevice` is requested only when the Bluetooth option is on and a nearby-device permission is granted; a `SecurityException` falls back to `dataSync`. A dataSync timeout stops the wrapper but leaves the engine alive. A genuine wrapper stop clears the "sharing desired" flag; internal rebinds (alias/relay/Bluetooth) never do. A cold launch calls `restoreSharingIfDesired()` silently.
 
-MIUI can still kill the process or refuse autostart; that cannot be fixed in code. We restore on next open and say so.
+MIUI can still kill the process or refuse autostart; that cannot be fixed in code. Sharing is restored on next open, with that state stated in the UI.
 
 ## 10. Concurrency model
 

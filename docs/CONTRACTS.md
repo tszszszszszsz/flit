@@ -9,8 +9,8 @@ Sources, in order of authority for a contract question:
 1. The JVM-pure `protocol` module (`protocol/src/main/kotlin/app/flit/share/protocol/`).
    This module has no Android dependency, so its bytes are the wire truth.
 2. The app's wiring of those pieces (`app/src/main/kotlin/app/flit/share/`,
-   chiefly `FlitEngine.kt`, `FlitRoute.kt`, `FlitKnown.kt`, `Qr.kt`,
-   `FlitCircleHost.kt`, `FlitCircleSync.kt`).
+   chiefly `FlitEngine.kt`, `FlitKnown.kt`, `FlitCircleHost.kt` and
+   `FlitCircleSync.kt`; `FlitRoute.kt` and `Qr.kt` now live in `:core`).
 3. The focused docs already in `docs/`: `transport-bluetooth.md`,
    `bluetooth-carrier.md`, `circle.md`, `qr-only-and-panic.md`, `milestone-e.md`,
    `milestone-{a,c,d}.md`, `open-file-and-sharing-restore.md`, `README.md`.
