@@ -108,12 +108,11 @@ The 2026-12-09 per-drop content key protocol layer added three JVM-pure classes
 (`DropKeyCoreTest` 15, `DropKeyBodyTest` 14, `DropKeyCryptoTest` 12), included
 in the green 588 from a clean `--rerun-tasks` run (§4.1).
 
-The 2026-12-10 per-drop parity Integration layer adds four test classes (§4.4)
-included in the green 588 from a clean `--rerun-tasks` run. The module table
-above reflects 240 + 281 + 67 = 588. Two classes are new (`DropParityTest` in
-`protocol/`, `DropKeyCliTest` in `harness/`) and two add cases to existing app
-classes (`FlitCircleSyncTest`, `FlitEngineTest`). No device observation is
-attached to these rows.
+The 2026-12-10 per-drop parity Integration layer added four test classes (§4.4)
+at that layer's green run, which then stood at 240 + 281 + 67 = 588. Two classes
+were new (`DropParityTest` in `protocol/`, `DropKeyCliTest` in `harness/`) and
+two added cases to existing app classes (`FlitCircleSyncTest`, `FlitEngineTest`).
+No device observation is attached to these rows.
 
 The 2026-12-11 delivery receipts protocol layer adds three JVM-pure protocol
 classes (§4.1), included in the green 588. No device observation or new wire
@@ -157,8 +156,8 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :harness:test \
     :app:assembleDebug :app:assembleRelease :harness:installDist :harness:distZip
 ```
 
-**CI standard** — the same task set plus harness tests and the distribution
-zip, with `--no-daemon --stacktrace` (`.github/workflows/rig.yml:35-43`):
+**CI standard** — the same task set with `--no-daemon --stacktrace`
+(`.github/workflows/rig.yml:35-43`):
 
 ```bash
 ./gradlew --no-daemon --stacktrace \
