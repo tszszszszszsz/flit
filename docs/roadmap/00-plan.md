@@ -49,6 +49,14 @@ same transport and is last.
 ## Out of scope for the whole plan
 
 Wi-Fi Aware (hardware absent), multi-hop relay routing, bonded Wi-Fi plus
-Bluetooth transfer, a desktop GUI and offline `.flitpack` bundles stay parked.
+Bluetooth transfer and offline `.flitpack` bundles stay parked.
 No remote revocation is claimed: a device that keeps an old drop can still open
 it. New work does not change the v2.2 wire surface.
+
+## Planned later phase: desktop GUI
+
+A desktop GUI is planned for a later phase, after the four additions above. It
+was previously listed as out of scope for this plan; that cut is superseded by
+[desktop-app.md](desktop-app.md). Implementation has not started. The non-profit
+constraints apply unchanged: no accounts, no cloud, no ads, no telemetry and no
+SDK that phones home.

@@ -56,7 +56,7 @@ The revision is recorded in the docs and the earlier wording is kept as history.
 
 ## 5. Scope cuts, named
 
-- **No GUI desktop app.** `flit-cli` is the Linux companion. A GUI would be a new product surface, not a quality fix.
+- **GUI desktop app — planned, not built.** The earlier scope cut that parked a GUI desktop app is superseded by the plan in [docs/roadmap/desktop-app.md](roadmap/desktop-app.md). `flit-cli` remains the Linux companion. Implementation has not started. The non-profit constraints apply unchanged: no accounts, no cloud, no ads, no telemetry and no SDK that phones home.
 - **No Wi‑Fi Aware carrier.** The rig phone reports `pm has-feature android.software.wifi.aware = false`. Building against absent hardware would be theatre.
 - **No multi-hop mesh.** A three-or-more-device relay/mesh walk needs hardware not on this rig. The seams exist; the walk does not.
 - **No bonded simultaneous Wi‑Fi+Bluetooth transfer.** Both are first-class routes chosen per peer; aggregation is a later, device-gated change.
@@ -110,7 +110,8 @@ File drops push bytes through `sendFiles`; the signed announcement alone did not
 | Circle v1 | built: groups, QR founding, signed log, polls, file drops, governance, host/rekey; two-node device walks |
 | Open-file / sharing restore | fixed and device-verified on the final build |
 | Wi‑Fi Aware | parked: hardware feature absent |
-| Multi-hop mesh, bonded carriers, GUI desktop, offline bundle | parked or not built, named above |
+| Multi-hop mesh, bonded carriers, offline bundle | parked or not built, named above |
+| GUI desktop | planned, not built; the earlier scope cut is superseded by [docs/roadmap/desktop-app.md](roadmap/desktop-app.md); non-profit constraints apply unchanged |
 
 ## 8. Working practice
 

@@ -24,6 +24,8 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 | 8 | **In-app note composer**: send a plain-text note to a peer straight from the app — no share sheet detour | **shipped** |
 | 9 | **Bluetooth direct-discovery**: when no Wi‑Fi network exists between you (mobile-data-only phones, dead access points), the roster just keeps working — the engine flips LE discovery on at the exact no-AP moment and the same v2.2 exchange rides a Bluetooth pipe; asks are the OS's own dialogs, once per device | **shipped** (engine + asks walked on device; full two-phone transfer awaits a second phone — see the transport doc's walkthrough record) |
 
+**Planned, not built:** a desktop GUI is planned; see [the desktop app roadmap](docs/roadmap/desktop-app.md). Implementation has not started.
+
 Working name. Rename is a 15-minute chore before Play listing (no trademark reuse of "LocalSend").
 
 ## Current capabilities

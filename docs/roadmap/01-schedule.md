@@ -101,6 +101,7 @@ stay on those dates.
 | 2027-01-06 | Docs | Final rig inventory and completion note |
 | 2027-01-07 | Device | Install and launch smoke on one physical device |
 | 2027-01-08 | Device | Partial feature walk with one phone and one CLI peer |
+| 2027-01-09 | Docs | Confidence assessment, desktop plan and remaining verification plan |
 
 ## Rules for a day
 

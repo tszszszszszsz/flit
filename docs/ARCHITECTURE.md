@@ -45,6 +45,12 @@ harness/    flit-cli: the same protocol engine as a Linux tool and interop rig.
   serve/send/discover/info/relay/panic/parse-qr/circle/bt-sim.
 ```
 
+Proposed future modules are planned but not built, so no build files are claimed
+for them: `:core` (JVM) for shared, Android-free logic and `:desktop` (Compose
+Multiplatform) for a desktop GUI on top of `:core`. See
+[docs/roadmap/desktop-app.md](roadmap/desktop-app.md). The non-profit constraints
+apply to both unchanged.
+
 ## 3. The transport seam: one brain, many pipes
 
 Every carrier becomes a `Link`: a stable pair of `InputStream`/`OutputStream` plus an optional `origin` label ([`Link.kt`](../protocol/src/main/kotlin/app/flit/share/protocol/client/Link.kt)).

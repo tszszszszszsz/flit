@@ -762,8 +762,9 @@ flit-cli circle vote --option 0
 flit-cli circle sync
 ```
 
-`poll` takes one comma-separated `--option A,B,…` value (Harness.kt:1170-1173);
-a repeated `--option` overwrites the earlier one in the arg parser. `vote`
+`poll` keeps every `--option` occurrence and also accepts one comma-separated
+`--option A,B,…` value (`ParsedArgs.opts`); the older overwrite behavior was
+replaced. `vote`
 takes a single integer `--option N` (Harness.kt:1187-1188).
 
 On the phone, join by pasting a QR v3 code or tapping a `flit://add?v=3&…` link
