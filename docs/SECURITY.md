@@ -18,7 +18,7 @@
   box, as recorded in the focused docs. A walk is claimed only where those docs
   record one.
 
-Rig status: 136 protocol + 228 app + 32 harness = 396 tests, 0 failures (last
+Rig status: 330 protocol + 309 app + 75 harness = 714 tests, 0 failures (final
 green `--rerun-tasks` run). Properties asserted only by a code comment or an
 unrun path are marked "not verified".
 
@@ -1317,6 +1317,137 @@ gates and the member-gated roll-up; PURE for the body, tally and canonical tests
 and the app confirmation helper; SIM-HARN for the two-bot confirm walk and its
 forgery/refusal cases. No device receipt walk is claimed.
 
+## Circle pad: signed events, route verification, plaintext bodies (2026-12-15)
+
+The 2026-12-15 protocol layer adds one `CircleEvent` verb, `PAD = "pad"`, and a
+JVM-pure fold in `protocol/src/main/kotlin/app/flit/share/protocol/circle/PadCore.kt`.
+The pad is a shared, line-oriented text view rebuilt from the signed event log;
+it adds no route, header, DTO field, persisted field or device walk. It rides the
+existing `/circle/join` and `/circle/sync` routes through the existing fan-out
+and repair path (`docs/roadmap/circle-pad.md`). The properties below belong to
+that one signed event and its pure fold; no new trust anchor is introduced.
+
+### Pad events are signed
+
+A `pad` event is signed and checked like a `message` or `file` event.
+`CircleCore.canonical` covers the same seven fields — `id`, `circleId`,
+`authorFp`, `lamport`, `type`, `body`, `createdMs` — as a domain-tagged,
+length-prefixed byte sequence, excluding only `sig` and `cert`. The two closed
+body shapes are `{"op":"put","key":"…","text":"…"}` and `{"op":"del","key":"…"}`,
+gated by `PadCore.PAD_PUT_KEYS` and `PAD_DEL_KEYS`. `PadCore` builds them with
+`padPutBody` and `padDelBody`, so a body cannot be minted in a shape the gate
+would refuse. Signing uses the same `TlsIdentity.sign` path as every other Flit
+signed type; `CircleCore.verify` binds the embedded certificate's own SHA-256 DER
+to `authorFp` before verifying and pinning, the pin-after-verify rule in
+"Signatures and cert-in-event". A forged `authorFp` or an altered body fails
+verification. The gate is structural only: it signs nothing, pins nothing and
+reads no store.
+
+### Verification and replay stay at the receiving route
+
+`PadCore.view` does not call `CircleCore.verify`. Verification and the replay
+guard run at the receiving route before events reach the fold:
+`FlitCircleSync.fresh` verifies each signature through `CircleCore.verify`, and
+`CircleCore.accept` applies the bounded seen set and window. Re-verifying inside
+a pure fold would pin certificates from a test vector or a cached snapshot, so
+the fold stays free of that side effect. `view` does apply `CircleCore.dedup`
+because dedup is pure: a repeated id counts once even when a snapshot is
+replayed. Replay uses the shared `6 h` window, `5 min` skew and `MAX_SEEN = 4096`
+from `CircleCore`, unchanged for the pad verb.
+
+### PadCore pins nothing
+
+`PadCore` is a JVM-pure object with no mutable state between calls and no pin
+store. It never reads or writes `TlsIdentity` pins; only `CircleCore.verify` and
+the routes pin certificates. Each `view` rebuilds from the events passed in, and
+the signed events in `FlitCircleStore.CircleState.events` remain the only durable
+pad state — there is no second persisted copy and no per-line state. An app layer
+may hold a derived `PadView` in a StateFlow rebuilt on each store fold, but this
+protocol layer adds none.
+
+### Stored bodies are plaintext with no content cipher
+
+Pad text travels as signed JSON in the shared Circle log. The group key stays
+membership/rekey material, not a content cipher: there is no per-line encryption
+path, no wrap and no new key material. TLS keeps the body off the wire in
+cleartext, but the stored body is plaintext JSON under the at-rest rule in
+"Storage and permissions" — anyone with device or backup access can read it. Do
+not put secrets in a pad line, the same rule as Circle messages. A departure, a
+rekey or a `del` event cannot erase a line already stored on another device. The
+courier and QR parcel paths may carry the event as opaque sealed payload, but
+that is their own envelope, not a second cipher for the pad line.
+
+Evidence: CODE for the verb, gate and pure fold, and PURE for the protocol tests
+(`PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest`). No harness
+test and no device observation are added for this layer; pad events over the
+production routes belong to the later app and CLI integration.
+
+## Circle pad in app and CLI: signed edits, route verification, no keys in the UI (2026-12-16)
+
+The 2026-12-16 integration puts the pad verb on both surfaces. The app exposes
+`FlitEngine.padView: StateFlow<PadView>`, rebuilt from `FlitCircleStore` events
+through `PadCore.view(events, circleId)` on every store fold, and publishes edits
+with `FlitEngine.circlePadPut(key, text)` and `FlitEngine.circlePadDel(key)`.
+The CLI adds `circle pad put --key K --text T`, `circle pad del --key K` and
+`circle pad show`. Every body comes from `PadCore.padPutBody` / `padDelBody` and
+is published as an ordinary signed `pad` event on the existing `/circle/sync`
+fan-out. No route, header, DTO field, QR parameter, store field, signature
+primitive or v2.2 status is added. The properties below are those of that one
+signed event; the integration introduces no new trust anchor.
+
+### Edits are signed pad events
+
+A put or del leaves the app through `FlitCircleSync.postPadPut` /
+`postPadDel` and leaves the CLI through its `circle pad` command path; both use
+the `PadCore` builders, so a body cannot be minted in a shape the gate refuses.
+The event is minted with the writer's own `TlsIdentity` through
+`CircleCore.create` / `sign`, reusing the same `TlsIdentity.sign` path as every
+other signed Circle verb. `CircleCore.canonical` covers the seven fields `id`,
+`circleId`, `authorFp`, `lamport`, `type`, `body` and `createdMs` as one
+domain-tagged, length-prefixed sequence, excluding only `sig` and `cert`; a
+changed key or text, or a forged `authorFp`, fails verification. The UI's
+`PadUi.keyError` / `textError` bounds mirror `PadCore.MAX_KEY_CHARS` and
+`MAX_TEXT_CHARS`, and the builders refuse a blank or oversized value before an
+event is created.
+
+### Verification stays at the receiving route
+
+Verification and the replay guard are owned by the receiving route, not by the
+fold or the UI. `FlitCircleSync.fresh` runs `CircleCore.verify`, which binds the
+embedded certificate's own SHA-256 DER to `authorFp` under the pin-after-verify
+rule, and `CircleCore.accept` applies the shared `6 h` window, `5 min` skew and
+`MAX_SEEN = 4096` before events reach the fold. `PadCore.view` still calls only
+`CircleCore.dedup`: it never verifies, pins or reads a store, so a derived view
+is not an authentication decision. `refreshCircle()` folds a pad digest into
+its content-diff signature so an edit republishes without a log change; that
+digest is a local change signal, not a signature over pad content and not a
+replacement for route verification. Pins and the seen set remain in the
+protocol and route layer.
+
+### The UI holds no keys
+
+`PadUi.kt` is Android-free: `object PadUi` with `data class PadRow(key, text)`,
+`rows(view: PadView)` returning lexicographically ordered rows, and `keyError`
+/ `textError` bound checks from `PadCore`. The Compose `PadCard(view, onPut,
+onDel, onClose)` renders an M3 list with edit and delete controls at 48 dp
+targets; `CircleUi` adds one pad surface entry, and `MainActivity` collects
+`FlitEngine.padView` and supplies the callbacks. None of these UI objects holds
+a `TlsIdentity`, a private key, the group key, a wrap or a certificate, and none
+signs, verifies, pins or writes a store. The card renders a derived view only;
+`onPut` and `onDel` call back into `FlitEngine`, which is the sole app caller
+that mints a pad event. `circle pad show` likewise prints `PadView` lines and
+holds no key. There is no per-line cipher: pad bodies stay plaintext JSON in the
+bounded Circle log under the at-rest rule in "Storage and permissions", and no
+UI layer adds an encryption path.
+
+### No device claim
+
+Evidence: CODE for the app and CLI seams named above and for the unchanged wire
+surface; PURE for `PadUiTest` and `FlitEngineTest`, and SIM-HARN for `PadCliTest`.
+No device observation is claimed for this layer: no phone-to-phone pad walk, no
+hardware observation of a pad edit and no radio or carrier pad exchange is
+recorded. Pad observation on hardware belongs to the device-walk date.
+
 ## Storage and permissions
 
 The app asks for the minimum local capabilities and exposes almost nothing:
@@ -1426,6 +1557,19 @@ The app asks for the minimum local capabilities and exposes almost nothing:
     remote action, and the confirmed tally is gated on the current-member roster:
     a departed or unknown author is not counted. The 2026-12-14 app and CLI
     integration adds no device receipt walk claim.
+16. **A pad line is plaintext and PadCore pins nothing.** Pad events are signed
+    and verified at the receiving route (`FlitCircleSync.fresh` /
+    `CircleCore.accept`), but the stored body is plaintext JSON in the shared log
+    with no per-line cipher — the group key is membership material, not
+    encryption. `PadCore` is a pure fold with no pin store and never calls
+    `CircleCore.verify`; it applies `dedup` only. Do not put secrets in a pad
+    line, and a `del` or rekey cannot erase another device's stored copy.
+17. **The pad UI is a view, not a trust decision.** The 2026-12-16 card and CLI
+    display render a derived `PadView`; they hold no `TlsIdentity`, private key,
+    group key, wrap or certificate, mint no event and verify nothing. Edits are
+    signed by `FlitEngine` / the CLI and verified at the receiving route, so a
+    rendered line is not by itself proof of authorship. No device walk or
+    hardware pad observation is claimed for this layer.
 
 ## Evidence status at a glance
 
@@ -1440,6 +1584,8 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | Per-drop content keys | `DropKeyCore.kt`, `CircleCore.validFileBody`, `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` (counts at integration) | not added on this date | no device walk |
 | Keyed drops app + CLI receive gate | `FlitEngine.onUploadFinish`, `FlitCircleSync.postFile(body)` / `circleBodyValid`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish` | core body/crypto tests, `FlitCircleSyncTest`, `FlitEngineTest`, `DropParityTest` | CLI keyed-drop round-trip and refusals (`DropKeyCliTest`, `CircleHarnessTest`) | no device walk |
 | Delivery receipts (local landing) | `CircleEvent.RECEIPT`, `CircleCore.RECEIPT_BODY_KEYS` / `validReceiptBody` / `receiptAuthors` | `ReceiptBodyTest`, `ReceiptTallyTest`, `ReceiptCanonicalTest` (counts at integration) | not added on this date | no device walk; one member's landing is not global delivery |
+| Circle pad (signed verb, pure fold) | `CircleEvent.PAD`, `PadCore.view` / `merge` / `validPadBody` | `PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest` (counts at integration) | not added on this date | no device walk |
+| Circle pad app + CLI integration | `FlitEngine.padView` / `circlePadPut` / `circlePadDel`, `FlitCircleSync.postPadPut` / `postPadDel`, `PadUi.kt`, `PadCard`, CLI `circle pad` commands | `PadUiTest`, `FlitEngineTest` | `PadCliTest` | no device walk |
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
 | Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | SIM via CLI carrier below | no device walk |
 | App courier handoff UI | `CourierCardUi.kt`, `FlitEngine.courierHandoffs`, `FlitCircleSync.postParcel` | `CourierCardUiTest` (counts recorded at integration) | consumed CLI carrier outcomes | no device walk; peer acceptance is not end-to-end delivery |

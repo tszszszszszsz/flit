@@ -29,22 +29,27 @@ put: {"op":"put","key":"<line-key>","text":"<text>"}
 del: {"op":"del","key":"<line-key>"}
 ```
 
-`PadCore.PAD_PUT_KEYS = {"op","key","text"}` and `PadCore.PAD_DEL_KEYS = {"op","key"}`. `PadCore.padPutBody(key, text)` and `PadCore.padDelBody(key)` build these strings. The gate and its producers stay in one JVM-pure file so a body cannot be minted in a shape the gate would refuse.
+`PadCore.PAD_PUT_KEYS = setOf("op", "key", "text")` and `PadCore.PAD_DEL_KEYS = setOf("op", "key")`. `PadCore.padPutBody(key: String, text: String): String` and `PadCore.padDelBody(key: String): String` build these strings. The gate and its producers stay in one JVM-pure file so a body cannot be minted in a shape the gate would refuse.
 
 ### Pure core surface
 
-All of the following live in `protocol/src/main/kotlin/app/flit/share/protocol/circle/PadCore.kt`, an `object` with no mutable state between calls:
+All of the following live in `protocol/src/main/kotlin/app/flit/share/protocol/circle/PadCore.kt`, an `object` with no mutable state between calls. This is the finalized surface:
 
-- `validPadBody(body: String): Boolean` — structural gate, modelled on `CircleCore.validFileBody`.
-- `PadLine(key: String, text: String)` and `PadView(lines: List<PadLine>)` — the derived view, sorted by `key`.
-- `view(events: Iterable<CircleEvent>, circleId: String): PadView` — keeps only `pad` events for that circle with a readable body, applies `CircleCore.dedup`, then resolves conflicts.
-- `merge(views: Iterable<PadView>): PadView` — applies the same per-key rule to views already derived from separate event sets, so `view(a + b)` equals `merge(view(a), view(b))`.
+- `const val MAX_LINES = 256`, `const val MAX_KEY_CHARS = 128`, `const val MAX_TEXT_CHARS = 4096` — the pad bounds.
+- `val PAD_PUT_KEYS = setOf("op", "key", "text")`, `val PAD_DEL_KEYS = setOf("op", "key")` — the two closed body key sets.
+- `data class PadLine(val key: String, val text: String, val lamport: Long = 0L, val authorFp: String = "", val id: String = "", val deleted: Boolean = false)` — one line plus the order-key metadata (`lamport`, `authorFp`, `id`) of its winning operation and a `deleted` tombstone flag.
+- `data class PadView(val lines: List<PadLine>, val winners: Map<String, PadLine> = emptyMap())` — the derived view; `lines` is lexicographic by `key` and holds no tombstoned key, while `winners` also carries tombstones and their order keys so `merge` can re-run the per-key conflict rule after the events are gone.
+- `fun padPutBody(key: String, text: String): String` — builds a `put` body.
+- `fun padDelBody(key: String): String` — builds a `del` body.
+- `fun validPadBody(body: String): Boolean` — structural gate, modelled on `CircleCore.validFileBody`.
+- `fun view(events: Iterable<CircleEvent>, circleId: String): PadView` — keeps only `pad` events for that circle with a readable body, applies `CircleCore.dedup`, then resolves conflicts per key.
+- `fun merge(views: Iterable<PadView>): PadView` — applies the same per-key rule to views already derived from separate event sets, so `view(a + b)` equals `merge(view(a), view(b))`.
 
 `view` does not call `CircleCore.verify`. Verification and the replay guard run at the receiving route (`FlitCircleSync.fresh`, then `CircleCore.accept`) before events reach the fold. Re-verifying here would pin certificates from a pure test or a cached snapshot, and `PadCore` owns no pin store. `view` does apply `CircleCore.dedup` because dedup is pure and a repeated id must count once even when a snapshot is replayed.
 
 ### Conflict rule
 
-Each surviving operation carries the order key `(lamport, authorFp, id)` — the first three components of `CircleCore.ORDER`. For one `key`, the operation with the greatest order key wins: `put` sets the line text, `del` tombstones the key. A `del` older than the winning `put` is inert. The view lists live keys in lexicographic order and omits tombstoned keys. Order keys come from signed fields and `id` is unique, so two devices resolve the same event set to the same view regardless of delivery order, and folding the same event twice changes nothing.
+Each surviving operation carries the order key `(lamport, authorFp, id)` — the first three components of `CircleCore.ORDER`. For one `key`, the operation with the greatest order key wins: `put` sets the line text, `del` tombstones the key. A `del` older than the winning `put` is inert. `view` resolves that winner for every key and lists live keys in lexicographic order, omitting tombstoned keys. `merge` applies the same per-key rule across views already derived from separate event sets: for each key it keeps the line whose backing event has the greatest order key, so a tombstone wins over an older put but loses to a greater put. That winning `PadLine`, with its order key and `deleted` flag, is retained in `PadView.winners` so a later merge can re-run the rule. Order keys come from signed fields and `id` is unique, so two peers resolve the same event set to the same view regardless of delivery order, folding the same event twice changes nothing, and `view(a + b) == merge(view(a), view(b))` for any partition or shuffle of one event set.
 
 ### Constants
 
@@ -52,8 +57,8 @@ Each surviving operation carries the order key `(lamport, authorFp, id)` — the
 | --- | --- | --- |
 | `PadCore.MAX_LINES` | `256` | Most live keys in a `PadView`; leaves headroom under `FlitCircleStore.EVENT_CAP = 500`. |
 | `PadCore.MAX_KEY_CHARS` | `128` | Line key bound; below `CircleCore.MAX_FIELD_CHARS = 256`. |
-| `PadCore.MAX_TEXT_CHARS` | `4 * 1024` | Per-line text; a put body with a quoted key and text stays under `CircleCore.MAX_BODY_CHARS = 16 * 1024`. |
-| `PadCore.PAD_PUT_KEYS` / `PAD_DEL_KEYS` | `{"op","key","text"}` / `{"op","key"}` | Closed key sets for the two verbs. |
+| `PadCore.MAX_TEXT_CHARS` | `4096` | Per-line text; a put body with a quoted key and text stays under `CircleCore.MAX_BODY_CHARS = 16 * 1024`. |
+| `PadCore.PAD_PUT_KEYS` / `PAD_DEL_KEYS` | `setOf("op", "key", "text")` / `setOf("op", "key")` | Closed key sets for the two verbs. |
 | `CircleCore.MAX_EVENTS_PER_REQUEST` | `1024` | Reused bound on events in one sync batch. |
 | `CircleCore.REPLAY_WINDOW_MS` / `CLOCK_SKEW_MS` | `6 h` / `5 min` | Reused replay window; older pad events are refused at the route. |
 | `CircleCore.MAX_SEEN` | `4096` | Reused bounded id set for `accept`/`fresh`. |
@@ -77,7 +82,7 @@ The signed `pad` events in `CircleState.events` are the only durable pad state. 
 
 1. `validPadBody` accepts exactly `PAD_PUT_KEYS` when `op == "put"` and `PAD_DEL_KEYS` when `op == "del"`. Any extra key, missing key, wrong JSON type or unknown `op` is refused.
 2. A `put` body has a non-blank `key` of at most `MAX_KEY_CHARS` and non-blank `text` of at most `MAX_TEXT_CHARS`; a `del` body has a non-blank `key` of at most `MAX_KEY_CHARS`. Every accepted body is at most `CircleCore.MAX_BODY_CHARS`.
-3. A `pad` event minted by `CircleCore.create` verifies with `CircleCore.verify`; its canonical bytes cover every field except `sig` and `cert`, unchanged from the other eight verbs.
+3. A `pad` event minted by `CircleCore.create` verifies with `CircleCore.verify`; its canonical bytes cover every field except `sig` and `cert`, unchanged from the existing verbs — `pad` is the twelfth verb in `CircleEvent.TYPES`.
 4. `view(events, circleId)` ignores events whose `type` is not `pad`, whose `circleId` differs, or whose body fails `validPadBody`; it applies `CircleCore.dedup` so a repeated id counts once.
 5. Fold order does not matter: for any partition and shuffle of one event set, `view(a + b) == merge(view(a), view(b))` and the result is byte-identical.
 6. Re-folding an event already present in the log leaves the `PadView` unchanged.
@@ -105,18 +110,12 @@ The signed `pad` events in `CircleState.events` are the only durable pad state. 
 
 ### Pure tests (this layer)
 
-`protocol/src/test/kotlin/app/flit/share/protocol/PadCoreTest.kt`, JVM-only, using `kotlin.test` and `runBlocking` where a suspend path is needed:
+Four JVM-only classes under `protocol/src/test/kotlin/app/flit/share/protocol/`, using `kotlin.test` and `runBlocking` where a suspend path is needed:
 
-- `validPadBody` accepts the two exact shapes and refuses an extra key, a missing key, a non-string `op`/`key`/`text`, an unknown `op`, blank `key`/`text`, and fields over `MAX_KEY_CHARS` / `MAX_TEXT_CHARS`.
-- `padPutBody` / `padDelBody` produce bodies that `validPadBody` accepts, and a put at `MAX_TEXT_CHARS` still fits `CircleCore.MAX_BODY_CHARS`.
-- `CircleCore.create` with `PAD` verifies, and a forged `authorFp` or a changed body fails `verify`.
-- `view` keeps only in-circle `pad` events with a valid body; other verbs, other circles and bad bodies are ignored.
-- Two opposite delivery orders of the same put/del set give byte-identical `PadView`s.
-- `view(a + b) == merge(view(a), view(b))` for disjoint event sets.
-- Re-folding the same event leaves the view unchanged.
-- A `del` with a greater order key tombstones a key; an older `del` leaves the text in place.
-- `PadView.lines` is sorted by key, omits tombstoned keys and never exceeds `MAX_LINES`.
-- Malformed JSON, blank fields and oversized fields never throw.
+- `PadBodyTest.kt` — `validPadBody` accepts the two exact shapes and refuses an extra key, a missing key, a non-string `op`/`key`/`text`, an unknown `op`, blank `key`/`text`, and fields over `MAX_KEY_CHARS` / `MAX_TEXT_CHARS`; `padPutBody` / `padDelBody` produce bodies that `validPadBody` accepts, and a put at `MAX_TEXT_CHARS` still fits `CircleCore.MAX_BODY_CHARS`; malformed JSON, blank fields and oversized fields never throw.
+- `PadViewTest.kt` — `view` keeps only in-circle `pad` events with a valid body; other verbs, other circles and bad bodies are ignored. Two opposite delivery orders of the same put/del set give byte-identical `PadView`s, and re-folding the same event leaves the view unchanged. A `del` with a greater order key tombstones a key; an older `del` leaves the text in place. `PadView.lines` is sorted by key, omits tombstoned keys and never exceeds `MAX_LINES`.
+- `PadMergeTest.kt` — `view(a + b) == merge(view(a), view(b))` for disjoint event sets; the per-key winner with its order key and tombstone flag survives in `PadView.winners`, so a tombstone in one view beats an older put in the other and re-merging is idempotent.
+- `PadCanonicalTest.kt` — `CircleCore.create` with `PAD` verifies, and a forged `authorFp` or a changed body fails `verify`; canonical bytes cover the same seven fields with `sig`/`cert` excluded, and the existing verbs stay byte-identical.
 
 Existing protocol suites (`CircleCoreTest`, `CircleHardeningTest`, `LinkServerParityTest`) are re-run unchanged; a `pad` verb must not alter their canonical bytes, refusals or v2.2 status behaviour. Counts and the exact rig command are recorded with the layer result, not asserted here.
 
@@ -130,7 +129,7 @@ No device walk in this layer. The full feature walk is 2026-12-17; any pad obser
 
 ## Evidence for this day
 
-`docs/completions/2026-12-15-circle-pad-core.md` records the protocol test-task result from a fresh `--rerun-tasks` run, the added test names and what each pins, the exact `PadCore` constants and file, and the post-layer protocol test count updated from the current 136 (the current rig is 396 = 136 protocol + 228 app + 32 harness after a green `--rerun-tasks` run). It records limitations at the CODE and PURE levels only: no UI, no CLI command, no persisted pad field and no device observation in this layer. Harness and device claims stay unmarked until their own dates.
+`docs/completions/2026-12-15-circle-pad.md` records the protocol test-task result from a fresh `--rerun-tasks` run, the added test names and what each pins, the exact `PadCore` constants and file, and the post-layer protocol test count updated from the then-current 240 (a historical figure for that layer; the current rig is 714 = 330 protocol + 309 app + 75 harness after a green `--rerun-tasks` run, with zero failures). It records limitations at the CODE and PURE levels only: no UI, no CLI command, no persisted pad field and no device observation in this layer. Harness and device claims stay unmarked until their own dates.
 
 ## Out of scope
 

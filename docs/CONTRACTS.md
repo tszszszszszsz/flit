@@ -533,7 +533,7 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 ### 7.3 Event kinds and closed body shapes (`circle/CircleEvent.kt`, `FlitCircleSync.kt:175-234`)
 
 `CircleEvent(id, circleId, authorFp, lamport, type, body, sig, createdMs, cert)`.
-`type` is one of eleven verbs, including `parcel` and `receipt`; `body` is a small JSON object:
+`type` is one of twelve verbs, including `parcel`, `receipt` and `pad`; `body` is a small JSON object:
 
 | Verb | Body shape (exact keys) |
 | --- | --- |
@@ -548,6 +548,7 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 | `rekey` | `{"keyB64":"...","gen":<int>}` (app adds a `members` array; host-authority only) |
 | `parcel` | `{"toFp":"...","envelope":"..."}` — **exactly** `PARCEL_BODY_KEYS`, no extra key; closed gate and envelope in §13.3 |
 | `receipt` | `{"dropId":"...","sha256":"...","keyId":"..."}` — **exactly** `RECEIPT_BODY_KEYS`, no `landedMs`, path or status; closed gate and roll-up in §21 |
+| `pad` | `{"op":"put","key":"...","text":"..."}` or `{"op":"del","key":"..."}` — **exactly** `PAD_PUT_KEYS` or `PAD_DEL_KEYS`; closed gate, caps and deterministic view in §23 |
 
 `validFileBody()` enforces the exact key set and types: `name`/`sha256` non-blank
 bounded strings, `size` a JSON number (the string `"12"` is refused). That is
@@ -676,10 +677,10 @@ trust and replay reasoning in [Security](SECURITY.md).
 | **On-device** | Panic QR-v2 pairing and one-phone↔box banner exchange; relay dial/subscribe with a 200 MiB camera shot and a 300 MiB mid-body relay kill resuming hash-exact from the exact prefix; Circle two-node join/message/leave and phone-as-host; the 2026-11-26 three-node baseline walk, which is DEVICE evidence for a 3-identity Circle (phone plus two CLI identities); file-drop landing hash-exact; QR v3 tap-to-join. |
 | **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. |
 
-The current rig baseline is 396 tests = 136 protocol + 228 app + 32 harness,
+The current rig baseline is 714 tests = 330 protocol + 309 app + 75 harness,
 read from a green `--rerun-tasks` run of `:protocol:test`,
-`:app:testDebugUnitTest` and `:harness:test`. That is a test count, not a
-device claim for the UI or CLI layers.
+`:app:testDebugUnitTest` and `:harness:test`, with zero failures. That is a test
+count, not a device claim for the UI or CLI layers.
 
 ## 11. Cross-links
 
@@ -2108,3 +2109,366 @@ shows one confirmed author, a forged receipt is refused at the host gate and a
 replayed id leaves the count at one. No device claim is made in this contract;
 any phone↔bot observation belongs in the completion document and records only
 what the logs show. See [receipts-parity.md](roadmap/receipts-parity.md).
+
+## 23. Circle pad contract — pad verb, closed bodies and deterministic view (2026-12-15)
+
+### 23.1 Layer and ownership
+
+This is the Protocol layer for a shared, line-oriented text pad in a Circle. A
+line is written or removed only by signed `CircleEvent`s; the pad itself is a
+derived view that every device folds from the same event log. It lives in the
+JVM-pure package `app.flit.share.protocol.circle`: the twelfth verb in
+`CircleEvent.kt` and a new object `PadCore.kt`. No Android import, socket, file
+write, preference or wall-clock read is added. No route, header, DTO field,
+store field, status code or v2.2 shape changes: the `pad` verb is carried in
+`CircleRequest.events` on the existing `POST /api/flit/v1/circle/sync` route
+(§1, §7.3, §7.5) and in the bounded seed log from `/circle/join`; it travels
+through `FlitCircleSync.fanout` and the calm repair pass. A stock LocalSend
+v2.2 peer sees the same wire it saw before (§2, §4).
+
+`PAD` is an event, not a second pad store. `PadCore` keeps no mutable state
+between calls and persists no view. The signed `pad` events in
+`FlitCircleStore.CircleState.events` are the only durable pad state.
+
+### 23.2 Frozen API (`PadCore.kt`)
+
+```
+object PadCore {
+  const val MAX_LINES = 256, MAX_KEY_CHARS = 128, MAX_TEXT_CHARS = 4096
+  val PAD_PUT_KEYS: Set<String> = setOf("op", "key", "text")
+  val PAD_DEL_KEYS: Set<String> = setOf("op", "key")
+  data class PadLine(val key: String, val text: String, val lamport: Long = 0L,
+                     val authorFp: String = "", val id: String = "",
+                     val deleted: Boolean = false)
+  data class PadView(val lines: List<PadLine>,
+                     val winners: Map<String, PadLine> = emptyMap())
+  fun padPutBody(key: String, text: String): String
+  fun padDelBody(key: String): String
+  fun validPadBody(body: String): Boolean
+  fun view(events: Iterable<CircleEvent>, circleId: String): PadView
+  fun merge(views: Iterable<PadView>): PadView
+}
+```
+
+`PadLine` carries the winning operation's order key (`lamport`, `authorFp`,
+`id`) and a `deleted` tombstone flag beside `key` and `text`; the four added
+fields have defaults, so a bare `(key, text)` construction still compiles.
+`PadView` has two fields: `lines` holds the live, lexicographically ordered
+keys, and `winners` holds one `PadLine` per key, including tombstones and order
+keys. Keeping the order keys in the view is what lets `merge` (§23.7) re-apply
+the conflict rule without the underlying events.
+
+`CircleEvent.PAD = "pad"` joins `CircleEvent.TYPES` as the twelfth verb. Adding
+it does not change `CircleCore.canonical`, `create`, `sign`, `verify`, `order`,
+`dedup`, `accept` or `validShape`: a pad event is signed and checked like a
+`message` or `file` event. Its canonical bytes cover every field except `sig`
+and `cert`, with domain tag `FLITCIRCLE1` and the existing field order (§4.1,
+§7.4).
+
+### 23.3 Closed body shapes
+
+The signed `body` is a small JSON object with exactly one of two closed shapes:
+
+| Shape | Body (exact keys) |
+| --- | --- |
+| `put` | `{"op":"put","key":"<line-key>","text":"<text>"}` — exactly `PAD_PUT_KEYS = {"op","key","text"}` |
+| `del` | `{"op":"del","key":"<line-key>"}` — exactly `PAD_DEL_KEYS = {"op","key"}` |
+
+`padPutBody(key, text)` and `padDelBody(key)` build these two strings, so a body
+cannot be minted in a shape the gate would refuse: the producers and the gate
+stay together in one JVM-pure file.
+
+| Field | Type | Contract |
+| --- | --- | --- |
+| `op` | String | Exactly `"put"` or `"del"`; any other value is refused. |
+| `key` | String | Non-blank line key, at most `MAX_KEY_CHARS` (128). Both shapes carry it. |
+| `text` | String | Non-blank line text, at most `MAX_TEXT_CHARS` (4096). Present only in `put`; a `del` body has no `text` key. |
+
+The whole body is at most `CircleCore.MAX_BODY_CHARS` (16 KiB). `validPadBody`
+accepts exactly `PAD_PUT_KEYS` when `op == "put"` and exactly `PAD_DEL_KEYS` when
+`op == "del"`. An extra key, a missing key, a non-string `op`/`key`/`text`, an
+unknown `op`, a blank key or text, or an over-cap value is refused. The body
+carries no circle id, author, order key, timestamp, path or local status: those
+stay in the signed event fields.
+
+### 23.4 Caps
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `PadCore.MAX_LINES` | `256` | Most live keys in a `PadView`; headroom under `FlitCircleStore.EVENT_CAP = 500`. |
+| `PadCore.MAX_KEY_CHARS` | `128` | Line key bound; below `CircleCore.MAX_FIELD_CHARS` (256). |
+| `PadCore.MAX_TEXT_CHARS` | `4096` | Per-line text; a put body with a quoted key and text stays under `CircleCore.MAX_BODY_CHARS` (16 KiB). |
+| `PadCore.PAD_PUT_KEYS` / `PAD_DEL_KEYS` | `{"op","key","text"}` / `{"op","key"}` | Closed key sets for the two shapes. |
+
+Pad events reuse the existing Circle bounds unchanged: `MAX_BODY_CHARS = 16
+KiB`, `MAX_FIELD_CHARS = 256`, `MAX_SIG_CHARS = 1024`, `MAX_CERT_CHARS = 8 KiB`,
+`MAX_EVENTS_PER_REQUEST = 1024`, `MAX_REQUEST_BYTES = 8 MiB`, a `6 h`
+`REPLAY_WINDOW_MS` with `5 min` `CLOCK_SKEW_MS`, a bounded `4096`-id `MAX_SEEN`
+set, and the `Invalid → OutsideWindow → Duplicate → Accept` precedence of §7.4.
+No new cap or replay state is introduced.
+
+### 23.5 `validPadBody` gate and `PadView`
+
+`validPadBody(body)` is the type-specific gate, in the shape of `validFileBody`
+(§19.5) and `validReceiptBody` (§21.4). It is structural and total: it parses
+the body as a `JsonObject`, checks the closed key set for the declared `op`, and
+checks each value's type and bound. A null, blank, malformed, oversized or
+non-string-valued body returns false; nothing is thrown at the caller. It signs
+nothing, pins nothing and reads no store. `CircleCore.validShape()` stays
+type-agnostic bounds (§7.4), so this gate never changes an existing event's
+signature or acceptance.
+
+`PadLine` is one resolved line: `key` and `text` plus the order key
+(`lamport`, `authorFp`, `id`) of the winning operation and a `deleted` flag. A
+line with `deleted = true` is a tombstone: its `text` is empty and it does not
+appear in `lines`, but it stays in `winners` so a later operation with a greater
+order key can replace it. `PadView` has two fields: `lines` is the live view —
+sorted lexicographically by `key`, free of tombstoned keys and capped at
+`MAX_LINES` (256) entries — while `winners` maps every key with a surviving
+operation to its `PadLine`, including tombstones and order keys and bounded only
+by the distinct keys in the folded log. A view is a value, not a persisted row.
+The app may hold one in a StateFlow rebuilt on each store fold, but the bounded
+event log remains the only durable pad state.
+
+### 23.6 `view` and the conflict rule
+
+`view(events, circleId)` folds a set of events into a `PadView`:
+
+1. Keep only events whose `type` is `pad`, whose `circleId` equals the argument
+   and whose body passes `validPadBody`. Other verbs, foreign circles and bad
+   bodies are ignored.
+2. Apply `CircleCore.dedup` so a repeated id counts once even when a snapshot is
+   replayed.
+3. Resolve each `key` by the order key `(lamport, authorFp, id)` — the first
+   three components of `CircleCore.ORDER` (§7.4). The greatest order key wins:
+   `put` sets the line text, a `del` with a greater order key tombstones the key,
+   and a `del` older than the winning `put` is inert.
+4. Emit the live keys sorted by `key`, capped at `MAX_LINES`.
+
+`view` does **not** call `CircleCore.verify`. Verification and the replay guard
+run at the receiving route (`FlitCircleSync.fresh`, then `CircleCore.accept`)
+before events reach the fold; a pure fold that re-verified would pin
+certificates from a test or a cached snapshot, and `PadCore` owns no pin store.
+Fold order does not matter: for any partition and shuffle of one event set the
+result is byte-identical, and re-folding an event already present leaves the
+`PadView` unchanged.
+
+### 23.7 `merge` and its law
+
+`merge(views)` re-applies the same per-key `(lamport, authorFp, id)` rule to
+views already derived from separate event sets. It reads each input's `winners`
+map (falling back to `lines` keyed by `key` for a bare view), compares the order
+key carried on each `PadLine`, keeps the greatest per key — tombstone included —
+and rebuilds both `winners` and `lines`. It is the view-level form of the
+conflict rule, so folded views compose without the underlying events:
+
+```
+view(a + b) == merge(view(a), view(b))
+```
+
+The equality holds for any partition and delivery order of one event set: a
+repeated event is resolved once, a tombstone from one view beats an older put in
+another, and the merged lines stay sorted by `key` and capped at `MAX_LINES`.
+The `lines` cap holds because each input view already has at most `MAX_LINES`
+live keys. The `winners` map is bounded by distinct keys with surviving
+operations, not by `MAX_LINES`, so a tombstone carried there can beat a put from
+another view even when neither line is in `lines`. `merge` is total, never
+throws on a malformed view, and keeps no state between calls.
+
+### 23.8 Canonical, replay, wire and state boundary
+
+1. **Canonical bytes unchanged.** The `pad` event reuses `CircleCore.canonical`
+   with domain tag `FLITCIRCLE1` and the existing field order; the body is one
+   length-prefixed field, so a change to a line key or text breaks the signature
+   (§4.1, §7.4). No existing verb's bytes change.
+2. **Signature and replay unchanged.** `CircleCore.create` mints the event with
+   the author's `TlsIdentity`, `sign` writes `sig`, and `verify` binds the
+   certificate to `authorFp` before pinning. The `pad` verb uses the same
+   `order`, `dedup`, `evaluate`/`accept`, `fresh` and `6 h` / `5 min` window as
+   every other verb (§21.6). Callers verify before `evaluate`, and `view` folds
+   only events that have already passed the route gate.
+3. **No route or v2.2 change.** No `PATH_*` constant, Ktor route, `LinkProvider`,
+   byte-transfer route, HTTP header, `CircleRequest`/`CircleResponse` field,
+   status code, QR key parameter or DTO default changes. The pad rides in
+   `CircleRequest.events` on `POST /api/flit/v1/circle/sync` (§1, §7.5) and in
+   the seed log from `/circle/join`, through `fanout` and the calm repair pass.
+   `/info`, `/register`, `/prepare-upload`, `/upload` and `/cancel`, their DTO
+   shapes and their status behaviour stay as in §2.
+4. **No second persisted state and no second encryption path.** The pad has no
+   field of its own in `FlitCircleStore.CircleState`, no reducer change and no
+   CLI state row. `FlitCircleStore.reduce` appends the verb as history in the
+   bounded event log, as it does for receipts (§21.6). Pad text travels as
+   signed JSON inside the existing pinned TLS session; the Circle group key
+   stays membership material, not pad encryption. An event trimmed by
+   `EVENT_CAP = 500` can remove a line from the rebuilt view; there is no
+   backfill, the same limit as file drops (§7.7).
+5. **No wire surface for the view.** `PadLine`, its order-key and tombstone
+   fields, and `PadView.winners` are JVM-only values; no DTO, header or response
+   field carries them. They are rebuilt on demand from the signed log, and the
+   `winners` map is never persisted as a second copy of pad state.
+
+### 23.9 Evidence boundary
+
+CODE establishes the twelfth verb, the two closed body shapes, the caps, the
+per-key conflict rule and the `merge` law. PURE JVM tests pin the exact key sets
+and bounds, the `padPutBody`/`padDelBody` producers feeding `validPadBody`,
+create/sign/verify round-trip and forged-author rejection with the existing
+verbs' canonical bytes unchanged, `view` ignoring wrong-type, wrong-circle and
+bad-body events and deduping repeats, delivery-order convergence, the older-`del`
+inert case, the lexicographic order and `MAX_LINES` bound, tombstones and order
+keys surviving in `winners`, and `view(a + b) == merge(view(a), view(b))` with
+the rule re-applied across views (including a bare view with no `winners` map).
+No SIM-HARN or DEVICE evidence exists for the pad on this date, and no device
+claim is made: the layer is a pure fold over signed events. No UI, CLI command
+or store adapter is wired here. See [circle-pad.md](roadmap/circle-pad.md).
+
+## 24. Circle pad app + CLI contract — pad view flow, PadUi and circle pad commands (2026-12-16)
+
+### 24.1 Layer and ownership
+
+This is the Integration layer over §23 (the JVM-pure pad core). It wires
+`PadCore` into the app's Circle surface and the CLI's `circle` command surface.
+It lives in `app/src/main/kotlin/app/flit/share/` (`FlitEngine.kt`,
+`FlitCircleSync.kt`, `PadUi.kt`, `CircleUi.kt`, `MainActivity.kt`) and
+`harness/src/main/kotlin/app/flit/share/harness/Harness.kt`. No protocol
+constant, canonical byte layout, event verb, body key set or view type is
+redefined: both surfaces call `PadCore.view`, `PadCore.padPutBody`,
+`PadCore.padDelBody` and read `MAX_KEY_CHARS` / `MAX_TEXT_CHARS` from §23. No
+route, header, DTO field, store field, QR parameter or v2.2 status code changes:
+a `pad` event is still the one signed `CircleEvent` of §23 carried in
+`CircleRequest.events` on `POST /api/flit/v1/circle/sync` (§1, §7.3, §7.5) and in
+the bounded `/circle/join` seed log, fanned out over the existing delta and
+calm-repair paths (§7.6). A stock LocalSend v2.2 peer sees the same wire it saw
+before (§2, §4).
+
+There is no second pad store. The signed events in
+`FlitCircleStore.CircleState.events` remain the only durable pad state (§23.1).
+The app holds one derived `PadView` in a StateFlow rebuilt on each store fold;
+the CLI derives a view on demand for `show`. Neither writes a pad row, a pad
+preference or a persisted copy of `winners`.
+
+### 24.2 App view flow
+
+| Seam | Contract |
+| --- | --- |
+| `FlitEngine.padView: StateFlow<PadView>` | Backed by a private `MutableStateFlow<PadView>`. On every Circle store fold it is rebuilt as `PadCore.view(events, circleId)` from the current `CircleState.events` and `id`, so live lines, order keys and tombstones are derived from the signed log only. With no Circle state loaded the fold yields an empty view. |
+| `FlitEngine.refreshCircle()` | The content-diff signature gains a pad digest computed from the folded view, beside the existing circle id, key, event count / last id, roster, deliveries and courier-handoff outcomes (§15.4). A pad edit therefore publishes a fresh `padView` even when no other tracked field changes, while an unchanged fold stays a no-op and does not invalidate Compose. |
+
+### 24.3 App publish seams
+
+| Seam | Contract |
+| --- | --- |
+| `FlitEngine.circlePadPut(key: String, text: String)` | Builds the body with `PadCore.padPutBody(key, text)` and delegates to `FlitCircleSync.postPadPut`. No body is assembled in the engine. |
+| `FlitEngine.circlePadDel(key: String)` | Builds the body with `PadCore.padDelBody(key)` and delegates to `FlitCircleSync.postPadDel`. |
+| `FlitCircleSync.postPadPut` / `postPadDel` | Publish the caller's body as a signed `CircleEvent.PAD` through the existing `post` → `emit` → `fanout` path (§7.6). No new route, header, `CircleRequest` / `CircleResponse` field or event verb is added; the body is exactly one of the two §23.3 shapes. |
+| `FlitCircleSync.circleBodyValid(type, body)`, `PAD` branch | Delegates to `PadCore.validPadBody(body)`. Only the exact `PAD_PUT_KEYS` / `PAD_DEL_KEYS` shapes pass; a partial, extra-key, blank or over-cap body is refused before `CircleCore.create`, store upsert or fan-out. This is also the mint-side gate for the two engine methods. |
+| Inbound host gate | An inbound pad event passes the existing §7.5 SYNC admission as a known verb with a bounded body; no pad-specific host rule is added in this layer. A body `validPadBody` refuses is ignored by `PadCore.view` when the view is rebuilt (§23.6). |
+
+### 24.4 `PadUi.kt` and the `CircleUi` / `MainActivity` surface
+
+`PadUi.kt` is Android-free. It defines `object PadUi` with `data class PadRow(key:
+String, text: String)`, `fun rows(view: PadView): List<PadRow>` — the view's
+`lines` are already lexicographic by `key`, so `rows` defensively re-sorts by key for hand-built views and drops
+nothing from `lines` — and `fun keyError` / `fun textError`, which report the
+blank and over-bound cases using `PadCore.MAX_KEY_CHARS` and
+`PadCore.MAX_TEXT_CHARS`. The shipped API also adds `data class PadHitRow(key,
+text, start, end, lineIndex)` — one hit with the original, unmodified line text
+and an inclusive `start` / exclusive `end` UTF-16 range into it — and `data class
+PadHitRows(rows, scannedLines, truncated, queryRejected)`, the result wrapper.
+`fun search(view: PadView, query: String, limit: Int = PadSearch.MAX_HITS):
+PadHitRows` projects the JVM-pure `PadSearch.search` result into those rows, and
+`fun searchRows(view: PadView, query: String, limit: Int = PadSearch.MAX_HITS):
+List<PadHitRow>` returns just the rows. Both only read the supplied `PadView`;
+they never rewrite or write to it, and a rejected or capped query still yields
+a bounded, non-throwing result. The file owns no Compose, socket, store or
+preference reference, so those functions are unit-tested directly.
+
+A Compose `PadCard(view: PadView, onPut: (String, String) -> Unit, onDel:
+(String) -> Unit, onClose: () -> Unit, query: String? = null)` renders the rows
+as an M3 list with edit and delete controls on 48 dp targets, plus a key/text
+input for a put. The trailing `query` is optional: when it is null or blank the
+full list shows as before; when present the card calls `PadUi.search` and lists
+only the hit rows, marking each match with an annotated range built from the
+`start` / `end` offsets over the original text, so the `PadView` is never
+mutated. A rejected query is reported in the subtitle and a capped result is
+marked as capped; every row keeps its 48 dp edit and delete targets. The card
+calls `PadUi.rows` for the unfiltered list and `PadUi.keyError` /
+`PadUi.textError` before enabling a put. All three callbacks are supplied from
+outside: `onPut` and `onDel` reach `FlitEngine.circlePadPut` / `circlePadDel`,
+and `onClose` dismisses the surface without writing anything.
+
+`CircleUi` gains one additive pad surface entry beside the existing Circle
+cards. It passes the collected `padView` and the put / delete / close callbacks
+to `PadCard`; no message, file, poll or vote card changes its shape.
+`MainActivity` collects `FlitEngine.padView` and supplies the callbacks that
+call into the engine. The pad surface is a local projection only: `PadView`,
+`PadLine`, `winners` and order keys stay in memory and never enter a signed
+event or a DTO.
+
+### 24.5 CLI pad commands
+
+`Harness.kt` adds three `circle` subcommands and extends
+`ParsedArgs.VALUE_FLAGS` with `--key` (`--text` already exists). Each command
+uses the joined identity and posts through the existing `circleEvent` /
+`pushCircleEvent` helper; no second post path is added.
+
+```
+circle pad put --key K --text T
+circle pad del --key K
+circle pad show
+```
+
+| Subcommand | Contract |
+| --- | --- |
+| `put` | Builds the body with `PadCore.padPutBody(K, T)` and appends one signed `pad` event to `circle.state`, then pushes it with the existing sync exchange. A bad key or text is refused by the builder before an event is minted. |
+| `del` | Builds the body with `PadCore.padDelBody(K)` and posts one signed `pad` event the same way. |
+| `show` | Runs `PadCore.view(st.events, st.circleId)` and prints the live `PadView.lines` in the view's lexicographic key order (`key` and `text`), omitting tombstoned keys. It prints no order keys, signatures, certificates or local status, and writes no state. |
+
+`pad show` is derived from the same bounded log as the app view; a line evicted
+by `EVENT_CAP = 500` is not backfilled (§23.8). No new route, v2.2 shape,
+`CircleRequest` field or state row is added.
+
+### 24.6 No-new-route and v2.2 boundary
+
+1. **Existing wire home only.** A pad event rides in `CircleRequest.events` on
+   `POST /api/flit/v1/circle/sync`, and in the `/circle/join` seed log, through
+   `fanout` and the repair tick (§7.5, §7.6). No `PATH_*` constant, Ktor route,
+   `LinkProvider`, byte-transfer route, HTTP header, DTO field or status code is
+   added.
+2. **Closed body, one builder.** Only `PadCore.padPutBody` / `padDelBody` mint
+   pad bodies and only `PadCore.validPadBody` admits them, on both surfaces. No
+   view field, order key, tombstone, path or local status enters a body (§23.3).
+3. **v2.2 untouched.** `/info`, `/register`, `/prepare-upload`, `/upload` and
+   `/cancel`, their DTO shapes and status behaviour stay as in §2. The earlier
+   courier, relay, parcel, per-drop-key and receipt contracts (§5, §13–§22) keep
+   their byte shapes; a `pad` event is opaque payload to them.
+4. **No second state or crypto path.** No `CircleState` field, CLI state row or
+   persisted `winners` map is introduced. `PadCore` is the only fold; signing,
+   verification, replay and dedup stay with `CircleCore` / `TlsIdentity` (§4.1,
+   §7.4, §23.8).
+
+### 24.7 Evidence boundary
+
+CODE establishes the engine view flow and publish seams, the `PadUi` functions,
+the Compose card, the `CircleUi` / `MainActivity` entry and the three CLI
+commands. PURE JVM tests pin `PadUi.rows` order and empty-view handling, the
+`keyError` / `textError` bounds at and beyond `MAX_KEY_CHARS` /
+`MAX_TEXT_CHARS`, engine publication of a view from a known event set, and the
+CLI body builders feeding `validPadBody` with `show` printing only live
+lexicographic lines. Harness coverage drives the put / del / show commands
+against the in-process Circle nodes using the same bodies. No device claim is
+made in this contract; any observation of the pad on hardware belongs in the
+completion document for this date. See [circle-pad.md](roadmap/circle-pad.md).
+
+### 24.8 Identity fallback labels and BLE duty audit
+
+Where a roster alias is blank, the app shows a stable label derived from the
+fingerprint by `PeerAlias` instead of a raw fingerprint prefix; an assigned
+roster alias stays authoritative and is shown verbatim. `PeerAlias` derives the
+same text from the same fingerprint on every JVM and changes neither the roster
+nor any wire field.
+
+`FlitBle.auditDutySchedule` checks the duty cycle against a ceiling and writes
+any finding to the supplied log sink only. The arbiter and the radio controls
+never read that result, so carrier behaviour is unchanged: no route, header,
+advertising record or advertise/scan stance is altered by the audit.

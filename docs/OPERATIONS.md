@@ -3,13 +3,14 @@
 > Part of the Flit design set. [Transport ladder and index](transport-bluetooth.md) ·
 > [README](../README.md).
 
-The rig's last green standard is **396 tests, 0 failures** (136 protocol + 228
-app + 32 harness), from a green `--rerun-tasks` run. Earlier docs quote older
-counts (76, 115, 302) and the CI workflow comment quotes 36/67/4; those are
-historical snapshots of the same suite at earlier commits, not the current
-inventory. The current inventory is in [TESTING.md](TESTING.md).
-The last commit is `72225f8` (Open-file crash + sharing restore), preceded by
-`2034fa6` (Circle file delivery + quality pass).
+The rig's final green standard is **714 tests, 0 failures** (330 protocol + 309
+app + 75 harness), from a green `--rerun-tasks` run. Earlier docs quote older
+counts (76, 115, 302, 396, 588) and the CI workflow comment quotes 36/67/4;
+those are historical snapshots of the same suite at earlier layers, not the
+current inventory. The current inventory is in [TESTING.md](TESTING.md).
+The v0.2.0 baseline was `72225f8` (Open-file crash + sharing restore), preceded
+by `2034fa6` (Circle file delivery + quality pass); later layers are recorded
+under `docs/completions/`.
 
 ## 1. Rig at a glance
 
@@ -18,7 +19,7 @@ Three modules, three roles ([README](../README.md#repo-layout)):
 | Module | Role | Runs on |
 | --- | --- | --- |
 | `protocol/` | JVM-pure wire engine (JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client, relay core) | JVM only; no Android dependency |
-| `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.2.0` (code 2), minSdk 26, compile/targetSdk 36 | Phone |
+| `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.3.0` (code 3), minSdk 26, compile/targetSdk 36 | Phone |
 | `harness/` | Desktop companion shipped as `flit-cli`; doubles as the interop and device-walk rig | Linux box with JDK 21 |
 
 Toolchain lives outside the repo in `~/.local/`; `env.sh` pins JDK 21
@@ -39,7 +40,7 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDe
 A plain `flit-cli` binary can be reached two ways: from the built distribution
 (`harness/build/install/flit-cli/bin/flit-cli`) or installed to `~/.local/bin`
 via `install-cli.sh`. The installer also accepts a CI zip:
-`./install-cli.sh --zip flit-cli-0.2.0.zip`, and an alternate root with
+`./install-cli.sh --zip flit-cli-0.3.0.zip`, and an alternate root with
 `--prefix DIR`. It gates both build and launch on Java 21 with one readable line
 (`flit-cli needs JDK 21 … set JAVA_HOME or put java 21 first on PATH`) rather
 than a JVM class-file stack trace (install-cli.sh:1-70).
@@ -63,12 +64,14 @@ bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pi
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
-circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt> [--circle ID] [--invite TOKEN]
+circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad> [--circle ID] [--invite TOKEN]
        [--text TEXT] [--file PATH] [--target FP] [--role ADMIN|MEMBER] [--option N]
-       [--sha SHA] [--drop-id ID] [--host ip[:port]] -- accountless group coordination over the production Circle routes
+       [--sha SHA] [--drop-id ID] [--host ip[:port]] [--key K] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
        receipt --sha SHA [--drop-id ID] publishes a signed receipt for a keyed drop
+       pad put --key K --text T sets a line; pad del --key K tombstones it;
+       pad show prints the local view, one line per live key in key order
 courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
 parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs back into bytes, offline
 ```
@@ -78,14 +81,15 @@ The `courier` surface is detailed in §2.4 and `parcel` in §11.
 Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:73-78):
 `--alias --port --dir --dest --udp-port --wait --pin --parallel --announce-to
 --bytes --sender --token --park-timeout --relay --text --circle --invite --file
---target --option --host --role --bag --to --cert --ttl --out --sha --drop-id`.
+--target --option --host --role --bag --to --cert --ttl --out --sha --drop-id
+--key`.
 Everything else is a presence flag. Defaults come from `Protocol.DEFAULT_PORT
 = 53317` and `MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay
 default is `DEFAULT_PORT + 1 = 53318` (Harness.kt:706). `--bag --to --cert
---ttl` belong to `courier` (§2.4), `--out` to `parcel` (§11), and `--sha
---drop-id` to `circle receipt` (§2.1). A relative `--bag` is rooted at
-`<identity home>` (`harnessHome()`); an absolute path is used as given. With no
-`--bag` the bag is `<identity home>/courier-bag`.
+--ttl` belong to `courier` (§2.4), `--out` to `parcel` (§11), `--sha
+--drop-id` to `circle receipt`, and `--key` to `circle pad` (§2.1). A relative
+`--bag` is rooted at `<identity home>` (`harnessHome()`); an absolute path is
+used as given. With no `--bag` the bag is `<identity home>/courier-bag`.
 
 ### 2.1 Commands, flags and observable output
 
@@ -194,6 +198,7 @@ host, members, events JSON, rekeyGen). Subcommands:
 | `leave` | — | publishes leave then discards the local key and deletes `circle.state` |
 | `sync` | a joined `--host` | pulls the full bounded log, prints feed, poll tally and confirmed count for keyed drops |
 | `receipt` | `--sha SHA`; optional `--drop-id ID`, `--host ip[:port]` | publishes a signed receipt for a keyed drop |
+| `pad` | `put` needs `--key K --text T`; `del` needs `--key K`; `show` needs neither | `put`/`del` publish a signed pad event on the existing Circle routes; `show` prints the local view |
 
 `file --file` is deliberately different from `post --file`: a plain post never
 moves bytes. The announcement body is the closed `{name,size,sha256}` shape with
@@ -215,6 +220,17 @@ receipts are for keyed drops` and mints nothing. The body is exactly
 the existing `circleEvent` / `pushCircleEvent` fan-out, so no route, header,
 DTO field or v2.2 status changes. There is no `landedMs`: `createdMs` is the
 acknowledgement time, and landings are not auto-detected by the CLI.
+
+`circle pad` has three subcommands and reuses the joined `circle.state`:
+`pad put --key K --text T` builds its body with `PadCore.padPutBody` and
+publishes a signed `pad` event; `pad del --key K` uses `PadCore.padDelBody` to
+publish a signed tombstone; `pad show` prints a `PadView` folded from the local
+event log, one line per live key in lexicographic key order, with tombstoned
+keys omitted. Both writes go through the existing Circle event fan-out on
+`/circle/join` and `/circle/sync`; no route, header, DTO field or v2.2 status is
+added. `--key` is shared by `put` and `del`, `--text` is used by `put`, and both
+are checked against `PadCore.MAX_KEY_CHARS = 128` and
+`PadCore.MAX_TEXT_CHARS = 4096`.
 
 `circle sync` and `circle file` print a confirmed count beside the file entry.
 It is the size of `CircleCore.receiptAuthors(st.events, dropId, sha256,
@@ -482,6 +498,7 @@ an observation, not a promise: it says what the engine saw at that instant.
 | `stopped` | the engine actually stopped; a process kill by MIUI does **not** produce this line |
 | `panic: <fp12> — <text>`, `panic: ignored unverified or QR-unknown origin <fp12>`, `panic: reached its hop limit …` | alert received, refused at the origin gate, or forward refused at 3 hops |
 | `circle sync: +N event(s) from <fp12>`, `circle host: <action> <fp12> — N event(s)`, `circle: left fully — key discarded` | inbound sync, host-side request, and full leave with key discard |
+| pad writes and reads | a pad put/del is one more signed event in the Circle log and shows up in the ordinary sync/host lines; `PadCard` publishes its `PadView` through the content-diff signature, with no separate pad log line |
 | `scan: pinned <alias> (code verified)`, `scan: <host>:<port> answers as <real>, code said <code> — NOT trusted` | QR pairing succeeded / fingerprint mismatch refused |
 | `no Wi‑Fi network; direct discovery on` / `access point back; direct discovery dark` / `… waiting on the system` | arbiter state at a no-AP moment, AP restored, or permission ask pending |
 
@@ -509,6 +526,7 @@ otherwise emits no log lines.
 | `recv-BAD <name> checksum mismatch` / `recv-ERR <name>` | hash gate failed / write error |
 | `session <id8> finished|cancelled` | transfer session ended; cancelled is an explicit end, not a crash |
 | `HH:mm:ss receipt <id8> → … event(s), … member(s), gen=…` | signed receipt published through the same `pushCircleEvent` line every other Circle verb uses |
+| `circle pad put` / `circle pad del` / `circle pad show` | write publishes a signed pad event through the existing Circle fan-out; `show` prints one line per live `PadView` key in key order |
 | confirmed count on `circle sync` / `circle file` | confirmed-author set size from `CircleCore.receiptAuthors` for a keyed drop; local send statuses stay unchanged |
 | `panic from <fp12> (ip): <text> [hops=N]` | signed alert arrived; `hops` is inside the signed canonical body |
 | `relaying on 0.0.0.0:<port> token=set|none` | relay listening; token gate on/off |
@@ -599,8 +617,8 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDe
     :app:assembleRelease :harness:installDist
 ```
 
-Expected: 396 tests, 0 failures (136 protocol + 228 app + 32 harness) at the
-last green `--rerun-tasks` run; debug and release APKs plus the CLI distribution
+Expected: 714 tests, 0 failures (330 protocol + 309 app + 75 harness) at the
+final green `--rerun-tasks` run; debug and release APKs plus the CLI distribution
 produced. CI runs the superset at .github/workflows/rig.yml:35-49 and uploads the
 CLI zip as artifact `flit-cli`.
 
@@ -815,6 +833,31 @@ arbiter/ask lifecycle is walked on hardware, but the real socket path is not
 Root cause, per-layer fix and the MIUI/Android 15 caveats are in
 [open-file-and-sharing-restore.md](open-file-and-sharing-restore.md).
 
+### 6.12 Circle pad (CLI and app surface, no walk)
+
+The 2026-12-16 integration adds a CLI surface and an additive phone surface for
+the pad bounded in §10.3. It carries no device walk: the commands are one-shot
+CLI operations, and the phone card is source- and unit-test-evidenced. The
+full-feature walk dated 2026-12-17 is not claimed here.
+
+```bash
+flit-cli circle pad put --key note --text "first line"
+flit-cli circle pad show
+flit-cli circle pad del --key note
+flit-cli circle pad show
+```
+
+`put` and `del` need a joined `circle.state` and post a signed `pad` event on
+the existing `/circle/join` and `/circle/sync` routes; the bodies come from
+`PadCore.padPutBody` and `PadCore.padDelBody`. `show` folds the local log into a
+`PadView`, prints one line per live key in lexicographic order and omits
+tombstoned keys. A key is at most 128 characters, text at most 4096, and a view
+holds at most 256 live keys; a blank or oversized field is refused before
+signing. On the phone the card is an additive entry in the Circle surface: the
+engine holds a derived `PadView` in a StateFlow, rebuilt on each store fold, and
+`PadUi.rows` lists the same live keys in key order. No phone observation is
+part of this recipe.
+
 ## 7. Troubleshooting
 
 | Symptom | What the log says | What it means / what to do |
@@ -831,6 +874,9 @@ Root cause, per-layer fix and the MIUI/Android 15 caveats are in
 | Relay pairing never happens | relay log silent; `relay: … — retry in 2s` on receiver | both peers must be live (no store-and-forward); token must match; address is hand-configured; `relayFor` on for the peer; check `pair cN + cM` lines |
 | Circle refuses a join/sync | `!! join refused: host refused: bad invite\|not-a-member\|wrong circle` | exact host reason is surfaced; re-scan/re-paste the v3 invite; a departed member is refused after rekey |
 | Circle file shows no Open button | card says "Not here yet · no local copy to open" | that SHA-256 is not present locally (a later joiner sees the card but no old bytes); delivery status is sender-local and never gossiped |
+| `!! blank pad key` / `!! pad key too long` / `!! pad text too long` | `PadCore` refuses before minting an event | a pad key must be non-blank and at most 128 chars; put text must be non-blank and at most 4096; shorten and retry |
+| `!! pad put body too long` / `!! pad del body too long` | body gate refused the write | a quoted key and text must stay under `CircleCore.MAX_BODY_CHARS = 16 KiB`; no partial line is published |
+| Pad line missing from `circle pad show` or the phone card | no error line; the view is rebuilt from the log | the key may be tombstoned by a newer `del`, its event may be for another circle or have a malformed body, or it may have aged out of the 500-event log; retry `show` after a sync |
 | `!! <message>` from the CLI | top-level handler; exit code 1 (or 2/3) | set `FLIT_TRACE=1` for a stack trace; check the command's positional args and flags |
 | FGS start refused from boot | `boot: FGS rationed — starting engine-only` | Android 15 bans `dataSync` FGS at BOOT; engine runs until a surface opens, then restore; not a crash |
 
@@ -921,14 +967,15 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
   re-check the APK signer before sideloading.
 - **Provenance:** development was private; the repository is published with its
   full commit history (scaffolding, milestones, regressions and fixes), not as
-  a reconstructed snapshot. The tag is `v0.2.0`.
+  a reconstructed snapshot. The release point is `v0.3.0`; the tag is applied at
+  push.
 - **Store metadata:** `fastlane/metadata/android/en-US/` holds title,
   short/full description and `changelogs/1.txt` ("First release").
-  `RELEASE_NOTES.md` carries v0.2.0 notes plus a dated 2026-11-25 correction:
-  the original "no new settings/vocabulary" copy was superseded by the opt-in
-  **Transfer over Bluetooth** option on 2026-11-24.
+  `RELEASE_NOTES.md` carries a v0.3.0 section plus the v0.2.0 notes and a dated
+  2026-11-25 correction: the original "no new settings/vocabulary" copy was
+  superseded by the opt-in **Transfer over Bluetooth** option on 2026-11-24.
 - **Version identity:** namespace/applicationId `app.flit.share`, versionName
-  `0.2.0`, versionCode 2, minSdk 26, compile/targetSdk 36. The app is
+  `0.3.0`, versionCode 3, minSdk 26, compile/targetSdk 36. The app is
   `allowBackup=false`; identity lives in `filesDir/flit-identity.p12`.
 - **Play listing / data safety:** zero collection, no accounts, no cloud, no
   ads, no telemetry, no phone-home SDKs; see
@@ -1088,6 +1135,82 @@ harness-evidenced, not a phone observation.
   [CONTRACTS.md](CONTRACTS.md) for the body shape, [SECURITY.md](SECURITY.md)
   for the signature and pinning rules, and
   [FAILURE-MODES.md](FAILURE-MODES.md) for refusals.
+
+### 10.3 Circle pad (operator limits)
+
+A Circle pad is a line-oriented text view rebuilt from signed `pad` events in the
+bounded Circle log. `pad` is the twelfth `CircleEvent` verb and the pure fold
+lives in `PadCore.kt`. The 2026-12-15 layer defined the verb and its bounds; the
+2026-12-16 integration adds the CLI commands and the additive phone surface.
+Neither adds a route, header, DTO field, store field or v2.2 shape: pad events
+travel over the existing `/circle/join` and `/circle/sync` routes through the
+existing fan-out and repair path. No device walk is part of either layer, and no
+phone observation of a pad is claimed here. The CLI is covered by harness tests;
+the phone surface is CODE and PURE.
+
+- **The view is bounded to `MAX_LINES = 256` live keys.** `PadView.lines` is
+  sorted lexicographically by `key`, omits tombstoned keys and holds at most 256
+  entries; a pad with more live keys cannot be shown in full by one view. A line
+  key is at most `MAX_KEY_CHARS = 128` characters (below
+  `CircleCore.MAX_FIELD_CHARS = 256`), and its text at most
+  `MAX_TEXT_CHARS = 4096` characters. A put body still fits
+  `CircleCore.MAX_BODY_CHARS = 16 KiB`. The body gate accepts
+  exactly `{"op":"put","key","text"}` or
+  `{"op":"del","key"}`; an extra key, missing key, wrong JSON type, unknown
+  `op`, blank value or oversized field is refused before signing and before the
+  fold.
+
+- **The CLI writes one line per command and reads only the local log.**
+  `circle pad put --key K --text T` and `circle pad del --key K` build their
+  bodies with `PadCore.padPutBody` and `PadCore.padDelBody` and publish a signed
+  event through the existing Circle fan-out. `circle pad show` prints one line
+  per live `PadView` key in key order and omits tombstones; an empty view prints
+  no pad lines. There is no bulk import, line-number addressing, remote read or
+  host pull, so a member that was offline sees only what its own log holds.
+
+- **The phone surface is derived, bounded and additive.** `FlitEngine.padView`
+  is a `StateFlow<PadView>` rebuilt from `FlitCircleStore` events through
+  `PadCore.view(events, circleId)` on every store fold; `refreshCircle()` includes
+  a pad digest in its signature so a view edit publishes without a log change.
+  `PadUi.PadRow(key, text)` and `PadUi.rows(view)` present the same lexicographic
+  live lines, and `PadUi.keyError` / `PadUi.textError` apply the `PadCore` bounds.
+  `PadCard(view, onPut, onDel, onClose)` renders an M3 list with edit and delete
+  controls on 48 dp targets, reached through an additive entry in `CircleUi`;
+  `MainActivity` collects the flow and supplies the callbacks. No second pad copy
+  is persisted, and no route, header or DTO field is added. Rows and targets are
+  CODE and PURE; no card is claimed to have been seen on a phone.
+
+- **Evicted lines have no backfill.** The signed `pad` events in
+  `CircleState.events` are the only durable pad state. `PadCore` keeps no state
+  between calls and rebuilds every view from the events passed in; the app holds
+  a derived `PadView` in a StateFlow but never persists a second copy.
+  The log is bounded by `FlitCircleStore.EVENT_CAP = 500`, and pad, receipts and
+  file drops share that cap with no per-type reservation, so a busy pad can push
+  older events out. A device that was offline receives pad events through the
+  courier carry core or the repair tick; a later joiner sees only what remains
+  in the bounded log, with no reconstruction of evicted lines, the same limit as
+  file drops. There is no archive, escrow or remote source to pull an evicted
+  line back.
+
+- **There is no remote delete beyond a signed `del` event.** A line is removed
+  from a view only by a `pad` event whose body is the closed `{"op":"del","key"}`
+  shape and whose signature verifies at the receiving route. Per key, the
+  operation with the greatest `(lamport, authorFp, id)` order key wins: a `del`
+  newer than the winning `put` tombstones the key, and a `del` older than it is
+  inert, leaving the text in place. There is no remote wipe, bulk delete or
+  command to erase a line on another device; removing or clearing a view locally
+  changes only that device's copy. Verification and the replay guard
+  (`FlitCircleSync.fresh`, then `CircleCore.accept`) run before the fold.
+  `PadCore.view` applies `CircleCore.dedup`, so a repeated id counts once, but
+  does not call `CircleCore.verify` and pins no certificate.
+
+Pad events otherwise share the usual Circle bounds: `REPLAY_WINDOW_MS = 6 h`,
+`CLOCK_SKEW_MS = 5 min`, `MAX_SEEN = 4096`, `MAX_EVENTS_PER_REQUEST = 1024`,
+`MAX_REQUEST_BYTES = 8 MiB` and the `EVENT_CAP = 500` log cap. No new cap, route
+or persisted field is introduced. The CLI commands are in §2.1 and §6.12 of this
+document. See [CONTRACTS.md](CONTRACTS.md) for the body shapes,
+[SECURITY.md](SECURITY.md) for verification and storage rules, and
+[FAILURE-MODES.md](FAILURE-MODES.md) for refusals.
 
 ## 11. Manual air-gap carry (QR parcel)
 

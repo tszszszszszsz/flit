@@ -113,7 +113,7 @@ Harness tests (2026-11-30): the CLI carrier moves `parcel` events between three 
 
 ## Evidence for this day
 
-`docs/completions/2026-11-27-courier-core.md` is written when the layer lands. It records the fresh pure-test run, the protocol test count moving from the 82 baseline to 136, CODE references to `CourierEnvelope.kt`, and that only PURE evidence is claimed. The current rig is 396 = 136 protocol + 228 app + 32 harness after a green `--rerun-tasks` run; the 302 inventory is historical. Harness and device rows stay unclaimed; the three-node mesh remains unverified until the 2026-12-02 walk.
+`docs/completions/2026-11-27-courier-core.md` is written when the layer lands. It records the fresh pure-test run, the protocol test count moving from the 82 baseline to 136, CODE references to `CourierEnvelope.kt`, and that only PURE evidence is claimed. The current rig is 714 = 330 protocol + 309 app + 75 harness after a green `--rerun-tasks` run; the 302 and 396 inventories are historical. Harness and device rows stay unclaimed; the three-node mesh remains unverified until the 2026-12-02 walk.
 
 ## Out of scope
 

@@ -5,7 +5,8 @@ A day's layer is accepted only when every rule below holds.
 ## Completeness
 
 - One layer, one commit. No partial merge, no deferred stub, no placeholder.
-- All 16 agents in the wave have reported; all owned files are present.
+- Every task in the wave has reported; all owned files are present. The
+  scheduled waves use 16 agents; the 2026-12-21 review wave used eight tasks.
 - The completion note under `docs/completions/` exists for that date.
 - Anything not built is listed as out of scope in that day's specification.
 

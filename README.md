@@ -101,6 +101,23 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   not replace the sender-local delivery record. It rides the existing signed Circle log with no
   new route, header or DTO field. This is JVM-pure on 2026-12-11: code and pure-tested only, with
   no device walk claimed.
+- **Shared Circle pad (protocol layer):** members can keep one shared, line-oriented text pad as
+  signed `pad` events in the Circle's existing event log — each event is a `put` or `del` of a line
+  key with a closed body shape and a strict gate. The protocol module folds those events into one
+  deterministic view: per key the operation with the greatest `(lamport, authorFp, id)` wins, a
+  `put` sets the text and a `del` tombstones the key, so every member resolves the same log to the
+  same view regardless of delivery order, and views derived from separate event sets merge to that
+  same result. The view is bounded (256 lines, keys to 128 characters, text to 4096) and rides the
+  existing `/circle/join` and `/circle/sync` routes; the signed events stay the only pad state, and
+  verification and pinning stay at the receiving route. It adds no route, header, DTO field or
+  second persisted copy. A phone pad surface and `flit-cli circle pad put|del|show` use the same
+  core; the view is rebuilt from the signed log, never a second stored copy. No device walk is
+  claimed.
+- **Small surface additions:** the pad card can search its lines against the same bounded view
+  without changing it, fingerprint fallback labels use a derived short display code instead of
+  a truncated fingerprint, and the shipped BLE duty schedule is checked at start-up as an
+  observation only — findings are logged and the carrier arbiter never reads them, so carrier
+  behavior is unchanged. These are code and JVM-tested additions; no device walk is claimed.
 
 ## Documentation
 
@@ -159,7 +176,7 @@ rig, shipped under a name that doesn't wear test-bench vocabulary.
 
 ```bash
 ./install-cli.sh                            # build from source → ~/.local/bin/flit-cli
-./install-cli.sh --zip flit-cli-0.2.0.zip   # or install a CI artifact directly
+./install-cli.sh --zip flit-cli-0.3.0.zip   # or install a CI artifact directly
 ```
 
 Common `flit-cli` commands (run `flit-cli` with no arguments for the complete

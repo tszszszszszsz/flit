@@ -13,8 +13,8 @@
 | **SIM/HARN** | Harness test or `bt-sim` run against the production client/server over in-process pipes or loopback TLS. The dated roadmap and CLI tables write this tag as SIM-HARN. |
 | **DEVICE** | Observed on the Redmi Note 10S (API 36) and/or the `flit-cli` box on the rig. The dated walks are cited; nothing else is claimed as walked. |
 
-Current rig state: **136 protocol + 228 app + 32 harness = 396 tests, 0
-failures** after a green `--rerun-tasks` run. The older 302-test figure was
+Current rig state: **330 protocol + 309 app + 75 harness = 714 tests, 0
+failures** after the final green `--rerun-tasks` run. The older 302-test figure was
 green at `72225f8` and is historical. The non-profit constraint holds
 throughout: no accounts, no cloud, no ads, no telemetry, no phone-home SDKs;
 every recovery path below is local.
@@ -76,6 +76,7 @@ shape.
 | Circle delivery-worker tick | 30 000; per-sha backoff 20/40/60 s | `FlitEngine.kt:612-629`, `:603-605` | pending/failed drop retries |
 | part aging | 24 h | `ServerCore.kt:1206-1223` | stale `.part` / `.part.token` sweep |
 | Circle event cap / replay window / skew / seen | 500 / 6 h / 5 min / 4096 | `FlitCircleStore.kt:72`, `CircleCore.kt:23-29` | bounded log and replay gate |
+| Pad body / view caps | `MAX_LINES` 256, `MAX_KEY_CHARS` 128, `MAX_TEXT_CHARS` 4096 | `PadCore.kt` | closed pad body gate and derived-view bound; the whole body also stays under `CircleCore.MAX_BODY_CHARS` (16 KiB) |
 | panic hops / replay / skew / seen | 3 / 6 h / 5 min / 1024 | `PanicCore.kt:18-27` | forward budget and dedup |
 | `MAX_ENVELOPE_CHARS` | 12 288 (12 KiB) | `CourierEnvelope.kt` | Base64 envelope cap; the framed `parcel` body stays under `MAX_BODY_CHARS` |
 | `MAX_PARCELS` | 256 | `CourierCarryCore.kt` | Bag cap; a Full refusal reserves no id |
@@ -111,6 +112,8 @@ Read this first; the sections below unfold each row.
 | Circle drop: returned `sent` | no | `SENT` (terminal) | bytes landed hash-exact | spool after all terminal | CODE / SIM / DEVICE |
 | Circle drop: spool file gone | no | record dropped | nothing | delivery record + card status | CODE |
 | Circle log: replay / wrong circle / forged cert | no | event skipped | log unchanged | event | CODE / PURE / SIM |
+| Circle pad: malformed body / wrong circle / replayed id / over-cap / torn snapshot | no | ignored, deduped or bounded; view unchanged | previous view and signed log unchanged | bad, foreign, repeat, over-cap or unmatched snapshot events | CODE / PURE |
+| Circle pad app/CLI: malformed key/text / over-cap / failed post / stale view | no | refused before signing or kept in the signed log for repair; unchanged pad is not republished | previous view and signed log unchanged | rejected input, over-cap body, failed fan-out or stale derived view | CODE / PURE |
 | Circle leave/kick | no | membership removed, generation bumped, key rotated | local earlier log stays plaintext | roster entry + old key material | CODE / PURE / SIM / DEVICE |
 | Drop key: no usable recipient cert, or no wrap for the reader | no | no wrap entry / `unwrap` null; no plaintext | source or caller's sealed bytes stay | that entry or the plaintext | CODE / PURE |
 | Drop key: roster above `MAX_WRAPS` (32), or wrap over `MAX_WRAPPED_CHARS` (512) | no | `wrap` refuses the whole map; body gate false | source bytes stay with the caller | over-cap map / over-cap body | CODE / PURE |
@@ -877,6 +880,83 @@ two-node confirm walk in the roadmap is not claimed here, and a receipt proves
 a local landing by one member, not delivery to the whole Circle. Test counts
 are recorded in TESTING.md, not in this table.
 
+### 3.14 Circle pad — the pure conclusion table
+
+The 2026-12-15 Protocol layer ([circle-pad.md](roadmap/circle-pad.md)) adds one
+signed verb, `CircleEvent.PAD = "pad"`, and a JVM-pure fold in
+`protocol/src/main/kotlin/app/flit/share/protocol/circle/PadCore.kt`. `PadCore`
+is an `object` with no mutable state: `MAX_LINES = 256`, `MAX_KEY_CHARS = 128`,
+`MAX_TEXT_CHARS = 4096`, `PAD_PUT_KEYS = setOf("op","key","text")` and
+`PAD_DEL_KEYS = setOf("op","key")`; its values are
+`PadLine(key, text, lamport = 0L, authorFp = "", id = "", deleted = false)` — a
+line carrying the order key of its winning operation — and
+`PadView(lines, winners = emptyMap())` — `lines` are the live keys lexicographic
+by key, while `winners` is a `Map<String, PadLine>` that also holds tombstones
+and their order keys so `merge` can re-run the per-key rule after the events are
+gone — and its functions are `padPutBody(key, text)`, `padDelBody(key)`,
+`validPadBody(body)`, `view(events, circleId)` and `merge(views)`. A body is
+exactly one of `{"op":"put","key":"...","text":"..."}` or
+`{"op":"del","key":"..."}`. `view` keeps only in-circle `pad` events with a body
+the gate accepts, applies `CircleCore.dedup`, resolves per key by the greatest
+`(lamport, authorFp, id)` order key, caps the derived `lines` at `MAX_LINES` and
+keeps every key's decision in `winners`; it does **not** call `CircleCore.verify`,
+because verification and the replay guard stay at the receiving route
+(`FlitCircleSync.fresh`, then `CircleCore.accept`) and a pure fold owns no pin
+store. `merge` applies the same per-key rule so
+`view(a + b) == merge(view(a), view(b))`. Canonical bytes (`FLITCIRCLE1`),
+`create`/`sign`/`verify`, `order`, `dedup` and `accept` are unchanged. The signed
+events in `FlitCircleStore.CircleState.events` are the only durable pad state;
+this layer adds no route, header, DTO field, store field or v2.2 change.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| Malformed pad body — a missing or extra key, a wrong JSON type, an unknown `op`, a blank or over-cap field, or malformed JSON | `validPadBody` false; `view` ignores the event, so it is never folded into a line | previous view unchanged; signed log otherwise unchanged | the malformed body and its event | CODE `PadCore.validPadBody`, `PadCore.view`; PURE `PadBodyTest`, `PadViewTest` |
+| Wrong circle — the event `circleId` differs from the one passed to `view` | `view(events, circleId)` ignores the foreign event; no line from it is applied | current view unchanged | the foreign event | CODE `PadCore.view`; PURE `PadViewTest` |
+| Replayed id — the same event id arrives twice, in one snapshot or across two | `CircleCore.dedup` keeps one copy (winner by `ORDER`) so a re-fold is byte-identical; at the route `CircleCore.accept` returns `Decision.Duplicate` and reserves no id again, so there is no second delivery | one surviving copy (the dedup winner by `ORDER`) and the seen set unchanged | the repeat | CODE `PadCore.view` (dedup), `CircleCore.dedup:220-227`, `CircleCore.evaluate:467-482` / `accept:492-495`; PURE `PadViewTest`, `PadCanonicalTest` |
+| Over-cap — `key` over `MAX_KEY_CHARS` (128), `text` over `MAX_TEXT_CHARS` (4096) or a body over `CircleCore.MAX_BODY_CHARS` (16 KiB); or a pad set whose live keys would exceed `MAX_LINES` (256) | The gate refuses an oversized body before signing or folding; `view`/`merge` never emit more than `MAX_LINES` live keys, so entries past the cap stay out of the derived view while the signed events remain in the bounded log | previous view and the rest of the log unchanged | the oversized body/event and, in the view only, the keys past 256 — no backfill | CODE `PadCore.validPadBody` / `view` / `merge`, `CircleCore.MAX_BODY_CHARS:32`, `FlitCircleStore.EVENT_CAP:73`; PURE `PadBodyTest`, `PadViewTest`, `PadMergeTest` |
+| Torn snapshot — a truncated or partially replicated event list is passed to `view`, or the same snapshot is folded twice | A total pure fold over exactly the events supplied: a torn snapshot yields a well-formed `PadView` of those events, never a half-applied line and never a thrown exception; `merge` is idempotent, so an overlapping re-fold does not apply a line twice; no partial view is persisted and no pin is written. Any derived app view is rebuilt on the next full fold | signed events already in the log and any previously derived view until the next fold | the unmatched or missing events of the torn snapshot; no backfill | CODE `PadCore.view` / `merge` (no stored state), `CircleCore.dedup:220-227`; PURE `PadViewTest`, `PadMergeTest` (malformed JSON never throws, re-fold byte-identical, merge idempotent) |
+
+The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN: the
+2026-12-17 full-feature walk is not part of this layer, and there is no harness
+walk, camera capture or phone observation here. A `del` older than the winning
+`put` is inert by the same per-key rule, and a `createdMs` outside the replay
+window or a cert that does not bind to `authorFp` is refused at the receiving
+route before the fold (`CircleCore.verify:180-195`, `evaluate:467-482`) — neither
+conclusion is a device claim. Test counts are recorded in TESTING.md, not in
+this table.
+
+### 3.15 Circle pad in app and CLI — the integration conclusion table
+
+The 2026-12-16 Integration layer ([circle-pad.md](roadmap/circle-pad.md)) puts
+the 2026-12-15 fold on both surfaces without a new route, header, DTO field,
+store field or v2.2 shape. In the app `FlitEngine.padView: StateFlow<PadView>`
+is rebuilt from `FlitCircleStore` events through `PadCore.view(events,
+circleId)` on every store fold; `refreshCircle()` includes a pad digest in its
+content-diff signature, so a pad edit publishes even when the signed log is
+unchanged. `FlitEngine.circlePadPut(key, text)` and `circlePadDel(key)` build
+their bodies with `PadCore.padPutBody` / `padDelBody` and publish signed `pad`
+events through `FlitCircleSync.postPadPut` / `postPadDel` on the existing
+`/circle/sync` fan-out. `PadUi.kt` is Android-free: `rows(view)` projects the
+already lexicographic `view.lines` and `keyError` / `textError` mirror the
+`PadCore` bounds; the Compose `PadCard` holds no key. The CLI's `circle pad`
+commands (`put`, `del`, `show`) use the same builders and print the derived live
+lines. No surface keeps a second pad store, a pin or a plaintext key.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| Malformed key or text — a blank or whitespace-only key/text at the UI or CLI entry, or a non-string value in a hand-built body | `PadUi.keyError` / `textError` refuse before the callback; `PadCore.padPutBody` / `padDelBody` refuse and `FlitCircleSync.postPadPut` / `postPadDel` return before `emit`, so no `pad` event is signed, stored or fanned out; `circleBodyValid` and `validPadBody` would refuse the same body at their gates | previous view and signed log unchanged | the rejected input; no event is minted | CODE `PadUi.kt` bounds, `PadCore.padPutBody` / `padDelBody` / `validPadBody`, `FlitCircleSync.postPadPut` / `postPadDel` / `circleBodyValid`; PURE `PadUiTest`, `FlitEngineTest` (`pad publish refuses blank and oversized fields before signing or fanning out`), `PadBodyTest` |
+| Over-cap — `key` past `MAX_KEY_CHARS` (128), `text` past `MAX_TEXT_CHARS` (4096), a body past `CircleCore.MAX_BODY_CHARS` (16 KiB), or more than `MAX_LINES` (256) live keys | Builders refuse before signing and the gate refuses before folding; a view never emits more than 256 live `lines`, so keys past the cap stay out of the derived view while the signed events remain in the bounded log | previous view and the rest of the log unchanged | the oversized body/event and, in `lines` only, the keys past 256 — no backfill | CODE `PadCore.validPadBody` / `view` / `merge`, `CircleCore.MAX_BODY_CHARS`, `FlitCircleStore.EVENT_CAP`, `PadUi.keyError` / `textError`; PURE `PadUiTest`, `PadBodyTest`, `PadViewTest`, `PadMergeTest` |
+| Failed post — a builder or gate refusal, or a fan-out with no route or a thrown carrier after the local emit | A refusal ends before `emit`: no signature, no persist and no delivery. A carrier failure after `emit` leaves the signed event in the local bounded log; peers catch it on the next SYNC or the calm repair pass. There is no second local "pad failed" state and no unsent copy to retry by hand | the signed local event and the last derived view stay; peer views stay as last folded until repair | nothing on a refusal; on a fan-out failure, no event is dropped locally | CODE `FlitCircleSync.post` / `emit` / `fanout`, `PadCore.view`, `FlitEngine.padView`; PURE `FlitEngineTest` (exact body fanned out; blank and oversized fields refuse before signing) |
+| Stale view — a peer edit not yet folded, a torn snapshot, or an unrelated fold that leaves the pad unchanged | The app holds no second pad copy: `padView` is rebuilt from the events supplied on every store fold, so a missing event leaves the last folded view until the next full fold and a torn snapshot yields a well-formed view of exactly those events. The pad digest in `refreshCircle()` compares derived content, so an unchanged pad publishes no new `padView`; a put or del that moves a winning line publishes once | the last derived view until the next fold; signed log untouched | the unmatched snapshot events; no partial view is persisted | CODE `FlitEngine.refreshCircle` / `padView`, `PadCore.view` / `merge`, `CircleUi.CircleScreen`, `MainActivity`; PURE `PadViewTest`, `PadMergeTest`, `PadUiTest` |
+
+The rows above use CODE from the frozen app, CLI and `PadCore` seams and PURE
+from the JVM-only app and protocol tests. No row claims DEVICE: no phone walk,
+radio exchange or hardware pad observation is attached to this Integration
+layer, and the 2026-12-17 full-feature walk is not claimed here. A CLI put/del
+posts an ordinary signed event on `/circle/sync` and `pad show` prints the
+derived live lines; neither adds a route nor asserts that a remote device has
+folded the line. Test counts are recorded in TESTING.md, not in this table.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -1074,6 +1154,8 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Per-drop parity (app + CLI) | `FlitEngine.circlePostFile`, `FlitCircleSync.circleBodyValid/postFile`, `FlitCircleStore.CircleDelivery.NO_KEY`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish`, `DropKeyCore.wrap/unwrap/open` | `DropParityTest`, `FlitCircleSyncTest`, `FlitEngineTest`, `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
 | Delivery receipts (protocol, local landing) | `CircleEvent.RECEIPT`, `CircleCore.RECEIPT_BODY_KEYS` / `validReceiptBody` / `receiptAuthors` / `verify` | `ReceiptBodyTest`, `ReceiptTallyTest`, `ReceiptCanonicalTest` | — | no device walk; one member's landing is not global delivery |
 | Delivery receipts (app + CLI, four conclusions) | `FlitEngine.onUploadFinish` / `postReceipt`, `FlitCircleSync.circleBodyValid`, `FlitCircleHost` SYNC filter, `CircleUi.computeFeedData`, `Harness circle receipt`, `DropKeyCore.open`, `FlitCircleStore.CircleDelivery.NO_KEY` | `FlitCircleSyncTest`, `FlitEngineTest`, `ReceiptCliTest`, `ReceiptBodyTest`, `ReceiptTallyTest`, `DropKeyCryptoTest`, `DropParityTest` | — | no device walk; one member's landing is not global delivery |
+| Circle pad (signed verb, pure fold) | `CircleEvent.PAD`, `PadCore.validPadBody` / `view` / `merge`, `CircleCore.dedup` / `evaluate` | `PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest` | not added on this date | no device walk; no harness, camera or phone observation |
+| Circle pad app + CLI integration | `FlitEngine.padView` / `circlePadPut` / `circlePadDel` / `refreshCircle`, `FlitCircleSync.postPadPut` / `postPadDel` / `circleBodyValid`, `PadUi.kt` / `PadCard`, `CircleUi`, `MainActivity`, `Harness circle pad` | `PadUiTest`, `FlitEngineTest`, `PadBodyTest`, `PadViewTest`, `PadMergeTest` | — | no device walk; no phone, radio or hardware pad observation |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -1095,7 +1177,15 @@ signature and duplicate acknowledgement — carry no harness, camera or device
 observation, and the 2026-12-14 two-node receipt walk is not claimed here. The
 2026-12-14 integration row in §3.13 is CODE and PURE only: its four conclusions
 — no drop, no key, digest mismatch and malformed body — carry no device claim;
-the two-node confirm walk is not claimed here.
+the two-node confirm walk is not claimed here. The 2026-12-15 circle pad row in
+§3.14 is CODE and PURE only: its five conclusions — malformed body, wrong
+circle, replayed id, over-cap and torn snapshot — carry no DEVICE or SIM/HARN
+claim; the app/CLI integration and the 2026-12-17 full-feature walk are not
+claimed here. The 2026-12-16 circle pad app + CLI row in §3.15 is CODE and PURE
+only: its four conclusions — malformed key/text, over-cap, failed post and stale
+view — carry no DEVICE claim; no phone walk, radio exchange or hardware pad
+observation is attached to this layer, and the 2026-12-17 full-feature walk is
+not claimed here.
 
 ---
 
@@ -1181,3 +1271,20 @@ None changes a shipped contract.
     carry no DEVICE or SIM/HARN: the two-node confirm walk in the roadmap is not
     claimed here. A receipt proves local landing by one member, not global
     delivery.
+16. **The 2026-12-15 circle pad protocol layer has no device walk here.** The
+    §3.14 rows are CODE from the frozen `CircleEvent`, `PadCore` and `CircleCore`
+    seams and PURE from the four JVM-only protocol test classes. The five
+    conclusions — malformed body, wrong circle, replayed id, over-cap and torn
+    snapshot — carry no DEVICE or SIM/HARN: no route, app surface, CLI command,
+    harness walk, camera capture or phone observation is attached to this layer,
+    and the 2026-12-17 full-feature walk is not claimed here.
+17. **The 2026-12-16 circle pad app + CLI layer has no device walk here.** The
+    §3.15 rows are CODE from the frozen app, CLI and `PadCore` seams and PURE
+    from the JVM-only app and protocol tests. The four conclusions — malformed
+    key/text, over-cap, failed post and stale view — carry no DEVICE claim: no
+    phone walk, radio exchange or hardware pad observation is attached to this
+    layer, and the 2026-12-17 full-feature walk is not claimed here. The §3.14
+    summary now states the shipped `PadView(lines, winners)` shape: `winners`
+    holds each key's winning `PadLine` with its `(lamport, authorFp, id)` order
+    key and tombstone flag so `merge` can re-run the conflict rule; the earlier
+    `PadView(lines)` shorthand did not describe that merge input.

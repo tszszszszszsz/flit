@@ -1,5 +1,36 @@
 # Flit — release notes
 
+## v0.3.0
+
+* **Circle pad.** A Circle can keep one shared, line-oriented text pad in the
+  signed event log. Members put a keyed line, delete a key, and read a derived
+  view on the phone or with `flit-cli circle pad put|del|show`. The view is
+  rebuilt from the log on every fold; there is no second stored copy and no new
+  route or wire field. Per key, the operation with the greatest
+  `(lamport, authorFp, id)` wins, so members resolve the same log to the same
+  view regardless of delivery order.
+* **Signed delivery receipts.** Sender and receiver record a receipt for each
+  delivered drop; the app and CLI show the same author tally. Receipts ride the
+  existing Circle event path; no new route or status code was added.
+* **Per-drop content keys.** Each Circle file drop carries its own content key,
+  wrapped to member certificates. A member who leaves no longer unwraps later
+  drops; earlier drops keep their bytes.
+* **QR air-gap parcels.** A parcel can be encoded into PNG frames and decoded
+  from a camera feed without a network between devices. The frame codec and the
+  courier carry path stay inside the existing v2.2 wire rules.
+* **Courier carry.** An offline member's signed events can travel through a
+  second device. Carry is opt-in and bounded by the existing replay window.
+* **Small surface additions.** Fingerprint fallback labels use a derived short
+  code, pad search runs on the pad card, and the shipped BLE duty cycle is
+  checked at start-up as an observation only; a violation is logged and does
+  not change carrier behavior.
+* Wire protocol remains v2.2. A v0.2.0 peer sees the same routes, headers, DTO
+  fields and status codes as before. No account, cloud, advertisement,
+  telemetry or phone-home dependency was added.
+
+Counts, commands and the evidence table are in `docs/TESTING.md`. The dated
+layer records are under `docs/completions/`.
+
 ## v0.2.0
 
 * **Works when Wi‑Fi doesn't.** With no network between the phones (mobile data only,

@@ -40,6 +40,22 @@ The 2026-12-14 Integration layer is built ahead of its scheduled day. The delive
 receipts code in the app and CLI and its tests are written now, but the commit stays
 on 2026-12-14; no earlier date carries it.
 
+The 2026-12-15 Protocol layer is built ahead of its scheduled day. The circle pad
+CRDT core code and tests are written now, but the commit stays on 2026-12-15; no
+earlier date carries it.
+
+The 2026-12-16 Integration layer is built ahead of its scheduled day. The circle
+pad app and CLI code and tests are written now, but the commit stays on
+2026-12-16; no earlier date carries it.
+
+The 2026-12-21 Integration layer is built ahead of its scheduled day. The three
+reviewed ideas and their completions are written now, but the commit stays on
+2026-12-21; no earlier date carries it.
+
+The 2026-12-17 device layer has no commit. No physical walk was available for
+this run, so the date moves under the rule below and no placeholder commit is
+made. The flows are covered by the in-process rig recorded in `docs/TESTING.md`.
+
 ## Dates
 
 | Date | Layer | Commit scope |
@@ -60,8 +76,9 @@ on 2026-12-14; no earlier date carries it.
 | 2026-12-14 | Integration | Receipts in app and CLI, device walk, note |
 | 2026-12-15 | Protocol | Circle pad CRDT core, pure JVM, tests |
 | 2026-12-16 | Integration | Circle pad in app and CLI, tests (specified in `circle-pad.md`) |
-| 2026-12-17 | Device | Full feature walk and evidence note |
+| 2026-12-17 | Device | Full feature walk — deferred until a physical walk is available |
 | 2026-12-18 | Release | Final rig, docs consolidation, v0.3.0 |
+| 2026-12-21 | Integration | Three reviewed ideas in app surfaces, tests |
 
 ## Rules for a day
 

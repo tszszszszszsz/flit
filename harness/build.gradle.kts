@@ -29,6 +29,6 @@ application {
     // the rename and every peer that trusted this machine keeps trusting it.
     applicationName = "flit-cli"
     // Keep in step with the app's versionName (app/build.gradle.kts).
-    version = "0.2.0"
+    version = "0.3.0"
     applicationDefaultJvmArgs = listOf("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn")
 }

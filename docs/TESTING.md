@@ -24,8 +24,8 @@ Rules applied here:
   378, 396) are snapshots of earlier layers, not the current inventory: 356
   after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer and
   396 after the 2026-12-01 App layer, 416 after the app QA fixes, 436 after the
-  QR codec layer, 448 after the QR CLI layer. The current green figure is 588
-  (240 protocol + 281 app + 67 harness) after a clean `--rerun-tasks` run.
+  QR codec layer, 448 after the QR CLI layer. The current green figure is 714
+  (330 protocol + 309 app + 75 harness) after a clean `--rerun-tasks` run.
 - The 2026-12-01 App layer added 18 courier cases in `app/src/test` (11 in
   `CourierCardUiTest`, 4 added to `FlitCircleStoreTest`, 3 added to
   `FlitCircleSyncTest`), recorded from a green `--rerun-tasks` run (§4.2).
@@ -36,7 +36,7 @@ Rules applied here:
   the harness (5 more in `CourierCliTest`, 2 more in
   `CourierCarrierHarnessTest`). They took the rig from 396 to 416. The two QR parcel protocol classes in §4.1
   added 20 more cases (14 + 6), taking the rig to 436; the QR CLI layer added 12
-  harness cases (9 + 3), taking it to 588. All counts come from the JUnit XML.
+  harness cases (9 + 3), taking it to 448. All counts come from the JUnit XML.
 - The 2026-12-04 QR parcel CLI layer added two harness classes, `ParcelCliTest`
   (9 cases) and `ParcelCliHarnessTest` (3 cases), recorded from a fresh
   `--rerun-tasks` run. Both are in-process, on one box, with no
@@ -59,6 +59,18 @@ Rules applied here:
   `ReceiptCliTest` in `harness/`, §4.5) with 3 + 6 + 5 cases, included in the
   green 588 from a clean `--rerun-tasks` run. No device walk, new route, header,
   DTO field, QR parameter or v2.2 status is attached to this layer.
+- The 2026-12-15 circle pad protocol layer adds four JVM-pure protocol test
+  classes (`PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest`,
+  §4.1) with 16 + 9 + 11 + 7 = 43 cases, recorded from the JUnit XML, taking
+  the protocol module from 240 to 283 at that layer. The final module totals
+  are 330 + 309 + 75 = 714. No app, CLI, harness, device walk, new route,
+  header, DTO field, store field or v2.2 status is attached to this layer.
+- The 2026-12-16 circle pad app + CLI Integration layer adds two test classes:
+  `PadUiTest` (app, Android-free JVM, 15 cases) and `PadCliTest` (harness,
+  in-process, 8 cases), recorded from the JUnit XML. At that layer the app
+  module stood at 296 cases and the harness at 75; the final module totals are
+  330 + 309 + 75 = 714. No device walk, new route, header, DTO field, store
+  field or v2.2 status is attached to this layer.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -69,13 +81,13 @@ Rules applied here:
 
 | Module | Role | Test count | Test task | Where it runs |
 | --- | --- | --- | --- | --- |
-| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **210** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
-| `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **257** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
-| `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **52** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **588** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
+| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **330** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
+| `app/` | Android shell (Compose), `app.flit.share`, version 0.3.0, minSdk 26, compile/targetSdk 36 | **309** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
+| `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **75** | `:harness:test` | JVM, in-process with real endpoints |
+| **Total** | Three modules, three roles | **714** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
 
 The 2026-12-04 CLI layer's two harness classes added 12 cases, moving harness
-from 39 to 51 and the total from 436 to 588 in the last green `--rerun-tasks`
+from 39 to 51 and the total from 436 to 448 in the last green `--rerun-tasks`
 run. The 2026-12-07 QR parcel App layer adds `ParcelScanStateTest` with 18
 cases, counted from source `@Test` annotations rather than a fresh JUnit XML
 report; the table above stays the last green inventory until a fresh
@@ -103,6 +115,13 @@ rows (§4.5) are included in the green 588. The module
 table above and the 240 + 281 + 67 = 588 figure stay at the last green run; no
 post-layer figure is asserted here. No Gradle run or device observation is
 attached to this edit.
+
+The 2026-12-15 circle pad protocol layer adds four JVM-pure protocol classes
+(§4.1) with 16 + 9 + 11 + 7 = 43 cases on top of the green 588. The module table
+above and the 240 + 281 + 67 = 588 figure stay at the last green run until a
+fresh `--rerun-tasks` run records the post-layer figure from the JUnit XML. No
+post-layer total is asserted here, and no app, CLI, harness or device claim is
+attached to these rows.
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -141,7 +160,7 @@ Two notes about these commands:
 1. The README command does **not** include `:harness:test`. The 302-test figure
    (which includes the 10 harness tests) was realized by the CI command, or by
    adding `:harness:test` locally; that baseline's README line ran 292 tests
-   (82 + 210). At the last green run the same README line ran 377 tests
+   (82 + 210). At the last green run the same README line ran 512 tests
    (240 + 272) and the CI command ran 588 (240 + 281 + 67). The 2026-12-07
    App layer's `ParcelScanStateTest` and the later QA cases are included in
    the green 588.
@@ -271,6 +290,24 @@ field or v2.2 status changes, and no device claim is attached to these cases.
 | `ReceiptTallyTest` (new) | 6 | `CircleCore.receiptAuthors(events, dropId, sha256, members)` filters receipt events by exact body `dropId`/`sha256`, verifies the signature, keeps only current members and returns a deduplicated set of author fingerprints with at most one receipt per member (latest wins); a forged author, a non-member, a mismatched drop or digest and a failed signature contribute nobody; non-receipt events and the existing kick/vote tallies are unaffected. |
 | `ReceiptCanonicalTest` (new) | 6 | Canonical bytes stay byte-identical for the existing verbs and cover `dropId`, `sha256` and `keyId` for `RECEIPT` with `sig`/`cert` excluded, so changing any covered field changes the bytes; replay windows and the bounded seen set are unchanged, and the additive receipt event adds no route, header, DTO field or v2.2 status. |
 
+#### Circle pad additions — four classes, 43 cases
+
+The four classes below are the 2026-12-15 circle pad protocol layer. All are
+JVM-pure, live in `protocol/src/test/kotlin/app/flit/share/protocol/` and drive
+the real `PadCore`, `CircleCore` and `CircleEvent` seams. Their 16 + 9 + 11 + 7
+= 43 cases are recorded from the JUnit XML and added on top of the green 588;
+the §2 module table and the 240 + 281 + 67 = 588 figure stay at the last green
+run until a fresh `--rerun-tasks` run records the post-layer figure. No app,
+CLI, harness, device walk, new route, header, DTO field, store field or v2.2
+status is attached to these rows.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `PadBodyTest` (new) | 16 | `PadCore.validPadBody` accepts exactly `PAD_PUT_KEYS = {op,key,text}` when `op == "put"` and `PAD_DEL_KEYS = {op,key}` when `op == "del"`, refusing an extra or missing key, a wrong-typed `op`/`key`/`text`, an unknown `op`, a blank or over-cap `key` (`MAX_KEY_CHARS = 128`) and a blank or over-cap `text` (`MAX_TEXT_CHARS = 4096`), with every accepted body at or below `CircleCore.MAX_BODY_CHARS`; `padPutBody`/`padDelBody` emit bodies the gate accepts, including a put at the text cap, and malformed JSON, blanks and oversized fields are refused rather than thrown. |
+| `PadViewTest` (new) | 9 | `PadCore.view(events, circleId)` keeps only `pad` events for the given circle with a body the gate accepts, ignoring other verbs, other circles and malformed bodies, and applies `CircleCore.dedup` so a repeated id counts once without calling `CircleCore.verify`; per `key` the operation with the greatest `(lamport, authorFp, id)` wins — a `put` sets the text, a greater-key `del` tombstones the key and an older `del` is inert — with `PadView.lines` sorted lexicographically, tombstoned keys omitted and at most `MAX_LINES = 256` entries; opposite delivery orders and a re-fold of the same events give byte-identical views. |
+| `PadMergeTest` (new) | 11 | `PadCore.merge` applies the same per-key greatest-order-key rule to views already derived from separate event sets, so `view(a + b) == merge(view(a), view(b))` for disjoint and overlapping sets and for either merge order; a tombstone in one view wins over an older put in the other, re-merging a view is idempotent and a merged view never grows past `MAX_LINES`. |
+| `PadCanonicalTest` (new) | 7 | `CircleEvent.PAD = "pad"` is the twelfth verb in `TYPES` with the existing verb values unchanged; `CircleCore.canonical` covers the same seven fields except `sig`/`cert` for `pad`, so a `pad` event minted by `CircleCore.create` verifies and a forged `authorFp` or a changed covered field fails `verify`, while canonical bytes, replay order, `dedup` and `accept` for the existing verbs stay byte-identical and no route, header, DTO field or v2.2 status is added. |
+
 ### 4.2 App — 239 tests (210 baseline + 18 courier + 11 QA)
 
 All are JVM tests of Android-free seams: codecs, reducers, pure policy math and
@@ -279,7 +316,7 @@ radio.
 
 | Class | # | What it pins |
 | --- | --- | --- |
-| `FlitBleTest` | 29 | BLE record codec (extended/legacy, fingerprint+alias, codepoint-safe clipping, garbage refused, both self-ghost kinds), arbiter (AP up dark, no-AP on, hidden listen-only, missing perm/dead radio off), rank rule, contextual ask book, 10-on/45-off duty constants and injectable phase, live-peer stop rule. |
+| `FlitBleTest` | 36 | BLE record codec (extended/legacy, fingerprint+alias, codepoint-safe clipping, garbage refused, both self-ghost kinds), arbiter (AP up dark, no-AP on, hidden listen-only, missing perm/dead radio off), rank rule, contextual ask book, 10-on/45-off duty constants and injectable phase, live-peer stop rule. |
 | `FlitBluetoothTest` | 14 | Android 12 permission split and legacy API 26-30 set, all-grants rule, RFCOMM backoff doubling/cap/no overflow, retry logs, quiet cancellation, transient accept failure re-listens, bounded handshake. |
 | `FlitCircleHostTest` | 19 | Wrong circle/unknown action refusals, invite + fingerprint gate on JOIN, signed-log return, outsider/blank SYNC refusal, verify-before-fold, cert cannot claim another fingerprint, wrong type/oversized/replayed skip, leave/kick/role governance and rekey invariants, departed member refused, replay roll-off, bounded log and roster, repeatable answers. |
 | `FlitCircleStoreTest` | 25 | Store codec and tolerant decode (defaults, corrupt, duplicate, oversized trim, negative generation), roster folds (join/leave/kick/vote/role/rekey), generation saturation, per-fingerprint delivery records (upsert/status/remove) untouched by event folds. |
@@ -423,6 +460,39 @@ walk, new route, header, DTO field, QR parameter or v2.2 status.
 | `FlitEngineTest` (added cases, app) | 6 | JVM mint-and-fold seams: after a keyed drop lands hash-exact and the plaintext digest matches the announced `file` event `sha256`, the engine reads that event's `id` and its `keyGen`/`wraps`, mints via `CircleCore.create(..., RECEIPT, {dropId,sha256,keyId})` and publishes through `post()`; a digest mismatch, wrong identity, `NO_KEY`, a carrier throw or a legacy plaintext drop mints nothing; `computeFeedData` folds `CircleCore.receiptAuthors` into the confirmation count with `remember` memoization while sender-local delivery statuses stay unchanged; `keyId` is provenance only and never selects a receipt. No radio, camera or device claim. |
 | `ReceiptCliTest` (new, harness) | 5 | In-process CLI parity in `app.flit.share.harness`: `circle receipt --sha SHA [--drop-id ID] [--host ip[:port]]` requires a joined circle, resolves the `file` event by plaintext `sha256` (or the given `--drop-id`), derives `keyId` from that signed keyed body and posts a signed receipt with body exactly `{dropId,sha256,keyId}`, refusing with no event when the drop or key id is absent; `circle sync`/`console` prints the confirmation count from `CircleCore.receiptAuthors`; a malformed receipt is refused by the host gate and a replayed id leaves the count at one; no value is fabricated. No new route, header, DTO field, QR parameter or v2.2 status; no device walk. |
 
+### 4.6 2026-12-16 circle pad app + CLI integration additions — 23 cases
+
+The two rows below belong to the 2026-12-16 Integration layer that wires the
+2026-12-15 pad protocol into the app surface and the CLI. One is a new
+Android-free JVM class in `app/src/test` and one is a new in-process harness
+class in `harness/src/test`. Their counts from the JUnit XML are 15 and 8;
+the final module totals are 330 + 309 + 75 = 714. No device walk, new route,
+header, DTO field, store field or v2.2 status is attached to these rows.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `PadUiTest` (new, app) | 15 | Android-free JVM tests of the `PadUi` seam: `rows(view)` yields lexicographically ordered `PadRow(key, text)` pairs from a `PadView`, with tombstoned keys omitted; `keyError` and `textError` reject blanks and enforce the `PadCore` bounds `MAX_KEY_CHARS = 128` and `MAX_TEXT_CHARS = 4096`. No Android import, no Robolectric, no device claim. |
+| `PadCliTest` (new, harness) | 8 | In-process CLI parity in `app.flit.share.harness` for `circle pad put --key K --text T`, `circle pad del --key K` and `circle pad show`: put and del bodies come from `PadCore.padPutBody`/`padDelBody`, `show` prints the `PadView` lines, and bad arguments or blank/over-cap fields are refused with no event posted. No new route, header, DTO field or v2.2 shape; no socket or device claim. |
+
+### 4.7 Idea and wiring classes — final XML counts
+
+The 2026-12-21 Integration layer wired the three WIRE prototype cores listed
+in `docs/ideas/PROGRAM.md` into existing surfaces. Their classes and the app
+wiring cases are counted from the JUnit XML:
+
+| Class | # | Module |
+| --- | --- | --- |
+| `PadSearchTest` | 17 | `protocol/` |
+| `PeerAliasTest` | 12 | `protocol/` |
+| `NoiseBudgetTest` | 18 | `protocol/` |
+| `PadUiTest` (search cases) | 7 | `app/` (included in the 15 above) |
+| `FlitBleTest` (budget cases) | 6 | `app/` (included in the 36 above) |
+
+The four pad protocol classes in §4.1 keep their recorded counts:
+`PadBodyTest` 16, `PadViewTest` 9, `PadMergeTest` 11 and `PadCanonicalTest` 7.
+No device walk, new route, header, DTO field, store field or v2.2 status is
+attached to these classes.
+
 ## 5. What the suites establish, by flow
 
 The per-class tables in §4 are the authority for counts.
@@ -502,7 +572,7 @@ cd /home/szszszs/flit
 source env.sh
 ./gradlew :harness:installDist
 # binary: harness/build/install/flit-cli/bin/flit-cli
-# or: ./install-cli.sh --zip flit-cli-0.2.0.zip  → ~/.local/bin/flit-cli
+# or: ./install-cli.sh --zip flit-cli-0.3.0.zip  → ~/.local/bin/flit-cli
 ```
 
 The CLI identity lives at `~/.config/flit/flit-harness/identity.p12` (override
@@ -715,4 +785,7 @@ The 2026-12-10 per-drop parity Integration layer adds four classes in §4.4
 with 31 cases included in the green 588; no device observation is asserted.
 The 2026-12-11 delivery receipts protocol layer adds three classes in §4.1
 with 24 cases included in the green 588; no device observation is asserted
-for them.
+for them. The 2026-12-15 circle pad protocol layer adds four classes in §4.1
+(`PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest`) on top of the
+green 588, with 16 + 9 + 11 + 7 = 43 cases recorded from the JUnit XML; no
+device observation is asserted for them.

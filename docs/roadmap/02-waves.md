@@ -36,6 +36,15 @@ The 2026-12-14 Integration wave is built ahead. Delivery receipts implementation
 the app and CLI runs now, but the commit stays on 2026-12-14; no earlier wave carries
 it.
 
+The 2026-12-15 Protocol wave is built ahead. Circle pad CRDT core implementation runs
+now, but the commit stays on 2026-12-15; no earlier wave carries it.
+
+The 2026-12-16 Integration wave is built ahead. Circle pad app and CLI implementation
+runs now, but the commit stays on 2026-12-16; no earlier wave carries it.
+
+The 2026-12-21 Integration wave is built ahead. Three reviewed ideas are integrated
+now, but the commit stays on 2026-12-21; no earlier wave carries it.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator
@@ -61,8 +70,9 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2026-12-14 | Integration | 16 agents split across app receipt UI, CLI export, device walk, tests and the completion note |
 | 2026-12-15 | Protocol | 16 agents split across CRDT state, merge function, bounds, event shapes, tests and the completion note |
 | 2026-12-16 | Integration | 16 agents split across app pad UI, CLI pad commands, sync wiring, tests and the completion note |
-| 2026-12-17 | Device | 16 agents on the full feature walk, logs and the evidence note |
+| 2026-12-17 | Device | Full feature walk deferred — no physical walk was available, so no wave ran and no evidence note was added |
 | 2026-12-18 | Release | Rig runners, docs consolidators, release notes, tag and asset checks |
+| 2026-12-21 | Integration | Eight tasks: three approved ideas across pad UI, circle UI, activity labels, BLE audit, tests and two read-only reviews |
 
 ## Integration gate
 
