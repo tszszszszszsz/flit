@@ -1,10 +1,11 @@
 # Trust-gate certificate binding — design record
 
-The `onlyTrusted` and `qrOnly` receive gates currently compare the fingerprint
-string carried in `PrepareUploadRequest.info` against a persisted pin or a
-known-device row. The field is caller-declared and unsigned. A sender who knows
-a trusted fingerprint can pass either gate. This record keeps the two designs
-that were evaluated and the reason neither is shipped in v0.3.1.
+Before the security wave the `onlyTrusted` and `qrOnly` receive gates compared
+the fingerprint string carried in `PrepareUploadRequest.info` against a
+persisted pin or a known-device row. The field is caller-declared and unsigned.
+This record keeps the two designs that were evaluated. Option B was later
+implemented behind off-by-default gates; see the disposition at the end of this
+record.
 
 ## Option A — bind the TLS peer certificate
 
@@ -61,7 +62,7 @@ signature binding: see `docs/roadmap/security-hardening.md` and
 `docs/completions/2027-01-13-security-fixes.md`. The binding remains opt-in;
 the default path keeps the declared-fingerprint behavior.
 
-If the requirement returns, Option B is the first candidate: it reuses an
+For any further certificate-binding requirement, Option B is the first candidate: it reuses an
 existing primitive, keeps the normal refusal shape, and is testable at the
 route without TLS adapter work. Whichever option is chosen must include tests
 for no certificate, claimed/presented mismatch, plain HTTP, Bluetooth, relay,

@@ -56,7 +56,9 @@ android {
         }
     }
 
-    // Netty jars carry overlapping META-INF bookkeeping; drop only that.
+    // Netty jars carry overlapping META-INF bookkeeping. META-INF/DEPENDENCIES
+    // is a dependency-attribution listing and is dropped here rather than
+    // merged; license and NOTICE text is kept.
     // Upstream license/NOTICE text must travel with the APK: merge one copy
     // per path instead of stripping every copy (which would break packaging
     // on duplicate entries and drop redistribution terms).

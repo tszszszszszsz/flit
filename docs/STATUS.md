@@ -6,7 +6,9 @@ new additions to the tree. The latest tag is `v0.3.1`; source still declares
 released.
 
 The full rig is green: 443 protocol, 167 core, 254 app and 108 harness tests,
-972 total, with zero failures, errors and skipped cases. Debug APK, release APK,
+972 total, with zero failures, errors and skipped cases. The zero-skipped value is an observation with
+`FLIT_HARNESS_HOME` unset; one harness gate also depends on POSIX file
+attribute availability. Debug APK, release APK,
 CLI install tree and CLI zip all build successfully.
 
 ## Shipped capability

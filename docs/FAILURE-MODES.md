@@ -17,7 +17,7 @@ Current rig state: **443 protocol + 167 core + 254 app + 108 harness = 972
 tests, 0 failures, 0 errors, 0 skipped**, from the last full green test XML
 (2026-11-28, `docs/TESTING.md` §1). That result covers the four test tasks; the release assembly is also green
 after the R8 keep-rule change. The 769 figure (359 + 323 + 87), the 714 figure
-(330 + 309 + 75) and the three-module 778 projection are historical; the older
+(330 + 309 + 75) and the three-module 778 green figure are historical; the older
 302-test figure was green at `72225f8` and is historical too. The non-profit constraint holds
 throughout: no accounts, no cloud, no ads, no telemetry, no phone-home SDKs;
 every recovery path below is local.
@@ -926,8 +926,8 @@ Harness circle receipt --sha SHA [--drop-id ID] [--host ip[:port]]
 | Digest mismatch: `DropKeyCore.open` fails, the opened plaintext `sha256` differs from the one signed in the `file` event, `UploadResult.Mismatch`/`Error` is returned, or the carrier throws | No receipt minted; the card stays on its local status and no author is promoted to `SENT`. The plaintext `sha256` is inside the signed body, so a substituted drop cannot be renamed as the announced one | landed ciphertext and its temp, or the sealed spool, follow the per-drop key layer's rules | the substituted plaintext and the failed mint | CODE `FlitEngine.onUploadFinish` mint gate, `DropKeyCore.open`, `CircleCore.canonical` (binds the plaintext `sha256`); PURE `FlitEngineTest`, `DropKeyCryptoTest`, `DropParityTest` |
 | Malformed body: a receipt body with a missing key, an extra key (including `landedMs`), a non-string or blank value, or a value over `MAX_FIELD_CHARS` (256) | `validReceiptBody` is false at both app gates: `FlitCircleSync.circleBodyValid` refuses the RECEIPT body and the `FlitCircleHost` SYNC filter refuses the event before fold. It is never minted, folded or counted | acknowledged drop bytes untouched; the bounded signed log unchanged | the malformed body or the incoming event | CODE `CircleCore.validReceiptBody`, `FlitCircleSync.circleBodyValid`, `FlitCircleHost` SYNC filter; PURE `FlitCircleSyncTest`, `ReceiptBodyTest` |
 
-The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN: the
-two-node confirm walk in the roadmap is not claimed here, and a receipt proves
+The rows above are CODE, PURE and SIM-HARN from the in-process two-bot
+`ReceiptCliTest` walk. No row claims DEVICE: a receipt proves
 a local landing by one member, not delivery to the whole Circle. Test counts
 are recorded in TESTING.md, not in this table.
 
@@ -1258,7 +1258,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Turbo chunk salvage | `ServerCore.kt:720-793` | `ResumeAndTurboTest` | multi-socket hash-exact test | late ~90 % kill → clean full resend |
 | Queue rows / spools | `FlitEngine.kt:2163-2233`, `:2582-2806`; `FlitRoster.kt:23-62`, `:272-306` | `FlitRosterTest`, `FlitSpoolTest` | — | kept → merged → 2/2 → cancel walk |
 | Hunt / route policy | `FlitRoute.kt:40-74`, `FlitEngine.kt:1612-1700` | `FlitRouteTest` | — | 2026-11-15 hunt walk |
-| Relay death | `RelayCore.kt`, `FlitEngine.kt:1709-1721` | `RelayCoreTest` | `RelayServerTest` (5 tests) | 2026-11-24 relay kill/resume, hash-exact |
+| Relay death | `RelayCore.kt`, `FlitEngine.kt:1709-1721` | `RelayCoreTest` | `RelayServerTest` (6 tests) | 2026-11-24 relay kill/resume, hash-exact |
 | Circle file statuses | `FlitEngine.kt:507-608` | `CircleHardeningTest` | `CircleHarnessTest` | 35 B drop landed + Open-file walk |
 | Circle governance / repair | `FlitCircleHost.kt`, `FlitCircleStore.kt:283-524`, `FlitCircleSync.kt` | `CircleCoreTest`, `CircleHardeningTest`, `FlitCircleHostTest`, `FlitCircleSyncTest` | `CircleHarnessTest` | join/post/poll-vote/file/kick/rekey walks; 3-identity Circle at 2026-11-26 |
 | Panic fan-out | `FlitEngine.kt:403-505`, `ServerCore.kt:925-944` | `PanicTest` | — | one phone + CLI box banner/hops |

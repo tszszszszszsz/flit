@@ -2,8 +2,9 @@
 
 ## Status
 
-This document is a plan. No convergence code exists: there is no shared `:core`
-module, no desktop source set, no desktop binary and no migrated state file. The
+This document is a plan. The shared `:core` module exists, but no convergence
+of the state types exists: there is no desktop source set, no desktop binary and
+no migrated state file. The
 only facts below that are already implemented are the phone-side `CircleState`
 codec and the CLI's eight-line file; their current locations are cited so the
 plan can be checked against them. Nothing here proposes a wire change: no new

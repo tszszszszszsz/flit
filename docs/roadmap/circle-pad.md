@@ -129,7 +129,7 @@ No device walk in this layer. The full feature walk is 2026-12-17; any pad obser
 
 ## Evidence for this day
 
-`docs/completions/2026-12-15-circle-pad.md` records the protocol test-task result from a fresh `--rerun-tasks` run, the added test names and what each pins, the exact `PadCore` constants and file, and the post-layer protocol test count updated from the then-current 240 (a historical figure for that layer; the current rig is 714 = 330 protocol + 309 app + 75 harness after a green `--rerun-tasks` run, with zero failures). It records limitations at the CODE and PURE levels only: no UI, no CLI command, no persisted pad field and no device observation in this layer. Harness and device claims stay unmarked until their own dates.
+`docs/completions/2026-12-15-circle-pad.md` records the protocol test-task result from a fresh `--rerun-tasks` run, the added test names and what each pins, the exact `PadCore` constants and file, and the post-layer protocol test count updated from the then-current 240 (a historical figure for that layer; the rig at that layer was 714 = 330 protocol + 309 app + 75 harness (historical; current inventory is 972), with zero failures). It records limitations at the CODE and PURE levels only: no UI, no CLI command, no persisted pad field and no device observation in this layer. Harness and device claims stay unmarked until their own dates.
 
 ## Out of scope
 

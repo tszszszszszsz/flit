@@ -102,7 +102,7 @@ The device walk is not part of this day. The tests above are the precondition fo
 
 ## Evidence for this day
 
-`docs/completions/2026-12-01-courier-app.md`, written when the layer lands, records the rig command, the green result for `:protocol:test`, `:app:testDebugUnitTest` and `:harness:test`, the new test names, and the `courier:` log lines observed in the harness. The current rig is 714 = 330 protocol + 309 app + 75 harness, after a green `--rerun-tasks` run; the 302 = 82 + 210 + 10 and the 396 inventories are historical. Evidence labels are CODE, PURE and SIM-HARN. No DEVICE claim is made on this day. Limitations recorded there: no phone-to-phone handoff walk, no live multi-member mesh, and no delivery receipt or decryption proof beyond the harness.
+`docs/completions/2026-12-01-courier-app.md`, written when the layer lands, records the rig command, the green result for `:protocol:test`, `:app:testDebugUnitTest` and `:harness:test`, the new test names, and the `courier:` log lines observed in the harness. The rig at that layer was 714 = 330 protocol + 309 app + 75 harness (historical; current inventory is 972), after a green `--rerun-tasks` run; the 302 = 82 + 210 + 10 and the 396 inventories are historical. Evidence labels are CODE, PURE and SIM-HARN. No DEVICE claim is made on this day. Limitations recorded there: no phone-to-phone handoff walk, no live multi-member mesh, and no delivery receipt or decryption proof beyond the harness.
 
 ## Out of scope
 

@@ -214,13 +214,17 @@ sessions with a 10-minute idle TTL, 1 GiB per file and 2 GiB per batch, and the
 existing 8 MiB control-body cap. Manifest and fetch share the same confinement
 helper, so symlinks and escaping paths are refused in both.
 
-One open design question: the v2.2 specification already names
-`prepare-download` and `GET /download?sessionId=&fileId=` routes, and they are
-compatible with existing LocalSend clients. The current contract records only
-the five implemented v2.2 routes and treats Flit extensions as additive. A
-route decision must choose between implementing the documented v2.2 download
-verbs and keeping all new paths under the Flit root; the two options have the
-same server-side controls but different interop consequences.
+The route family is settled for the smallest version: keep
+`downloadApiEnabled` and the advertised `PeerInfo.download` bit false, because
+that bit names LocalSend's browser-facing `/prepare-download` and `/download`
+verbs, and a LocalSend peer would call endpoints Flit does not implement. The
+Flit surface would go under `/api/flit/v1` with its own process-local gate
+supplier, so the v2.2 wire stays byte-for-byte unchanged and no LocalSend peer
+is invited to a missing route. Two additive routes would cover listing and file
+fetch; they would ride the same `ServerCore`, so TCP/TLS, Bluetooth pipe and
+relay carriers would share one implementation. No such route exists in the tree
+today; the gap is recorded in `docs/STATUS.md`. A separate decision would be needed to implement the v2.2
+download verbs for LocalSend interoperability.
 
 The test plan starts with pure seams in `core` (PIN gate, listing derivation,
 path guard, budget accounting, inventory merge from receive/courier/QR
@@ -278,8 +282,9 @@ additions that leave the v2.2 wire unchanged. They are not failures.
 Two true failures come out of the comparison:
 
 - **General host-side download availability is absent.** The capability flag
-  exists in DTOs but no route, client or product surface reads it, and no
-  scope decision names it as omitted. Interop coverage missed it because the
+  exists in DTOs but no route, client or product surface reads it. The v2.2
+  download verbs were explicitly left out by the route decision recorded above,
+  so the product gap is a missing surface, not a missing boundary decision. Interop coverage missed it because the
   tests exercise the DTO field, not a flow.
 - **Pad events render as unsupported in the Circle feed.** The pad sheet shows
   the line, so the event is not lost; the feed path routes it to the unknown
@@ -366,11 +371,13 @@ fan-out weaken confidence but do not show a broken shipped contract.
   no NOTICE entry; the CLI notices contain many "no license text in jar" rows.
 - Store metadata is stale: `metadata/app.flit.share.yml:9` says `License: MIT`
   against a GPL project, its allowed signing-key digest and version do not
-  match the current build, and Fastlane changelogs stop at codes 1 and 2.
+  match the current build, and changelogs stop below code 4 in both `metadata/en-US/changelogs/` and
+  `fastlane/metadata/android/en-US/changelogs/`.
 - The local APK verifies against the intended release key, but that check is
   not recorded in the release docs, and CI has no signing secret.
-- The post-R8 assembly is green locally but is not recorded as such in the
-  evidence docs; a doc pass is needed so the record matches the run.
+- The post-R8 assembly is green and is recorded in `docs/TESTING.md`,
+  `RELEASE_NOTES.md` and `.github/workflows/rig.yml`; assembly results are
+  outside the JUnit XML.
 - Commit dates were assigned to believable weekdays while work was built ahead
   of its commit date; a0fb938 is dated before its parent. This follows the
   dating constraint and is recorded as a history property, not a defect to
@@ -387,8 +394,10 @@ These are process failures, not one-off code defects. They recur across waves.
   runs the test tasks without it and has no step that parses XML for failures,
   errors or skips. A capability inventory cannot be trusted until CI forces a
   fresh run and checks counts against a checked-in manifest.
-- **Skipped assumptions counted as green.** Eight `assumeTrue` gates across six
-  harness classes skip when `FLIT_HARNESS_HOME` pins a single home. The walk
+- **Skipped assumptions counted as green.** Seven `assumeTrue` gates across six
+  harness classes skip when `FLIT_HARNESS_HOME` pins a single home; an eighth
+  at `CourierCliTest.kt:681` skips when POSIX file attributes are unavailable.
+  The walk
   guidance recommends distinct homes for CLI bots, so an operator following it
   can silently skip those cases while completion notes still record zero
   skipped. Zero skipped must be a rig assertion, not an observation.
@@ -402,10 +411,10 @@ These are process failures, not one-off code defects. They recur across waves.
   and PIN material are documented as bearer values with process-local replay
   scope. There is no per-token lifecycle row covering issuer, binding,
   lifetime, storage, replay scope, rotation, revocation and default behavior.
-- **Design records not retired.** `docs/roadmap/trust-gate-cert-binding.md`
-  still described both options as parked after the binding landed. Design notes
-  need an implemented, superseded or parked status with a link to the landing
-  record.
+- **Design records were not retired in the same layer.** The landing record
+  now names Option B as implemented and links to
+  `docs/roadmap/trust-gate-cert-binding.md`; that link was added in a later doc
+  pass rather than with the code change.
 - **Docs drift in repeated passes.** Three consecutive doc-only commits
   (`41734be`, `08f9b0d`, `0c6d562`) reconciled the same rig and assembly
   evidence state; the same reconciliation was needed again during this

@@ -94,7 +94,7 @@ Known compatible in the shipped build, read from the files named:
 | Kotlinx serialization | 1.9.0 | `gradle/libs.versions.toml:3` |
 | Coroutines | 1.10.2 | `gradle/libs.versions.toml:4` |
 | Ktor | 3.2.2 | `gradle/libs.versions.toml:5` |
-| Bouncy Castle | 1.81.1 | `gradle/libs.versions.toml:6` |
+| Bouncy Castle | 1.87 | `gradle/libs.versions.toml:8` |
 | AGP | 8.13.2 | `gradle/libs.versions.toml:8` |
 | Compose BOM (Android) | 2026.06.00 | `gradle/libs.versions.toml:9` |
 | zxing | 3.5.3 | `gradle/libs.versions.toml:11` |
@@ -179,9 +179,9 @@ checks are kept.
 
 ## Re-baseline point
 
-The shipped green inventory is 778 tests: 362 protocol + 324 app + 92 harness,
-read from JUnit XML after a forced `--rerun-tasks` run with zero failures,
-errors and skipped cases
+The historical baseline at plan time was 778 tests: 362 protocol + 324 app +
+92 harness. The current four-module XML inventory is 972 (443 protocol + 167
+core + 254 app + 108 harness) with zero failures, errors and skipped cases
 (`docs/TESTING.md:108-113,204-224`; `docs/QUALITY-CONFIDENCE.md:22-30`). It is a
 floor for the desktop wave, not a target count.
 

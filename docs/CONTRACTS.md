@@ -92,7 +92,7 @@ current line numbers.
 | Max fingerprint / token | `128` chars each | `RelayCore.kt:47,50` |
 | Relay CLI default port | `53318` (`DEFAULT_PORT + 1`) | `harness/.../Harness.kt:675` |
 | Relay handshake timeout | `10_000 ms` | `harness/.../RelayServer.kt:40` |
-| Relay park timeout | `0` = wait forever | `RelaySubscriber.kt:70`, `RelayServer.kt:33` |
+| Relay park timeout | `300 s` default; `0` waits forever | `protocol/.../relay/RelayEndpoints.kt:81`, `protocol/.../relay/RelayServer.kt:41` |
 | Relay retry backoff | `2 s → 4 s … → 60 s` | `FlitEngine.kt:1720-1733` |
 
 ### 1.5 Panic numbers (`PanicCore.kt`)
@@ -180,7 +180,7 @@ registers back.
 | Route | Method | Shape / result |
 | --- | --- | --- |
 | `/info` | GET | `200` + `selfInfo().sansAnnounce()` JSON (`ServerCore.kt:283-285`). |
-| `/register` | GET, POST | Optional body decoded as `PeerInfo`; a non-blank fingerprint calls `delegate.onRegister(info, origin)`; `200` + self info either way (`ServerCore.kt:287-297`). A GET never decodes a body. |
+| `/register` | GET, POST | A GET never decodes a body. POST decodes `PeerInfo` and applies `validRegisterOffer` before the delegate: a non-canonical fingerprint, blank/oversized/control-char alias or off-link origin returns `403 Rejected`; an oversized body returns `413`. A valid offer calls `delegate.onRegister(info, origin)` and returns `200` + self info (`ServerCore.kt:320-352`, `:1321-1359`). |
 | `/prepare-upload` | POST | `400 Invalid body` on empty/invalid body or zero files; when `requirePrepareCert()` is on, `X-Flit-Prepare-Cert` must parse and its `X-Flit-Prepare-Sig` must verify over the exact body bytes and the derived digest must equal `info.fingerprint`, else `403` + refusal marker before the delegate; delegate decides; `403 Rejected` on decline; `204` when no accepted file survives path sanitising; `200` + `PrepareUploadResponse` with a fresh UUID session id and per-file UUID tokens (`ServerCore.kt:354-389`, `:463-493`). |
 | `/upload` | POST | Query `sessionId`, `fileId`, `token` all required or `400 Missing parameters`. Claim checks session id + sender origin + token + `settled`; bad claim `403 Invalid token or IP address`; resumed base no longer held `409 Resume base no longer held`. Digest mismatch `422`, success `200`, other error `500` (`ServerCore.kt:393-666`). |
 | `/cancel` | POST | Query `sessionId`; if it matches the live session for this origin, end it as cancelled; always `200` (`ServerCore.kt:1088-1100`). |
@@ -514,9 +514,9 @@ verifies `originSig` under that certificate (`PanicCore.kt:165-200`). A relay
 copies the pair unchanged while re-signing only `sig`, so forwarded alerts still
 pass; a relay that rewrites the hop count or claims a different origin fails. A
 legacy alert with a blank `originFp` falls back to the verified sender. The
-route calls `verifyOrigin` before delivery, writes no pin on refusal, pins only
-after the verdict and delegate, and records the id only after a successful
-delivery (`ServerCore.kt:1049-1124`).
+route calls `verifyOrigin` before delivery, writes no pin on refusal, and
+reserves the id atomically before delivery through `PanicCore.accept`; a
+delegate error returns `500` with the id already consumed (`ServerCore.kt:1049-1124`).
 
 ### 6.3 Create, verify, forward (`PanicCore.kt:85-190`)
 
@@ -546,9 +546,9 @@ negative hops with `400`, requires a decodable `X-Flit-Panic-Cert` (else `403`),
 requires its own fingerprint to equal `senderFp`, and checks both
 `PanicCore.verify` (current hop) and `PanicCore.verifyOrigin` (hop-zero origin)
 against the cert in hand before any pin write (else `403 Forged panic alert`).
-Then `PanicCore.evaluate()` decides; only `Accept` calls `delegate.onPanic` and
-pins the cert, and `PanicCore.accept()` records the id only after a successful
-delivery (`ServerCore.kt:1049-1124`). **Every valid alert, including a duplicate
+Then `PanicCore.evaluate()` decides; `PanicCore.accept()` reserves the id
+before delivery, only `Accept` calls `delegate.onPanic`, and a delegate error
+returns `500` with the id consumed (`ServerCore.kt:1049-1124`). **Every valid alert, including a duplicate
 or a stale one, gets a quiet `200`** so a sender never retries a delivered alert
 forever.
 
@@ -858,7 +858,7 @@ A v3 tap-to-join link (`flit://add?v=3&…&circle=…&invite=…`) is handled by
 | panic | `400` / `403` / `200` | Bad wire / bad identity or forgery / accepted (also duplicates and stale). |
 | circle | `400` / `403` / `500` / `200` | Bad shape or size / cert mismatch / delegate error / signed decision (including refusal). |
 | circle join proof | host-signed `200` | Proof refused at the route before the delegate: `join proof required`, `invalid join proof`, or `join proof replay` (§7.8). |
-| relay | `OK` / `ERR <reason>` | Paired / refused (`bad-hello`, `bad-token`, `timeout`, `partner-gone`); then blind copy. |
+| relay | `OK` / `ERR <reason>` | Paired / refused (`bad-hello`, `bad-token`, `timeout`, `partner-gone`, `cap`, `throttled`); then blind copy. `missing-token` and `weak-token` exist at bind time but a non-loopback bind refuses before listening. |
 
 Full retry/keep/drop conclusions are in [Failure modes](FAILURE-MODES.md);
 trust and replay reasoning in [Security](SECURITY.md).
@@ -875,8 +875,9 @@ trust and replay reasoning in [Security](SECURITY.md).
 
 The last full green JUnit XML records 443 protocol + 167 core + 254 app + 108
 harness = 972 tests with zero failures, zero errors and zero skipped
-(`docs/TESTING.md` §1). That result covers the four test tasks only; the release
-release assembly is green after the R8 keep-rule change. The 769 figure (359 + 323 + 87), the 714 figure
+(`docs/TESTING.md` §1). That result covers the four test tasks only; the full rig rerun, including `:app:assembleDebug`, `:app:assembleRelease`,
+`:harness:installDist` and `:harness:distZip`, is green after the R8 keep-rule
+change; assembly results are outside the JUnit XML. The 769 figure (359 + 323 + 87), the 714 figure
 (330 + 309 + 75) and the four-module 778 projection are historical. These are
 test counts, not a device claim for the UI or CLI layers.
 
@@ -1066,9 +1067,9 @@ gains the sender's certificate only after `verify` succeeds.
 CODE establishes the constants, the two domain tags, the canonical field
 order, the closed body keys and the decision precedence. PURE JVM tests cover
 canonical bytes, `encode`/`decode` bounds, tamper rejection, `seal`/`open`,
-recipient wrapping, certificate binding and bag decisions. Carrier (`SIM-HARN`)
-and three-node (`DEVICE`) handoffs are dated 2026-11-30 and 2026-12-02; no such
-evidence is claimed for this layer. A courier "handoff" means a peer accepted an
+recipient wrapping, certificate binding and bag decisions. The carrier handoff has SIM-HARN evidence dated 2026-11-30. The
+three-node courier walk is a plan dated 2026-12-02
+(`docs/roadmap/courier-device-walk.md`) with no recorded DEVICE observation. A courier "handoff" means a peer accepted an
 offered parcel (a transport OK), never that the parcel was opened or that file
 bytes landed on the recipient. See
 [courier-envelope.md](roadmap/courier-envelope.md) and
@@ -1930,7 +1931,7 @@ sha256}`) stays plaintext and keeps its current behaviour; the CLI's
 | Seam | Contract |
 | --- | --- |
 | `Harness.circleFileAnnouncement` | Gains a keyed overload that mints the same body shape as `DropKeyCore.keyedFileBody` (§19.3). The legacy `{name, size, sha256}` builder stays and is used by `circle post --file`. |
-| `Harness.kt` `circle file` | Wraps to the current members in `CircleCliState` using `TlsIdentity.pinned(fp)`, seals a `*.flitdrop` copy of the spool, announces the keyed event through the keyed `circleFileAnnouncement`, and calls the existing `deliverCircleFile` with the sealed path. Above `MAX_WRAPS` or with no usable certificate, the command prints `!! no recipient key material — nothing posted` and exits without an event. There is no second announcement builder for the keyed form. |
+| `Harness.kt` `circle file` | Wraps to the current members in `CircleCliState` using `TlsIdentity.pinned(fp)`, seals a `*.flitdrop` copy of the spool, announces the keyed event through the keyed `circleFileAnnouncement`, and calls the existing `deliverCircleFile` with the sealed path. Above `MAX_WRAPS` or with no usable certificate, the command prints `!! <N> recipients exceeds key wrap cap — nothing posted` or `!! no recipient key material — nothing posted` respectively, and exits without an event. There is no second announcement builder for the keyed form. |
 | `CircleFileDelivery` | Gains `cipherSha` and `wrappedFor` with defaults; `circleDeliveryOutcome` is unchanged. Statuses stay local to the CLI and are never gossiped. |
 | `flit-cli parse-qr`, `Qr.kt` v1/v2/v3, parcel frame codecs | Untouched. Sealed drop bytes cross them as opaque payload; no QR key parameter or frame field is added (§8, §16, §17). |
 
@@ -2752,14 +2753,10 @@ stock LocalSend v2.2 peer sees the same bytes it saw before the move (§2, §4).
 
 ### 25.5 Evidence boundary
 
-No green claim is made here. The full rig covering all four modules had not
-produced a result available to this layer when this section was written, so the
-112 core and 212 app figures stay projections from the file inventory. A result
-may be published only after the JUnit XML for the completed run is read: confirm
-that the core and app case totals match 112 and 212, then record the failures,
-errors and skipped values from those XML files. No claim of zero failures, zero
-errors or zero skipped is made for any module, and earlier green totals are
-historical and are not carried forward by this wave.
+At the 2027-01-11 layer the 112 core and 212 app figures were source-inventory
+projections. The current four-module JUnit XML records 443 protocol + 167 core
++ 254 app + 108 harness = 972 tests with zero failures, zero errors and zero
+skipped (`docs/TESTING.md` §1).
 
 CODE covers the source-level facts: the JVM-only module in the build, the ten
 production classes and ten test classes under `core/src/main` and `core/src/test`,

@@ -73,10 +73,9 @@ than a JVM class-file stack trace (install-cli.sh:1-70).
 
 ## 2. `flit-cli` reference
 
-The command list below is the no-argument output of `flit-cli` itself,
-defined by `usage()` at `Harness.kt:193-217`. The README's shorter list is a
-user-facing summary; where the two differ, the help text and the arg parser
-decide.
+The command list below is a condensed summary of `flit-cli`; the help text
+printed by `usage()` (`Harness.kt:193-217`) and the arg parser decide. The
+README carries a separate user-facing summary.
 
 ```
 flit-cli — the LocalSend v2.2 command line (same stack as the Flit app)
@@ -271,8 +270,10 @@ a rotated key is adopted only from a host-signed REKEY event in the signed log,
 installed by generation. This adds no route, header, DTO field or v2.2 status.
 
 `file --file` is deliberately different from `post --file`: a plain post never
-moves bytes. The announcement body is the closed `{name,size,sha256}` shape with
-no spool path and no queue token (Harness.kt:906-911). Delivery statuses are
+moves bytes. The `post --file` announcement is the closed `{name,size,sha256}`
+shape; `circle file` announces the signed keyed body
+`{name,size,sha256,keyGen,cipherSha,iv,wraps}`, with no spool path, no queue
+token and no plaintext key on the wire (`Harness.kt:1389-1394`, `:1403-1413`). Delivery statuses are
 `pending → sent|refused|failed`, are local-only and never gossiped; a thrown
 carrier leaves the recipient `pending` for retry (Harness.kt:913-1009). Full
 semantics and evidence live in [Circle](circle.md#file-delivery-as-built).
@@ -1051,13 +1052,14 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
   `SPDX-License-Identifier: GPL-3.0-or-later`. The earlier permissive MIT
   license was replaced deliberately; derivatives that are distributed must
   remain under the same license.
-- **Release verification:** the published bundle carries the signed APK, the
-  CLI zip and `SHA256SUMS.txt`. Check with `sha256sum -c SHA256SUMS.txt` and
-  re-check the APK signer before sideloading.
+- **Release verification (plan):** a bundle with the signed APK, the CLI zip
+  and `SHA256SUMS.txt` is planned, not assembled here. No release zip or
+  checksum file exists in the tree. The local APK verifies against the release
+  key; CI release builds fall back to debug signing.
 - **Provenance:** development was private; the repository is published with its
   full commit history (scaffolding, milestones, regressions and fixes), not as
-  a reconstructed snapshot. The historical release point is `v0.3.0` (tagged at
-  push); the current in-tree version is `0.3.1`, and `v0.3.2` is planned for the
+  a reconstructed snapshot. The latest released tag is `v0.3.1`; `v0.3.0` is an earlier
+  release point. The current in-tree version is `0.3.1`, and `v0.3.2` is planned for the
   security closeout wave. Build files still declare `0.3.1`; no `v0.3.2` release
   has been assembled here.
 - **Store metadata:** `fastlane/metadata/android/en-US/` holds title,
@@ -1133,8 +1135,9 @@ claimed here.
 - **An over-cap roster is refused, never trimmed.** `MAX_WRAPS` is 32. A member
   list above the cap is refused at post time with no event — the app logs
   `circle drop: N recipients exceeds key wrap cap` and the CLI prints
-  `!! no recipient key material — nothing posted`, the same refusal line it uses
-  when no member has a usable certificate — and the source spool is kept. Wraps
+  `!! <N> recipients exceeds key wrap cap — nothing posted`; the separate
+  `!! no recipient key material — nothing posted` line is used only when no
+  member has a usable certificate — and the source spool is kept. Wraps
   are not silently dropped to fit.
 
 - **A published drop cannot be revoked on another device.** Leaving the circle,

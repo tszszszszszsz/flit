@@ -23,8 +23,9 @@ The current green test inventory is 972 tests — 443 protocol, 167 core, 254
 app, 108 harness — from the four test tasks with zero failures, errors and
 skipped cases. That figure is PURE and SIM-HARN evidence for the seams and
 in-process paths; it is not a device observation. The 778 figure from the
-three-module layout is historical, and the release assembly result is recorded
-separately in `docs/TESTING.md`. `docs/TESTING.md` §8 records a stale-output incident in which
+three-module layout is historical, and the full rig rerun, including all four assemblies, is green after the R8
+keep-rule change; assembly results are recorded separately in `docs/TESTING.md`
+and are outside the JUnit XML. `docs/TESTING.md` §8 records a stale-output incident in which
 UP-TO-DATE tasks reported green against an older class layout, which is why the
 counts are read from the XML and cross-checked against source-level test
 annotations. Historical totals (302, 588, 714, 769, 773 and others) are
@@ -42,8 +43,8 @@ hash-exact. Interop with `localsend-cli` v1.18.2 is recorded both directions in
 the app's announce transmit was wired.
 
 **Resume, death and partial-state handling.** `ChunkTrackerTest` (6),
-`PartialSidecarTest` (1), `ResumeAndTurboTest` (5), `ProtocolRefusalTest` (4)
-and `RelayCoreTest` (11) pin the central contract: a carrier death throws
+`PartialSidecarTest` (1), `ResumeAndTurboTest` (5), `ProtocolRefusalTest` (22)
+and `RelayCoreTest` (20) pin the central contract: a carrier death throws
 instead of reporting success, a returned report means the peer spoke, and kept
 bytes stay owed. The sidecar exists before the first body byte. Device evidence
 in `docs/TESTING.md` §6 backs the Wi-Fi case (a 300 MiB shot cut 0.8 s after
@@ -56,18 +57,18 @@ part). A late kill near completion took a clean full resend.
 `PinCacheTest` (6) pin fingerprint derivation as uppercase hex SHA-256 of the
 certificate, a bounded LRU pin store, and cert-in-hand verification that never
 touches the shared pin store. `CircleCoreTest` (12), `CircleHardeningTest` (14),
-`PanicTest` (6) and `FlitCircleHostTest` (22) cover forged authors, bounded seen
+`PanicTest` (12) and `FlitCircleHostTest` (23) cover forged authors, bounded seen
 sets, replay windows and host governance. The 2026-11-27 partial walk carried a
 pinned host fingerprint on the phone's join; the three-node baseline on
 2026-11-26 recorded a promoted admin, a kick with rekey, and C refused as a
 non-member with `!! sync refused: host refused: not-a-member`.
 
 **Signed JOIN proof and shared authority law.** §4.8 of `docs/TESTING.md`
-groups 15 classes. `JoinProofTest` (14) checks an independent golden vector for
+groups 15 classes. `JoinProofTest` (15) checks an independent golden vector for
 the length-prefixed `FLITJOIN1` nonce, per-field binding, the closed `{proof}`
 body, the three refusal reasons (`join proof required`, `invalid join proof`,
 `join proof replay`), and that a forged author neither verifies nor pins the
-victim. `CircleAuthorityTest` (12) checks the full `foldable` truth table: JOIN
+victim. `CircleAuthorityTest` (16) checks the full `foldable` truth table: JOIN
 never folds, REKEY folds only for a current owner or admin, ordinary verbs fold
 only in their own circle, and hostile input stays total. `CircleHardeningTest`
 (14) pins the proofless, valid and forged JOIN route branches;
@@ -75,7 +76,7 @@ only in their own circle, and hostile input stays total. `CircleHardeningTest`
 pre-proof JOIN is refused at admission.
 
 **Per-drop keys, receipts and pad law.** `DropKeyCoreTest` (18),
-`DropKeyBodyTest` (14) and `DropKeyCryptoTest` (12) pin key minting, the closed
+`DropKeyBodyTest` (24) and `DropKeyCryptoTest` (12) pin key minting, the closed
 keyed body, wrap binding to the certificate's fingerprint, and `IV ‖ ciphertext
 ‖ tag` open with AAD. `ReceiptBodyTest` (12), `ReceiptTallyTest` (6) and
 `ReceiptCanonicalTest` (6) pin the `{dropId,sha256,keyId}` body and
@@ -133,7 +134,9 @@ the partial walk.
 
 **Trust gates.** Both gates are wired in `FlitEngine.onPrepare` at CODE
 level. `qrOnly` also has PURE coverage for its persisted default and toggle in
-`FlitKnownTest`; `onlyTrusted` has no PURE gate test. No device walk has
+`FlitKnownTest`; `onlyTrusted` has PURE gate tests in `TrustGateTest`
+and `FlitEngineTest` but no PURE test of a persisted default or toggle helper,
+because it is read directly from SharedPreferences. No device walk has
 toggled either gate and captured the paired trusted/untrusted prepare answers;
 Flow 8 of the deferred plan is unperformed.
 
@@ -194,8 +197,9 @@ the same proof is replay while the invite remains a bearer credential usable
 under its holder's own key while valid. `docs/completions/2026-12-22-join-proof.md`
 states that a captured proof is single-use only in-process: the id is reserved
 once in a process-local bounded seen set at `MAX_SEEN = 4096`, a restart or
-another process has no memory of the reservation, and eviction can forget an
-older id. There is no shared or durable replay store.
+another process has no memory of the reservation. A saturated set returns
+`Decision.Full` for a newcomer and only expired reservations are purged
+(`CircleCore.kt:87-147`). There is no shared or durable replay store.
 
 **Trust gates default off, and a bound prepare is the opt-in path.** When
 `onlyTrusted` and `qrOnly` are off, the shipped prepare flow keeps the v2.2
@@ -262,6 +266,6 @@ The plan explicitly assumes no second physical phone, so phone-to-phone
 RFCOMM, a live multi-phone mesh and Wi-Fi Aware remain outside it and need a rig
 with that hardware and the Aware feature. MIUI autostart behavior needs a soak
 test with the last surface closed, not another app-screen capture. Closing the
-JOIN replay and declared-fingerprint gate items needs code changes plus the
-tests named in `docs/roadmap/trust-gate-cert-binding.md`, not further walking
-of the current build.
+durable replay item needs a durable store plus the tests named in
+`docs/roadmap/security-hardening.md`. The declared-fingerprint binding has
+landed; its remaining gap is the unperformed device walk.

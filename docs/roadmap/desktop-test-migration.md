@@ -2,11 +2,11 @@
 
 ## Status
 
-No test has been moved and no test has been run for this wave. No module, source
-set, task or desktop binary has been added. The repository still has three test
-locations for JVM code: `protocol/` (362 cases), `app/src/test` (324 cases) and
-`harness/` (92 cases). Those numbers are the shipped baseline and stay labelled
-historical. `:core` and `ui-common` are planned modules.
+This section records the state when the plan was written. The repository now
+has four JVM test locations: `protocol/` (443 cases), `core/` (167),
+`app/src/test` (254) and `harness/` (108), totalling 972 in the current green
+XML. The 362/324/92 figures were the three-module baseline at that layer and
+are historical. `:core` exists; `ui-common` and `:desktop` are planned.
 
 This document records where the app's JVM tests would go when the extraction in
 `desktop-app.md` lands, which cases remain in `app`, which cases need a new

@@ -14,7 +14,9 @@ Rules applied here:
 - **Current inventory** (last full green test XML, 2026-11-28, read from the
   four modules' `build/test-results/.../TEST-*.xml` files): **443 protocol +
   167 core + 254 app + 108 harness = 972 tests, 0 failures, 0 errors,
-  0 skipped**. This green result covers the four test tasks only. A background
+  0 skipped**. The zero-skipped value is an observation with
+`FLIT_HARNESS_HOME` unset; one harness gate also depends on POSIX file
+attribute availability. This green result covers the four test tasks only. A background
   full rig rerun (tests plus assemblies) is green after the R8 keep-rule change
   (§2, §3). Every smaller total —
   778, 773, 769 and the per-layer figures — is historical, and the four-module
@@ -184,18 +186,18 @@ table above is the later green XML inventory (972), and that projection is
 historical.
 
 Each of the four modules declares `testImplementation(kotlin("test"))` plus the
-JUnit Platform launcher (`protocol/build.gradle.kts:23-24`,
-`harness/build.gradle.kts:16-17`, `app/build.gradle.kts:108`,
+JUnit Platform launcher (`protocol/build.gradle.kts:22-23`,
+`harness/build.gradle.kts:19-20`, `app/build.gradle.kts:121`,
 `core/build.gradle.kts:14-15`) and configures `useJUnitPlatform()`
-(`protocol/build.gradle.kts:27-29`, `harness/build.gradle.kts:20-22`,
-`core/build.gradle.kts:18-20`). The app has no separate release-unit-test
+(`protocol/build.gradle.kts:27`, `harness/build.gradle.kts:24`,
+`core/build.gradle.kts:19`). The app has no separate release-unit-test
 task in the rig; debug and release are only *assembled*.
 
 Toolchain: JDK 21 lives at `~/.local/jdks/temurin-21` and `env.sh` puts it first
 on PATH; Gradle 8.14.3 is pinned outside the repo. CI uses
 `actions/setup-java` with Temurin 21 instead of `env.sh` (`.github/workflows/rig.yml:24-28`).
 The reference peer for interop is the official `localsend-cli` v1.18.2 at
-`~/.local/opt/localsend-cli` (README:133-134, `interop/README.md`).
+`~/.local/opt/localsend-cli` (`README.md:193-194`, `interop/README.md`).
 
 Dependency floor and R8. `gradle/libs.versions.toml:6-10` pins BouncyCastle
 (`bcprov-jdk18on` and `bcpkix-jdk18on`) to 1.87 because 1.81.1 is affected,
@@ -301,8 +303,8 @@ inventory.
 ## 4. Test inventory by module and class
 
 Counts in §4.1, §4.2 and §4.3 are from the JUnit XML reports of an earlier
-fresh run under the three-module layout; they agree with a source-level
-`@Test` count and are historical. The current inventory is the 2026-11-28
+fresh run under the three-module layout; they agreed with the source `@Test`
+counts at that layer and are historical. The current inventory is the 2026-11-28
 four-module XML (§1, §2) and the security-wave classes in §4.10. The ten
 classes moved into `:core` are listed in §4.9 with their historical projected
 counts from source. Layer notes that quote 588, 52 harness, 302, 769, 773 or
@@ -377,12 +379,12 @@ socket or persistence claim is made here.
 | `ParcelCodecTest` (new) | 21 | Frame grammar of one opaque UTF-8 `String` per QR frame with `FRAME_MAGIC = "FLITPARCEL1"`, CRC32 per frame and caps `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`; `parse` yields a `FrameDescriptor(parcelId, seq, count, totalBytes, crc)` on framed input and `null` on malformed input; `encodeParcel` uses `CourierEnvelope.seal`, `complete` verifies frames/CRC/sequence/count/digest/recipient and opens through `CourierEnvelope.open`, returning the exact `ParcelPayload(parcelId, recipientFp, signerFp, sha256, bytes)`; round-trips over single-frame and multi-frame payloads with scrambled frame order. |
 | `ParcelCodecTamperTest` (new) | 10 | Refusals at the frame seam: a changed byte under the per-frame CRC, bad magic or scheme, out-of-range `seq`/`count`/chunk and byte caps, a missing frame, a whole-parcel digest mismatch, a forged envelope signature and a wrong recipient fingerprint all return `null` from `parse`/`complete` with no bytes released; a pairing-code string is never accepted as a parcel. |
 
-#### Per-drop key additions — 44 cases in the final XML
+#### Per-drop key additions — 54 cases in the final XML
 
 The three classes below are the 2026-12-09 per-drop content key protocol layer.
 They are JVM-pure, live in `protocol/src/test/kotlin/app/flit/share/protocol/`
 and drive the real `DropKeyCore`, `CircleCore` and `TlsIdentity` seams. Their
-final XML case counts are 18 + 14 + 12; the three added `wrapVerified` cases in
+final XML case counts are 18 + 24 + 12; the three added `wrapVerified` cases in
 `DropKeyCoreTest` are named in §4.8. At the 2026-12-09 layer the counts stood at
 15 + 14 + 12 = 41. No app, CLI, harness, camera or device claim is attached to
 these cases.
@@ -599,7 +601,7 @@ DTO field, store field or v2.2 status is attached to these rows.
 | `PadUiTest` (new, app) | 15 | Android-free JVM tests of the `PadUi` seam: `rows(view)` yields lexicographically ordered `PadRow(key, text)` pairs from a `PadView`, with tombstoned keys omitted; `keyError` and `textError` reject blanks and enforce the `PadCore` bounds `MAX_KEY_CHARS = 128` and `MAX_TEXT_CHARS = 4096`. No Android import, no Robolectric, no device claim. |
 | `PadCliTest` (new, harness) | 8 | In-process CLI parity in `app.flit.share.harness` for `circle pad put --key K --text T`, `circle pad del --key K` and `circle pad show`: put and del bodies come from `PadCore.padPutBody`/`padDelBody`, `show` prints the `PadView` lines, and bad arguments or blank/over-cap fields are refused with no event posted. No new route, header, DTO field or v2.2 shape; no socket or device claim. |
 
-### 4.7 Idea and wiring classes — final XML counts
+### 4.7 Idea and wiring classes — 2026-12-21 integration layer (historical)
 
 The 2026-12-21 Integration layer wired the three WIRE prototype cores listed
 in `docs/ideas/PROGRAM.md` into existing surfaces. Their classes and the app
@@ -611,7 +613,7 @@ wiring cases are counted from the JUnit XML:
 | `PeerAliasTest` | 12 | `protocol/` |
 | `NoiseBudgetTest` | 18 | `protocol/` |
 | `PadUiTest` (search cases) | 7 | `app/` (included in the 15 above) |
-| `FlitBleTest` (budget cases) | 6 | `app/` (included in the 36 above) |
+| `FlitBleTest` (budget cases) | 6 | `core/` (included in the 36 recorded in §4.2 and §4.9) |
 
 The four pad protocol classes in §4.1 keep their recorded counts:
 `PadBodyTest` 16, `PadViewTest` 9, `PadMergeTest` 11 and `PadCanonicalTest` 7.
@@ -718,6 +720,7 @@ fields, recorded in `docs/CONTRACTS.md` §26.
 | `AnnounceAdmissionTest` (new) | 27 | `core/` | Admission arithmetic with injected clock, registry and source IP: canonical 64-hex fingerprint and port 1..65535 bounds; null, blank, malformed, manual-stub, self and out-of-range announces refused; alias capped at 64; loopback, unspecified, multicast, reserved and CGNAT sources refused while private, link-local and on-link IPv6 ranges pass; repeat window, future timestamps and registry-cap rules; hostile fields and a throwing caller map fail closed, and the gate keeps no state of its own. |
 | `FlitCrushTest` (new) | 5 | `core/` | File-intake side of the crush pass on a temp root: the 512 MiB unpack ceiling; a gzip bomb is refused and its partial output removed while a valid wire still unpacks; crush→unpack round-trips into a single plain name; traversal, separators and absolute paths are refused; a symlink output is refused rather than written through. |
 | `PeerIdentityPinTest` (new) | 12 | `protocol/` | Certificate and signature binding on the prepare wire: `cert`/`sig` headers bind the sender certificate to a signature over the exact body; every prepare carries them; `SendTarget.pin` reaches the link provider (null by default) and a pin on plain HTTP throws before a socket opens; a piped TLS pin accepts a match, a mismatch aborts before any HTTP byte is written, and a rogue server certificate is rejected; verified pins survive a flood, noncanonical Base64 signatures are refused, markers stay bounded, and expired or signature-forbidding certificates cannot verify. |
+| `DropKeyBodyTest` | 24 | `protocol/` | Body gates at the keyed-drop seam: exact announced fields, cipher digest and iv bounds, wrap list shape, and the ten `safeLandingName` cases that confine a keyed drop to one safe leaf name. Fourteen cases landed with the 2026-12-09 per-drop layer; ten were added by the security wave. |
 | `ProtocolRefusalTest` | 22 | `protocol/` | Refusal semantics at the prepare, register and control seams: a marked decline carries the refusal header and concludes as a report while transient statuses still throw `TransferException`; an aborted upload ends as cancelled, not saved; prepare without cert headers, a replayed certificate without a body signature, a declared fingerprint differing from the certificate digest, a signature by another key and malformed or oversized binding headers are refused before the delegate; a self-consistent attacker identity is still refused by the delegate trust gate; refused panic and circle requests and quiet panic refusals leave the pin tiers unchanged; oversized control bodies and an over-declared upload body are bounded; spoofed register offers are refused while a legitimate fingerprint reaches the delegate. |
 | `ReplayBoundaryTest` (new) | 5 | `protocol/` | Adversarial `CircleCore` replay boundaries with fixed clocks: a flood of live ids does not evict an in-window replay record; expired reservations are reclaimed only past the retain deadline; a future-skew event stays reserved for the whole window; a re-signed JOIN proof with a new id is still refused as replay; a captured JOIN proof stays replay-refused after a live-id flood. |
 | `UdpDiscoveryTest` (new) | 15 | `protocol/` | Announce-flood admission with an injected clock and scope, no socket: the default policy matches the flood limits; a normal announce reaches the callback and one register; repeat floods from one IP and unique-fingerprint floods are throttled before the callback and bounded by source and table caps; stale fingerprints are forgotten; malformed self, out-of-range port, invalid input and blank source are refused; register jobs are bounded, a busy register refuses without consuming fingerprint state, only canonical 64-hex fingerprints pass, a known fingerprint cannot be refreshed from a different source IP, and a cancelled register releases its permit. |

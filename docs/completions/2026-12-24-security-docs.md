@@ -70,7 +70,7 @@ client is that a pre-proof JOIN is refused with an exact reason.
 | Total | 769 | 0 failures, 0 errors, 0 skipped; all assemblies green |
 
 No tests are added by this documentation layer. The 2026-12-28 Release layer
-also adds none, so 769 is the final green rig figure for this tree. No timing
+also adds none, so 769 is the final green rig figure at this layer (historical); current inventory is in `docs/TESTING.md` §1. No timing
 or hardware measurement is attached to these counts.
 
 ## Test classes named by the inventory

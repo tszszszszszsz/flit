@@ -94,7 +94,7 @@ unverified answer or a sync response is never adopted.
 The app increase is 14 cases; the harness increase is 2. All assemblies are
 green at this inventory. No timing or hardware result is attached to these
 counts. The 2026-12-24 Docs and 2026-12-28 Release layers add no tests, so 769
-is the final green rig figure recorded here.
+is the final green rig figure at this layer (historical); the current inventory is in `docs/TESTING.md` §1.
 
 ## Tests
 

@@ -31,10 +31,9 @@ and its evidence level, and no case is dropped to make a per-module figure
 read cleanly. The rig task list and the counts are one change, not a follow-up
 to the source move.
 
-A new module count is a result only once green JUnit XML exists for the
-extended rig, with zero failures, zero errors and zero skipped cases. Until
-that XML exists, every `:core` figure is a projection and no green result is
-claimed for the relocated tests. The 778 figure (362 protocol + 324 app +
+A new module count is a result only with green JUnit XML. The extended-rig XML
+exists and records `:core` at 167 cases within 972 (443 + 167 + 254 + 108),
+zero failures, errors and skipped cases; the 112 figure is historical. The 778 figure (362 protocol + 324 app +
 92 harness) stays historical until a new green inventory replaces it; a move
 between modules does not by itself discard or reassign that baseline.
 

@@ -195,7 +195,7 @@ author can be verified without poisoning the pin store: a forged event whose
 canonical bytes cannot be signed twice by accident (`CircleCore.kt:152-163`).
 
 The panic route uses the same rule with the certificate in a header rather than
-in the body: `ServerCore.panicRoute` decodes `X-Panic-Cert`, pins it under its
+in the body: `ServerCore.panicRoute` decodes `X-Flit-Panic-Cert`, pins it under its
 own digest, requires that digest to equal `alert.senderFp`, and verifies the
 signature (`protocol/.../server/ServerCore.kt:902-945`). Circle routes require
 `X-Flit-Circle-Cert` and compare its digest to `memberFp`
@@ -1017,7 +1017,7 @@ TLS inside the pipe (`protocol/.../relay/RelayEndpoints.kt:25-109`).
 - **Per-device opt-in governs a device's traffic, not the relay's door.** A Known
   devices entry needs an address/token and `relayFor` on before Flit will route
   that device's sends, Circle dials or panic fan-out through a relay
-  (`FlitEngine.kt:477-491`, `:813-830`, `:796-832`; `README.md:163-165`). An
+  (`FlitEngine.kt:477-491`, `:813-830`, `:796-832`; `README.md:249-251`). An
   opted-out device is never sent that way. The relay's own access control is
   the separate optional shared token in Options/CLI — one token per relay, not
   a per-peer ACL (`docs/milestone-e.md:30-61`, `:90-93`).
@@ -1027,8 +1027,8 @@ TLS inside the pipe (`protocol/.../relay/RelayEndpoints.kt:25-109`).
   receiver's on-disk prefix. No relay-side storage exists; both peers must be
   live (`docs/milestone-e.md:67-81`, `docs/transport-bluetooth.md:108-119`).
 
-Pure-test evidence: `RelayCoreTest` (11 tests: match, wrong token, both-sides-live,
-isolation, clean close) and harness `RelayServerTest` (3 MB production send
+Pure-test evidence: `RelayCoreTest` (20 tests at the current layer; 11 at the
+earlier relay layer: match, wrong token, both-sides-live, isolation, clean close) and harness `RelayServerTest` (3 MB production send
 hash-exact, wrong token refused on the wire, unpaired subscription times out,
 dead relay dial throws). On-device evidence: the 2026-11-24 relay-kill walk
 recorded in `docs/transport-bluetooth.md:108-119` — a 200 MiB shot crossed the
@@ -1634,8 +1634,8 @@ canonical `(id, originFp, sentMs, text, hops = 0, originFp)` and requires
 `originSig` to verify under a certificate whose own SHA-256 DER equals
 `originFp`; a legacy blank origin falls back to the verified sender
 (`:165-200`). The route calls it before delivery, pins only after the verdict
-and delegate, and records the id only after a successful delivery
-(`ServerCore.kt:1049-1124`). Evidence: CODE and PURE `PanicTest`,
+and delegate; the id is reserved atomically before delivery and a delegate
+error consumes it (`ServerCore.kt:1049-1124`). Evidence: CODE and PURE `PanicTest`,
 `ProtocolRefusalTest`. Open: two-phone mesh hops are still not verified; the
 one-phone-plus-box banner exchange remains the only device observation.
 
@@ -1716,9 +1716,10 @@ of unknown advisories.
 
 ## Limitations
 
-1. **No content encryption at rest.** The group key is membership/rekey
-   material, not a cipher. A member in the roster can read everything; a
-   departed device keeps earlier plaintext events already stored.
+1. **No encryption for the event log or landed files at rest.** The group key
+   is membership/rekey material, not a cipher. File drops add a per-drop
+   AES-GCM key for the sealed copy, and a member without a wrap cannot open a
+   drop. A departed device keeps earlier plaintext events already stored.
 2. **Bearer invite and process-local JOIN proof replay.** A photographed
    pairing QR or Circle invite can be used by whoever holds it. Pairing pins
    only after a matching live answer for IP codes; relay/MAC-only codes pin
@@ -1737,8 +1738,9 @@ of unknown advisories.
    after eviction or restart. All production ingresses re-pin from a cert in the
    event or header.
 5. **Replay state is in-memory.** Six-hour windows (24 h for courier parcels)
-   and bounded FIFO sets survive neither restarts nor a flood past `MAX_SEEN`;
-   full-log repair covers sync, not indefinite replay memory.
+   and bounded FIFO sets are lost on restart. A saturated Circle set refuses
+   newcomers rather than evicting an in-window id; `PanicCore`'s FIFO still
+   evicts its oldest id.
 6. **Relay is blind, optional and single-point.** No discovery, no
    store-and-forward, no per-peer ACL; the token is one shared secret; both
    peers must be live. Opt-in controls Flit's use of it, not who else may use it.
@@ -1747,7 +1749,9 @@ of unknown advisories.
    are not verified.
 8. **Trust gates are off by default.** QR-only and Trusted-senders-only are
    opt-in; the open roster is the default. The CLI `serve` auto-accepts incoming
-   offers and has no trusted-senders gate (`README.md:152-154`).
+   offers only while both prepare gates are off; `--only-trusted` and
+   `--qr-only` are the CLI gates, both off by default (`README.md:214`,
+   `README.md:237-240`).
 9. **OS pairing is not Flit trust.** Accepting a Bluetooth system consent sheet
    does not pin a peer; a real two-phone RFCOMM transfer has no hardware on this
    rig, and Wi-Fi Aware is absent (`docs/bluetooth-carrier.md:266-278`,
@@ -1834,7 +1838,7 @@ of unknown advisories.
 | Keyed landing name / intake caps | `DropKeyCore.safeLandingName`, `FlitEngine.writeLandingFile`, `FlitCrush` | `FlitEngineTest`, `DropKeyBodyTest`, `FlitCrushTest` (5) | — | no device walk |
 | Replay / hop guards | `PanicCore.kt`, `CircleCore.kt` | `PanicTest`, `CircleHardeningTest` | panic via `LinkServer`; Circle full-log empty-delta pull | panic banner box↔phone; full-log repair line in log |
 | QR authority / invite | `Qr.kt`, `FlitEngine.kt`, `FlitCircleSync.kt` | `FlitQrTest` | invite text/HTML pushed to Downloads | QR v3 join, full leave discards key |
-| Relay blindness / opt-in | `RelayCore.kt`, `RelayEndpoints.kt`, `FlitEngine.kt` | `RelayCoreTest` (11) | `RelayServerTest` over production endpoints | 200 MiB cross + 300 MiB kill/resume |
+| Relay blindness / opt-in | `RelayCore.kt`, `RelayEndpoints.kt`, `FlitEngine.kt` | `RelayCoreTest` (20) | `RelayServerTest` over production endpoints | 200 MiB cross + 300 MiB kill/resume |
 | File no-path / local status | `CircleCore.validFileBody`, `FlitEngine` delivery loop | `CircleCoreTest`, `CircleHardeningTest`, `FlitSpoolTest` | `CircleHarnessTest` | 35 B drop landed hash-exact; Open-file walk |
 | Per-drop content keys | `DropKeyCore.kt`, `CircleCore.validFileBody`, `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` (counts at integration) | not added on this date | no device walk |
 | Keyed drops app + CLI receive gate | `FlitEngine.onUploadFinish`, `FlitCircleSync.postFile(body)` / `circleBodyValid`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish` | core body/crypto tests, `FlitCircleSyncTest`, `FlitEngineTest`, `DropParityTest` | CLI keyed-drop round-trip and refusals (`DropKeyCliTest`, `CircleHarnessTest`) | no device walk |

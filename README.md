@@ -3,16 +3,15 @@
 **Send any file to nearby v2.2 devices — over Wi‑Fi when there is one, Bluetooth when
 there isn't (opt-in). Resumable within a carrier, no accounts, no cloud.**
 
-A no-fluff, native-Kotlin file transfer app that speaks the
+A native-Kotlin implementation of the
 [LocalSend protocol v2.2](https://github.com/localsend/protocol) so it interoperates with every
 existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves on it with:
 
-> **Non-profit, by construction.** Flit has **no accounts, no cloud, no ads, no telemetry,
-> and no SDKs that phone home**. There is no server to sign up with, nothing to pay for,
-> and no data collected about you — devices talk directly to each other, on your network
-> or over Bluetooth. This is a hard constraint on every feature, not a setting.
+Flit has no accounts, cloud, ads, telemetry or SDKs that phone home. Devices
+talk directly to each other over Wi-Fi or Bluetooth; this constrains every
+feature rather than being a setting.
 
-| # | Capability | Status |
+| # | Transfer basics (see Current capabilities below for the full inventory) | Status |
 |---|---|---|
 | 1 | Chunked **resumable** transfers (their issue #2127, open 20+ months) | **shipped** (Flit↔Flit extension: interrupted uploads keep their prefix on disk and resume after a reconnect, verified hash-exact in both directions) |
 | 2 | **Rescue mode**: direct transport when no network path exists | **shipped — Bluetooth direct-discovery (row 9)**; joining a phone's own hotspot works by-address; the multicast-blocking-network case now **sweeps**: an empty roster on Wi-Fi knocks on the whole subnet for a running v2.2 server (throttled, bounded, hidden-mode-respecting) |
@@ -178,8 +177,7 @@ source env.sh                 # puts JDK 21 first on PATH
 cd harness/build/install/flit-cli/bin && ./flit-cli
 ```
 
-The full command list with every flag is in the [canonical `flit-cli` list](#desktop-companion-flit-cli)
-below — there is one list, not two. Of those, `bt-sim` runs a complete v2.2 exchange
+The command list below is the complete set; `docs/OPERATIONS.md` documents every flag. Of those, `bt-sim` runs a complete v2.2 exchange
 (info → register → files) both ends in one process: the receiver is the production server,
 the sender is the production protocol client riding the simulated Bluetooth pipe
 (`--bytes MB` for synthetic bodies, `--no-tls` for the plain carrier). The rig standard
@@ -205,8 +203,7 @@ rig, shipped under a name that doesn't wear test-bench vocabulary.
 ./install-cli.sh --zip flit-cli-0.3.1.zip   # or install a CI artifact directly
 ```
 
-Common `flit-cli` commands (run `flit-cli` with no arguments for the complete
-flag list; `docs/OPERATIONS.md` is the canonical reference):
+Complete `flit-cli` command list (`docs/OPERATIONS.md` is the flag reference):
 
 ```bash
 flit-cli serve --dir ~/Public [--relay host:port --token T]   # receive; announces on the LAN like the app
@@ -219,7 +216,9 @@ flit-cli bt-sim [file...] [--bytes MB] [--no-tls]           # both ends in one p
 flit-cli relay --port 53318 [--host IP] [--token T] [--park-timeout S]  # blind pairer; binds loopback by default
 flit-cli panic <ip[:port]> [--text NOTE]                    # signed informational alert
 flit-cli parse-qr <image...>                                # decode pairing codes from screenshots
-flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>   # accountless group coordination
+flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad>  # accountless groups
+flit-cli courier <drop|carry|receive|status|sweep>                # signed-event carry between devices
+flit-cli parcel <encode|decode>                                  # QR air-gap frames
 ```
 
 The prepare-gate flags bind the declared fingerprint to a signed certificate digest and to the

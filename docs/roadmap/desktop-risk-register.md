@@ -31,7 +31,7 @@ target.
 - **Verification:** A dependency-inspection step on the planned desktop target
   reports one coherent Kotlin/CMP/Compose set and no duplicate versions. A
   trivial shared composable from `ui-common` compiles for both the Android app
-  and the desktop target. The historical 778-test baseline stays green after
+  and the desktop target. The historical 778-test baseline was superseded by the current 972-case XML after
   the pin. No desktop build exists to run this check yet.
 
 ## 2. Identity continuity

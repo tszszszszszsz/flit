@@ -93,7 +93,7 @@ The phone holds circle id, key, roster, bounded event log and rekey generation i
 
 ## Tests
 
-PURE — no new test is added on this date. Re-run the shipped suites with `--rerun-tasks`: 82 protocol + 210 app + 10 harness = 302 tests, 0 failures, at `72225f8` (historical). The current rig is 714 = 330 protocol + 309 app + 75 harness after a green `--rerun-tasks` run; the 396 inventory is historical. The relevant classes are `CircleCoreTest`, `CircleHardeningTest`, `FlitCircleHostTest`, `FlitCircleSyncTest`, `FlitQrTest`, `DtoParityTest` and `LinkServerParityTest`; constants and refusal reasons are asserted exactly, with `createdMs` injected for window edges. The rig command is the CI command in `docs/TESTING.md` §3.
+PURE — no new test is added on this date. Re-run the shipped suites with `--rerun-tasks`: 82 protocol + 210 app + 10 harness = 302 tests, 0 failures, at `72225f8` (historical). The rig at that layer was 714 = 330 protocol + 309 app + 75 harness (historical; current inventory is 972) after a green `--rerun-tasks` run; the 396 inventory is historical. The relevant classes are `CircleCoreTest`, `CircleHardeningTest`, `FlitCircleHostTest`, `FlitCircleSyncTest`, `FlitQrTest`, `DtoParityTest` and `LinkServerParityTest`; constants and refusal reasons are asserted exactly, with `createdMs` injected for window edges. The rig command is the CI command in `docs/TESTING.md` §3.
 
 SIM-HARN — re-run `CircleHarnessTest` (five two-node cases over production routes) and `bt-sim` as the transport-agnostic regression gate. No three-node harness case is added on this date; the two box identities are CLI processes in the device walk, not a new harness module.
 

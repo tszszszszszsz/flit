@@ -8,3 +8,6 @@ joins the waiting batch instead of failing; a flush broken by the peer
 walking out keeps its row; completed batches release their storage
 grants), and a start-time sweep reclaims disk from staged copies a
 previous process left behind.
+
+Correction (2026-11-25): Bluetooth is opt-in under Transfer over Bluetooth in
+Options and is off by default.

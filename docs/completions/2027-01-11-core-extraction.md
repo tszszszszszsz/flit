@@ -41,19 +41,14 @@ The historical inventory is 362 protocol + 324 app + 92 harness = 778 cases.
 After the relocation the projected split is 362 protocol + 112 core + 212 app
 + 92 harness = 778. The total is unchanged because this is a move between
 modules rather than an addition or removal of cases; only the module column
-changes. The inventory in `docs/TESTING.md` still shows the pre-move
-three-module split and is not updated by this note. All post-move figures
-above are projections from the file inventory, not measured results.
+changes. `docs/TESTING.md` §1/§2 now records the four-module green XML 443 + 167 +
+254 + 108 = 972; the pre-move 778 split is historical. The figures above were
+projections from the file inventory at this layer.
 
-This note does not record a green rig result. The full rig covering the four
-modules has not produced a result that this layer can publish, so the core
-count of 112 and the app count of 212 remain projections. The published
-figures must be filled from the JUnit XML: read the core XML and the app XML
-from the completed run, confirm that their case totals match 112 and 212, and
-record the failures, errors and skipped values there. No claim of zero
-failures, zero errors or zero skipped is made here for any module, and earlier
-green totals are historical and are not carried forward as a result of this
-wave.
+The 112 core and 212 app figures remain source-level projections for this
+extraction layer. The full rig result is recorded in `docs/TESTING.md` §1/§2 and
+`docs/completions/2027-01-14-release-032.md`: the four-module XML records
+443 + 167 + 254 + 108 = 972 cases with zero failures, errors and skipped cases.
 
 Evidence labels follow the weakest-level rule in `docs/TESTING.md` §1.
 

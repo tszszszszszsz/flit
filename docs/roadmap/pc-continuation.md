@@ -9,19 +9,19 @@ No Gradle task, git operation or commit was run for it. The statements below are
 a continuation plan and a record of what is already present on disk, not a
 claim that a desktop build, test or walk has happened.
 
-The security wave leaves six findings open: the `onlyTrusted` and `qrOnly` gates
-read the caller-declared fingerprint in `PeerInfo` and TLS is trust-all with no
-client certificate on TCP; senders trust all server certificates, so a rogue
-access point can impersonate a receiver; JOIN proof replay is bounded by a
-roughly five-minute bucket and process-local single-use with no durable
-single-use; replay state is process-local (`MAX_SEEN` 4096) and lost on restart;
-the pin cache is memory-only (512 LRU); and no adversarial traffic,
-resource-exhaustion campaign or dependency CVE scan has been recorded. These
-are findings from `docs/QUALITY-CONFIDENCE.md` and
-`docs/roadmap/trust-gate-cert-binding.md`. The two certificate-binding designs
-there are parked: neither is shipped, and a design review is not a security
-proof. Closing a gap means a tested change with evidence at the appropriate
-level, not a note that a design exists.
+Before the security wave, `docs/QUALITY-CONFIDENCE.md` named six findings: the
+receive gates read a caller-declared fingerprint; senders trusted all server
+certificates; JOIN proof single-use was process-local; replay state was
+process-local; the pin cache was memory-only; and no adversarial campaign or
+dependency scan was recorded. The 2027-01-12/13 wave landed the prepare
+certificate and signature binding (Option B in
+`docs/roadmap/trust-gate-cert-binding.md`), the sender-side TLS peer pin, the
+signed JOIN proof with digest-keyed single-use, replay retention and the pin
+tiers. Option A is superseded. What remains is the durable pin source, the
+durable replay store, the hostile-input corpus, the advisory scan and the
+unperformed device walk. A passing test is not a security proof. Closing a gap
+means a tested change with evidence at the appropriate level, not a note that a
+design exists.
 
 ## Gate 0 — version pins
 
@@ -66,12 +66,11 @@ The matching test directory holds ten test classes, including `FlitQrTest`,
 `ParcelScanStateTest` and `FlitSpeedEdgeTest`; local JUnit XML under
 `core/build/test-results/test/` accounts for 112 cases.
 
-The rig floor is 778, now split in projection as 362 protocol + 112 core +
-212 app + 92 harness. That split is a projection until a green JUnit XML for
-the extended four-module rig exists with zero failures, errors and skips; a
-local `:core` result by itself does not re-baseline the whole rig. The 778 total
-stays the floor, and moved tests keep their assertions and evidence level. A
-new module count is a result only when the extended rig is green. Re-baseline
+The old floor was 778, split as 362 protocol + 112 core + 212 app + 92
+harness. That split was a projection before the extended rig was green. The
+current four-module JUnit XML records 443 protocol + 167 core + 254 app + 108
+harness = 972 tests with zero failures, errors and skipped cases; 778 is
+historical, and moved tests kept their assertions and evidence level. Re-baseline
 rules are in `docs/roadmap/03-quality-gates.md` and
 `docs/roadmap/desktop-test-migration.md`.
 
@@ -204,8 +203,8 @@ a release date.
 - `docs/roadmap/desktop-state-convergence.md` — CLI persistence convergence.
 - `docs/roadmap/desktop-test-migration.md` — test disposition and counts.
 - `docs/roadmap/desktop-risk-register.md` — risks and verification.
-- `docs/roadmap/trust-gate-cert-binding.md` — parked certificate-binding
-  designs and their required tests.
+- `docs/roadmap/trust-gate-cert-binding.md` — design record; Option B landed as
+  the prepare certificate/signature binding (see landing records).
 - `docs/roadmap/03-quality-gates.md` — completeness, re-baseline and evidence
   rules.
 - `docs/QUALITY-CONFIDENCE.md` and `docs/FAILURE-MODES.md` — security findings

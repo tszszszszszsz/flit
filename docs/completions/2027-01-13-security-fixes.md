@@ -16,7 +16,9 @@ observation.
 Counts come from the JUnit XML of the last full four-module run, cross-checked
 with source `@Test` annotations. That run recorded 443 protocol + 167 core +
 254 app + 108 harness = 972 cases with zero failures, zero errors and zero
-skipped cases. The figures are historical for this layer because the release
+skipped cases. The zero-skipped value is an observation with
+`FLIT_HARNESS_HOME` unset; one harness gate also depends on POSIX file
+attribute availability. The figures are historical for this layer because the release
 assembly is green after the R8 keep-rule fix.
 
 ## Pin flooding
@@ -60,7 +62,7 @@ the verified sender for older alerts.
 The panic route in `ServerCore` checks the sender certificate binding, the
 current-hop signature and `verifyOrigin` before calling the delegate; a quiet
 refusal for duplicate, stale or hop-spent alerts touches neither pin tier, and
-the id is recorded only after delivery. `PanicTest` has 12 cases in the XML;
+the id is reserved atomically before delivery. `PanicTest` has 12 cases in the XML;
 the historical count was 6. The six added cases pin hop-zero origin signing
 and certificate carriage, rejection of an attacker-signed victim-origin alert,
 preservation of the origin pair across a forward, refusal of a hop reset with a

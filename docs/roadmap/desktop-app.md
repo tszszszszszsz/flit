@@ -3,7 +3,7 @@
 ## Status
 
 No desktop GUI exists in this repository. `flit-cli` in `harness/` is the only
-companion on a box, and the JVM modules are `protocol`, `harness` and `app`, with
+companion on a box, and the JVM modules are `protocol`, `harness`, `app` and `core`, with
 the Android application in `app/src/main`. The earlier GUI-desktop scope cut
 is already superseded in `docs/PRODUCT-DECISIONS.md` §5 and
 `docs/roadmap/00-plan.md`, which point to this document; `docs/ARCHITECTURE.md`
@@ -138,7 +138,8 @@ optional and separate from the Phase 1 paste path.
 
 ## Tests
 
-The 778-test baseline (362 protocol + 324 app + 92 harness) stays green; moving
+The historical 778 baseline was superseded by the four-module XML of 972
+(443 + 167 + 254 + 108); a moved case keeps its assertion. Moving
 a seam is not a reason to drop a case. New cases raise the total, so the
 baseline is a floor and not a target count.
 

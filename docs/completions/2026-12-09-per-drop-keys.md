@@ -166,7 +166,7 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
 
 `--rerun-tasks` is required: stale XML has previously reported green against an
 older class layout. The "before" figures are the prior green inventory in
-`TESTING.md` §2; the "after" figures come from a clean run.
+`TESTING.md` §2; the "after" figures were projections at this layer.
 
 ## Tests
 

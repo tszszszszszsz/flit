@@ -2,15 +2,15 @@
 # TODO before submission: SourceCode / IssueTracker / WebSite (GitHub repo URLs),
 # AuthorEmail, and an fdroidserver lint pass (`fdroid checkupdate` +
 # `fdroid build --verbose`). The signing-key guard below pins releases to the
-# current local dev key until a dedicated release keystore replaces it.
+# release key. CI builds without keystore.properties fall back to the debug key.
 Categories:
   - Connectivity
   - System
-License: MIT
+License: GPL-3.0-or-later
 AuthorName: Flit contributors
 AuthorEmail: flit@example.org  # TODO: real contact once the repo is public
-SourceCode: https://github.com/TODO/flit  # TODO
-IssueTracker: https://github.com/TODO/flit/issues  # TODO
+SourceCode: https://github.com/tszszszszszsz/flit
+IssueTracker: https://github.com/tszszszszszsz/flit/issues
 
 Name: Flit
 AutoName: Flit
@@ -27,11 +27,12 @@ FullDescription: >-
   When there is no Wi-Fi network between two devices at all — mobile data
   only, a dead access point — the roster keeps working: discovery and the
   exchange ride Bluetooth at exactly that moment, the same secure protocol,
-  the same list. There are no settings for any of it; the only prompts are
-  the system's own, each asked once per device.
+  the same list. Bluetooth is opt-in under **Transfer over Bluetooth** in
+  Options and is off by default; the only prompts are the system's own, each
+  asked once per device.
 
 # Anti-tamper: only this signing key may publish APKs.
-AllowedAPKSigningKeys: e5491353aeb15e3270f160ae6f04eef642d847221fcf25d1606dce0408c90379
+AllowedAPKSigningKeys: b6f08dea473266189b0e49f1c41eb32d3b022915258be0a35844b045e94687ed
 
-CurrentVersion: 0.2.0
-CurrentVersionCode: 2
+CurrentVersion: 0.3.1
+CurrentVersionCode: 4

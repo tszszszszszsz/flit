@@ -10,9 +10,9 @@ extended here.
 
 Counts are read from the JUnit XML under `protocol/build/test-results/test/`,
 `app/build/test-results/testDebugUnitTest/` and
-`harness/build/test-results/test/`. The last green run recorded 362 protocol +
+`harness/build/test-results/test/`. At this layer the green run recorded 362 protocol +
 324 app + 92 harness = 778 cases with zero failures, zero errors and zero
-skipped. Debug and release assemblies and the CLI distribution were green in
+skipped (historical). The current inventory is 972 (443 + 167 + 254 + 108). Debug and release assemblies and the CLI distribution were green in
 the same rig run. The 773 figure (362 + 324 + 87) is the historical inventory
 before this layer.
 
@@ -26,7 +26,7 @@ before this layer.
 | `harness/src/test/kotlin/app/flit/share/harness/CircleHarnessTest.kt` | Four added cases over production routes and CLI seams; 18 cases in the final XML |
 | `harness/src/test/kotlin/app/flit/share/harness/RelayServerTest.kt` | One added case over a fake relay peer that writes the OK line and a TLS-record prefix together; 6 cases in the final XML |
 | `harness/src/test/kotlin/app/flit/share/harness/ParcelCliHarnessTest.kt` | Hardened PNG read helper; unchanged at 3 cases |
-| `docs/TESTING.md` | Current inventory 778 with 773 kept as a historical snapshot, the five added case descriptions, the QR reader note and the evidence-label wording |
+| `docs/TESTING.md` | Inventory at this layer was 778 (historical) with 773 kept as a historical snapshot, the five added case descriptions, the QR reader note and the evidence-label wording |
 | `.github/workflows/rig.yml` | Workflow comment line 2 updated to 362 protocol + 324 app + 92 harness tests |
 | `docs/completions/2027-01-05-cli-parity.md` | This layer record |
 

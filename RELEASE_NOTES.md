@@ -125,9 +125,9 @@ layer records are under `docs/completions/`.
 
 ### Highlights
 
-* **Device-to-device over your own Wi-Fi.** No accounts, no cloud, no cables —
-  everything, including discovery metadata, rides mutual TLS with pinned
-  fingerprints.
+* **Device-to-device over your own Wi-Fi.** No accounts, no cloud, no cables.
+  Register and file exchange ride mutual TLS with pinned fingerprints; UDP
+  announce metadata is plain JSON on the LAN.
 * **Resumable transfers.** An interrupted upload keeps its prefix and continues
   from there when the device is back — hash-exact both ways.
 * **Direct-to-storage receive.** Incoming files stream into a pending
@@ -146,8 +146,9 @@ layer records are under `docs/completions/`.
 
 ## Install
 
-- `app-release.apk` — sideload, signed build
-- `app-release.aab` — Play upload bundle
+- `app-release.apk` — sideload, locally signed build. No AAB has been assembled;
+  a Play upload bundle is a future plan.
 
-Verification: v2/v3-signed with a pinned key (SHA-256 fingerprint in the
-F-Droid metadata draft).
+Verification: the local APK verifies against `keystore/flit-release.jks`
+(SHA-256 `b6f08dea473266189b0e49f1c41eb32d3b022915258be0a35844b045e94687ed`).
+CI builds without `keystore.properties` fall back to debug signing.

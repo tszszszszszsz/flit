@@ -3,7 +3,7 @@
 ## Status
 
 No UI module exists in this repository. The declared modules are `:protocol`,
-`:harness` and `:app`. Every UI file named below lives under
+:harness`, `:app` and `:core`. Every UI file named below lives under
 `app/src/main/kotlin/app/flit/share` and is compiled into the Android
 application. There is no `ui-common` module, no desktop source set, no desktop
 binary and no desktop test run. `flit-cli` in `harness/` is the only companion
@@ -12,7 +12,7 @@ program that runs on a box today.
 This document records the planned `ui-common` KMP module and the boundary it
 must keep. It is a plan: it adds no source set, no build task and no wire
 change. The v2.2 wire surface — routes, headers, DTO fields and Circle event
-verbs — stays as shipped. The JVM `:core` module is also still a plan; the pure
+verbs — stays as shipped. The JVM `:core` module exists as of 2027-01-11; the pure
 seams that the UI files import need a shared home before those files can move.
 
 The 778-test figure (362 protocol + 324 app + 92 harness) is a historical count
