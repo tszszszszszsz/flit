@@ -16,6 +16,7 @@ import app.flit.share.protocol.server.ProtocolServer
 import app.flit.share.protocol.server.ServerConfig
 import app.flit.share.protocol.tls.TlsIdentity
 import java.io.IOException
+import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
@@ -239,6 +240,53 @@ class RelayServerTest {
                 "timeout said: ${alone.exceptionOrNull()?.message}",
             )
         } finally {
+            relay.close()
+        }
+    }
+
+    /**
+     * The reply is exactly one line; every byte after "OK\n" belongs to the
+     * peer's TLS ClientHello and must stay on the raw stream handed onward.
+     * A buffering reader here would read ahead into those bytes and discard
+     * them when it is dropped, so the handshake would hang or reset.
+     */
+    @Test
+    fun `the OK reply leaves following bytes readable on the paired stream`() = runBlocking {
+        val relay = ServerSocket(0)
+        // A plausible TLS record prefix written in the same packet as "OK\n".
+        val extra = byteArrayOf(0x16, 0x03, 0x01, 0x00, 0x04, 0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte())
+        val fakeRelay = launch(Dispatchers.IO) {
+            val peer = relay.accept()
+            try {
+                val input = peer.getInputStream()
+                while (true) {
+                    val b = input.read()
+                    if (b < 0 || b == '\n'.code) break // consume the hello line only
+                }
+                val out = peer.getOutputStream()
+                out.write("OK\n".toByteArray(Charsets.US_ASCII) + extra)
+                out.flush()
+            } finally {
+                runCatching { peer.close() } // EOF makes a stuck reader fail fast, not hang
+            }
+        }
+        try {
+            val link = RelayLinkProvider(TlsIdentity.generate()).connect(
+                "127.0.0.1", relay.localPort, tls = false, timeoutMs = 2_000,
+                relayFor = "D".repeat(64),
+            )
+            link.use {
+                val got = ByteArray(extra.size + 1)
+                var n = 0
+                while (n < got.size) {
+                    val r = it.input.read(got, n, got.size - n)
+                    if (r < 0) break
+                    n += r
+                }
+                assertContentEquals(extra, got.copyOf(n))
+            }
+        } finally {
+            fakeRelay.cancel()
             relay.close()
         }
     }

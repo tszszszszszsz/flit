@@ -20,6 +20,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.putJsonArray
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.util.Random
@@ -955,5 +956,143 @@ class CircleHarnessTest {
         assertEquals(listOf(honest.id), folded.map { it.id })
         assertFalse(CircleCore.verify(forged))
         assertTrue(CircleCore.verify(honest))
+    }
+
+    @Test
+    fun `a CLI peer ignores a departed officer hand-off above the host rotation`() {
+        val circleId = "cli-departed-officer"
+        val hostId = TlsIdentity.generate()
+        val adminId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val host = hostId.fingerprint
+        val admin = adminId.fingerprint
+        val member = memberId.fingerprint
+
+        fun rekeyBody(key: String, gen: Int) = buildJsonObject {
+            put("keyB64", JsonPrimitive(key))
+            put("gen", JsonPrimitive(gen))
+        }.toString()
+
+        // The phone host keeps the officer's vetoed REKEY in its signed answer
+        // as inert history, while its forced rotation carries a LOWER gen.
+        // Folding the greatest generation blindly installs the attacker key.
+        val appoint = CircleCore.create(
+            circleId, host, hostId, CircleEvent.ROLE,
+            """{"targetFp":"$admin","role":"ADMIN"}""", lamport = 1L,
+        )
+        val leave = CircleCore.create(circleId, admin, adminId, CircleEvent.LEAVE, "{}", lamport = 2L)
+        val handoff = CircleCore.create(
+            circleId, admin, adminId, CircleEvent.REKEY, rekeyBody("attacker-key", 99), lamport = 3L,
+        )
+        val hostRekey = CircleCore.create(
+            circleId, host, hostId, CircleEvent.REKEY, rekeyBody("host-fresh-key", 2), lamport = 4L,
+        )
+        val answer = CircleResponse.sign(
+            CircleResponse(
+                ok = true,
+                key = "",
+                members = listOf(host, member),
+                events = listOf(appoint, leave, handoff, hostRekey),
+            ),
+            hostId,
+        )
+        assertTrue(circleAnswerSigned(answer, host))
+        val st = CircleCliState(
+            circleId = circleId,
+            key = "group-key-v1",
+            members = mutableListOf(host, admin, member),
+            // The appointment predates this answer, so the officer really is
+            // an ADMIN on the CLI's pre-batch snapshot before it leaves.
+            events = mutableListOf(appoint),
+            hostFp = host,
+        )
+        mergeCircleAnswer(st, answer)
+        assertEquals("host-fresh-key", st.key, "the departed officer's high-gen key won")
+        assertEquals(2, st.rekeyGen, "the vetoed generation must not advance the CLI")
+        assertTrue(st.events.any { it.id == handoff.id }, "the vetoed rekey stays inert history")
+    }
+
+    @Test
+    fun `circleFreshEvents drops a host-answer JOIN and member REKEY but folds an ordinary event`() {
+        val circleId = "fresh-authority"
+        val hostId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val host = hostId.fingerprint
+        val member = memberId.fingerprint
+        val st = CircleCliState(circleId = circleId, members = mutableListOf(host, member), hostFp = host)
+        val join = joinProof(host, circleId, "invite", memberId)
+        val memberRekey = CircleCore.create(
+            circleId, member, memberId, CircleEvent.REKEY,
+            """{"keyB64":"member-key","gen":1}""", lamport = 1L,
+        )
+        val message = CircleCore.create(
+            circleId, member, memberId, CircleEvent.MESSAGE,
+            """{"text":"hello"}""", lamport = 2L,
+        )
+        val answer = CircleResponse.sign(
+            CircleResponse(
+                ok = true, key = "", members = listOf(host, member),
+                events = listOf(join, memberRekey, message),
+            ),
+            hostId,
+        )
+        assertTrue(circleAnswerSigned(answer, host), "host-signed answer expected")
+        assertEquals(listOf(message.id), circleFreshEvents(st, answer.events).map { it.id })
+    }
+
+    @Test
+    fun `a stale pin from another circle does not vouch for a join to a new circle`() {
+        val st = CircleCliState(circleId = "circle-a", hostFp = "HOST-A", key = "old-key")
+        val different = ParsedArgs(arrayOf("circle", "join", "--circle", "circle-b", "--host-fp", "host-b"))
+        assertEquals("HOST-B", circleExpectedHostFp(different, st))
+        val sameCircle = ParsedArgs(arrayOf("circle", "join", "--circle", "circle-a", "--host-fp", "host-b"))
+        assertNull(circleExpectedHostFp(sameCircle, st), "a conflicting pin for the same circle is refused")
+        val noPin = ParsedArgs(arrayOf("circle", "join", "--circle", "circle-b"))
+        assertNull(circleExpectedHostFp(noPin, st), "a different circle needs a fresh pin")
+    }
+
+    @Test
+    fun `circle join clears a stale pin before it rewrites the circle id`() {
+        assumeTrue(
+            System.getenv("FLIT_HARNESS_HOME").isNullOrBlank(),
+            "the CLI home is pinned by FLIT_HARNESS_HOME and cannot be isolated",
+        )
+        val root = Files.createTempDirectory("circle-pin-join")
+        val previousHome = System.getProperty("user.home")
+        System.setProperty("user.home", root.toString())
+        val hostId = TlsIdentity.generate()
+        val circleId = "circle-b"
+        val invite = "invite-b"
+        val key = "host-b-key"
+        val delegate = ConsoleDelegate()
+        delegate.circleHost.seed(circleId, invite, key, hostId.fingerprint, hostId)
+        val server = ProtocolServer(
+            hostId, delegate,
+            ServerConfig(
+                alias = "pin-host", port = 0, tls = true,
+                destDir = Files.createTempDirectory("pin-host"),
+            ),
+        )
+        server.start()
+        try {
+            saveCircleState(CircleCliState(circleId = "circle-a", hostFp = "STALE-HOST-A", key = "old-key"))
+            main(
+                arrayOf(
+                    "circle", "join",
+                    "--host", "127.0.0.1:${server.port}",
+                    "--circle", circleId, "--invite", invite,
+                    "--host-fp", hostId.fingerprint,
+                ),
+            )
+            val lines = Files.readAllLines(harnessHome().resolve("circle.state"))
+            assertTrue(lines.size >= 8, "join did not persist a pinned state")
+            assertEquals(circleId, lines[0], "join must move to the requested circle")
+            assertEquals(key, lines[2], "the new host's key must be adopted")
+            assertEquals(hostId.fingerprint, lines[7], "the stale pin must not survive")
+        } finally {
+            server.close()
+            if (previousHome == null) System.clearProperty("user.home")
+            else System.setProperty("user.home", previousHome)
+        }
     }
 }

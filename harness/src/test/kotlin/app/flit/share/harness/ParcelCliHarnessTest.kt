@@ -4,6 +4,7 @@ import app.flit.share.protocol.parcel.ParcelCodec
 import app.flit.share.protocol.tls.TlsIdentity
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
 import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.RGBLuminanceSource
@@ -151,7 +152,7 @@ class ParcelCliHarnessTest {
      */
     private fun frameString(png: Path): String {
         val img = ImageIO.read(png.toFile()) ?: error("$png is not an image")
-        for (d in 1..4) {
+        for (d in 1..6) {
             val w = img.width / d
             val h = img.height / d
             if (w < 1 || h < 1) continue
@@ -163,12 +164,17 @@ class ParcelCliHarnessTest {
             small.getRGB(0, 0, w, h, px, 0, w)
             val text = runCatching {
                 MultiFormatReader()
-                    .decode(BinaryBitmap(HybridBinarizer(RGBLuminanceSource(w, h, px))))
-                    .text
+                    .decode(
+                        BinaryBitmap(HybridBinarizer(RGBLuminanceSource(w, h, px))),
+                        mapOf<DecodeHintType, Any>(
+                            DecodeHintType.TRY_HARDER to true,
+                            DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+                        ),
+                    ).text
             }.getOrNull()
             if (text != null) return text
         }
-        error("$png has no readable frame at scales 1..4")
+        error("$png has no readable frame at scales 1..6")
     }
 
     /** Rewrite a PNG so it carries a frame whose own CRC no longer matches. */

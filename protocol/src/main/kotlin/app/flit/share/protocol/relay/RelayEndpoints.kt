@@ -8,9 +8,8 @@ import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -109,9 +108,26 @@ object RelaySubscriber {
     }
 }
 
-/** One line, bounded by the relay's own hello limit; null at a clean close. */
+/**
+ * One line, bounded by the relay's own hello limit; null at a clean close.
+ *
+ * Read a byte at a time and stop at the newline — like LinkServer and the
+ * relay's own hello reader. A buffering reader would swallow the peer's
+ * first TLS bytes that follow "OK\n" along with the reply, so the raw stream
+ * handed to TlsLink would start mid-ClientHello and the handshake would
+ * hang or reset.
+ */
 private fun readReply(socket: Socket): String? {
-    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.US_ASCII))
-    val line = reader.readLine() ?: return null
-    return line.trim().takeIf { it.isNotBlank() && it.length <= RelayHello.MAX_LINE }
+    val input = socket.getInputStream()
+    val bytes = ByteArrayOutputStream()
+    while (bytes.size() <= RelayHello.MAX_LINE) {
+        val b = input.read()
+        if (b < 0) return null
+        if (b == '\n'.code) {
+            val line = bytes.toString(Charsets.US_ASCII).trimEnd('\r').trim()
+            return line.takeIf { it.isNotBlank() && it.length <= RelayHello.MAX_LINE }
+        }
+        bytes.write(b)
+    }
+    return null // over-long line: not a reply we accept
 }

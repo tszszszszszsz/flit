@@ -1025,15 +1025,51 @@ internal fun circleAnswerSigned(resp: CircleResponse?, expectedHostFp: String?):
 }
 
 /**
- * The single fold gate for events arriving in a host answer, mirroring the
- * app's `FlitCircleSync.fresh`: shape/circle, closed body gates, bounded
- * readable JSON, signature, local-id dedup, deterministic order and the
- * harness event cap. No replay id is reserved before the signature passes.
+ * One immutable fingerprint→role.name authority snapshot for a fold. The
+ * CLI's persisted roster holds fingerprints only: the pinned host is the
+ * OWNER, other members start as MEMBER, and an ADMIN is known only from a ROLE
+ * event already in the pre-answer log. No event in the batch being folded can
+ * promote its own signer.
  */
-internal fun circleFreshEvents(st: CircleCliState, events: Iterable<CircleEvent>): List<CircleEvent> {
+internal fun circleRoleMap(st: CircleCliState): Map<String, String> {
+    val host = normalized(st.hostFp)
+    val roles = LinkedHashMap<String, String>()
+    for (raw in st.members) {
+        val fp = normalized(raw) ?: continue
+        roles[fp] = if (fp == host) "OWNER" else "MEMBER"
+    }
+    if (host != null) roles.putIfAbsent(host, "OWNER")
+    for (e in st.events) {
+        if (e.type != CircleEvent.ROLE || normalized(e.authorFp) != host) continue
+        val obj = circleBody(e.body) ?: continue
+        val target = normalized(circleText(obj, "targetFp")) ?: continue
+        val desired = circleText(obj, "role")?.uppercase(Locale.ROOT) ?: continue
+        if (desired in setOf("ADMIN", "MEMBER") && target in roles && roles[target] != "OWNER") {
+            roles[target] = desired
+        }
+    }
+    return roles
+}
+
+/**
+ * The single fold gate for events arriving in a host answer, mirroring the
+ * app's `FlitCircleSync.fresh`: shape/circle, the shared authority gate on a
+ * pre-answer role snapshot (JOIN never folds, REKEY needs OWNER/ADMIN), closed
+ * body gates, bounded readable JSON, signature, local-id dedup, deterministic
+ * order and the harness event cap. No replay id is reserved before the
+ * signature passes.
+ */
+internal fun circleFreshEvents(
+    st: CircleCliState,
+    events: Iterable<CircleEvent>,
+    roles: Map<String, String> = circleRoleMap(st),
+): List<CircleEvent> {
     val localIds = st.events.mapTo(HashSet()) { it.id }
+    // Taken before any answer event is admitted: a ROLE or LEAVE in this batch
+    // must not grant or revoke authority mid-fold.
     val candidates = events.filter { e ->
         e.circleId == st.circleId &&
+            CircleAuthority.foldable(e, st.circleId, roles) &&
             (e.type != CircleEvent.FILE || CircleCore.validFileBody(e.body)) &&
             (e.type != CircleEvent.RECEIPT || CircleCore.validReceiptBody(e.body)) &&
             e.body.isNotBlank() && e.body.length <= CircleCore.MAX_BODY_CHARS &&
@@ -1048,17 +1084,35 @@ internal fun circleFreshEvents(st: CircleCliState, events: Iterable<CircleEvent>
 /** Newest key/gen carried by a REKEY event in a signed log, if one is present. */
 internal data class CircleKeyUpdate(val key: String, val gen: Int)
 
-internal fun circleLatestRekey(events: Iterable<CircleEvent>): CircleKeyUpdate? {
+/**
+ * The CLI's install gate for rotations in [events], mirroring the app store's
+ * `applyRekey`: one pre-batch authority snapshot, and an absolute same-batch
+ * veto for any signer who also leaves. The phone host keeps a vetoed hand-off
+ * in its signed answer as inert history, so the greatest generation in the
+ * log is NOT automatically the live key.
+ */
+internal fun circleLatestRekey(
+    st: CircleCliState,
+    events: Iterable<CircleEvent> = st.events,
+    roles: Map<String, String> = circleRoleMap(st),
+): CircleKeyUpdate? {
+    val leavers = events.asSequence()
+        .filter { it.type.equals(CircleEvent.LEAVE, ignoreCase = true) }
+        .mapTo(HashSet()) { normalized(it.authorFp) }
     var best: CircleKeyUpdate? = null
     for (e in CircleCore.order(events)) {
         if (e.type != CircleEvent.REKEY) continue
+        // A departing officer cannot install its own key on the way out, and
+        // only the pre-batch OWNER/ADMIN snapshot may install one at all.
+        if (normalized(e.authorFp) in leavers) continue
+        if (!CircleAuthority.foldable(e, st.circleId, roles)) continue
         val obj = circleBody(e.body) ?: continue
         val key = circleText(obj, "keyB64") ?: circleText(obj, "key") ?: continue
         if (key.length > MAX_CIRCLE_KEY_CHARS) continue
         val gen = (obj["gen"] as? JsonPrimitive)?.content?.toIntOrNull() ?: continue
         if (gen < 0) continue
         // CircleCore.order breaks ties deterministically, so >= keeps the
-        // greatest-by-(gen, order) update.
+        // greatest-by-(gen, order) update among the admissible rekeys.
         if (best == null || gen >= best.gen) best = CircleKeyUpdate(key, gen)
     }
     return best
@@ -1070,10 +1124,13 @@ internal fun circleLatestRekey(events: Iterable<CircleEvent>): CircleKeyUpdate? 
  * installed monotonically by generation.
  */
 internal fun mergeCircleAnswer(st: CircleCliState, resp: CircleResponse, fromJoin: Boolean = false) {
-    st.events = CircleCore.order(CircleCore.dedup(st.events + circleFreshEvents(st, resp.events))).toMutableList()
+    // One immutable authority snapshot for the whole answer: neither a ROLE
+    // nor a departure carried by this batch may change who can install a key.
+    val roles = circleRoleMap(st)
+    st.events = CircleCore.order(CircleCore.dedup(st.events + circleFreshEvents(st, resp.events, roles))).toMutableList()
     if (resp.members.isNotEmpty()) st.members = resp.members.toMutableList()
     if (fromJoin && resp.key.isNotBlank()) st.key = resp.key
-    val newest = circleLatestRekey(st.events)
+    val newest = circleLatestRekey(st, st.events, roles)
     if (newest != null && newest.gen >= st.rekeyGen) {
         st.key = newest.key
         st.rekeyGen = maxOf(st.rekeyGen, newest.gen)
@@ -1396,11 +1453,16 @@ private suspend fun circle(args: ParsedArgs) {
         "join" -> {
             val host = args.opt("--host") ?: st.host
             if (host.isBlank()) { println("!! join needs --host ip[:port]"); return }
-            st.circleId = args.opt("--circle") ?: st.circleId
-            st.invite = args.opt("--invite") ?: st.invite
-            if (st.circleId.isBlank()) { println("!! join needs --circle ID"); return }
+            // Resolve the pin BEFORE rewriting the circle id: a stored pin
+            // belongs to the circle it was learned for, so a join to a
+            // different circle must not inherit it. Mutating st.circleId first
+            // makes circleExpectedHostFp's circle-changed guard dead code.
+            val requestedCircle = args.opt("--circle") ?: st.circleId
+            if (requestedCircle.isBlank()) { println("!! join needs --circle ID"); return }
             val expected = circleExpectedHostFp(args, st)
                 ?: run { println("!! join needs --host-fp FP (the fingerprint printed by serve)"); return }
+            st.circleId = requestedCircle
+            st.invite = args.opt("--invite") ?: st.invite
             // The bearer invite alone is not proof of the claimed fingerprint:
             // sign a one-key nonce bound to this host, circle, invite and
             // freshness bucket with OUR private key, inside the existing event
