@@ -1,4 +1,4 @@
-# 2026-12-03 — QR parcel codec (Protocol) — DRAFT
+# 2026-12-03 — QR parcel codec (Protocol)
 
 Layer: 2026-12-03 Protocol. The work is a JVM-pure frame codec in
 `app.flit.share.protocol.parcel`: one opaque UTF-8 string per QR frame, a
@@ -7,7 +7,11 @@ sequence of frame strings back into a signed, recipient-addressed payload. The
 payload crypto stays in `CourierEnvelope`; this layer adds no second crypto
 path.
 
-Counts are to be taken from a fresh `--rerun-tasks` JUnit run. No device
+Counts are read from the current JUnit XML under each module's
+`build/test-results` directory. At this layer the protocol module stood at 158
+cases and the rig at 436; those are historical figures for the 2026-12-03
+layer. The final inventory is 330 protocol + 309 app + 75 harness = 714 cases
+with zero failures, errors or skips, recorded in `docs/TESTING.md`. No device
 evidence is claimed here; real-camera decode stays with the 2026-12-08 walk.
 The layer is dated 2026-12-03.
 
@@ -18,7 +22,7 @@ The layer is dated 2026-12-03.
 | `protocol/src/main/kotlin/app/flit/share/protocol/parcel/ParcelCodec.kt` | `object ParcelCodec`: frame grammar, CRC32, caps, `parse`, `encodeParcel`, `complete` |
 | `protocol/src/test/kotlin/app/flit/share/protocol/ParcelCodecTest.kt` | Pure round-trip, descriptor, cap and bound tests |
 | `protocol/src/test/kotlin/app/flit/share/protocol/ParcelCodecTamperTest.kt` | Pure CRC, digest, sequence, count and recipient refusal tests |
-| `docs/TESTING.md` | New protocol classes with counts from the integration run |
+| `docs/TESTING.md` | Final test inventory and evidence levels |
 | `docs/CONTRACTS.md` | Frame grammar |
 | `docs/SECURITY.md` | Air-gap trust and frame-layer limits |
 | `docs/FAILURE-MODES.md` | Frame loss, CRC mismatch, wrong recipient |
@@ -111,39 +115,41 @@ CLI or app.
 
 ## Verification
 
-Fresh pure run, counts to be recorded after integration:
+Counts are read from the current JUnit XML under
+`protocol/build/test-results/test/`, `app/build/test-results/testDebugUnitTest/`
+and `harness/build/test-results/test/`.
 
-```
-source env.sh && ./gradlew --no-daemon --rerun-tasks :protocol:test
-```
+| Module | At this layer (historical) | Current XML |
+| --- | --- | --- |
+| `protocol` | 158 | 330 |
+| `app` | 228 (unchanged by this layer) | 309 |
+| `harness` | 32 (unchanged by this layer) | 75 |
+| Total | 436 | 714 |
 
-| Module | Baseline | Current rig | Task |
-| --- | --- | --- | --- |
-| `protocol` | 138 | 158 | `:protocol:test` |
-| `app` | 228 | 228 (unchanged by this layer) | `:app:testDebugUnitTest` |
-| `harness` | 32 | 32 (unchanged by this layer) | `:harness:test` |
-| Total | 416 | 436 | — |
-
-`--rerun-tasks` is required: stale XML has previously reported green against an
-older class layout. No run is claimed here.
+The 138 → 158 protocol and 416 → 436 rig figures describe the state at the
+2026-12-03 layer and are historical for that layer. `docs/TESTING.md` holds the
+final inventory: 330 + 309 + 75 = 714 cases, zero failures, zero errors and
+zero skipped. Stale XML has previously reported green against an older class
+layout, so the counts are taken from the current result files.
 
 ## Tests
 
 | Class | Cases | What it pins |
 | --- | --- | --- |
-| `ParcelCodecTest` | 14 | Single- and multi-frame round-trip, descriptor fields with `seq == count` on the final frame, chunks at `MAX_CHUNK_BYTES`, `parse` bounds and caps, and `complete` accepting a full verified frame set |
-| `ParcelCodecTamperTest` | 6 | CRC mismatch after a change to a covered field, digest mismatch, missing and conflicting frames, wrong recipient, and refusal returning `null` with no bytes released |
+| `ParcelCodecTest` | 21 | Single- and multi-frame round-trip, descriptor fields with `seq == count` on the final frame, chunks at `MAX_CHUNK_BYTES`, `parse` bounds and caps, and `complete` accepting a full verified frame set |
+| `ParcelCodecTamperTest` | 10 | CRC mismatch after a change to a covered field, digest mismatch, missing and conflicting frames, wrong recipient, and refusal returning `null` with no bytes released |
 
-Case counts are to come from the JUnit XML of a fresh run, not from a target figure.
-Test names follow the `@Test` declarations in each class. No harness or app
-test is added in this layer.
+Case counts are read from the current JUnit XML. The 14 and 6 cases recorded at
+this layer are historical for the layer; the current result files carry 21 and
+10. Test names follow the `@Test` declarations in each class. No harness or app
+test is added in this layer; `docs/TESTING.md` holds the final inventory.
 
 ## Evidence
 
 | Label | Claimed here | Basis |
 | --- | --- | --- |
 | CODE | Yes | `ParcelCodec.kt` matches the corrected API, constants and frame grammar |
-| PURE | TBD | 14 + 6 cases planned for a fresh `--rerun-tasks` run |
+| PURE | Yes | 21 + 10 cases from the current protocol JUnit XML, zero failures |
 | SIM-HARN | No | CLI encode/decode is the 2026-12-04 layer |
 | DEVICE | No | No device walk at this layer; camera and air-gap walks belong to later dates |
 
@@ -169,6 +175,8 @@ decode is not verified by this layer.
 
 ## Verification status
 
-Draft. Counts and evidence labels above stay placeholders until the
-integration run. No Gradle result is claimed here. The frame string layout is
-in `ParcelCodec.kt` and `docs/CONTRACTS.md` §16. The DEVICE row is not claimed.
+Counts and evidence labels above are read from the current JUnit XML; the
+per-layer figures are historical for the 2026-12-03 layer and
+`docs/TESTING.md` holds the final inventory of 330 + 309 + 75 = 714 cases with
+zero failures. The frame string layout is in `ParcelCodec.kt` and
+`docs/CONTRACTS.md` §16. The DEVICE row is not claimed.

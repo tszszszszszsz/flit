@@ -1,4 +1,4 @@
-# 2026-12-07 — QR parcel app (App) — DRAFT
+# 2026-12-07 — QR parcel app (App)
 
 Layer: 2026-12-07 App. The work is the on-screen parcel frame display and the
 camera frame intake in `app.flit.share`: a pure state holder that folds one
@@ -10,9 +10,12 @@ signature and recipient check stay in the 2026-12-03 `ParcelCodec` and the
 `CourierEnvelope` it calls; this layer adds no second crypto path and restates
 no codec cap.
 
-Counts are placeholders and are to be taken from a fresh `--rerun-tasks` run.
-The layer is dated 2026-12-07. No device walk is claimed here; the air-gap,
-second-phone camera walk stays on 2026-12-08.
+Counts are read from the current JUnit XML under each module's
+`build/test-results` directory. The figures recorded at this layer are
+historical for the 2026-12-07 layer; `docs/TESTING.md` holds the final inventory
+of 330 protocol + 309 app + 75 harness = 714 cases with zero failures, errors
+or skips. The layer is dated 2026-12-07. No device walk is claimed here; the
+air-gap, second-phone camera walk stays on 2026-12-08.
 
 ## Files in the layer
 
@@ -22,7 +25,7 @@ second-phone camera walk stays on 2026-12-08.
 | `app/src/main/kotlin/app/flit/share/ParcelUi.kt` | Compose screen with two modes, Show and Scan; `Qr.encode` render, camera/paste intake, progress, injected writer |
 | `app/src/main/kotlin/app/flit/share/MainActivity.kt` | Additive parcel-screen entry point and injected writer into the existing received bucket; Circle and transfer behavior unchanged |
 | `app/src/test/kotlin/app/flit/share/ParcelScanStateTest.kt` | JVM-only reducer tests over the real `ParcelCodec.complete`; no Compose, no Android framework, no engine start |
-| `docs/TESTING.md` | New app classes with counts from the integration run (TBD) |
+| `docs/TESTING.md` | Final test inventory and evidence levels |
 | `docs/CONTRACTS.md` | App seam over `ParcelCodec` and the injected writer |
 | `docs/SECURITY.md` | Camera frames stay local; no file name in a frame |
 | `docs/FAILURE-MODES.md` | Camera, decode, duplicate, mixed-id and verification-refusal states |
@@ -189,26 +192,21 @@ or rewrites them.
 
 ## Verification
 
-The rig command from [TESTING.md](../TESTING.md) §3:
+Counts are read from the current JUnit XML under
+`protocol/build/test-results/test/`, `app/build/test-results/testDebugUnitTest/`
+and `harness/build/test-results/test/`.
 
-```bash
-source env.sh && ./gradlew --no-daemon --rerun-tasks \
-  :protocol:test :app:testDebugUnitTest :harness:test
-```
+| Module | At this layer (historical) | Current XML |
+| --- | --- | --- |
+| `protocol` | 158 (unchanged) | 330 |
+| `app` | 239 before this layer; `ParcelScanStateTest` added here | 309 |
+| `harness` | 51 (unchanged) | 75 |
+| Total | 478 | 714 |
 
-Counts are TBD and must come from a fresh `--rerun-tasks` XML run, not from a
-target figure. The inherited baseline after the 2026-12-04 CLI layer is 158
-protocol + 257 app + 52 harness = 478 ([TESTING.md](../TESTING.md) §2); this
-layer adds app cases only.
-
-| Module | Baseline | Current rig | Task |
-| --- | --- | --- | --- |
-| `protocol` | 158 | 158 (unchanged) | `:protocol:test` |
-| `app` | 239 | TBD | `:app:testDebugUnitTest` |
-| `harness` | 51 | 51 (unchanged) | `:harness:test` |
-| Total | 478 | TBD | — |
-
-No Gradle result is claimed here.
+The inherited figures above describe the state at the 2026-12-07 layer and are
+historical for that layer; `docs/TESTING.md` holds the final inventory of
+330 + 309 + 75 = 714 cases with zero failures, zero errors and zero skipped.
+This layer adds app cases only.
 
 ## Tests
 
@@ -221,22 +219,22 @@ with a recipient fingerprint and the receiving `TlsIdentity`; the codec's own
 CRC, digest and signature cases stay in the 2026-12-03 protocol suite and are
 not duplicated here. The roadmap also describes a rendered-frame case alongside
 `FlitQrTest` and a small UI-state case for index wrap and progress label; those
-are planned app cases, not separate files in this layer.
+are counted among the app cases in `docs/TESTING.md`, not in separate files in
+this layer.
 
 | Class | Cases | What it pins |
 | --- | --- | --- |
-| `ParcelScanStateTest` | TBD | Pure reducer over the real codec: dedup, cap, mixed-id, count mismatch, completion and refusal paths |
-| Additional app cases (roadmap plan) | TBD | Rendered-frame pixel proof and display-index/progress UI state |
+| `ParcelScanStateTest` | 18 | Pure reducer over the real codec: dedup, cap, mixed-id, count mismatch, completion and refusal paths |
 
-Case counts are to come from the JUnit XML of a fresh run, not from a target figure.
-No protocol or harness test is added by this layer.
+Case counts are read from the current JUnit XML; `docs/TESTING.md` holds the
+final inventory. No protocol or harness test is added by this layer.
 
 ## Evidence
 
 | Label | Claimed here | Basis |
 | --- | --- | --- |
 | CODE | Yes — contract | The seams above and the codec/QR APIs already on disk |
-| PURE | TBD | `ParcelScanStateTest` counts from the integration run |
+| PURE | Yes | `ParcelScanStateTest` 18 cases in the current app JUnit XML, zero failures |
 | SIM-HARN | No | The box-side encode/decode round-trip is the 2026-12-04 CLI layer |
 | DEVICE | No | No camera, phone or air-gap observation; the walk is 2026-12-08 |
 
@@ -256,22 +254,17 @@ No radio, phone, camera or QR observation is claimed on this date.
 - No device walk, second-phone observation, real capture timing or throughput
   figure is claimed here.
 
-## Placeholders
+## Deferred detail
 
-The following items are open for the integration pass:
-
-- `app` current-rig count and the rig total in the Verification table (TBD).
-- `ParcelScanStateTest` case count and the additional planned app-case count in
-  the Tests section (TBD).
-- The PURE evidence row (TBD) and the exact `@Test` names inside
-  `ParcelScanStateTest`.
-- The concrete Kotlin declarations and member names of `ParcelScanState`,
-  `ParcelUi` and the `MainActivity` entry point/writer (declared by those
-  files; only the contract shape is recorded here).
-- The rig command and cross-linked count tables in
-  [TESTING.md](../TESTING.md) after the new app count is known.
+The concrete Kotlin declarations and member names of `ParcelScanState`,
+`ParcelUi` and the `MainActivity` entry point and writer are declared by those
+files; only the contract shape is recorded here. Test names follow the `@Test`
+declarations in `ParcelScanStateTest`. The rig command and cross-linked count
+tables are in [TESTING.md](../TESTING.md).
 
 ## Verification status
 
-Draft. Counts and the PURE evidence row stay placeholders until the integration
-run. No Gradle result is claimed here. No DEVICE observation is claimed.
+Counts and the PURE evidence row are read from the current JUnit XML; the
+per-layer figures above are historical for the 2026-12-07 layer and
+`docs/TESTING.md` holds the final inventory of 714 cases with zero failures.
+No DEVICE observation is claimed.

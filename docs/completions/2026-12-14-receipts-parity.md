@@ -1,4 +1,4 @@
-# 2026-12-14 — Delivery receipts parity (Integration) — DRAFT
+# 2026-12-14 — Delivery receipts parity (Integration)
 
 Layer: 2026-12-14 Integration. The JVM-pure receipt core landed on 2026-12-11 is
 wired into the app's Circle delivery path and the CLI's Circle commands. Both
@@ -13,12 +13,13 @@ schema field, signature primitive or v2.2 status. A receipt travels in
 `CircleRequest.events` on the existing `POST /api/flit/v1/circle/sync`, or
 inside a courier/QR parcel payload that already carries signed events.
 
-Counts below are placeholders. They are to be read from the JUnit XML of a
-fresh `--rerun-tasks` run, as required by `TESTING.md` §3 and §8. No Gradle run
-was made for this draft, and no test result is claimed here. No device
-observation is claimed on this date: there is no phone, second phone, radio,
-carrier or camera walk recorded by this document, and any phone-to-bot receipt
-walk stays a reproduction recipe rather than an observation.
+Counts below are read from the current JUnit XML under each module's
+`build/test-results` directory: 330 protocol + 309 app + 75 harness = 714 cases
+with zero failures, errors and skips, as recorded in `docs/TESTING.md`. The
+figures recorded at this layer are historical for the 2026-12-14 layer. No
+device observation is claimed on this date: there is no phone, second phone,
+radio, carrier or camera walk recorded by this document, and any phone-to-bot
+receipt walk stays a reproduction recipe rather than an observation.
 
 ## Files in the layer
 
@@ -32,7 +33,7 @@ walk stays a reproduction recipe rather than an observation.
 | `app/src/test/kotlin/app/flit/share/FlitCircleSyncTest.kt` | RECEIPT branch of `circleBodyValid` (exact keys accepted, malformed bodies refused) |
 | `app/src/test/kotlin/app/flit/share/FlitEngineTest.kt` | Mint gate, confirmation fold, sha correlation and `setDeliveryStatus` promotion |
 | `harness/src/test/kotlin/app/flit/share/harness/ReceiptCliTest.kt` | CLI receipt publishing, missing-key refusal and confirmed-count output |
-| `docs/TESTING.md` | Three new test-class rows with 3 + 6 + 5 cases in the green 588 |
+| `docs/TESTING.md` | Three test-class rows with 3 + 6 + 5 cases at this layer; final inventory 714 |
 | `docs/CONTRACTS.md` | Receipt body contract on the app and CLI seams |
 | `docs/SECURITY.md` | Receipt as a signed landing assertion; no remote status or revocation |
 | `docs/FAILURE-MODES.md` | Malformed body, forged author, stale/duplicate event and keyed-drop refusals |
@@ -218,25 +219,22 @@ earlier receipt for the same `(dropId, sha256)`.
 
 ## Verification
 
-Fresh rig run, counts to be recorded from the JUnit XML:
+Counts are read from the current JUnit XML under
+`protocol/build/test-results/test/`, `app/build/test-results/testDebugUnitTest/`
+and `harness/build/test-results/test/`.
 
-```
-source env.sh && ./gradlew --no-daemon --rerun-tasks \
-  :protocol:test :app:testDebugUnitTest :harness:test
-```
+| Module | At this layer (historical) | Current XML |
+| --- | --- | --- |
+| `protocol` | 240 (unchanged) | 330 |
+| `app` | 281 | 309 |
+| `harness` | 67 | 75 |
+| Total | 588 | 714 |
 
-| Module | Before (last green inventory) | After this layer | Task |
-| --- | --- | --- | --- |
-| `protocol` | 240 | 240 (unchanged) | `:protocol:test` |
-| `app` | 272 | 281 | `:app:testDebugUnitTest` |
-| `harness` | 62 | 67 | `:harness:test` |
-| Total | 574 | 588 | — |
-
-`--rerun-tasks` is required: stale XML has previously reported green against
-an older class layout. The "before" figures are the last green inventory in
-`TESTING.md` §2; the "after" figures and every per-class count below are
-placeholders pending that run. No Gradle run was made for this draft, so no
-test result is asserted here.
+The 574 → 588 figures describe the state at the 2026-12-14 layer and are
+historical for that layer. `docs/TESTING.md` holds the final inventory of
+330 + 309 + 75 = 714 cases, zero failures, zero errors and zero skipped. Stale
+XML has previously reported green against an older class layout, so the counts
+are taken from the current result files.
 
 ## Tests
 
@@ -246,19 +244,20 @@ test result is asserted here.
 | `FlitEngineTest` (added cases, app) | 6 | Receipt mint after a keyed landing and no mint on a digest mismatch, `Error`, a carrier throw or a plaintext drop; confirmation fold by sha, one author per fingerprint under reversed order and reversed re-announcements, `keyId` changes leaving the count intact, non-member authors ignored, and `setDeliveryStatus` promoting a row to `SENT` |
 | `ReceiptCliTest` (new, harness) | 5 | `circle receipt` resolves the keyed `file` event by sha, derives `keyId`, posts a signed receipt and prints one confirmed author on the next `circle sync`; a missing event or missing key material prints the no-key-id line and exits without an event; a forged receipt is refused at the host gate and a replayed id leaves the count at one |
 
-Case counts come from a clean `--rerun-tasks` JUnit XML run, not from a target
-figure. Test names are the `@Test` declarations in each class. The two-bot
-keyed-drop confirm walk described in the roadmap is harness evidence under
-this layer; no device or extra walk is claimed. The 2026-12-11 protocol
-receipt tests are dependency tests, re-run here and not new work on this date.
+Case counts are read from the current JUnit XML, not from a target figure;
+`docs/TESTING.md` holds the final inventory. Test names are the `@Test`
+declarations in each class. The two-bot keyed-drop confirm walk described in
+the roadmap is harness evidence under this layer; no device or extra walk is
+claimed. The 2026-12-11 protocol receipt tests are dependency tests counted in
+the current XML and not new work on this date.
 
 ## Evidence
 
 | Label | Claimed here | Basis |
 | --- | --- | --- |
 | CODE | Yes | The app and CLI seams match the API and byte rules recorded above; no new route, header, DTO field, QR parameter, schema field or v2.2 status |
-| PURE | Yes | The confirmation fold and the CLI body derivation are planned for a fresh `--rerun-tasks` run; counts not yet read from XML |
-| SIM-HARN | Yes | In-process two-bot receipt walks are planned for this layer; counts not yet read from XML |
+| PURE | Yes | The confirmation fold and the CLI body derivation are counted in the current app and protocol JUnit XML |
+| SIM-HARN | Yes | In-process two-bot receipt walks are counted in the current harness JUnit XML (`ReceiptCliTest` 5 cases) |
 | DEVICE | No | No phone, second phone, radio, carrier or camera observation is made on this date |
 
 The weakest recorded level governs each claim. No device observation is
@@ -297,10 +296,10 @@ its logs show.
 
 ## Verification status
 
-Counts for `FlitCircleSyncTest`, `FlitEngineTest` and `ReceiptCliTest`, the
-module totals and the rig total come from a clean `--rerun-tasks` run once the
-code and tests land. CODE, PURE and SIM-HARN evidence are recorded above as
-planned; no DEVICE evidence exists for receipts on this date. The route and
-frame surface is unchanged from the 2026-12-11 protocol layer. Every numeric
-field in this draft is a placeholder pending that run, and no Gradle run or
-test result is claimed here.
+Counts for `FlitCircleSyncTest` (3), `FlitEngineTest` (6) and `ReceiptCliTest`
+(5), the module totals and the rig total are read from the current JUnit XML;
+the per-layer figures above are historical for the 2026-12-14 layer and
+`docs/TESTING.md` holds the final inventory of 330 + 309 + 75 = 714 cases with
+zero failures. CODE, PURE and SIM-HARN evidence are recorded above; no DEVICE
+evidence exists for receipts on this date. The route and frame surface is
+unchanged from the 2026-12-11 protocol layer.
