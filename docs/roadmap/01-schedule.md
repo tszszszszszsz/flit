@@ -99,6 +99,7 @@ stay on those dates.
 | 2027-01-04 | Docs | Device-walk plan, trust-gate design record, rig inventory |
 | 2027-01-05 | Integration | CLI fold and rekey parity, relay pairing read, tests |
 | 2027-01-06 | Docs | Final rig inventory and completion note |
+| 2027-01-07 | Device | Install and launch smoke on one physical device |
 
 ## Rules for a day
 

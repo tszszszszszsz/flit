@@ -85,6 +85,7 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2027-01-04 | Docs | Device-walk plan, trust-gate design review, rig inventory |
 | 2027-01-05 | Integration | CLI fold/rekey parity, --host-fp guard, relay pairing read, tests |
 | 2027-01-06 | Docs | Final rig inventory and completion note |
+| 2027-01-07 | Device | Install, launch and render observation on one physical device |
 
 ## Integration gate
 
