@@ -414,7 +414,7 @@ class FlitCircleStoreTest {
     }
 
     @Test
-    fun `only known participants may rekey and payloads are bounded`() {
+    fun `only a current owner or admin may rekey and payloads are bounded`() {
         // A stranger with no roster entry and no signed history cannot rotate.
         val outsider = FlitCircleStore.reduce(
             state(), event("rk-out", "fp-outsider", "rekey", """{"keyB64":"evil","gen":1}"""),
@@ -422,21 +422,49 @@ class FlitCircleStoreTest {
         assertEquals("key-v1", outsider.keyB64)
         assertEquals(0, outsider.rekeyGen)
 
-        // An officer on the roster may rotate.
-        val officer = FlitCircleStore.reduce(
+        // An OWNER and an ADMIN on the roster may rotate.
+        val ownerKey = FlitCircleStore.reduce(
+            state(), event("rk-owner", "fp-owner", "rekey", """{"keyB64":"owner-key","gen":1}"""),
+        )
+        assertEquals("owner-key", ownerKey.keyB64)
+        assertEquals(1, ownerKey.rekeyGen)
+
+        val adminKey = FlitCircleStore.reduce(
             state(), event("rk-admin", "fp-admin", "rekey", """{"keyB64":"key-v2","gen":1}"""),
         )
-        assertEquals("key-v2", officer.keyB64)
-        assertEquals(1, officer.rekeyGen)
+        assertEquals("key-v2", adminKey.keyB64)
+        assertEquals(1, adminKey.rekeyGen)
 
-        // A departing device can hand off a key in the same batch: its signed
-        // leave is already in the log, so the author is a known participant.
+        // A MEMBER on the roster has no key authority either.
+        val plainMember = FlitCircleStore.reduce(
+            state(), event("rk-member", "fp-member", "rekey", """{"keyB64":"member-key","gen":1}"""),
+        )
+        assertEquals("key-v1", plainMember.keyB64)
+        assertEquals(0, plainMember.rekeyGen)
+
+        // A departing MEMBER can no longer hand off a key in the same batch:
+        // its leave is in the log, but log authorship is not rekey authority.
         val afterLeave = FlitCircleStore.reduce(state(), event("l-1", "fp-member", "leave"))
         val handoff = FlitCircleStore.reduce(
             afterLeave, event("rk-handoff", "fp-member", "rekey", """{"keyB64":"peer-key","gen":1}"""),
         )
-        assertEquals("peer-key", handoff.keyB64)
-        assertEquals(1, handoff.rekeyGen)
+        assertEquals("key-v1", handoff.keyB64)
+        assertEquals(1, handoff.rekeyGen) // only the leave bumped it
+
+        // Being an author in the log alone never grants the verb, even when
+        // the rekey carries a fresh, plausible key and generation.
+        val withLogAuthor = FlitCircleStore.reduce(
+            state(), event("m-former", "fp-former", "message", """{"text":"old"}"""),
+        )
+        val loggedAuthor = FlitCircleStore.reduce(
+            withLogAuthor, event("rk-log-author", "fp-former", "rekey", """{"keyB64":"log-key","gen":1}"""),
+        )
+        assertEquals("key-v1", loggedAuthor.keyB64)
+        assertEquals(0, loggedAuthor.rekeyGen)
+        assertEquals(
+            listOf("m-former", "rk-log-author"),
+            loggedAuthor.events.map { it.id }, // refused rekeys are still inert log history
+        )
 
         val negative = FlitCircleStore.reduce(
             state(), event("rk-neg", "fp-owner", "rekey", """{"keyB64":"evil","gen":-1}"""),
@@ -450,6 +478,57 @@ class FlitCircleStoreTest {
         )
         assertEquals("key-v1", oversized.keyB64)
         assertEquals(0, oversized.rekeyGen)
+    }
+
+    @Test
+    fun `an officer cannot hand off a key in the same batch as its leave`() {
+        val evil = "officer-key"
+        for (author in listOf("fp-owner", "fp-admin")) {
+            val rekey = event(
+                "rk-handoff-$author", author, "rekey",
+                """{"keyB64":"$evil","gen":1}""", lamport = 1,
+            )
+            val leave = event("l-officer-$author", author, "leave", lamport = 2)
+
+            for (batch in listOf(listOf(rekey, leave), listOf(leave, rekey))) {
+                val merged = FlitCircleStore.merge(state(), batch)
+                val label = "$author / ${batch.map { it.type }}"
+                assertEquals("key-v1", merged.keyB64, label)
+                assertEquals(1, merged.rekeyGen, label) // only the leave bumped it
+                assertTrue(merged.members.none { it.fp == author }, label)
+                // The attempted hand-off is inert history either way.
+                assertEquals(batch.map { it.id }, merged.events.map { it.id }, label)
+            }
+        }
+    }
+
+    @Test
+    fun `pre batch authority is order independent and only the leaver is vetoed`() {
+        val leave = event("l-member", "fp-member", "leave", lamport = 1)
+        val rekey = event(
+            "rk-staying", "fp-admin", "rekey", """{"keyB64":"admin-key","gen":1}""", lamport = 2,
+        )
+        for (batch in listOf(listOf(rekey, leave), listOf(leave, rekey))) {
+            // A staying officer keeps its authority; somebody else's leave in
+            // the batch must not veto its rekey, in either fold order.
+            val merged = FlitCircleStore.merge(state(), batch)
+            assertEquals("admin-key", merged.keyB64)
+            assertTrue(merged.rekeyGen >= 1)
+            assertTrue(merged.members.none { it.fp == "fp-member" })
+            assertTrue(merged.members.any { it.fp == "fp-admin" })
+        }
+
+        // A departed officer cannot rotate in a later batch either: the
+        // snapshot for that batch no longer grants it authority.
+        val departed = FlitCircleStore.merge(
+            state(), listOf(event("l-admin", "fp-admin", "leave")),
+        )
+        val late = FlitCircleStore.reduce(
+            departed,
+            event("rk-late", "fp-admin", "rekey", """{"keyB64":"late-key","gen":1}"""),
+        )
+        assertEquals("key-v1", late.keyB64)
+        assertEquals(1, late.rekeyGen)
     }
 
     @Test

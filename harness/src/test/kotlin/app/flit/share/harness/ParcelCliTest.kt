@@ -160,6 +160,48 @@ class ParcelCliTest {
         assertEquals(null, bare.opt("--dir"), "an empty flag value is treated as absent")
     }
 
+    @Test
+    fun `repeated value flags keep every occurrence for poll options`() {
+        val args = ParsedArgs(
+            arrayOf(
+                "circle", "poll", "--text", "Ship?",
+                "--option", "yes", "--option", "no", "--option", "maybe",
+            ),
+        )
+        assertEquals(listOf("yes", "no", "maybe"), args.opts("--option"))
+        assertEquals("maybe", args.opt("--option"), "the last value still wins for single-value callers")
+        assertTrue(args.has("--option"))
+        assertTrue(args.opts("--missing").isEmpty())
+
+        // The documented comma form travels through the same flatMap path.
+        val comma = ParsedArgs(arrayOf("circle", "poll", "--option", "yes,no,maybe"))
+        assertEquals(listOf("yes,no,maybe"), comma.opts("--option"))
+        assertEquals(listOf("yes", "no", "maybe"), comma.opts("--option").flatMap { it.split(',') })
+    }
+
+    @Test
+    fun `encode refuses a payload above the codec payload cap before rendering`() = inIsolatedHome {
+        val dir = Files.createTempDirectory("parcel-cap-")
+        // One byte over the codec's real payload ceiling; the frame-layer
+        // defensive ceiling is much larger and must not be used here.
+        val payload = ByteArray(ParcelCodec.MAX_AIR_GAP_PAYLOAD_BYTES + 1).also { SecureRandom().nextBytes(it) }
+        val file = Files.write(dir.resolve("too-big.bin"), payload)
+        val frames = Files.createDirectory(dir.resolve("frames"))
+        val recipient = TlsIdentity.generate()
+        val cert = writeCert(dir.resolve("recipient.b64"), recipient)
+
+        val code = ParcelCli.run(
+            ParsedArgs(
+                arrayOf(
+                    "parcel", "encode", file.toString(), "--dir", frames.toString(),
+                    "--to", recipient.fingerprint, "--cert", cert.toString(),
+                ),
+            ),
+        )
+        assertEquals(2, code, "an oversized payload is bad args, not a late seal refusal")
+        assertEquals(0, pngCount(frames), "nothing is rendered for a refused payload")
+    }
+
     // ---- exit codes ---------------------------------------------------------
 
     @Test

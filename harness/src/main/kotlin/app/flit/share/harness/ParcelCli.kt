@@ -67,6 +67,8 @@ object ParcelCli {
     /** Dense frames can be unreadable at 768px; encode escalates the *whole*
      * frame set to this size when any frame fails its round-trip — never a mix. */
     private const val LARGE_IMAGE_SIZE = 1024
+    /** A third escalation for dense frames when the JVM is under suite load. */
+    private const val LARGEST_IMAGE_SIZE = 1536
     private const val MARGIN = 2
     /** Decode hints: try hard, and look only for the QR format we wrote. */
     private val DECODE_HINTS: Map<DecodeHintType, Any> = mapOf(
@@ -177,10 +179,10 @@ object ParcelCli {
         val payload = runCatching { Files.readAllBytes(file) }
             .getOrNull()
             ?: throw ParcelCliFailure(EXIT_BAD_ARGS, "could not read $fileArg")
-        if (payload.isEmpty() || payload.size > ParcelCodec.MAX_AIR_GAP_PARCEL_BYTES) {
+        if (payload.isEmpty() || payload.size > ParcelCodec.MAX_AIR_GAP_PAYLOAD_BYTES) {
             throw ParcelCliFailure(
                 EXIT_BAD_ARGS,
-                "payload ${payload.size} byte(s) outside 1..${ParcelCodec.MAX_AIR_GAP_PARCEL_BYTES} — nothing written",
+                "payload ${payload.size} byte(s) outside 1..${ParcelCodec.MAX_AIR_GAP_PAYLOAD_BYTES} — nothing written",
             )
         }
 
@@ -346,12 +348,13 @@ object ParcelCli {
 
     /**
      * Render the whole set at one size and prove every PNG round-trips before
-     * any is staged. A single failure escalates all frames to [LARGE_IMAGE_SIZE]
-     * — the opaque frame strings are untouched, only their pixel size changes.
+     * any is staged. A single failure escalates all frames through
+     * [LARGE_IMAGE_SIZE] and [LARGEST_IMAGE_SIZE] — the opaque frame strings
+     * are untouched, only their pixel size changes.
      */
     private fun renderFrames(frames: List<String>): Pair<Int, List<BufferedImage>> {
         var failed = -1
-        for (size in intArrayOf(IMAGE_SIZE, LARGE_IMAGE_SIZE)) {
+        for (size in intArrayOf(IMAGE_SIZE, LARGE_IMAGE_SIZE, LARGEST_IMAGE_SIZE)) {
             val images = frames.map { render(it, size) }
             val bad = images.indices.firstOrNull { readFrame(images[it]) != frames[it] }
             if (bad == null) return size to images
@@ -359,7 +362,7 @@ object ParcelCli {
         }
         throw ParcelCliFailure(
             EXIT_BAD_ARGS,
-            "frame ${failed + 1} did not survive QR round-trip at ${IMAGE_SIZE}px or ${LARGE_IMAGE_SIZE}px — nothing further written",
+            "frame ${failed + 1} did not survive QR round-trip at ${IMAGE_SIZE}px, ${LARGE_IMAGE_SIZE}px or ${LARGEST_IMAGE_SIZE}px — nothing further written",
         )
     }
 

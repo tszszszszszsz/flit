@@ -19,6 +19,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.putJsonArray
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.util.Random
@@ -27,6 +28,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -51,6 +53,21 @@ class CircleHarnessTest {
             memberFp = fp,
             events = events,
         ),
+    )
+
+    /** The signed proof-of-possession the production JOIN route now requires. */
+    private fun joinProof(
+        hostFp: String,
+        circleId: String,
+        invite: String,
+        identity: TlsIdentity,
+        nowMs: Long = System.currentTimeMillis(),
+    ): CircleEvent = CircleCore.create(
+        circleId, identity.fingerprint, identity, CircleEvent.JOIN,
+        CircleCore.joinProofBody(
+            hostFp, circleId, invite, identity.fingerprint, CircleCore.joinProofBucket(nowMs),
+        ),
+        lamport = 0L, createdMs = nowMs,
     )
 
     private fun assertRekey(event: CircleEvent, key: String, gen: Int, members: Set<String>) {
@@ -100,6 +117,9 @@ class CircleHarnessTest {
                         circleId = circleId,
                         invite = "wrong-invite",
                         memberFp = member,
+                        // The proof binds the presented invite, so it is valid
+                        // for this request and still reaches the host's gate.
+                        events = listOf(joinProof(owner, circleId, "wrong-invite", memberId)),
                     ),
                 )
                 assertNotNull(badJoin)
@@ -115,10 +135,12 @@ class CircleHarnessTest {
                         circleId = circleId,
                         invite = invite,
                         memberFp = member,
+                        events = listOf(joinProof(owner, circleId, invite, memberId)),
                     ),
                 )
                 assertNotNull(joined, "join got no answer")
                 assertTrue(joined.ok, "join refused: ${joined.reason}")
+                assertTrue(CircleResponse.verify(joined, owner), "join answer was not signed by the host")
                 assertEquals(keyV1, joined.key)
                 assertEquals(setOf(owner, member), joined.members.toSet())
                 assertTrue(joined.events.isEmpty())
@@ -166,6 +188,7 @@ class CircleHarnessTest {
                         circleId = circleId,
                         invite = invite,
                         memberFp = third,
+                        events = listOf(joinProof(owner, circleId, invite, thirdId)),
                     ),
                 )
                 assertNotNull(thirdJoined)
@@ -262,6 +285,7 @@ class CircleHarnessTest {
                 val adminKicked = memberClient.sync(target, circleId, member, listOf(adminKick))
                 assertNotNull(adminKicked)
                 assertTrue(adminKicked.ok, "admin kick refused: ${adminKicked.reason}")
+                assertEquals("", adminKicked.key, "a SYNC answer never hands out the group key")
                 val afterAdmin = delegate.circleHost.snapshot()
                 assertFalse(afterAdmin.members.contains(third), "promoted admin's kick did not remove the member")
                 assertEquals(setOf(owner, member), afterAdmin.members.toSet())
@@ -296,6 +320,7 @@ class CircleHarnessTest {
                 val kicked = ownerClient.sync(target, circleId, owner, listOf(kick))
                 assertNotNull(kicked)
                 assertTrue(kicked.ok)
+                assertEquals("", kicked.key, "a SYNC answer never hands out the group key")
 
                 val after = delegate.circleHost.snapshot()
                 assertFalse(after.members.contains(member), "kicked member still on the roster")
@@ -333,7 +358,10 @@ class CircleHarnessTest {
         host.seed(circleId, invite, "group-key-v1", owner, ownerId)
 
         val joined = host.onCircle(
-            CircleRequest(CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member),
+            CircleRequest(
+                CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member,
+                events = listOf(joinProof(ownerId.fingerprint, circleId, invite, memberId)),
+            ),
         )
         assertTrue(joined.ok)
 
@@ -399,7 +427,10 @@ class CircleHarnessTest {
             val memberClient = ProtocolClient(senderId)
             val joined = memberClient.circleJoin(
                 target,
-                CircleRequest(CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = sender),
+                CircleRequest(
+                    CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = sender,
+                    events = listOf(joinProof(receiver, circleId, invite, senderId)),
+                ),
             )
             assertNotNull(joined, "join got no answer")
             assertTrue(joined.ok, "join refused: ${joined.reason}")
@@ -488,5 +519,441 @@ class CircleHarnessTest {
             circleDeliveryOutcome(SendReport(emptyList(), emptyList(), null), name),
         )
         assertEquals(CircleDeliveryStatus.PENDING, circleDeliveryOutcome(null, name))
+    }
+
+    @Test
+    fun `a member cannot inject another member's signed event through SYNC`() {
+        val circleId = "author-gate"
+        val invite = "bearer-invite"
+        val ownerId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val owner = ownerId.fingerprint
+        val member = memberId.fingerprint
+        val host = CircleHostState()
+        host.seed(circleId, invite, "group-key-v1", owner, ownerId)
+        assertTrue(
+            host.onCircle(
+                CircleRequest(
+                    CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member,
+                    events = listOf(joinProof(owner, circleId, invite, memberId)),
+                ),
+            ).ok,
+        )
+
+        // Properly signed by the owner, but submitted by a plain member: the
+        // request cert binds only that member, so the event is not admissible.
+        val borrowed = CircleCore.create(
+            circleId, owner, ownerId, CircleEvent.MESSAGE,
+            """{"text":"borrowed"}""", lamport = 1L,
+        )
+        val injected = host.onCircle(
+            CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = member, events = listOf(borrowed)),
+        )
+        assertTrue(injected.ok)
+        assertTrue(injected.events.none { it.id == borrowed.id }, "a borrowed author entered the log")
+
+        // The refusal must not burn the id: the real author may still post it.
+        val resubmitted = host.onCircle(
+            CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = owner, events = listOf(borrowed)),
+        )
+        assertTrue(resubmitted.ok)
+        assertTrue(resubmitted.events.any { it.id == borrowed.id }, "the author's id was consumed by a forgery")
+    }
+
+    @Test
+    fun `a signed JOIN injected through SYNC neither enters the log nor changes the roster`() {
+        val circleId = "join-injection"
+        val invite = "bearer-invite"
+        val ownerId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val owner = ownerId.fingerprint
+        val member = memberId.fingerprint
+        val host = CircleHostState()
+        host.seed(circleId, invite, "group-key-v1", owner, ownerId)
+        host.onCircle(
+            CircleRequest(
+                CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member,
+                events = listOf(joinProof(owner, circleId, invite, memberId)),
+            ),
+        )
+
+        // A member may know a perfectly valid JOIN proof — it is still a
+        // host-routed handshake, never a log entry contributed via SYNC.
+        val injected = joinProof(owner, circleId, invite, memberId)
+        val answered = host.onCircle(
+            CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = member, events = listOf(injected)),
+        )
+        assertTrue(answered.ok)
+        assertTrue(answered.events.none { it.id == injected.id }, "JOIN entered the signed log via SYNC")
+        assertEquals(setOf(owner, member), host.snapshot().members.toSet())
+    }
+
+    @Test
+    fun `only an officer REKEY installs a key and a lower generation never rolls it back`() {
+        val circleId = "rekey-governance"
+        val invite = "bearer-invite"
+        val ownerId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val owner = ownerId.fingerprint
+        val member = memberId.fingerprint
+        val host = CircleHostState()
+        host.seed(circleId, invite, "group-key-v1", owner, ownerId)
+        host.onCircle(
+            CircleRequest(
+                CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member,
+                events = listOf(joinProof(owner, circleId, invite, memberId)),
+            ),
+        )
+
+        fun rekeyBody(key: String, gen: Int) = buildJsonObject {
+            put("keyB64", JsonPrimitive(key))
+            put("gen", JsonPrimitive(gen))
+            putJsonArray("members") { add(JsonPrimitive(owner)); add(JsonPrimitive(member)) }
+        }.toString()
+
+        // A MEMBER-signed rekey is history, even if its signature is perfect.
+        val memberRekey = CircleCore.create(
+            circleId, member, memberId, CircleEvent.REKEY, rekeyBody("member-key", 1), lamport = 1L,
+        )
+        val skipped = host.onCircle(
+            CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = member, events = listOf(memberRekey)),
+        )
+        assertTrue(skipped.ok)
+        assertEquals("group-key-v1", host.snapshot().key)
+        assertTrue(host.snapshot().events.none { it.id == memberRekey.id })
+
+        // The owner appoints an ADMIN; now that ADMIN may rotate the key.
+        val role = CircleCore.create(
+            circleId, owner, ownerId, CircleEvent.ROLE,
+            buildJsonObject {
+                put("targetFp", JsonPrimitive(member))
+                put("role", JsonPrimitive("ADMIN"))
+            }.toString(),
+            lamport = 2L,
+        )
+        assertTrue(host.onCircle(CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = owner, events = listOf(role))).ok)
+        assertEquals("ADMIN", host.snapshot().roles[member])
+
+        val ownerRekey = CircleCore.create(
+            circleId, owner, ownerId, CircleEvent.REKEY, rekeyBody("owner-key-v2", 1), lamport = 3L,
+        )
+        assertTrue(host.onCircle(CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = owner, events = listOf(ownerRekey))).ok)
+        assertEquals("owner-key-v2", host.snapshot().key)
+        assertEquals(1, host.snapshot().rekeyGen)
+
+        // Same officer, older generation: the key must never roll back.
+        val stale = CircleCore.create(
+            circleId, member, memberId, CircleEvent.REKEY, rekeyBody("old-key-v0", 0), lamport = 4L,
+        )
+        assertTrue(host.onCircle(CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = member, events = listOf(stale))).ok)
+        assertEquals("owner-key-v2", host.snapshot().key, "a stale rekey rolled the key back")
+        assertEquals(1, host.snapshot().rekeyGen)
+    }
+
+    @Test
+    fun `a departing owner or admin cannot hand off the group key in either fold order`() {
+        val circleId = "departure-handoff"
+        val invite = "bearer-invite"
+        val ownerId = TlsIdentity.generate()
+        val adminId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val owner = ownerId.fingerprint
+        val admin = adminId.fingerprint
+        val member = memberId.fingerprint
+        val originalKey = "group-key-v1"
+        val attackerKey = "attacker-key"
+
+        /** One batch from [officer], with the two events folded in either order. */
+        fun handoff(officer: TlsIdentity, rekeyFirst: Boolean) {
+            val host = CircleHostState()
+            host.seed(circleId, invite, originalKey, owner, ownerId)
+            assertTrue(
+                host.onCircle(
+                    CircleRequest(
+                        CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member,
+                        events = listOf(joinProof(owner, circleId, invite, memberId)),
+                    ),
+                ).ok,
+            )
+            if (officer.fingerprint != owner) {
+                assertTrue(
+                    host.onCircle(
+                        CircleRequest(
+                            CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = admin,
+                            events = listOf(joinProof(owner, circleId, invite, adminId)),
+                        ),
+                    ).ok,
+                )
+                val appoint = CircleCore.create(
+                    circleId, owner, ownerId, CircleEvent.ROLE,
+                    """{"targetFp":"$admin","role":"ADMIN"}""", lamport = 1L,
+                )
+                assertTrue(
+                    host.onCircle(
+                        CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = owner, events = listOf(appoint)),
+                    ).ok,
+                )
+                assertEquals("ADMIN", host.snapshot().roles[admin])
+            }
+
+            val officerFp = officer.fingerprint
+            val genBefore = host.snapshot().rekeyGen
+            val keyBefore = host.snapshot().key
+            val handoffBody = buildJsonObject {
+                put("keyB64", JsonPrimitive(attackerKey))
+                put("gen", JsonPrimitive(genBefore + 1))
+            }.toString()
+            // CircleCore.order sorts by lamport: these two lamports choose the
+            // fold order. Submit in the OPPOSITE order so arrival cannot matter.
+            val rekey = CircleCore.create(
+                circleId, officerFp, officer, CircleEvent.REKEY, handoffBody,
+                lamport = if (rekeyFirst) 10L else 20L,
+            )
+            val leave = CircleCore.create(
+                circleId, officerFp, officer, CircleEvent.LEAVE, "{}",
+                lamport = if (rekeyFirst) 20L else 10L,
+            )
+            val batch = if (rekeyFirst) listOf(leave, rekey) else listOf(rekey, leave)
+            val answered = host.onCircle(
+                CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = officerFp, events = batch),
+            )
+            assertTrue(answered.ok, "sync refused: ${answered.reason}")
+
+            val after = host.snapshot()
+            assertFalse(after.members.contains(officerFp), "the officer did not depart")
+            assertFalse(after.key == attackerKey, "the attacker's key was installed")
+            assertFalse(after.key == keyBefore, "departure did not rotate the key")
+            assertTrue(after.key.isNotBlank())
+            assertTrue(after.events.none { it.id == rekey.id }, "the hand-off REKEY entered the signed log")
+            assertTrue(answered.events.none { it.id == rekey.id })
+            assertEquals(genBefore + 1, after.rekeyGen, "only the departure bumped the generation")
+            val rotations = after.events.filter { it.type == CircleEvent.REKEY }
+            assertEquals(1, rotations.size)
+            assertRekey(rotations.single(), after.key, after.rekeyGen, after.members.toSet())
+
+            val denied = host.onCircle(CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = officerFp))
+            assertFalse(denied.ok, "the departed officer was still served")
+            assertEquals("not-a-member", denied.reason)
+        }
+
+        handoff(adminId, rekeyFirst = true)
+        handoff(adminId, rekeyFirst = false)
+        handoff(ownerId, rekeyFirst = true)
+        handoff(ownerId, rekeyFirst = false)
+    }
+
+    @Test
+    fun `a forced rotation outranks a rekey admitted in the same batch`() {
+        val circleId = "rekey-departure-gen"
+        val invite = "bearer-invite"
+        val ownerId = TlsIdentity.generate()
+        val memberId = TlsIdentity.generate()
+        val owner = ownerId.fingerprint
+        val member = memberId.fingerprint
+        val officerKey = "officer-key-v7"
+
+        fun run(rekeyFirst: Boolean) {
+            val host = CircleHostState()
+            host.seed(circleId, invite, "group-key-v1", owner, ownerId)
+            assertTrue(
+                host.onCircle(
+                    CircleRequest(
+                        CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = member,
+                        events = listOf(joinProof(owner, circleId, invite, memberId)),
+                    ),
+                ).ok,
+            )
+            val before = host.snapshot()
+            val requestedGen = before.rekeyGen + 7
+            val rekey = CircleCore.create(
+                circleId, owner, ownerId, CircleEvent.REKEY,
+                buildJsonObject {
+                    put("keyB64", JsonPrimitive(officerKey))
+                    put("gen", JsonPrimitive(requestedGen))
+                }.toString(),
+                lamport = if (rekeyFirst) 1L else 2L,
+            )
+            val kick = CircleCore.create(
+                circleId, owner, ownerId, CircleEvent.KICK,
+                buildJsonObject {
+                    put("kickId", JsonPrimitive("kick-$rekeyFirst"))
+                    put("targetFp", JsonPrimitive(member))
+                    put("approve", JsonPrimitive(true))
+                    put("mode", JsonPrimitive("admin"))
+                }.toString(),
+                lamport = if (rekeyFirst) 2L else 1L,
+            )
+            val batch = if (rekeyFirst) listOf(rekey, kick) else listOf(kick, rekey)
+            val answered = host.onCircle(
+                CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = owner, events = batch),
+            )
+            assertTrue(answered.ok, "sync refused: ${answered.reason}")
+            val after = host.snapshot()
+            assertFalse(after.members.contains(member))
+            assertTrue(
+                after.key != before.key && after.key != officerKey,
+                "the fresh host key must replace an admitted rekey on departure",
+            )
+            assertEquals(requestedGen + 1, after.rekeyGen, "generation must stay monotonic")
+            val hostRekey = after.events.filter { it.type == CircleEvent.REKEY }
+                .maxByOrNull { e ->
+                    (Json.parseToJsonElement(e.body).jsonObject["gen"] as JsonPrimitive).content.toInt()
+                }!!
+            assertRekey(hostRekey, after.key, after.rekeyGen, setOf(owner))
+            // A peer folding the signed answer lands on the host's fresh key.
+            val st = CircleCliState(circleId = circleId, key = before.key, hostFp = owner)
+            mergeCircleAnswer(st, answered)
+            assertEquals(after.key, st.key)
+            assertEquals(after.rekeyGen, st.rekeyGen)
+        }
+
+        run(rekeyFirst = true)
+        run(rekeyFirst = false)
+    }
+
+    @Test
+    fun `the JOIN proof gate refuses an invited attacker without a signed proof`() = runBlocking {
+        val circleId = "join-proof-walk"
+        val invite = "bearer-invite"
+        val ownerId = TlsIdentity.generate()
+        val attackerId = TlsIdentity.generate()
+        val victimId = TlsIdentity.generate()
+        val owner = ownerId.fingerprint
+        val attacker = attackerId.fingerprint
+        val victim = victimId.fingerprint
+        val delegate = ConsoleDelegate()
+        delegate.circleHost.seed(circleId, invite, "group-key-v1", owner, ownerId)
+        val server = ProtocolServer(
+            ownerId, delegate,
+            ServerConfig(
+                alias = "join-proof-host", port = 0, tls = true,
+                destDir = Files.createTempDirectory("join-proof-harness"),
+            ),
+        )
+        server.start()
+        val target = SendTarget("127.0.0.1", server.port, tls = true)
+        try {
+            val attackerClient = ProtocolClient(attackerId)
+            val victimClient = ProtocolClient(victimId)
+
+            // The invite is a bearer token, but an attacker who knows it and
+            // presents their OWN certificate still has no proof of possession.
+            val noProof = attackerClient.circleJoin(
+                target, CircleRequest(CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = attacker),
+            )
+            assertNotNull(noProof)
+            assertFalse(noProof.ok)
+            assertEquals("join proof required", noProof.reason)
+            assertTrue(CircleResponse.verify(noProof, owner), "a signed refusal must still pin to the host")
+            assertFalse(delegate.circleHost.snapshot().members.contains(attacker))
+
+            // A validly signed proof naming a different host does not pass.
+            val wrongHost = joinProof(attacker, circleId, invite, attackerId)
+            val forged = attackerClient.circleJoin(
+                target,
+                CircleRequest(
+                    CircleRequest.ACTION_JOIN, circleId, invite = invite,
+                    memberFp = attacker, events = listOf(wrongHost),
+                ),
+            )
+            assertNotNull(forged)
+            assertFalse(forged.ok)
+            assertEquals("invalid join proof", forged.reason)
+            assertFalse(delegate.circleHost.snapshot().members.contains(attacker))
+
+            // The rightful member's own signed proof succeeds.
+            val joined = victimClient.circleJoin(
+                target,
+                CircleRequest(
+                    CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = victim,
+                    events = listOf(joinProof(owner, circleId, invite, victimId)),
+                ),
+            )
+            assertNotNull(joined)
+            assertTrue(joined.ok, "honest join refused: ${joined.reason}")
+            assertTrue(delegate.circleHost.snapshot().members.contains(victim))
+            assertNull(delegate.circleHost.snapshot().roles[attacker])
+
+            attackerClient.close()
+            victimClient.close()
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `circleAnswerSigned pins an answer to the host fingerprint`() {
+        val hostId = TlsIdentity.generate()
+        val otherId = TlsIdentity.generate()
+        val answer = CircleResponse.sign(CircleResponse(true, key = "group-key"), hostId)
+        assertTrue(circleAnswerSigned(answer, hostId.fingerprint))
+        assertTrue(circleAnswerSigned(answer, "  ${hostId.fingerprint.lowercase()}  "), "pin is normalised")
+        assertFalse(circleAnswerSigned(answer, otherId.fingerprint), "another host's answer is refused")
+        assertFalse(circleAnswerSigned(answer, null), "without a pin the answer is not trusted")
+        assertFalse(circleAnswerSigned(answer.copy(sig = ""), hostId.fingerprint))
+        assertFalse(circleAnswerSigned(null, hostId.fingerprint))
+        assertTrue(
+            explainCircleFailure(answer.copy(sig = ""), null, "host", hostId.fingerprint)
+                .contains("not signed by"),
+        )
+    }
+
+    @Test
+    fun `mergeCircleAnswer learns only host-signed rekeys and never a sync key`() {
+        val circleId = "merge-rekey"
+        val hostId = TlsIdentity.generate()
+        val host = hostId.fingerprint
+        fun rekeyBody(key: String, gen: Int) = buildJsonObject {
+            put("keyB64", JsonPrimitive(key))
+            put("gen", JsonPrimitive(gen))
+            putJsonArray("members") { add(JsonPrimitive(host)) }
+        }.toString()
+        fun answer(events: List<CircleEvent>, key: String = "") = CircleResponse.sign(
+            CircleResponse(true, key = key, members = listOf(host), events = events), hostId,
+        )
+
+        val st = CircleCliState(circleId = circleId, key = "group-key-v1", hostFp = host)
+        val rotated = CircleCore.create(
+            circleId, host, hostId, CircleEvent.REKEY, rekeyBody("group-key-v2", 1), lamport = 1L,
+        )
+        mergeCircleAnswer(st, answer(listOf(rotated)))
+        assertEquals("group-key-v2", st.key, "the rotated key is learned from the host-signed rekey")
+        assertEquals(1, st.rekeyGen)
+
+        // A lower generation in the same signed log is history.
+        val stale = CircleCore.create(
+            circleId, host, hostId, CircleEvent.REKEY, rekeyBody("group-key-v0", 0), lamport = 2L,
+        )
+        mergeCircleAnswer(st, answer(listOf(stale)))
+        assertEquals("group-key-v2", st.key)
+        assertEquals(1, st.rekeyGen)
+
+        // Even a signed SYNC answer carrying a key must not replace it.
+        mergeCircleAnswer(st, answer(emptyList(), key = "rogue-key"))
+        assertEquals("group-key-v2", st.key, "a sync answer never hands out a key")
+
+        // Only an explicit JOIN-fold adopts the key field.
+        val joining = CircleCliState(circleId = circleId, key = "", hostFp = host)
+        mergeCircleAnswer(joining, answer(emptyList(), key = "join-key"), fromJoin = true)
+        assertEquals("join-key", joining.key)
+    }
+
+    @Test
+    fun `circleFreshEvents drops an event whose certificate does not match its author`() {
+        val circleId = "fresh-gate"
+        val victim = TlsIdentity.generate()
+        val attacker = TlsIdentity.generate()
+        val forged = CircleCore.create(
+            circleId, victim.fingerprint, attacker, CircleEvent.MESSAGE,
+            """{"text":"I am the victim"}""", lamport = 1L,
+        )
+        val honest = CircleCore.create(
+            circleId, attacker.fingerprint, attacker, CircleEvent.MESSAGE,
+            """{"text":"I am myself"}""", lamport = 2L,
+        )
+        val folded = circleFreshEvents(CircleCliState(circleId = circleId), listOf(forged, honest))
+        assertEquals(listOf(honest.id), folded.map { it.id })
+        assertFalse(CircleCore.verify(forged))
+        assertTrue(CircleCore.verify(honest))
     }
 }

@@ -1,5 +1,6 @@
 package app.flit.share.harness
 
+import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.client.ProtocolClient
@@ -431,15 +432,15 @@ object CourierCli {
 
             // Fold-time gates mirror FlitCircleSync.openAtMe + fresh. The
             // envelope is ciphertext to every carrier, yet once opened its
-            // author is untrusted: JOIN and REKEY are governance verbs, only a
-            // current local member may mint a foldable event, the circle must
-            // match, the type body must be well formed and the signature must
-            // verify before anything is staged for circle.state.
+            // author is untrusted: even an OWNER could seal a self-signed JOIN
+            // or REKEY. Foldability is the shared CircleAuthority decision with
+            // NO role data here — so neither privileged verb may enter from a
+            // parcel — while the membership check keeps a departed or
+            // never-member author out. CircleCore.verify checks every
+            // signature before anything is staged for circle.state.
             val allowed = opened.filter { event ->
-                event.type != CircleEvent.JOIN &&
-                    event.type != CircleEvent.REKEY &&
-                    norm(event.authorFp) in members &&
-                    event.circleId == st.circleId &&
+                norm(event.authorFp) in members &&
+                    CircleAuthority.foldable(event, st.circleId, emptyMap()) &&
                     (event.type != CircleEvent.FILE || CircleCore.validFileBody(event.body)) &&
                     (event.type != CircleEvent.PARCEL || CourierCarryCore.validParcelBody(event.body)) &&
                     bodyReadable(event.body) &&
@@ -636,6 +637,9 @@ object CourierCli {
                 members = lines[4].split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList(),
                 events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5]).toMutableList(),
                 rekeyGen = lines[6].toIntOrNull() ?: 0,
+                // Same optional eighth line as Harness.loadCircleState; legacy
+                // seven-line files still load with no pin.
+                hostFp = lines.getOrNull(7)?.trim().orEmpty(),
             )
         }.getOrNull()
     }

@@ -295,6 +295,14 @@ class PadCliTest {
         try {
             val ownerClient = ProtocolClient(ownerId)
             val memberClient = ProtocolClient(memberId)
+            val now = System.currentTimeMillis()
+            val proof = CircleCore.create(
+                circleId, member, memberId, CircleEvent.JOIN,
+                CircleCore.joinProofBody(
+                    owner, circleId, invite, member, CircleCore.joinProofBucket(now),
+                ),
+                0L, now,
+            )
             val joined = memberClient.circleJoin(
                 target,
                 CircleRequest(
@@ -302,6 +310,7 @@ class PadCliTest {
                     circleId = circleId,
                     invite = invite,
                     memberFp = member,
+                    events = listOf(proof),
                 ),
             )
             assertNotNull(joined)

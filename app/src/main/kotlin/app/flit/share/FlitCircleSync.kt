@@ -1,5 +1,6 @@
 package app.flit.share
 
+import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.circle.PadCore
@@ -136,7 +137,7 @@ internal fun circleAckOf(batch: List<CircleEvent>): CircleWatermark? =
  * Strict shape for an event WE mint. A malformed body must never be signed,
  * stored or fanned out — a bad vote or kick would otherwise travel to every
  * peer as a perfectly valid signature over unusable data. The rules mirror
- * the store's reducers; a body they cannot act on is refused here, honestly.
+ * the store's reducers; a body they cannot act on is refused here, explicitly.
  */
 internal fun circleBodyValid(type: String, body: String): Boolean {
     if (body.isBlank() || body.length > CircleCore.MAX_BODY_CHARS) return false
@@ -366,6 +367,7 @@ object FlitCircleSync {
         handoffHook = null
         handoffPublishHook = null
         parcelShas.clear()
+        CircleCore.clear() // the fold-time replay set must not leak between tests
         nextDialAt.clear()
         misses.clear()
         watermarks.clear()
@@ -424,33 +426,46 @@ object FlitCircleSync {
 
     /** Join a founded Circle from its QR code (bearer invite, no key in the QR). */
     suspend fun join(code: QrAdd) {
-        // The host only supplies circle data. Our own fingerprint comes from
-        // meFp(), which already prefers the test seam and otherwise reads the
-        // persisted identity — no separate signing identity is needed to join.
+        // The invite is a bearer token, so it must be accompanied by a proof
+        // from the private key behind the claimed fingerprint. Both the JOIN
+        // event and its nonce digest are minted here, with the same identity
+        // the store records as selfFp; a mismatch refuses before any dial.
+        val idf = identity() ?: return
         val me = meFp() ?: return
+        if (me != circleFp(idf.fingerprint)) return
         val host = circleFp(code.fingerprint)
         val circleId = code.circle?.trim()?.takeIf { it.isNotBlank() } ?: return
         if (host.isBlank()) return
+        val invite = code.invite.orEmpty()
+        val now = nowMs()
+        // The proof is bound to the bucket containing `now`, not to an
+        // unbounded timestamp: a captured handshake stops working when the
+        // grid rolls over. The signed event carries `now` as its clock too.
+        val proof = CircleCore.joinProofBody(
+            host, circleId, invite, me, CircleCore.joinProofBucket(now),
+        )
 
         val route = dial(host) ?: return
         val request = CircleRequest(
             action = CircleRequest.ACTION_JOIN,
             circleId = circleId,
-            invite = code.invite.orEmpty(),
+            invite = invite,
             memberFp = me,
-            events = emptyList(),
+            events = listOf(
+                CircleCore.create(circleId, me, idf, CircleEvent.JOIN, proof, 0L, now),
+            ),
             body = "",
         )
         val response = runCatching { route.join(request) }.getOrNull() ?: return
-        if (!response.ok || response.key.isBlank()) return
-        // A rogue relay or on-path peer must not be able to substitute the
-        // group key: the answer is signed by the host named in the QR.
-        // Protocol suites own signature/signing verification; the pure sync
-        // seam returns synthetic answers with no Android keystore.
+        // The signature is checked before the answer is trusted, including a
+        // refusal: a rogue relay must not be able to block a join by forging
+        // an unsigned rejection. Protocol suites own signature verification;
+        // the pure sync seam returns synthetic answers with no Android keystore.
         if (joinPersistHook == null && !CircleResponse.verify(response, host)) {
             log("circle: host answer was not signed by ${host.take(12)} — not joined")
             return
         }
+        if (!response.ok || response.key.isBlank()) return
         // Only now, after the host proved itself and accepted the invite, may
         // this device persist the bearer token.
         // Pure JVM tests use joinPersistHook and have no Android runtime.
@@ -904,16 +919,16 @@ object FlitCircleSync {
         }
         val state = storedState() ?: return
         // The envelope is ciphertext to every carrier but us, yet its author is
-        // still untrusted once opened: a member could seal self-signed JOIN or
-        // REKEY events and rewrite our roster or group key. Only a current
-        // member may mint a foldable inner event, and never those two verbs.
-        // fresh() still verifies every signature before anything is persisted.
+        // still untrusted once opened: even an OWNER could seal a self-signed
+        // JOIN or REKEY and rewrite our roster or group key. Foldability is the
+        // shared CircleAuthority decision with NO role data here — so neither
+        // privileged verb may enter from a parcel — while the membership check
+        // keeps a departed or never-member author out. fresh() still verifies
+        // every signature before anything is persisted.
         val authors = state.members.map { circleFp(it.fp) }.toSet()
         val rejected = inner.filterTo(HashSet()) { event ->
-            event.circleId != state.id ||
-                circleFp(event.authorFp) !in authors ||
-                event.type.equals(CircleEvent.JOIN, ignoreCase = true) ||
-                event.type.equals(CircleEvent.REKEY, ignoreCase = true)
+            circleFp(event.authorFp) !in authors ||
+                !CircleAuthority.foldable(event, state.id, emptyMap())
         }
         if (rejected.isNotEmpty()) {
             log("courier: rejected ${rejected.size} opened event(s) — foreign circle, " +
@@ -975,22 +990,45 @@ object FlitCircleSync {
     }
 
     /**
-     * Verified, in-window, deduplicated and deterministically ordered events.
+     * The single fold gate for events arriving from a peer or opened from a
+     * parcel. The stages are deliberately ordered:
      *
-     * Incoming dedup is against the local log, not a one-shot global
-     * reservation: `CircleCore.evaluate` consumes ids, so using it here would
-     * silently drop an event whose persistence failed on an earlier tick.
-     * Bodies must parse as one bounded JSON object before a reducer sees them.
+     *  1. pure shape and circle gates;
+     *  2. [CircleAuthority.foldable] with the roster's fingerprint→role map —
+     *     a JOIN is a host-routed handshake, never a log entry, and a REKEY
+     *     needs an OWNER/ADMIN author;
+     *  3. type-specific body gates, then one bounded JSON object;
+     *  4. [CircleCore.verify] — no replay id is reserved before the signature
+     *     passes, so a forgery cannot burn a valid event's id;
+     *  5. deterministic [CircleCore.order] and [CircleCore.dedup];
+     *  6. a hash set of local log ids, so an already-stored event is not news;
+     *  7. the bounded [FlitCircleStore.EVENT_CAP]; and finally
+     *  8. [CircleCore.accept] at [nowMs] — the shared replay/skew window guard.
+     *
+     * Only events that survive every stage reserve a replay id. [nowMs] is an
+     * injectable clock so the window decision is testable without sleeping.
      */
-    internal fun fresh(state: CircleState, events: List<CircleEvent>): List<CircleEvent> =
-        CircleCore.dedup(CircleCore.order(events.filter { event ->
-            event.circleId == state.id &&
+    internal fun fresh(
+        state: CircleState,
+        events: List<CircleEvent>,
+        nowMs: Long = this@FlitCircleSync.nowMs(),
+    ): List<CircleEvent> {
+        val localIds = state.events.mapTo(HashSet()) { it.id }
+        val roles = state.members.associate { circleFp(it.fp) to it.role.name }
+        val candidates = events.filter { event ->
+            CircleCore.validShape(event) &&
+                event.circleId == state.id &&
+                CircleAuthority.foldable(event, state.id, roles) &&
                 (event.type != CircleEvent.FILE || CircleCore.validFileBody(event.body)) &&
                 (event.type != CircleEvent.PARCEL || CourierCarryCore.validParcelBody(event.body)) &&
                 circleBodyReadable(event.body) &&
-                CircleCore.verify(event) &&
-                state.events.none { it.id == event.id }
-        })).take(FlitCircleStore.EVENT_CAP)
+                CircleCore.verify(event)
+        }
+        return CircleCore.dedup(CircleCore.order(candidates))
+            .filterNot { it.id in localIds }
+            .take(FlitCircleStore.EVENT_CAP)
+            .filter { CircleCore.accept(it, nowMs) == CircleCore.Decision.Accept }
+    }
 
     /**
      * Best-effort delivery to every remaining member. Each peer gets only the
@@ -998,7 +1036,7 @@ object FlitCircleSync {
      * the whole bounded log back on the wire. An OK answer advances that
      * peer's watermark; a refusal leaves it untouched (and applies backoff),
      * so the missing delta is retried — or repaired by [sync]'s full-log pass.
-     * An empty delta still makes one tiny probe: it keeps the watermark honest
+     * An empty delta still makes one tiny probe: it keeps the watermark accurate
      * and lets us fold any answer the peer has for us.
      *
      * Failures are recorded in the same per-peer backoff the pull worker uses;

@@ -1,6 +1,7 @@
 package app.flit.share.harness
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.circle.DropKeyCore
@@ -50,7 +51,10 @@ import kotlin.system.exitProcess
 // ==== tiny arg parser ========================================================
 
 internal class ParsedArgs(argv: Array<String>) {
+    /** Last value wins here, so existing single-value callers keep their contract. */
     val flags = LinkedHashMap<String, String>()
+    /** Every occurrence, in argv order — for flags such as `poll --option A --option B`. */
+    val repeated = LinkedHashMap<String, MutableList<String>>()
     val positional = mutableListOf<String>()
 
     init {
@@ -59,9 +63,14 @@ internal class ParsedArgs(argv: Array<String>) {
             val a = argv[i]
             if (a.startsWith("--")) {
                 if (i + 1 < argv.size && VALUE_FLAGS.contains(a)) {
-                    flags[a] = argv[i + 1]; i += 2
+                    val value = argv[i + 1]
+                    flags[a] = value
+                    repeated.getOrPut(a) { mutableListOf() }.add(value)
+                    i += 2
                 } else {
-                    flags[a] = ""; i++
+                    flags[a] = ""
+                    repeated.getOrPut(a) { mutableListOf() }.add("")
+                    i++
                 }
             } else {
                 positional.add(a); i++
@@ -70,6 +79,7 @@ internal class ParsedArgs(argv: Array<String>) {
     }
 
     fun opt(k: String): String? = flags[k]?.takeIf { it.isNotEmpty() }
+    fun opts(k: String): List<String> = repeated[k].orEmpty().filter { it.isNotBlank() }
     fun optInt(k: String, def: Int): Int = opt(k)?.toIntOrNull() ?: def
     fun has(k: String): Boolean = flags.containsKey(k)
 
@@ -79,6 +89,7 @@ internal class ParsedArgs(argv: Array<String>) {
             "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
             "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host", "--role",
             "--bag", "--to", "--cert", "--ttl", "--out", "--sha", "--drop-id", "--key",
+            "--host-fp",
         )
     }
 }
@@ -161,7 +172,7 @@ panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad> [--circle ID] [--invite TOKEN]
        [--text TEXT] [--file PATH] [--target FP] [--role ADMIN|MEMBER] [--option N]
-       [--host ip[:port]] -- accountless group coordination over the production Circle routes
+       [--host ip[:port]] [--host-fp FP] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
        receipt --sha SHA [--drop-id ID] [--host ip[:port]] — signed acknowledgement of a keyed drop
@@ -176,7 +187,8 @@ private fun circleUsage() {
     println(
         """circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad>
   create          mint a circle id + invite token; print the host command
-  join            --host ip[:port] --circle ID --invite TOKEN — fetch the group key
+  join            --host ip[:port] --circle ID --invite TOKEN --host-fp FP — fetch the group key;
+                  --host-fp is the fingerprint printed by `serve`, pinned for later answers
   post            --text NOTE — signed message; --file PATH — file-drop ANNOUNCEMENT only
                   ({name,size,sha256}: no bytes, no path, no token)
   file            --file PATH — announce the file AND send real bytes to every current
@@ -188,7 +200,8 @@ private fun circleUsage() {
   kick            --target FP — OWNER/ADMIN kick executes now; a MEMBER opens a vote-kick.
                   The key rotates only when the member actually departs.
   leave           publish a leave event, then discard the local key
-  sync            pull the shared log and print the feed + poll tally + confirmed counts
+  sync            pull the shared log and print the feed + poll tally + confirmed counts;
+                  every answer must be signed by the fingerprint pinned at join
   receipt         --sha SHA [--drop-id ID] [--host ip[:port]] — signed ack of a keyed drop
                   resolves dropId and keyId from the signed keyed file event; no key, no event
   pad             put --key K --text T — publish one signed line; del --key K — tombstone it;
@@ -355,10 +368,22 @@ internal class CircleHostState {
         if (fp !in roster) return CircleResponse(false, reason = "not-a-member")
 
         val before = roster.keys.toSet()
+        // ONE immutable pre-batch roster snapshot for every governance
+        // decision in this fold — never the roster the fold itself mutates.
+        // A LEAVE or ROLE earlier in the batch cannot strip or grant authority
+        // mid-flight, so the verdict cannot depend on the fold order.
+        val roles = roster.toMap()
         val ids = log.keys.toHashSet()
-        val admitted = req.events.asSequence()
-            .filter { it.circleId == id }
-            .filter { it.type.trim().lowercase(Locale.ROOT) in CircleEvent.TYPES }
+        val ordered = req.events.asSequence()
+            // The shared authority gate: circle match, known verb, JOIN is a
+            // host-routed handshake (never a SYNC payload), and REKEY needs an
+            // OWNER/ADMIN author. Roles are the snapshot above, so a batch
+            // cannot promote its own rekey mid-flight.
+            .filter { CircleAuthority.foldable(it, id, roles) }
+            // A member may only contribute events it authored. verify() binds
+            // a cert to its own authorFp, not to the fingerprint on the request;
+            // without this a sockpuppet could inject a borrowed signed event.
+            .filter { normalized(it.authorFp) == fp }
             .filter { it.body.length <= MAX_BODY_CHARS }
             // A file announcement is EXACTLY {name,size,sha256}. This is the
             // gate that keeps a sender's local spool path (or a queue token)
@@ -376,51 +401,84 @@ internal class CircleHostState {
             .filter { CircleCore.evaluate(it) == CircleCore.Decision.Accept }
             .toList()
             .let { CircleCore.order(it).take(MAX_EVENTS) }
+        // A signer who also leaves in this batch has no key authority: its
+        // REKEY is a hand-off to a device that is no longer a member. Refuse
+        // it from the admitted set in BOTH fold orders, so the signed REKEY
+        // never reaches a peer that folds the newest generation into its key.
+        val leaving = ordered.filter {
+            it.type.equals(CircleEvent.LEAVE, ignoreCase = true)
+        }.mapTo(HashSet()) { normalized(it.authorFp) }
+        val admitted = ordered.filterNot { e ->
+            e.type.equals(CircleEvent.REKEY, ignoreCase = true) &&
+                normalized(e.authorFp) in leaving
+        }
+        // Greatest generation a REKEY in this batch was allowed to install.
+        // A forced host rotation must outrank it so a peer's monotonic fold
+        // lands on the fresh host key, not an earlier key from the same batch.
+        val batchKeyGen = admitted.maxOfOrNull { e ->
+            if (e.type.equals(CircleEvent.REKEY, ignoreCase = true)) {
+                circleBody(e.body)?.let { circleText(it, "gen")?.toIntOrNull() } ?: Int.MIN_VALUE
+            } else Int.MIN_VALUE
+        } ?: Int.MIN_VALUE
         for (e in admitted) {
             putLog(e)
-            applyGovernanceLocked(e)
+            applyGovernanceLocked(e, roles)
         }
-        if (before.any { it !in roster } &&
-            admitted.none { it.type.equals(CircleEvent.REKEY, ignoreCase = true) }
-        ) rekeyLocked()
+        if (before.any { it !in roster }) {
+            // A departure ALWAYS rotates, admitted REKEY or not: a departing
+            // signer must not keep the live key. Stay monotonic and strictly
+            // above any generation this batch admitted.
+            val floor = if (batchKeyGen == Int.MAX_VALUE) Int.MAX_VALUE else batchKeyGen + 1
+            gen = maxOf(gen, floor)
+            rekeyLocked()
+        }
         if (groupKey.isBlank()) return CircleResponse(false, reason = "circle has no key")
-        return CircleResponse(true, key = groupKey, members = roster.keys.toList(), events = ordered())
+        // Only the invite-gated JOIN hands out the group key. A SYNC answer
+        // never carries it, even to an already-known member; rotations travel
+        // in the host-signed REKEY event instead.
+        return CircleResponse(true, key = "", members = roster.keys.toList(), events = ordered())
     }
 
     /**
      * Store-equivalent reducers: only the OWNER changes roles, only OWNER/ADMIN
      * execute a kick directly (a plain member opens a vote-kick that lands on a
-     * strict majority of current members), and LEAVE removes its own author.
+     * strict majority of the pre-batch members), and LEAVE removes its own
+     * author. [roles] is the one immutable pre-batch snapshot; the mutating
+     * [roster] is only the state being updated, never a source of authority.
      */
-    private fun applyGovernanceLocked(e: CircleEvent) {
+    private fun applyGovernanceLocked(e: CircleEvent, roles: Map<String, String>) {
         val obj = circleBody(e.body) ?: return
         val author = normalized(e.authorFp) ?: return
-        val actor = roster[author] ?: return
+        val actor = roles[author] ?: return
         when (e.type.trim().lowercase(Locale.ROOT)) {
             CircleEvent.LEAVE -> departLocked(author)
             CircleEvent.KICK -> {
                 if (circleBool(obj, "approve") == false) return
                 val target = normalized(circleText(obj, "targetFp") ?: circleText(obj, "target")) ?: return
-                if (roster[target] == "OWNER") return
+                if (roles[target] == "OWNER") return
                 val mode = circleText(obj, "mode")?.lowercase(Locale.ROOT)
                 if ((actor == "OWNER" || actor == "ADMIN") && mode != "vote") {
                     departLocked(target)
                 } else {
-                    val (yes, _) = CircleCore.kickTally(log.values, target, roster.keys)
-                    if (yes > roster.size / 2) departLocked(target)
+                    val (yes, _) = CircleCore.kickTally(log.values, target, roles.keys)
+                    if (yes > roles.size / 2) departLocked(target)
                 }
             }
             CircleEvent.ROLE -> {
                 if (actor != "OWNER") return
                 val target = normalized(circleText(obj, "targetFp")) ?: return
-                if (roster[target] == null || roster[target] == "OWNER") return
+                if (roles[target] == null || roles[target] == "OWNER") return
                 val desired = circleText(obj, "role")?.uppercase(Locale.ROOT) ?: return
-                if (desired !in setOf("ADMIN", "MEMBER") || roster[target] == desired) return
+                if (desired !in setOf("ADMIN", "MEMBER") || roles[target] == desired) return
                 roster[target] = desired
             }
             CircleEvent.REKEY -> {
+                // A lower or absent generation is history: never roll the key
+                // back to one a departed member still holds.
+                val requested = circleText(obj, "gen")?.toIntOrNull() ?: return
+                if (requested < gen) return
                 circleText(obj, "keyB64")?.let { groupKey = it }
-                circleText(obj, "gen")?.toIntOrNull()?.let { gen = maxOf(gen, it) }
+                gen = maxOf(gen, requested)
             }
             else -> Unit
         }
@@ -461,6 +519,9 @@ internal class CircleHostState {
 /** One canonical fingerprint spelling for roster comparison and responses. */
 private fun normalized(fp: String?): String? =
     fp?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotBlank() && it.length <= 128 }
+
+/** Bounds a key learned from a REKEY body, mirroring the app store's key cap. */
+internal const val MAX_CIRCLE_KEY_CHARS = 256
 
 private fun freshCircleKey(): String {
     val bytes = ByteArray(32)
@@ -661,7 +722,7 @@ private suspend fun serve(args: ParsedArgs) {
     println("${ts()} fingerprint ${identity.fingerprint}")
     println("${ts()} circle $circleId invite=$circleInvite — join with: flit-cli circle join --host 127.0.0.1:${
         server.port
-    } --circle $circleId --invite $circleInvite")
+    } --circle $circleId --invite $circleInvite --host-fp ${identity.fingerprint}")
 
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { discovery.stop(); server.close() }
@@ -861,6 +922,8 @@ internal class CircleCliState(
     var members: MutableList<String> = mutableListOf(),
     var events: MutableList<CircleEvent> = mutableListOf(),
     var rekeyGen: Int = 0,
+    /** Fingerprint of the host that signed the JOIN answer; pinned for later answers. */
+    var hostFp: String = "",
 )
 
 private fun circleStatePath(): Path = harnessHome().resolve("circle.state")
@@ -879,6 +942,9 @@ private fun loadCircleState(): CircleCliState? {
             members = lines[4].split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList(),
             events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5]).toMutableList(),
             rekeyGen = lines[6].toIntOrNull() ?: 0,
+            // A legacy seven-line file still loads, but forces a fresh verified
+            // join before any answer can be persisted.
+            hostFp = lines.getOrNull(7)?.trim().orEmpty(),
         )
     }.getOrNull()
 }
@@ -891,6 +957,7 @@ internal fun saveCircleState(st: CircleCliState) {
         st.members.joinToString(","),
         WireJson.encode(st.events),
         st.rekeyGen.toString(),
+        st.hostFp,
     )
     Files.write(f, lines.joinToString("\n").toByteArray(Charsets.UTF_8))
 }
@@ -922,22 +989,95 @@ private suspend fun circleExchange(
 /**
  * One honest explanation for every refused Circle call: a host refusal is
  * reported with the host's own reason; a transport failure is reported as such
- * instead of being disguised as a refusal (or vice versa).
+ * instead of being disguised as a refusal (or vice versa). An answer that is
+ * not signed by the pinned host is never reported as authoritative.
  */
-internal fun explainCircleFailure(resp: CircleResponse?, error: Throwable?, host: String): String = when {
+internal fun explainCircleFailure(
+    resp: CircleResponse?,
+    error: Throwable?,
+    host: String,
+    expectedHostFp: String? = null,
+): String = when {
+    resp != null && expectedHostFp != null && !circleAnswerSigned(resp, expectedHostFp) ->
+        "host answer not signed by ${expectedHostFp.take(12)}…"
     resp?.ok == false && resp.reason.isNotBlank() -> "host refused: ${resp.reason}"
     resp != null -> "host returned an empty refusal"
     error != null -> "no answer from $host (${error.message ?: error.javaClass.simpleName})"
     else -> "no answer from $host"
 }
 
-private fun mergeCircleAnswer(st: CircleCliState, resp: CircleResponse) {
-    st.events = CircleCore.order(CircleCore.dedup(st.events + resp.events)).toMutableList()
+/** The host pin: an explicit --host-fp, or the one learned at join. */
+internal fun circleExpectedHostFp(args: ParsedArgs, st: CircleCliState): String? {
+    val explicit = normalized(args.opt("--host-fp"))
+    val circleChanged = args.opt("--circle")?.takeIf { it.isNotBlank() }?.let { requested ->
+        st.circleId.isNotBlank() && !requested.equals(st.circleId, ignoreCase = true)
+    } ?: false
+    val stored = if (circleChanged) null else normalized(st.hostFp)
+    if (explicit != null && stored != null && !explicit.equals(stored, ignoreCase = true)) return null
+    return explicit ?: stored
+}
+
+/** True only for a well-formed answer signed by the expected host fingerprint. */
+internal fun circleAnswerSigned(resp: CircleResponse?, expectedHostFp: String?): Boolean {
+    val fp = normalized(expectedHostFp) ?: return false
+    if (resp == null) return false
+    return CircleResponse.verify(resp, fp)
+}
+
+/**
+ * The single fold gate for events arriving in a host answer, mirroring the
+ * app's `FlitCircleSync.fresh`: shape/circle, closed body gates, bounded
+ * readable JSON, signature, local-id dedup, deterministic order and the
+ * harness event cap. No replay id is reserved before the signature passes.
+ */
+internal fun circleFreshEvents(st: CircleCliState, events: Iterable<CircleEvent>): List<CircleEvent> {
+    val localIds = st.events.mapTo(HashSet()) { it.id }
+    val candidates = events.filter { e ->
+        e.circleId == st.circleId &&
+            (e.type != CircleEvent.FILE || CircleCore.validFileBody(e.body)) &&
+            (e.type != CircleEvent.RECEIPT || CircleCore.validReceiptBody(e.body)) &&
+            e.body.isNotBlank() && e.body.length <= CircleCore.MAX_BODY_CHARS &&
+            runCatching { Json.parseToJsonElement(e.body) as? JsonObject }.getOrNull() != null &&
+            CircleCore.verify(e)
+    }
+    return CircleCore.order(CircleCore.dedup(candidates))
+        .filterNot { it.id in localIds }
+        .take(CircleHostState.MAX_EVENTS)
+}
+
+/** Newest key/gen carried by a REKEY event in a signed log, if one is present. */
+internal data class CircleKeyUpdate(val key: String, val gen: Int)
+
+internal fun circleLatestRekey(events: Iterable<CircleEvent>): CircleKeyUpdate? {
+    var best: CircleKeyUpdate? = null
+    for (e in CircleCore.order(events)) {
+        if (e.type != CircleEvent.REKEY) continue
+        val obj = circleBody(e.body) ?: continue
+        val key = circleText(obj, "keyB64") ?: circleText(obj, "key") ?: continue
+        if (key.length > MAX_CIRCLE_KEY_CHARS) continue
+        val gen = (obj["gen"] as? JsonPrimitive)?.content?.toIntOrNull() ?: continue
+        if (gen < 0) continue
+        // CircleCore.order breaks ties deterministically, so >= keeps the
+        // greatest-by-(gen, order) update.
+        if (best == null || gen >= best.gen) best = CircleKeyUpdate(key, gen)
+    }
+    return best
+}
+
+/**
+ * Fold a host answer into local state. Only a JOIN answer's key is adopted
+ * verbatim; every later rotation arrives in a host-signed REKEY event and is
+ * installed monotonically by generation.
+ */
+internal fun mergeCircleAnswer(st: CircleCliState, resp: CircleResponse, fromJoin: Boolean = false) {
+    st.events = CircleCore.order(CircleCore.dedup(st.events + circleFreshEvents(st, resp.events))).toMutableList()
     if (resp.members.isNotEmpty()) st.members = resp.members.toMutableList()
-    if (resp.key.isNotBlank()) st.key = resp.key
-    st.rekeyGen = st.events.filter { it.type == CircleEvent.REKEY }.maxOfOrNull { e ->
-        circleBody(e.body)?.let { (it["gen"] as? JsonPrimitive)?.content?.toIntOrNull() } ?: 0
-    } ?: 0
+    if (fromJoin && resp.key.isNotBlank()) st.key = resp.key
+    val newest = circleLatestRekey(st.events)
+    if (newest != null && newest.gen >= st.rekeyGen) {
+        st.key = newest.key
+        st.rekeyGen = maxOf(st.rekeyGen, newest.gen)
+    }
 }
 
 private fun circleNextLamport(st: CircleCliState): Long =
@@ -1259,6 +1399,20 @@ private suspend fun circle(args: ParsedArgs) {
             st.circleId = args.opt("--circle") ?: st.circleId
             st.invite = args.opt("--invite") ?: st.invite
             if (st.circleId.isBlank()) { println("!! join needs --circle ID"); return }
+            val expected = circleExpectedHostFp(args, st)
+                ?: run { println("!! join needs --host-fp FP (the fingerprint printed by serve)"); return }
+            // The bearer invite alone is not proof of the claimed fingerprint:
+            // sign a one-key nonce bound to this host, circle, invite and
+            // freshness bucket with OUR private key, inside the existing event
+            // list — no new route, header, DTO field or status code.
+            val now = System.currentTimeMillis()
+            val proofBody = CircleCore.joinProofBody(
+                expected, st.circleId, st.invite, me, CircleCore.joinProofBucket(now),
+            )
+            val proof = CircleCore.create(
+                st.circleId, me, identity, CircleEvent.JOIN, proofBody,
+                lamport = 0L, createdMs = now,
+            )
             val result = runCatching {
                 ProtocolClient(identity).use { cli ->
                     cli.circleJoin(
@@ -1268,19 +1422,21 @@ private suspend fun circle(args: ParsedArgs) {
                             circleId = st.circleId,
                             invite = st.invite,
                             memberFp = me,
+                            events = listOf(proof),
                         ),
                     )
                 }
             }
             val resp = result.getOrNull()
-            if (resp == null || !resp.ok) {
-                println("!! join refused: ${explainCircleFailure(resp, result.exceptionOrNull(), host)}")
+            // Verify before trusting even a refusal: an on-path peer must not
+            // be able to fake "bad invite" or substitute the group key.
+            if (resp == null || !circleAnswerSigned(resp, expected) || !resp.ok || resp.key.isBlank()) {
+                println("!! join refused: ${explainCircleFailure(resp, result.exceptionOrNull(), host, expected)}")
                 return
             }
             st.host = host
-            st.key = resp.key
-            st.members = resp.members.toMutableList()
-            st.events = CircleCore.order(CircleCore.dedup(st.events + resp.events)).toMutableList()
+            st.hostFp = expected
+            mergeCircleAnswer(st, resp, fromJoin = true)
             saveCircleState(st)
             println("${ts()} joined ${st.circleId}: ${st.members.size} member(s), ${st.events.size} event(s), key=${st.key.take(8)}…")
         }
@@ -1358,9 +1514,17 @@ private suspend fun circle(args: ParsedArgs) {
             pushCircleEvent(st, identity, ev)
 
             // 2. refresh the roster, then deliver the sealed bytes to every member.
+            //    A bad answer leaves the roster unchanged so a redirected reply
+            //    cannot aim the byte push at a different set of recipients.
             if (st.host.isNotBlank()) {
+                val expected = normalized(st.hostFp)
                 val result = circleExchange(identity, circleTarget(st.host), st, emptyList())
-                result.getOrNull()?.takeIf { it.ok }?.let { mergeCircleAnswer(st, it) }
+                val answer = result.getOrNull()
+                if (answer == null || !circleAnswerSigned(answer, expected) || !answer.ok) {
+                    println("!! roster refresh: ${explainCircleFailure(answer, result.exceptionOrNull(), st.host, expected)} — using the current roster")
+                } else {
+                    mergeCircleAnswer(st, answer)
+                }
                 saveCircleState(st)
             }
             val routes = circleRecipients(identity, st, me)
@@ -1380,7 +1544,7 @@ private suspend fun circle(args: ParsedArgs) {
         "poll" -> {
             if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
             val q = args.opt("--text") ?: run { println("!! poll needs --text QUESTION"); return }
-            val opts = (args.opt("--option") ?: "").split(',')
+            val opts = args.opts("--option").flatMap { it.split(',') }
                 .map { it.trim() }.filter { it.isNotEmpty() }
             if (opts.isEmpty()) { println("!! poll needs --option A,B,C"); return }
             val pollId = UUID.randomUUID().toString().replace("-", "").take(12)
@@ -1450,11 +1614,12 @@ private suspend fun circle(args: ParsedArgs) {
                 println("${ts()} left ${st.circleId} locally — no host registered, key discarded")
                 return
             }
+            val expected = normalized(st.hostFp)
             val result = circleExchange(identity, circleTarget(st.host), st, listOf(ev))
             val resp = result.getOrNull()
             Files.deleteIfExists(circleStatePath())
-            if (resp == null || !resp.ok) {
-                println("!! leave: ${explainCircleFailure(resp, result.exceptionOrNull(), st.host)} — left locally, key discarded; host may still list this device")
+            if (resp == null || !circleAnswerSigned(resp, expected) || !resp.ok) {
+                println("!! leave: ${explainCircleFailure(resp, result.exceptionOrNull(), st.host, expected)} — left locally, key discarded; host may still list this device")
             } else {
                 println("${ts()} left ${st.circleId} — host confirmed, key discarded")
             }
@@ -1462,10 +1627,12 @@ private suspend fun circle(args: ParsedArgs) {
         "sync" -> {
             if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
             if (st.host.isBlank()) { println("!! no host — join with --host first"); return }
+            val expected = circleExpectedHostFp(args, st)
+                ?: run { println("!! no host fingerprint pin — join with --host-fp first"); return }
             val result = circleExchange(identity, circleTarget(st.host), st, emptyList())
             val resp = result.getOrNull()
-            if (resp == null || !resp.ok) {
-                println("!! sync refused: ${explainCircleFailure(resp, result.exceptionOrNull(), st.host)}")
+            if (resp == null || !circleAnswerSigned(resp, expected) || !resp.ok) {
+                println("!! sync refused: ${explainCircleFailure(resp, result.exceptionOrNull(), st.host, expected)}")
                 return
             }
             mergeCircleAnswer(st, resp)
@@ -1541,11 +1708,12 @@ private suspend fun pushCircleEvent(st: CircleCliState, identity: TlsIdentity, e
         println("${ts()} ${ev.type} recorded locally (no host yet — sync after joining)")
         return
     }
+    val expected = normalized(st.hostFp)
     val result = circleExchange(identity, circleTarget(st.host), st, listOf(ev))
     val resp = result.getOrNull()
-    if (resp == null || !resp.ok) {
+    if (resp == null || !circleAnswerSigned(resp, expected) || !resp.ok) {
         saveCircleState(st)
-        println("!! ${ev.type} not accepted: ${explainCircleFailure(resp, result.exceptionOrNull(), st.host)} (kept locally)")
+        println("!! ${ev.type} not accepted: ${explainCircleFailure(resp, result.exceptionOrNull(), st.host, expected)} (kept locally)")
         return
     }
     mergeCircleAnswer(st, resp)

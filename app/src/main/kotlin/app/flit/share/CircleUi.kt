@@ -189,8 +189,9 @@ fun CircleScreen(
     var question by remember { mutableStateOf("") }
     var choices by remember { mutableStateOf("") }
     var showMembers by remember { mutableStateOf(false) }
-    // The pad is its own surface, opened from the top bar and dismissed through
-    // PadCard's onClose. It never reads the store: the caller supplies the view.
+    // The pad is a modal sheet, opened from the top bar. The scrim/dialog window
+    // keeps the feed behind inert and dismisses on back or outside tap. Search
+    // state stays local to the sheet; it never reads the store or a pure object.
     var showPad by remember { mutableStateOf(false) }
     // Identity loads asynchronously, so meFp can briefly be blank. The store
     // keeps exactly one OWNER — this device — so that roster entry is a safe
@@ -480,13 +481,14 @@ fun CircleScreen(
     }
 
     if (showPad) {
-        // Pure presentation: PadCard reads only the supplied view and routes
-        // every edit/delete back through the caller's signed publish callbacks.
-        PadCard(
+        // Modal sheet: its scrim and dialog window own focus/hit-testing, so the
+        // feed behind the pad cannot be reached, and back/outside tap dismisses.
+        // PadCard stays pure presentation; the only new state is the local query.
+        PadSheet(
             view = padView,
             onPut = onPadPut,
             onDel = onPadDel,
-            onClose = { showPad = false },
+            onDismiss = { showPad = false },
         )
     }
 }
@@ -1144,6 +1146,57 @@ private fun MemberSheet(
                     Text("Leave circle", style = typ.labelMedium, fontWeight = FontWeight.Bold)
                 }
             }
+        }
+    }
+}
+
+// ---- pad sheet -------------------------------------------------------------
+
+/**
+ * Modal host for the Circle pad.
+ *
+ * [ModalBottomSheet] supplies the scrim and the dialog window that owns focus
+ * and hit-testing, so the feed behind the pad is not reachable while it is up;
+ * back and outside tap dismiss through the same [onDismiss] path as the close
+ * icon inside [PadCard]. The search field is local Compose state: it is fed
+ * straight into [PadCard]'s `query` and never touches the store or a pure
+ * object. Every control [PadCard] draws keeps its 48 dp target.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PadSheet(
+    view: PadView,
+    onPut: (String, String) -> Unit,
+    onDel: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                label = { Text("Search pad") },
+                singleLine = true,
+                shape = RoundedCornerShape(FlitCorner.largeIncreased),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            )
+            // Pure presentation: PadCard reads only the supplied view and the
+            // local query, routing every edit/delete back through the caller's
+            // signed publish callbacks. Its close icon uses onDismiss too.
+            PadCard(
+                view = view,
+                onPut = onPut,
+                onDel = onDel,
+                onClose = onDismiss,
+                query = query,
+            )
         }
     }
 }

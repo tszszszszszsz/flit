@@ -1,6 +1,7 @@
 package app.flit.share
 
 import android.content.Context
+import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.courier.CourierCarryCore
 import kotlinx.serialization.Serializable
@@ -50,10 +51,14 @@ fun reduce(state: CircleState, event: CircleEvent): CircleState =
  *            for a kick; `{"pollId":..., "option": n}` for a poll. Votes are
  *            changeable: the latest vote per member wins.
  * - `rekey`  `{"keyB64": "...", "gen": n}` — installs a fresh group key.
- *            Only a known participant may rotate (a current member, or an
- *            author already present in the signed log, so a device can hand
- *            off a fresh key in the same batch as its leave), and a generation
- *            older than the local one is stale replay: it cannot replace the key.
+ *            Only an OWNER or ADMIN on the *pre-batch* roster may rotate (the
+ *            shared `CircleAuthority.foldable` gate): membership alone, a
+ *            departed signer and a fingerprint known only from the signed log
+ *            carry no authority. [merge] snapshots the roster once before the
+ *            fold, so event order cannot change who is authorised, and a signer
+ *            who also submits a `leave` in the same batch is refused outright
+ *            — a device cannot hand off a key as it departs. A generation older
+ *            than the local one is stale replay: it cannot replace the key.
  *
  * Governance: the founder is OWNER; only OWNER appoints/removes ADMINs; ADMIN
  * (and OWNER) may kick MEMBER/ADMIN but never OWNER; a vote-kick needs a simple
@@ -309,17 +314,41 @@ object FlitCircleStore {
 
     // ==== pure reducers =========================================================
 
-    /** Deterministic fold; each event is applied once, in the given order. */
-    fun merge(state: CircleState, events: List<CircleEvent>): CircleState =
-        events.fold(state) { acc, event -> reduce(acc, event) }
+    /**
+     * Deterministic fold; each event is applied once, in the given order.
+     * Rekey authority is decided from one immutable snapshot of the roster as
+     * it stood before the batch, never from the partially folded roster: fold
+     * order alone cannot promote a signer or let one hand off a key while
+     * leaving. The authors of every `leave` in the batch are vetoed as rekey
+     * signers as well, so a departing officer cannot install its own key even
+     * when its rekey is folded before its leave.
+     */
+    fun merge(state: CircleState, events: List<CircleEvent>): CircleState {
+        val roles = rolesOf(state.members)
+        val leavers = leavingAuthors(events)
+        return events.fold(state) { acc, event -> reduce(acc, event, roles, leavers) }
+    }
 
     /**
      * Total reducer: wrong-circle, duplicate and malformed events are appended
      * as history (or ignored) but never crash and never change membership.
      * Events with no id or no author are dropped before dispatch: they cannot
      * be deduplicated or attributed, so they must not enter the log at all.
+     *
+     * The two-argument form is the single-event entry point: it takes its
+     * authority snapshot from [state] and has no same-batch leavers. [merge]
+     * supplies the batch-wide context through the four-argument form.
      */
-    fun reduce(state: CircleState, event: CircleEvent): CircleState {
+    fun reduce(state: CircleState, event: CircleEvent): CircleState =
+        reduce(state, event, rolesOf(state.members), emptySet())
+
+    /** Fold one event with the immutable authority context of its batch. */
+    fun reduce(
+        state: CircleState,
+        event: CircleEvent,
+        preBatchRoles: Map<String, String>,
+        batchLeavers: Set<String>,
+    ): CircleState {
         if (event.id.isBlank() || event.authorFp.isBlank()) return state
         if (!event.circleId.equals(state.id, ignoreCase = false)) return state
         if (state.events.any { it.id == event.id }) return state
@@ -328,7 +357,7 @@ object FlitCircleStore {
             "leave" -> applyLeave(state, event)
             "kick" -> applyKick(state, event)
             "role" -> applyRole(state, event)
-            "rekey" -> applyRekey(state, event)
+            "rekey" -> applyRekey(state, event, preBatchRoles, batchLeavers)
             "vote" -> applyVote(state, event)
             else -> append(state, event)
         }
@@ -408,21 +437,37 @@ object FlitCircleStore {
         )
     }
 
+    /** Single-event form: authority comes from this state's own roster. */
+    fun applyRekey(state: CircleState, event: CircleEvent): CircleState =
+        applyRekey(state, event, rolesOf(state.members), emptySet())
+
     /**
-     * Installs a fresh group key after a departure. Only a known signer may
-     * rotate: someone on the roster or already present as an author in the
-     * log (so a departing device can hand off a key in the same batch as its
-     * leave). `gen` is mandatory, non-negative and at least the local
-     * generation, so an old rekey replay cannot roll the live key back. A
-     * successful install never bumps the generation a second time — the
-     * departure already did.
+     * Installs a fresh group key after a departure. Authority comes from the
+     * shared [CircleAuthority.foldable] gate applied to [preBatchRoles], the
+     * immutable roster snapshot taken at [merge] entry: the signer must hold
+     * OWNER or ADMIN on that roster, so folding a `leave` before or after the
+     * rekey cannot change the decision. A signer whose fingerprint is in
+     * [batchLeavers] is refused even when the snapshot grants it authority:
+     * an officer cannot install its chosen key on the way out. Being a MEMBER,
+     * a departed signer, or merely an author in the signed log is never enough,
+     * and `join` is never foldable. `gen` is mandatory, non-negative and at
+     * least the local generation, so an old rekey replay cannot roll the live
+     * key back. A successful install never bumps the generation a second time
+     * — the departure already did.
      */
-    fun applyRekey(state: CircleState, event: CircleEvent): CircleState {
+    fun applyRekey(
+        state: CircleState,
+        event: CircleEvent,
+        preBatchRoles: Map<String, String>,
+        batchLeavers: Set<String>,
+    ): CircleState {
         val next = append(state, event)
-        // Check `state`, not `next`: the rekey event must not vouch for itself.
-        val known = state.members.any { it.fp.equals(event.authorFp, ignoreCase = true) } ||
-            state.events.any { it.authorFp.equals(event.authorFp, ignoreCase = true) }
-        if (!known) return next
+        // The same-batch veto is absolute and order-independent. Check the
+        // snapshot, not `next`: the rekey event must not vouch for itself, and
+        // a same-batch leave must not retroactively bless a key that was folded
+        // first — it refuses the key outright instead.
+        if (event.authorFp.trim().uppercase(Locale.ROOT) in batchLeavers) return next
+        if (!CircleAuthority.foldable(event, state.id, preBatchRoles)) return next
         val body = bodyOf(event) ?: return next
         val key = body.str("keyB64") ?: body.str("key") ?: return next
         if (key.length > MAX_KEY_CHARS) return next
@@ -556,6 +601,17 @@ object FlitCircleStore {
         if (yes > state.members.size / 2) return depart(state, target)
         return state
     }
+
+    /** Canonical fingerprint → role map expected by [CircleAuthority.foldable]. */
+    private fun rolesOf(members: Collection<Member>): Map<String, String> =
+        members.associate { it.fp.trim().uppercase(Locale.ROOT) to it.role.name }
+
+    /** Uppercased authors of every leave in a batch, for the same-batch veto. */
+    private fun leavingAuthors(events: List<CircleEvent>): Set<String> =
+        events.asSequence()
+            .filter { it.type.trim().lowercase(Locale.ROOT) == CircleEvent.LEAVE }
+            .mapNotNull { it.authorFp.trim().uppercase(Locale.ROOT).takeIf { fp -> fp.isNotEmpty() } }
+            .toSet()
 
     private fun bodyOf(event: CircleEvent): JsonObject? =
         runCatching { Json.parseToJsonElement(event.body) as? JsonObject }.getOrNull()

@@ -250,6 +250,97 @@ class FlitCircleHostTest {
     }
 
     @Test
+    fun `a departing officer cannot smuggle its rekey past the host in either order`() {
+        val h = host()
+        val st = state(members = listOf(ownerMember, adminMember, memberMember))
+        val stolen = "officer-key"
+
+        for (rekeyFirst in listOf(false, true)) {
+            // Fresh ids for each order: CircleCore's replay guard remembers ids
+            // across calls, so reusing the same signed events would mask the fold.
+            // onSync sorts by lamport, so vary lamports to vary the fold order;
+            // submit in the opposite order to prove arrival cannot matter.
+            val rekey = signed(
+                adminId, CircleEvent.REKEY,
+                """{"keyB64":"$stolen","gen":1}""",
+                lamport = if (rekeyFirst) 10L else 20L,
+            )
+            val leave = signed(
+                adminId, CircleEvent.LEAVE, """{"memberFp":"$adminFp"}""",
+                lamport = if (rekeyFirst) 20L else 10L,
+            )
+            val batch = if (rekeyFirst) listOf(leave, rekey) else listOf(rekey, leave)
+            val result = h.onRequest(sync(adminFp, batch), st)
+            assertTrue(result.ok)
+            assertEquals(listOf(ownerFp, memberFp), result.members)
+            assertEquals("", result.key) // SYNC never carries key material
+
+            val rekeys = result.events.filter { it.type == CircleEvent.REKEY }
+            assertEquals(2, rekeys.size) // refused as history, plus the host mint
+            assertTrue(rekeys.any { it.id == rekey.id })
+            val hostRekey = rekeys.single { it.authorFp == ownerFp }
+            assertNotEquals(rekey.id, hostRekey.id) // the officer's key event never wins
+            assertTrue(CircleCore.verify(hostRekey))
+            assertTrue(hostRekey.lamport > batch.maxOf { it.lamport }) // sorts after the batch
+
+            val next = h.accept(result, st)
+            assertNotEquals(stolen, next.keyB64) // attacker key is never installed
+            assertNotEquals("key-v1", next.keyB64) // host rotated to a fresh key
+            assertTrue(next.rekeyGen >= 1) // generation never moves backwards
+            assertEquals(listOf(ownerFp, memberFp), next.members.map { it.fp })
+            assertEquals("key-v1", st.keyB64) // input untouched
+        }
+    }
+
+    @Test
+    fun `a departure forces a host rotation above a rekey admitted in the same batch`() {
+        for (rekeyFirst in listOf(false, true)) {
+            val h = host()
+            val st = state(members = listOf(ownerMember, adminMember, memberMember))
+            val requestedGen = st.rekeyGen + 7
+            val rekey = signed(
+                ownerId, CircleEvent.REKEY,
+                """{"keyB64":"officer-key","gen":$requestedGen}""",
+                lamport = if (rekeyFirst) 1L else 2L,
+            )
+            val kick = signed(
+                ownerId, CircleEvent.KICK,
+                """{"kickId":"kick-$rekeyFirst","targetFp":"$memberFp","mode":"admin","approve":true}""",
+                lamport = if (rekeyFirst) 2L else 1L,
+            )
+            val batch = if (rekeyFirst) listOf(rekey, kick) else listOf(kick, rekey)
+
+            val result = h.onRequest(sync(ownerFp, batch), st)
+            assertTrue(result.ok)
+            val next = h.accept(result, st)
+            assertTrue(next.members.none { it.fp == memberFp })
+            assertNotEquals("officer-key", next.keyB64) // host key replaces admitted one
+            assertNotEquals("key-v1", next.keyB64)
+            assertEquals(requestedGen + 1, next.rekeyGen) // monotonic in both fold orders
+        }
+    }
+
+    @Test
+    fun `admin signed rekey via sync is admitted without a host rotation`() {
+        val h = host()
+        val st = state(members = listOf(ownerMember, adminMember, memberMember))
+        val rekey = signed(adminId, CircleEvent.REKEY, """{"keyB64":"admin-key","gen":1}""")
+
+        val result = h.onRequest(sync(adminFp, listOf(rekey)), st)
+        assertTrue(result.ok)
+        assertEquals(listOf(rekey.id), result.events.map { it.id })
+        val admitted = result.events.single { it.type == CircleEvent.REKEY }
+        assertEquals(adminFp, admitted.authorFp) // the admin's own event, not a host mint
+        assertEquals("", result.key) // SYNC never hands out key material
+
+        val next = h.accept(result, st)
+        assertEquals("admin-key", next.keyB64)
+        assertEquals(1, next.rekeyGen)
+        assertEquals(3, next.members.size) // no departure, so no host rotation
+        assertEquals("key-v1", st.keyB64) // input untouched
+    }
+
+    @Test
     fun `owner signed role event promotes a member through request and accept`() {
         val h = host()
         val st = state(members = listOf(ownerMember, memberMember))

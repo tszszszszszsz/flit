@@ -6,6 +6,7 @@ import app.flit.share.protocol.courier.CarryState
 import app.flit.share.protocol.courier.CourierCarryCore
 import app.flit.share.protocol.courier.CourierEnvelope
 import app.flit.share.protocol.courier.PARCEL
+import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.tls.TlsIdentity
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
@@ -394,6 +395,76 @@ class CourierCliTest {
                     ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
                 ),
             )
+        }
+    }
+
+    @Test
+    fun `receive folds neither JOIN nor REKEY out of an opened parcel`() = inIsolatedHome {
+        val identity = loadOrCreateIdentity()
+        val me = identity.fingerprint
+        val circleId = "cli-fold-gate"
+        val now = System.currentTimeMillis()
+        saveCircleState(
+            CircleCliState(
+                circleId = circleId, host = "",
+                members = mutableListOf(me), events = mutableListOf(),
+            ),
+        )
+        // All three are validly signed by a current member. Foldability — not
+        // the signature — is what keeps the two privileged verbs out.
+        val join = CircleCore.create(
+            circleId, me, identity, CircleEvent.JOIN, """{"alias":"me"}""", lamport = 0L,
+        )
+        val rekey = CircleCore.create(
+            circleId, me, identity, CircleEvent.REKEY,
+            """{"keyB64":"rogue-key","gen":1}""", lamport = 1L,
+        )
+        val message = CircleCore.create(
+            circleId, me, identity, CircleEvent.MESSAGE, """{"text":"kept"}""", lamport = 2L,
+        )
+        val envelope = CourierEnvelope.seal(
+            listOf(join, rekey, message), circleId, me, me, identity.certificate, identity, now,
+        ) ?: error("production seal refused a small, valid envelope")
+        val body = buildJsonObject {
+            put("toFp", JsonPrimitive(me))
+            put("envelope", JsonPrimitive(CourierEnvelope.encode(envelope)))
+        }.toString()
+        val parcelEvent = CircleCore.create(circleId, me, identity, PARCEL, body, lamport = 3L)
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)
+            ?: error("production parcelOf refused a valid parcel")
+
+        withTempDir("courier-cli-fold-gate-") { bag ->
+            Files.writeString(
+                bag.resolve("${parcel.id}.parcel"),
+                CourierCarryCore.encode(CarryState(listOf(parcel))),
+                Charsets.UTF_8,
+            )
+            Files.writeString(
+                expectedHome().resolve(CourierCli.STATE_FILE),
+                CourierCli.encodeRows(
+                    listOf(
+                        CourierCli.Row(
+                            parcel.id, me, me, circleId, "pending", parcel.createdMs, parcel.expiresMs,
+                        ),
+                    ),
+                ),
+                Charsets.UTF_8,
+            )
+            assertEquals(
+                0,
+                CourierCli.run(
+                    ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
+                ),
+            )
+            val stateLines = Files.readAllLines(expectedHome().resolve("circle.state"))
+            val folded = WireJson.json.decodeFromString<List<CircleEvent>>(stateLines[5])
+            assertEquals(listOf(message.id), folded.map { it.id })
+            assertFalse(folded.any { it.type == CircleEvent.JOIN })
+            assertFalse(folded.any { it.type == CircleEvent.REKEY })
+            val row = CourierCli.decodeRows(
+                Files.readString(expectedHome().resolve(CourierCli.STATE_FILE), Charsets.UTF_8),
+            ).single()
+            assertEquals("delivered", row.state)
         }
     }
 }

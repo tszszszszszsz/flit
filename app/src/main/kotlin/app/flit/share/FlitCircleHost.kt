@@ -1,10 +1,13 @@
 package app.flit.share
 
+import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.tls.TlsIdentity
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.putJsonArray
@@ -160,7 +163,9 @@ class FlitCircleHost(
         // 500-event cap. accept() runs LAST so a forged event cannot reserve a
         // legitimate id before its signature is checked.
         val ids = HashSet(current.events.map { it.id })
-        val roleOf = current.members.associate { normalized(it.fp) to it.role }
+        val roleOf = current.members.associate {
+            it.fp.trim().uppercase(Locale.ROOT) to it.role.name
+        }
         val admitted = req.events.asSequence()
             .filter { it.circleId == current.id }
             .filter { it.type.trim().lowercase(Locale.ROOT) in CircleEvent.TYPES }
@@ -176,13 +181,11 @@ class FlitCircleHost(
             // self-signed sockpuppet cannot enter through SYNC.
             .filter { normalized(it.authorFp) == fp }
             // JOIN is a host-routed action, not something a member injects;
-            // REKEY is host-authority only, never a member's payload.
-            .filter { !it.type.equals(CircleEvent.JOIN, ignoreCase = true) }
-            .filter {
-                !it.type.equals(CircleEvent.REKEY, ignoreCase = true) ||
-                    roleOf[fp] == FlitCircleStore.Role.OWNER ||
-                    roleOf[fp] == FlitCircleStore.Role.ADMIN
-            }
+            // REKEY needs an OWNER/ADMIN author. Both rules live in the shared
+            // CircleAuthority gate so the app and the box host decide alike.
+            // This stays before signature verification and id reservation:
+            // an unauthorised verb never reaches CircleCore.accept.
+            .filter { CircleAuthority.foldable(it, current.id, roleOf) }
             .filter { it.cert.isNotBlank() && CircleCore.verify(it) }
             .filter { ids.add(it.id) }
             .filter { CircleCore.accept(it) == CircleCore.Decision.Accept }
@@ -192,7 +195,29 @@ class FlitCircleHost(
         var next = FlitCircleStore.merge(current, admitted)
         val after = next.members.mapNotNull { normalized(it.fp) }.toSet()
         val departed = before.any { it !in after }
-        if (departed && admitted.none { it.type.equals(CircleEvent.REKEY, ignoreCase = true) }) {
+        // A departure invalidates the key no matter what else the batch carries.
+        // An admitted REKEY may be a departing officer's hand-off (the store
+        // vetoes those, but the host cannot rely on every fold site doing so),
+        // or a staying officer's key the leaver already knows. Only a fresh
+        // host-minted key is safe.
+        if (departed) {
+            // A REKEY admitted in this batch may have installed a high gen.
+            // The forced rotation must outrank it: peers folding the same
+            // answer in another order must not treat our key as stale replay.
+            // Hand-off attempts by same-batch leavers are excluded — the store
+            // refuses them, so they installed nothing.
+            val leavers = admitted.asSequence()
+                .filter { it.type.equals(CircleEvent.LEAVE, ignoreCase = true) }
+                .mapNotNull { normalized(it.authorFp) }
+                .toSet()
+            val batchKeyGen = admitted.asSequence()
+                .filter { it.type.equals(CircleEvent.REKEY, ignoreCase = true) }
+                .filterNot { normalized(it.authorFp) in leavers }
+                .mapNotNull { rekeyGenOf(it.body) }
+                .maxOrNull() ?: Int.MIN_VALUE
+            // Saturate: a corrupt MAX_VALUE gen must not wrap negative.
+            val floor = if (batchKeyGen == Int.MAX_VALUE) Int.MAX_VALUE else batchKeyGen + 1
+            if (floor > next.rekeyGen) next = next.copy(rekeyGen = floor)
             next = rotateKey(next)
         }
         val key = next.keyB64.takeIf { it.isNotBlank() } ?: keyB64
@@ -209,6 +234,13 @@ class FlitCircleHost(
     }
 
     // ==== rekey =================================================================
+
+    /** Generation requested by a REKEY body, or null when absent/corrupt. */
+    private fun rekeyGenOf(body: String): Int? = runCatching {
+        val obj = Json.parseToJsonElement(body) as? JsonObject ?: return@runCatching null
+        (obj["gen"] as? JsonPrimitive)?.content?.toIntOrNull()
+            ?: (obj["rekeyGen"] as? JsonPrimitive)?.content?.toIntOrNull()
+    }.getOrNull()
 
     /**
      * A leave or a realised kick invalidates the old key: bump done by the

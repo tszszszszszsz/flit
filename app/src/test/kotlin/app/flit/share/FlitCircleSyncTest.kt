@@ -1,5 +1,6 @@
 package app.flit.share
 
+import app.flit.share.protocol.circle.CircleAuthority
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.circle.DropKeyCore
@@ -281,6 +282,10 @@ class FlitCircleSyncTest {
 
     @Test
     fun `rejoin keeps existing delivery rows and replaces only host-owned fields`() = runBlocking {
+        // A signed JOIN needs a real identity: the join gate refuses a claimed
+        // fingerprint that does not match the key minting the proof.
+        val id = TlsIdentity.generate()
+        val me = id.fingerprint
         val delivery = CircleDelivery(
             id = "d-1",
             name = "notes.gflit",
@@ -290,7 +295,7 @@ class FlitCircleSyncTest {
             statuses = mapOf("AABB" to CircleDelivery.SENT),
             createdMs = 5L,
         )
-        val prior = state("ME", "HOSTFP").copy(
+        val prior = state(me, "HOSTFP").copy(
             keyB64 = "old-key",
             events = listOf(event("old-event")),
             deliveries = mapOf(delivery.sha256 to delivery),
@@ -298,17 +303,18 @@ class FlitCircleSyncTest {
         var persisted: CircleState? = null
         FlitCircleSync.resetForTest()
         FlitCircleSync.stateHook = { prior }
-        FlitCircleSync.meHook = { "ME" }
+        FlitCircleSync.meHook = { me }
+        FlitCircleSync.identityHook = { id }
         FlitCircleSync.dialHook = { fp ->
             FlitCircleSync.Route(
                 peer = fp,
                 sync = { CircleResponse(false, reason = "unused") },
                 join = { req ->
                     assertEquals("c1", req.circleId)
-                    assertEquals("ME", req.memberFp)
+                    assertEquals(me, req.memberFp)
                     // No seed events: verification of fabricated signatures is
                     // not what this test is about; the local rows are.
-                    CircleResponse(true, key = "new-key", members = listOf("hostfp", "ME"))
+                    CircleResponse(true, key = "new-key", members = listOf("hostfp", me))
                 },
             )
         }
@@ -323,10 +329,10 @@ class FlitCircleSyncTest {
                 "rejoining must not wipe locally recorded delivery rows",
             )
             assertEquals("new-key", joined.keyB64, "host key replaces the stale local one")
-            assertEquals("ME", joined.selfFp, "selfFp tracks this device exactly")
+            assertEquals(me, joined.selfFp, "selfFp tracks this device exactly")
             assertEquals(emptyList(), joined.events, "stale local log is not carried over")
             assertEquals(
-                setOf("HOSTFP", "ME"),
+                setOf("HOSTFP", me),
                 joined.members.map { it.fp }.toSet(),
                 "host roster is authoritative",
             )
@@ -1216,7 +1222,8 @@ class FlitCircleSyncTest {
             statuses = mapOf("HOSTFP" to CircleDelivery.SENT),
             createdMs = 5L,
         )
-        val prior = state("ME", "HOSTFP").copy(
+        val me = recipient.fingerprint
+        val prior = state(me, "HOSTFP").copy(
             keyB64 = "old-key",
             events = listOf(event("old-event")),
             deliveries = mapOf(delivery.sha256 to delivery),
@@ -1225,15 +1232,16 @@ class FlitCircleSyncTest {
         var persisted: CircleState? = null
         FlitCircleSync.resetForTest()
         FlitCircleSync.stateHook = { prior }
-        FlitCircleSync.meHook = { "ME" }
+        FlitCircleSync.meHook = { me }
+        FlitCircleSync.identityHook = { recipient }
         FlitCircleSync.dialHook = { fp ->
             FlitCircleSync.Route(
                 peer = fp,
                 sync = { CircleResponse(false, reason = "unused") },
                 join = { req ->
                     assertEquals("c1", req.circleId)
-                    assertEquals("ME", req.memberFp)
-                    CircleResponse(true, key = "new-key", members = listOf("hostfp", "ME"))
+                    assertEquals(me, req.memberFp)
+                    CircleResponse(true, key = "new-key", members = listOf("hostfp", me))
                 },
             )
         }
@@ -1572,5 +1580,330 @@ class FlitCircleSyncTest {
             CircleCore.receiptAuthors(folded.events, dropId, sha, listOf(sender.fingerprint)),
             "the folded receipt confirms exactly its author for this drop",
         )
+    }
+
+    // ==== receive-side fold gate: replay, window, verify, order, local log =======
+
+    /** A real signed event with a caller-chosen id, so dedup vectors are exact. */
+    private fun signedEvent(
+        id: String,
+        sender: TlsIdentity,
+        lamport: Long,
+        type: String = CircleEvent.MESSAGE,
+        body: String = """{"text":"hello"}""",
+        createdMs: Long = COURIER_NOW,
+        circleId: String = "c1",
+    ): CircleEvent = CircleCore.sign(
+        CircleEvent(
+            id = id,
+            circleId = circleId,
+            authorFp = sender.fingerprint,
+            lamport = lamport,
+            type = type,
+            body = body,
+            sig = "",
+            createdMs = createdMs,
+            cert = Base64.getEncoder().encodeToString(sender.certificate.encoded),
+        ),
+        sender,
+    )
+
+    @Test
+    fun `fresh accepts a verified event once and refuses a replay of its id`() {
+        FlitCircleSync.resetForTest()
+        val sender = TlsIdentity.generate()
+        val st = state(sender.fingerprint)
+        val first = signedEvent("replay-1", sender, 1L)
+        try {
+            assertEquals(listOf(first), FlitCircleSync.fresh(st, listOf(first), COURIER_NOW))
+            assertTrue(
+                FlitCircleSync.fresh(st, listOf(first), COURIER_NOW).isEmpty(),
+                "the shared accept gate must refuse a second presentation of the same id",
+            )
+            val impostor = signedEvent("replay-1", sender, 2L)
+            assertTrue(
+                FlitCircleSync.fresh(st, listOf(impostor), COURIER_NOW).isEmpty(),
+                "an honest event reusing a reserved id is still a replay",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    @Test
+    fun `fresh refuses events outside the replay window on either side`() {
+        FlitCircleSync.resetForTest()
+        val sender = TlsIdentity.generate()
+        val st = state(sender.fingerprint)
+        val old = signedEvent(
+            "window-old", sender, 1L,
+            createdMs = COURIER_NOW - CircleCore.REPLAY_WINDOW_MS - 1L,
+        )
+        val future = signedEvent(
+            "window-future", sender, 2L,
+            createdMs = COURIER_NOW + CircleCore.CLOCK_SKEW_MS + 1L,
+        )
+        val edge = signedEvent(
+            "window-edge", sender, 3L,
+            createdMs = COURIER_NOW - CircleCore.REPLAY_WINDOW_MS,
+        )
+        val ahead = signedEvent(
+            "window-ahead", sender, 4L,
+            createdMs = COURIER_NOW + CircleCore.CLOCK_SKEW_MS,
+        )
+        try {
+            assertTrue(
+                FlitCircleSync.fresh(st, listOf(old, future), COURIER_NOW).isEmpty(),
+                "a stale replay and an implausible clock must both be refused",
+            )
+            assertEquals(
+                listOf(edge, ahead),
+                FlitCircleSync.fresh(st, listOf(ahead, edge), COURIER_NOW),
+                "the exact window edges stay admissible, in deterministic order",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    @Test
+    fun `fresh verifies before reserving an id so a forgery cannot burn an honest event`() {
+        FlitCircleSync.resetForTest()
+        val sender = TlsIdentity.generate()
+        val st = state(sender.fingerprint)
+        val honest = signedEvent("verify-first", sender, 1L)
+        val forged = honest.copy(sig = "not-a-signature")
+        try {
+            assertTrue(FlitCircleSync.fresh(st, listOf(forged), COURIER_NOW).isEmpty())
+            assertEquals(
+                listOf(honest),
+                FlitCircleSync.fresh(st, listOf(honest), COURIER_NOW),
+                "the same id must still be free after a rejected forgery",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    @Test
+    fun `fresh dedups by id with the canonical order independent of arrival order`() {
+        FlitCircleSync.resetForTest()
+        val sender = TlsIdentity.generate()
+        val st = state(sender.fingerprint)
+        val low = signedEvent("dup-id", sender, 1L, body = """{"text":"low"}""")
+        val high = signedEvent("dup-id", sender, 2L, body = """{"text":"high"}""")
+        val later = signedEvent("other-id", sender, 3L, body = """{"text":"later"}""")
+        try {
+            assertEquals(
+                listOf(low, later),
+                FlitCircleSync.fresh(st, listOf(high, later, low), COURIER_NOW),
+                "two peers must resolve one id to the same event and the same order",
+            )
+            FlitCircleSync.resetForTest()
+            assertEquals(
+                listOf(low, later),
+                FlitCircleSync.fresh(st, listOf(later, low, high), COURIER_NOW),
+                "arrival order must not change the winner or the fold order",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    @Test
+    fun `fresh filters local log ids and caps the accepted batch`() {
+        FlitCircleSync.resetForTest()
+        val sender = TlsIdentity.generate()
+        val logged = signedEvent("logged-id", sender, 1L, body = """{"text":"logged"}""")
+        val twin = signedEvent("logged-id", sender, 2L, body = """{"text":"replacement"}""")
+        val freshOne = signedEvent("new-id", sender, 3L, body = """{"text":"new"}""")
+        val st = state(sender.fingerprint).copy(events = listOf(logged))
+        try {
+            assertEquals(
+                listOf(freshOne),
+                FlitCircleSync.fresh(st, listOf(logged, twin, freshOne), COURIER_NOW),
+                "an id in the local log is skipped even for a different signed event",
+            )
+
+            FlitCircleSync.resetForTest()
+            val many = (1..FlitCircleStore.EVENT_CAP + 5).map {
+                signedEvent("cap-$it", sender, it.toLong(), body = """{"text":"m$it"}""")
+            }
+            val accepted = FlitCircleSync.fresh(state(sender.fingerprint), many, COURIER_NOW)
+            assertEquals(
+                many.take(FlitCircleStore.EVENT_CAP).map { it.id },
+                accepted.map { it.id },
+                "the fold is bounded after dedup and the local-log filter",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    @Test
+    fun `fresh applies roster roles to rekey and never folds a join`() {
+        FlitCircleSync.resetForTest()
+        val officer = TlsIdentity.generate()
+        val member = TlsIdentity.generate()
+        val st = state(officer.fingerprint, member.fingerprint).copy(
+            members = listOf(
+                Member(officer.fingerprint, "", Role.ADMIN),
+                Member(member.fingerprint, "", Role.MEMBER),
+            ),
+        )
+        val join = signedEvent("join-ev", member, 1L, CircleEvent.JOIN, """{"alias":"ghost"}""")
+        val memberRekey = signedEvent(
+            "member-rekey", member, 2L, CircleEvent.REKEY, circleRekeyBody("newkey", 1, emptyList()),
+        )
+        val officerRekey = signedEvent(
+            "officer-rekey", officer, 3L, CircleEvent.REKEY, circleRekeyBody("newkey", 1, emptyList()),
+        )
+        try {
+            assertEquals(
+                listOf(officerRekey),
+                FlitCircleSync.fresh(st, listOf(join, memberRekey, officerRekey), COURIER_NOW),
+                "JOIN is a handshake and REKEY needs an OWNER/ADMIN author",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    // ==== join proof: the signed bearer handshake ================================
+
+    @Test
+    fun `join mints a signed proof bound to host circle invite member and clock`() = runBlocking {
+        val id = TlsIdentity.generate()
+        val me = id.fingerprint
+        val host = TlsIdentity.generate().fingerprint
+        val now = COURIER_NOW
+        var captured: CircleRequest? = null
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { state(me, host) }
+        FlitCircleSync.meHook = { me }
+        FlitCircleSync.identityHook = { id }
+        FlitCircleSync.clockHook = { now }
+        FlitCircleSync.dialHook = { fp ->
+            FlitCircleSync.Route(
+                peer = fp,
+                sync = { CircleResponse(false, reason = "unused") },
+                join = { req ->
+                    captured = req
+                    CircleResponse(true, key = "new-key", members = listOf(host, me))
+                },
+            )
+        }
+        FlitCircleSync.joinPersistHook = { }
+        try {
+            FlitCircleSync.join(QrAdd(fingerprint = host, circle = "c1", invite = "bearer-token"))
+            val req = assertNotNull(captured, "the join request must reach the host")
+            assertEquals(CircleRequest.ACTION_JOIN, req.action)
+            assertEquals("c1", req.circleId)
+            assertEquals("bearer-token", req.invite)
+            assertEquals(me, req.memberFp)
+
+            val proof = req.events.single()
+            assertEquals(CircleEvent.JOIN, proof.type)
+            assertEquals("c1", proof.circleId)
+            assertEquals(me, proof.authorFp)
+            assertEquals(0L, proof.lamport)
+            assertEquals(now, proof.createdMs)
+            assertTrue(CircleCore.verify(proof), "the proof event verifies against its signer")
+            assertEquals(CircleCore.JOIN_PROOF_BODY_KEYS, obj(proof.body).keys)
+            assertTrue(CircleCore.validJoinProofBody(proof.body))
+            assertFalse(
+                CircleAuthority.foldable(proof, "c1", mapOf(me to "OWNER")),
+                "a JOIN is a handshake, never a foldable log entry",
+            )
+            assertNull(
+                CircleCore.joinProofFailure(req, host, now),
+                "the host's stateless verifier must admit the proof we minted",
+            )
+            assertNotNull(
+                CircleCore.joinProofFailure(req, host, now + 2L * CircleCore.JOIN_PROOF_BUCKET_MS),
+                "a proof outside the one-bucket tolerance must be refused",
+            )
+            assertNotNull(
+                CircleCore.joinProofFailure(req, TlsIdentity.generate().fingerprint, now),
+                "another host must not be able to replay the proof",
+            )
+            assertNotNull(
+                CircleCore.joinProofFailure(req.copy(invite = "other-token"), host, now),
+                "a changed invite must break the bound digest",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `join refuses a claimed fingerprint that is not the signing identity`() = runBlocking {
+        val id = TlsIdentity.generate()
+        val other = TlsIdentity.generate()
+        var dialed = false
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { state(id.fingerprint) }
+        FlitCircleSync.meHook = { other.fingerprint }
+        FlitCircleSync.identityHook = { id }
+        FlitCircleSync.dialHook = { dialed = true; null }
+        try {
+            FlitCircleSync.join(QrAdd(fingerprint = "HOSTFP", circle = "c1", invite = "invite"))
+            assertFalse(dialed, "a fingerprint/key mismatch must refuse before any dial")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierReceive refuses officer-signed governance even from a roster officer`() = runBlocking {
+        CourierCarryCore.clear()
+        val officer = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val me = recipient.fingerprint
+        val file = courierFileEvent(officer, "ordinary-sha")
+        // Same officer who is a current OWNER in the roster: role data is NOT
+        // supplied to the authority gate here, so neither verb may be folded.
+        val join = signedEvent("sealed-join", officer, 2L, CircleEvent.JOIN, """{"alias":"owner"}""")
+        val rekey = signedEvent(
+            "sealed-rekey", officer, 3L, CircleEvent.REKEY,
+            circleRekeyBody("newkey", 9, emptyList()),
+        )
+        val (parcelEvent, _) = sealedParcel(officer, recipient, listOf(file, join, rekey), toFp = me)
+        var current = courierState(me, "AABB").copy(
+            members = listOf(
+                Member(me, "", Role.MEMBER),
+                Member("AABB", "", Role.MEMBER),
+                Member(officer.fingerprint, "", Role.OWNER),
+            ),
+        )
+        val upserted = mutableListOf<CircleEvent>()
+        val logs = mutableListOf<String>()
+        val bagWrites = mutableListOf<String>()
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.meHook = { me }
+        FlitCircleSync.identityHook = { recipient }
+        FlitCircleSync.clockHook = { COURIER_NOW }
+        FlitCircleSync.logHook = { logs += it }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        try {
+            FlitCircleSync.courierReceive(current, listOf(parcelEvent))
+            assertEquals(
+                listOf(file),
+                upserted,
+                "a sealed JOIN/REKEY is refused even when its author is an officer",
+            )
+            assertTrue(bagWrites.isNotEmpty(), "the parcel itself is still held")
+            assertTrue(logs.any { it.contains("rejected 2 opened event(s)") }, logs.toString())
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
     }
 }
