@@ -40,6 +40,7 @@ class CircleHardeningTest {
         private val headers: Map<String, String> = emptyMap(),
     ) : HttpExchange {
         var status: Int = 0
+        var contentType: String = ""
         var response: String = ""
         private var at = 0
 
@@ -57,6 +58,7 @@ class CircleHardeningTest {
 
         override suspend fun respondText(status: Int, contentType: String, text: String) {
             this.status = status
+            this.contentType = contentType
             this.response = text
         }
 
@@ -66,11 +68,15 @@ class CircleHardeningTest {
     }
 
     private val delegate = object : ServerDelegate {
+        var circleCalls: Int = 0
+
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision =
             PrepareDecision.Accept(request.files.keys)
 
-        override fun onCircle(request: CircleRequest, ip: String): CircleResponse =
-            CircleResponse(ok = true, key = "group-key")
+        override fun onCircle(request: CircleRequest, ip: String): CircleResponse {
+            circleCalls++
+            return CircleResponse(ok = true, key = "group-key")
+        }
     }
 
     private fun event(
@@ -438,6 +444,128 @@ class CircleHardeningTest {
             call(brokenServer, exchange(raw = validBody, headers = mapOf(certHeader to ownCert))),
             500, "Circle delegate error",
         )
+    }
+
+    // ---- route-level JOIN proof gate ---------------------------------------
+
+    private fun joinProofEvent(
+        hostFp: String,
+        circleId: String,
+        invite: String,
+        member: TlsIdentity,
+    ): CircleEvent {
+        val bucket = CircleCore.joinProofBucket(System.currentTimeMillis())
+        // Centre the proof inside its bucket: the route reads the clock a
+        // moment later, and a test must not flake on a bucket rollover.
+        val createdMs = bucket * CircleCore.JOIN_PROOF_BUCKET_MS + CircleCore.JOIN_PROOF_BUCKET_MS / 2
+        val body = CircleCore.joinProofBody(hostFp, circleId, invite, member.fingerprint, bucket)
+        return CircleCore.create(circleId, member.fingerprint, member, CircleEvent.JOIN, body, 0L, createdMs)
+    }
+
+    @Test
+    fun `JOIN without a proof is a signed refusal and never reaches the delegate`() {
+        val host = TlsIdentity.generate()
+        val member = TlsIdentity.generate()
+        val server = ServerCore(
+            host,
+            ServerConfig(tls = false, destDir = Files.createTempDirectory("circle-join-empty")),
+            delegate,
+        )
+        val request = CircleRequest(
+            CircleRequest.ACTION_JOIN, "circle-1", invite = "invite-token", memberFp = member.fingerprint,
+        )
+        val certHeader = Protocol.HEADER_CIRCLE_CERT.lowercase() to
+            Base64.getEncoder().encodeToString(member.certificate.encoded)
+        val answered = call(
+            server,
+            exchange(
+                path = Protocol.PATH_CIRCLE_JOIN,
+                raw = WireJson.encode(request).toByteArray(Charsets.UTF_8),
+                headers = mapOf(certHeader),
+            ),
+        )
+        assertEquals(200, answered.status)
+        assertEquals("application/json", answered.contentType)
+        val refusal = WireJson.decode<CircleResponse>(answered.response)
+        assertFalse(refusal.ok)
+        assertEquals("join proof required", refusal.reason)
+        assertEquals(0, delegate.circleCalls, "the delegate must never see an unproven JOIN")
+        assertTrue(CircleResponse.verify(refusal, host.fingerprint))
+    }
+
+    @Test
+    fun `a valid signed JOIN proof reaches the delegate`() {
+        val host = TlsIdentity.generate()
+        val member = TlsIdentity.generate()
+        val server = ServerCore(
+            host,
+            ServerConfig(tls = false, destDir = Files.createTempDirectory("circle-join-valid")),
+            delegate,
+        )
+        val request = CircleRequest(
+            CircleRequest.ACTION_JOIN, "circle-1", invite = "invite-token",
+            memberFp = member.fingerprint,
+            events = listOf(joinProofEvent(host.fingerprint, "circle-1", "invite-token", member)),
+        )
+        val certHeader = Protocol.HEADER_CIRCLE_CERT.lowercase() to
+            Base64.getEncoder().encodeToString(member.certificate.encoded)
+        val answered = call(
+            server,
+            exchange(
+                path = Protocol.PATH_CIRCLE_JOIN,
+                raw = WireJson.encode(request).toByteArray(Charsets.UTF_8),
+                headers = mapOf(certHeader),
+            ),
+        )
+        assertEquals(200, answered.status)
+        val response = WireJson.decode<CircleResponse>(answered.response)
+        assertTrue(response.ok)
+        assertEquals("group-key", response.key)
+        assertEquals(1, delegate.circleCalls)
+    }
+
+    @Test
+    fun `a forged JOIN proof is refused with a verifiable signature`() {
+        val host = TlsIdentity.generate()
+        val member = TlsIdentity.generate()
+        val attacker = TlsIdentity.generate()
+        val server = ServerCore(
+            host,
+            ServerConfig(tls = false, destDir = Files.createTempDirectory("circle-join-forged")),
+            delegate,
+        )
+        val proof = joinProofEvent(host.fingerprint, "circle-1", "invite-token", member)
+        // Correct host/circle/invite/bucket digest, but signed by a stranger
+        // who claims the member's fingerprint and presents its own cert.
+        val forged = CircleCore.sign(
+            proof.copy(
+                id = "forged-${proof.id}",
+                cert = Base64.getEncoder().encodeToString(attacker.certificate.encoded),
+                sig = "",
+            ),
+            attacker,
+        )
+        val request = CircleRequest(
+            CircleRequest.ACTION_JOIN, "circle-1", invite = "invite-token",
+            memberFp = member.fingerprint, events = listOf(forged),
+        )
+        val certHeader = Protocol.HEADER_CIRCLE_CERT.lowercase() to
+            Base64.getEncoder().encodeToString(member.certificate.encoded)
+        val answered = call(
+            server,
+            exchange(
+                path = Protocol.PATH_CIRCLE_JOIN,
+                raw = WireJson.encode(request).toByteArray(Charsets.UTF_8),
+                headers = mapOf(certHeader),
+            ),
+        )
+        assertEquals(200, answered.status)
+        assertEquals("application/json", answered.contentType)
+        val refusal = WireJson.decode<CircleResponse>(answered.response)
+        assertFalse(refusal.ok)
+        assertEquals("invalid join proof", refusal.reason)
+        assertEquals(0, delegate.circleCalls)
+        assertTrue(CircleResponse.verify(refusal, host.fingerprint))
     }
 
     @Test

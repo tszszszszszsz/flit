@@ -357,11 +357,21 @@ class CircleCoreTest {
         val identity = TlsIdentity.generate()
         val delegate = CircleDelegate()
         val server = core(identity, delegate)
+        val now = System.currentTimeMillis()
+        val proof = CircleCore.create(
+            "circle-1", identity.fingerprint, identity, CircleEvent.JOIN,
+            CircleCore.joinProofBody(
+                identity.fingerprint, "circle-1", "bearer-token",
+                identity.fingerprint, CircleCore.joinProofBucket(now),
+            ),
+            0L, now,
+        )
         val request = CircleRequest(
             action = CircleRequest.ACTION_JOIN,
             circleId = "circle-1",
             invite = "bearer-token",
             memberFp = identity.fingerprint,
+            events = listOf(proof),
         )
         val certHeader = mapOf(
             Protocol.HEADER_CIRCLE_CERT.lowercase() to
@@ -371,9 +381,17 @@ class CircleCoreTest {
             "POST", Protocol.PATH_CIRCLE_JOIN,
             body = WireJson.encode(request), headers = certHeader,
         )
+        val syncProof = CircleCore.create(
+            "circle-1", identity.fingerprint, identity, CircleEvent.JOIN,
+            CircleCore.joinProofBody(
+                identity.fingerprint, "circle-1", "bearer-token",
+                identity.fingerprint, CircleCore.joinProofBucket(now),
+            ),
+            0L, now,
+        )
         val sync = FakeExchange(
             "POST", Protocol.PATH_CIRCLE_SYNC,
-            body = WireJson.encode(request), headers = certHeader,
+            body = WireJson.encode(request.copy(events = listOf(syncProof))), headers = certHeader,
         )
         val bogus = FakeExchange("POST", "${Protocol.API_ROOT}/circle/sync", body = "{}")
         val malformed = FakeExchange("POST", Protocol.PATH_CIRCLE_SYNC, body = "{")
@@ -432,9 +450,21 @@ class CircleCoreTest {
                 launch(Dispatchers.IO) { server.serve(inbox.receive().serverLink("192.0.2.31")) }
             }
             val target = SendTarget("127.0.0.1", 53317, tls = false)
+            val now = System.currentTimeMillis()
+            val proof = CircleCore.create(
+                "circle-1", sender.fingerprint, sender, CircleEvent.JOIN,
+                CircleCore.joinProofBody(
+                    receiver.fingerprint, "circle-1", "invite",
+                    sender.fingerprint, CircleCore.joinProofBucket(now),
+                ),
+                0L, now,
+            )
             val joined = client.circleJoin(
                 target,
-                CircleRequest(CircleRequest.ACTION_JOIN, "circle-1", "invite", sender.fingerprint),
+                CircleRequest(
+                    CircleRequest.ACTION_JOIN, "circle-1", "invite", sender.fingerprint,
+                    events = listOf(proof),
+                ),
                 timeoutMs = 10_000,
             )
             assertNotNull(joined)

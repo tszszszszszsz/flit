@@ -1,15 +1,19 @@
 package app.flit.share.protocol.circle
 
+import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
 import java.util.LinkedHashMap
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -41,6 +45,18 @@ object CircleCore {
 
     /** The exact, closed key set of a delivery [CircleEvent.RECEIPT] body. */
     val RECEIPT_BODY_KEYS: Set<String> = setOf("dropId", "sha256", "keyId")
+
+    /** The exact, closed key set of a stateless JOIN proof body. */
+    val JOIN_PROOF_BODY_KEYS: Set<String> = setOf("proof")
+
+    /** Separate signing domain: a Circle signature can never double as a JOIN proof. */
+    private const val JOIN_PROOF_TAG = "FLITJOIN1"
+
+    /** A proof is accepted only in the bucket that contains the host's current time. */
+    const val JOIN_PROOF_BUCKET_MS: Long = CLOCK_SKEW_MS
+
+    /** SHA-256 of the domain-tagged nonce: fixed size, no caller-controlled framing. */
+    private const val JOIN_PROOF_BYTES = 32
 
     /** Largest accepted id / circleId / authorFp / type string. */
     const val MAX_FIELD_CHARS = 256
@@ -447,6 +463,135 @@ object CircleCore {
             if (content.isBlank() || content.length > MAX_FIELD_CHARS) return false
         }
         return true
+    }
+
+    /**
+     * Index of [createdMs] on the JOIN proof grid. The bucket is exactly one
+     * clock-skew wide, so a captured proof is useful only until the grid rolls
+     * over; this is the stateless half of the replay defence and adds no store.
+     * `floorDiv` keeps the function total for a hostile negative timestamp.
+     */
+    fun joinProofBucket(createdMs: Long): Long = Math.floorDiv(createdMs, JOIN_PROOF_BUCKET_MS)
+
+    /**
+     * Deterministic, domain-separated nonce for one JOIN handshake. It uses the
+     * SAME four-byte length-prefixed UTF-8 field framing as [canonical] (plus
+     * the eight-byte bucket), so no delimiter can be smuggled through an
+     * invite or fingerprint, and a `FLITCIRCLE1` event signature can never be
+     * replayed here. Every string field is trimmed and uppercased with
+     * [Locale.ROOT] before framing, so casing/whitespace differences on the
+     * two devices cannot change the bytes. No clock, store or pin is touched.
+     */
+    fun joinProofNonce(
+        hostFp: String,
+        circleId: String,
+        invite: String?,
+        memberFp: String,
+        bucket: Long,
+    ): ByteArray {
+        val bytes = ByteArrayOutputStream()
+        val out = DataOutputStream(bytes)
+        field(out, JOIN_PROOF_TAG)
+        field(out, hostFp.trim().uppercase(Locale.ROOT))
+        field(out, circleId.trim().uppercase(Locale.ROOT))
+        field(out, (invite ?: "").trim().uppercase(Locale.ROOT))
+        field(out, memberFp.trim().uppercase(Locale.ROOT))
+        out.writeLong(bucket)
+        out.flush()
+        return bytes.toByteArray()
+    }
+
+    /** SHA-256 of the domain-tagged nonce — exactly 32 bytes, Base64URL (no padding). */
+    private fun joinProofDigest(hostFp: String, circleId: String, invite: String?, memberFp: String, bucket: Long): ByteArray =
+        MessageDigest.getInstance("SHA-256").digest(joinProofNonce(hostFp, circleId, invite, memberFp, bucket))
+
+    /**
+     * Builds the exact body accepted by [validJoinProofBody] for one bucket.
+     * The `proof` is a digest of the nonce, not a secret: authorship comes from
+     * the signed JOIN event that carries this body, so a carrier cannot mint a
+     * proof for another member, circle, host, invite or bucket.
+     */
+    fun joinProofBody(
+        hostFp: String,
+        circleId: String,
+        invite: String?,
+        memberFp: String,
+        bucket: Long,
+    ): String {
+        val encoded = Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(joinProofDigest(hostFp, circleId, invite, memberFp, bucket))
+        val body = buildJsonObject { put("proof", JsonPrimitive(encoded)) }.toString()
+        require(body.length <= MAX_BODY_CHARS) { "join proof body too long" }
+        return body
+    }
+
+    /**
+     * Strict Base64URL bytes of a well-formed proof body, or null. The decoder
+     * refuses the standard `+`/`/` alphabet and whitespace, the round-trip
+     * refuses padding and non-canonical trailing bits, and the size check pins
+     * the value to one SHA-256 digest. Total on hostile input; never throws.
+     */
+    private fun joinProofBytes(body: String): ByteArray? {
+        if (body.isBlank() || body.length > MAX_BODY_CHARS) return null
+        val obj = bodyObject(body) ?: return null
+        if (obj.keys != JOIN_PROOF_BODY_KEYS) return null
+        val value = obj["proof"] as? JsonPrimitive ?: return null
+        if (!value.isString) return null
+        val text = value.content
+        if (text.isBlank() || text.length > MAX_FIELD_CHARS) return null
+        val decoded = runCatching { Base64.getUrlDecoder().decode(text) }.getOrNull() ?: return null
+        if (decoded.size != JOIN_PROOF_BYTES) return null
+        if (Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) != text) return null
+        return decoded
+    }
+
+    /** Structural gate for a JOIN proof body: see [joinProofBytes]. */
+    fun validJoinProofBody(body: String): Boolean = joinProofBytes(body) != null
+
+    /**
+     * Stateless refusal reason for a JOIN request, or null when the proof is
+     * admissible. Other actions need no proof and return null. The precedence
+     * is: `join proof required` (no JOIN event and no `proof` field at all),
+     * `invalid join proof` (bad body, wrong author/circle, a forged or
+     * unparseable signature, or a nonce that does not match this host, circle,
+     * invite and member), `join proof replay` (a bucket other than the host's
+     * current one, or the same proof presented twice in one request).
+     *
+     * The signature check is [verify]: an embedded certificate is bound to its
+     * OWN SHA-256 DER before the signature is checked and only pinned on
+     * success, so a forged author can never poison the shared pin store. This
+     * function owns no replay set — bucket rollover is the bound — and it
+     * never changes canonical bytes, TYPES, create, sign or verify.
+     */
+    fun joinProofFailure(req: CircleRequest, hostFp: String, nowMs: Long): String? {
+        if (req.action != CircleRequest.ACTION_JOIN) return null
+        val joins = req.events.filter { it.type == CircleEvent.JOIN }
+        if (joins.isEmpty()) return "join proof required"
+        if (joins.none { bodyObject(it.body)?.containsKey("proof") == true }) return "join proof required"
+
+        val member = req.memberFp.trim().uppercase(Locale.ROOT)
+        val circle = req.circleId.trim().uppercase(Locale.ROOT)
+        val proof = joins.firstOrNull {
+            it.authorFp.trim().uppercase(Locale.ROOT) == member &&
+                it.circleId.trim().uppercase(Locale.ROOT) == circle &&
+                validJoinProofBody(it.body)
+        } ?: return "invalid join proof"
+
+        if (!verify(proof) || nowMs <= 0L) return "invalid join proof"
+        val bucket = joinProofBucket(proof.createdMs)
+        val current = joinProofBucket(nowMs)
+        val lower = if (current > Long.MIN_VALUE + 1L) current - 1L else current
+        val upper = if (current < Long.MAX_VALUE - 1L) current + 1L else current
+        if (bucket < lower || bucket > upper) return "join proof replay"
+        val expected = joinProofDigest(hostFp, req.circleId, req.invite, req.memberFp, bucket)
+        val presented = joinProofBytes(proof.body) ?: return "invalid join proof"
+        if (!MessageDigest.isEqual(expected, presented)) return "invalid join proof"
+        if (joins.count { it.id == proof.id && it.body == proof.body } > 1) return "join proof replay"
+        // A captured proof is a bearer token until its bucket rolls over.
+        // Reserve the event id in the same bounded set used by accept/fresh so
+        // this process will not admit the verbatim event a second time.
+        if (!fresh(proof.id, nowMs)) return "join proof replay"
+        return null
     }
 
     /**

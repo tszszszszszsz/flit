@@ -154,19 +154,6 @@ class ProtocolClient(
         timeoutMs: Long = 5_000,
     ): CircleResponse? = circleCall(target, Protocol.PATH_CIRCLE_JOIN, request, timeoutMs)
 
-    /** Convenience join from the fields a QR v3 invite carries. */
-    suspend fun circleJoin(
-        target: SendTarget,
-        circleId: String,
-        invite: String,
-        memberFp: String,
-        timeoutMs: Long = 5_000,
-    ): CircleResponse? = circleJoin(
-        target,
-        CircleRequest(CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = memberFp),
-        timeoutMs,
-    )
-
     /**
      * Flit-only Circle sync: sends our bounded event-log delta, receives the
      * events we are missing. Same transport and identity story as [circleJoin].

@@ -950,8 +950,11 @@ class ServerCore(
      * encode whatever decision it returns. Malformed/oversized wire gets 400,
      * a bad identity header gets 403, a delegate that throws gets 500; every
      * real decision — including refusal — is a decodable 200 [CircleResponse].
-     * The same semantics serve TCP and pipes. Signatures are still the
-     * delegate's concern: the route only checks shape, size and cert binding.
+     * A JOIN must additionally pass [CircleCore.joinProofFailure]; a failed
+     * proof is answered here with a host-signed refusal and never reaches the
+     * delegate. The same semantics serve TCP and pipes. Delegate decisions are
+     * still the delegate's concern: the route only checks shape, size, cert
+     * binding and the join proof.
      */
     private suspend fun circleRoute(x: HttpExchange) {
         val raw = x.readBodyCapped(CircleCore.MAX_REQUEST_BYTES)
@@ -994,6 +997,22 @@ class ServerCore(
         ) {
             x.respondText(403, MIME_TEXT, "Certificate does not match member fingerprint")
             return
+        }
+        // A join carries its own signed proof: a bare claim (or a stale /
+        // forged proof) must never reach the delegate, which would otherwise
+        // hand out the group key to whoever knows a member fingerprint. The
+        // refusal is still an honest, host-signed 200 the joiner can pin.
+        if (request.action == CircleRequest.ACTION_JOIN) {
+            val reason = CircleCore.joinProofFailure(
+                request, identity.fingerprint, System.currentTimeMillis(),
+            )
+            if (reason != null) {
+                x.respondText(
+                    200, MIME_JSON,
+                    WireJson.encode(CircleResponse.sign(CircleResponse.refused(reason), identity)),
+                )
+                return
+            }
         }
         val response = try {
             delegate.onCircle(request, x.origin.orEmpty())
