@@ -64,6 +64,10 @@ The 2026-12-31 and 2027-01-04 layers are built ahead. The relay hunt gate, the
 verified key-wrap seam, the device-walk plan and the trust-gate design record are
 written now; the commits stay on those dates.
 
+The 2027-01-05 and 2027-01-06 layers are built ahead. The CLI parity fixes, the
+relay pairing read and the rig inventory update are written now; the commits
+stay on those dates.
+
 ## Dates
 
 | Date | Layer | Commit scope |
@@ -93,6 +97,8 @@ written now; the commits stay on those dates.
 | 2026-12-28 | Release | v0.3.1 tag and release notes |
 | 2026-12-31 | Integration | Relay hunt opt-in gate and verified key wrap, tests |
 | 2027-01-04 | Docs | Device-walk plan, trust-gate design record, rig inventory |
+| 2027-01-05 | Integration | CLI fold and rekey parity, relay pairing read, tests |
+| 2027-01-06 | Docs | Final rig inventory and completion note |
 
 ## Rules for a day
 

@@ -83,6 +83,8 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2026-12-28 | Release | 16 tasks across release notes, tag checks and final rig record |
 | 2026-12-31 | Integration | Relay hunt opt-in gate, verified key wrap, pure tests |
 | 2027-01-04 | Docs | Device-walk plan, trust-gate design review, rig inventory |
+| 2027-01-05 | Integration | CLI fold/rekey parity, --host-fp guard, relay pairing read, tests |
+| 2027-01-06 | Docs | Final rig inventory and completion note |
 
 ## Integration gate
 
