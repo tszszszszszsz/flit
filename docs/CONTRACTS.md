@@ -1129,10 +1129,10 @@ the byte layout.
 `complete` accepts frames in any order, keeps one frame per `(parcelId, seq)`,
 requires a single common `count` and every `seq` in `1..count`, checks the frame
 CRC and the whole-parcel digest, then requires `CourierEnvelope.verify` to pass
-and `CourierEnvelope.open` to yield a payload whose recipient fingerprint equals
-the one passed to `complete`. Only then does it release bytes. A digest mismatch,
-a failed envelope signature or a recipient mismatch releases no bytes and writes
-no file.
+and `CourierEnvelope.open` — using the `identity` passed to `complete` — to yield
+a payload whose recipient fingerprint equals `recipientFp` on that same identity.
+Only then does it release bytes. A digest mismatch, a failed envelope signature
+or a recipient mismatch releases no bytes and writes no file.
 
 ### 16.3 Closed caps
 
@@ -1155,8 +1155,10 @@ object ParcelCodec {
                              val totalBytes: Int, val crc: Long)
   fun parse(frame: String): FrameDescriptor?
   fun encodeParcel(payload: ByteArray, parcelId: String, recipientFp: String,
-                   signerFp: String, identity: TlsIdentity): List<String>
-  fun complete(frames: List<String>, recipientFp: String): ParcelPayload?
+                   recipientCert: X509Certificate, signerFp: String,
+                   identity: TlsIdentity): List<String>
+  fun complete(frames: List<String>, recipientFp: String,
+               identity: TlsIdentity): ParcelPayload?
   data class ParcelPayload(val parcelId: String, val recipientFp: String,
                            val signerFp: String, val sha256: String,
                            val bytes: ByteArray)
@@ -1164,9 +1166,16 @@ object ParcelCodec {
 ```
 
 `parse` returns `null` on any failed check and never throws at the caller.
-`encodeParcel` seals the payload through `CourierEnvelope.seal` and frames the
-encoded bytes; `complete` verifies frames, CRC, sequence, count, digest and
-recipient before decrypting through `CourierEnvelope.open`.
+`encodeParcel` seals the payload through `CourierEnvelope.seal`, which binds the
+wrapping key to the certificate's own fingerprint and refuses a `recipientCert`
+whose fingerprint differs from `recipientFp`. Recipient privacy is therefore
+enforced inside `seal` by that cert-fingerprint binding, not by the frame layer;
+only after sealing does the codec frame the encoded bytes. `complete` verifies
+frames, CRC, sequence, count, digest and recipient, then decrypts through
+`CourierEnvelope.open` with the `identity` passed to it. Decoding thus needs the
+recipient's identity on the decoding device: a captured frame set cannot be
+opened without that private key, and the `recipientFp` argument alone never
+releases bytes.
 
 ### 16.5 No-new-route and v2.2 boundary
 

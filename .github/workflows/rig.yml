@@ -1,5 +1,5 @@
 # The rig standard, green before any commit merges:
-# 136 protocol tests + 228 app tests + 32 harness tests + debug/release
+# 158 protocol tests + 239 app tests + 32 harness tests + debug/release
 # assemblies + the CLI dist.
 name: rig
 

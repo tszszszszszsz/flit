@@ -548,29 +548,47 @@ socket, no radio carrier, no camera, no Android and no persistence; `parse`,
 
 ### Signed and encrypted through one crypto path
 
-`encodeParcel(payload, parcelId, recipientFp, signerFp, identity)` does not
-invent a second cipher. It passes the payload through `CourierEnvelope.seal`
+`encodeParcel(payload, parcelId, recipientFp, recipientCert, signerFp,
+identity)` does not invent a second cipher. Both the recipient fingerprint and
+the recipient's X.509 certificate are explicit arguments: `recipientFp` is
+required, and the certificate's own SHA-256 DER fingerprint must match it, so
+a certificate for a different device cannot be substituted to redirect a
+parcel. The content key is wrapped to that certificate's public key. It passes
+the payload through `CourierEnvelope.seal`
 (`protocol/.../courier/CourierEnvelope.kt:149-207`), so the bytes framed into
 QRs are the signed envelope: AES-256-GCM ciphertext under a fresh 32-byte
 content key, that key wrapped with RSA-OAEP/SHA-256 to the recipient
 certificate, and a `SHA256withRSA` signature over the canonical envelope bytes
 with the signer certificate's digest bound to `signerFp`. `complete(frames,
-recipientFp)` checks the frames, each frame's CRC32, the sequence and count,
-the whole-parcel digest and the recipient before decrypting through
-`CourierEnvelope.verify` and `open` (`CourierEnvelope.kt:215-261`). One failure
-returns `null` and no bytes. Frame-layer caps are `MAX_FRAMES = 64`,
-`MAX_AIR_GAP_PARCEL_BYTES = 131072`, `MAX_CHUNK_BYTES = 512` and the domain tag
-`FRAME_MAGIC = "FLITPARCEL1"`; the byte cap is named apart from
-`CourierEnvelope.MAX_ENVELOPE_CHARS` so the two limits are not confused.
+recipientFp, identity)` takes the decoding device's own `TlsIdentity`: it
+checks the frames, each frame's CRC32, the sequence and count, the whole-parcel
+digest and the recipient against the explicit `recipientFp`, then decrypts
+through `CourierEnvelope.verify` and `open` (`CourierEnvelope.kt:215-261`) with
+`identity`, whose own fingerprint must equal `recipientFp`. Opening needs that
+device's private key to unwrap the content key; frames plus a fingerprint
+string cannot decode a parcel. One failure returns `null` and no bytes.
+Frame-layer caps are `MAX_FRAMES = 64`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`,
+`MAX_CHUNK_BYTES = 512` and the domain tag `FRAME_MAGIC = "FLITPARCEL1"`; the
+byte cap is named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` so the two
+limits are not confused.
+
+Decode is not tied to the encoding process. The receiving device passes its own
+`TlsIdentity` directly to `complete` along with `recipientFp`; there is no
+in-memory identity registry and no requirement that encode and decode share a
+process or that an encode in this process ran first. Any device holding the
+identity whose fingerprint is `recipientFp` — and therefore its private key —
+can open the parcel, so cross-device decode is supported.
 
 ### No key on a frame
 
 A frame carries encrypted material only: a chunk of the sealed envelope's
 encoded bytes plus the metadata needed to order and check it. No private key,
-content key, plaintext payload or shared secret is emitted on any QR frame, and
-the frame grammar has no `key` parameter. A `ParcelPayload` is produced only by
-`complete` after verification; nothing on the carrying side can turn a frame
-into key material. The frame format is separate from the `flit://add` and
+recipient certificate, content key, plaintext payload or shared secret is
+emitted on any QR frame, and the frame grammar has no `key` parameter. A
+`ParcelPayload` is produced only by `complete` after verification, using the
+decoding device's private key supplied in its `identity` argument and matched
+against `recipientFp`; nothing on the carrying side can turn a frame into key
+material. The frame format is separate from the `flit://add` and
 `flit://pair` pairing codes in "QR codes: pairing authority and invite bearer
 semantics": a pairing code is not a parcel frame and a frame is not a pairing
 credential, so carrying a parcel never pins a network peer and never supplies
@@ -591,16 +609,20 @@ confidentiality and integrity of the bytes, not availability of the carry.
 
 ### Wrong recipient refused
 
-`complete(frames, recipientFp)` releases bytes only when the checked recipient
-fingerprint matches the parcel addressed by the frames. It verifies frames,
-CRC, sequence, count and digest first, then decrypts through
-`CourierEnvelope.open`, which independently requires the envelope's `toFp` to
-equal the opening identity's own fingerprint (`CourierEnvelope.kt:235-261`). A
-parcel addressed to a different fingerprint is refused even with intact
-frames, a passing CRC and a valid signature; opened bytes naming another
-recipient are never returned as `ParcelPayload`. A failed digest, a failed
-signature or a recipient mismatch returns `null`, writes no file and releases
-no partial bytes; held frames stay with the caller until it drops them.
+`complete(frames, recipientFp, identity)` releases bytes only when the checked
+recipient fingerprint matches the parcel addressed by the frames and equals
+both the explicit `recipientFp` and the decoding device's own
+`identity.fingerprint`. It verifies frames, CRC, sequence, count and digest
+first, then decrypts through `CourierEnvelope.open` with that identity, which
+independently requires the envelope's `toFp` to equal the opening identity's
+own fingerprint (`CourierEnvelope.kt:235-261`) and uses its private key to
+unwrap the content key. A parcel addressed to a different
+fingerprint is refused even with intact frames, a passing CRC and a valid
+signature; opened bytes naming another recipient are never returned as
+`ParcelPayload`. A failed digest, a failed signature, a recipient mismatch or
+an identity without the matching private key returns `null`, writes no file
+and releases no partial bytes; held frames stay with the caller until it drops
+them.
 
 ### No remote action
 

@@ -23,8 +23,9 @@ Rules applied here:
 - Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302, 356,
   378, 396) are snapshots of earlier layers, not the current inventory: 356
   after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer and
-  396 after the 2026-12-01 App layer. The current figure is 416 after the app QA
-  fixes (138 protocol + 239 app + 39 harness).
+  396 after the 2026-12-01 App layer, 416 after the app QA fixes. The current
+  figure is 436 after the 2026-12-03 QR codec layer (158 protocol + 239 app +
+  39 harness).
 - The 2026-12-01 App layer added 18 courier cases in `app/src/test` (11 in
   `CourierCardUiTest`, 4 added to `FlitCircleStoreTest`, 3 added to
   `FlitCircleSyncTest`), recorded from a green `--rerun-tasks` run (§4.2).
@@ -33,9 +34,9 @@ Rules applied here:
   396 inventory: 2 in the new `CourierAuthorizationTest` (protocol), 11 in the
   app (10 more in `FlitCircleSyncTest`, 1 more in `CourierCardUiTest`) and 7 in
   the harness (5 more in `CourierCliTest`, 2 more in
-  `CourierCarrierHarnessTest`). They take the rig from 396 to 416, recorded from
-  the JUnit XML, not from a target figure. The two QR parcel protocol classes
-  in §4.1 are added on top of this 416 baseline with counts still TBD.
+  `CourierCarrierHarnessTest`). They took the rig from 396 to 416. The two QR parcel protocol classes in §4.1
+  added 20 more cases (14 + 6), taking the rig to 436. All counts come from the
+  JUnit XML, not from a target figure.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -49,7 +50,7 @@ Rules applied here:
 | `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **138** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
 | `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **239** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
 | `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **39** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **416** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
+| **Total** | Three modules, three roles | **436** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -89,7 +90,7 @@ Two notes about these commands:
    (which includes the 10 harness tests) was realized by the CI command, or by
    adding `:harness:test` locally; that baseline's README line ran 292 tests
    (82 + 210). On the current tree the same README line runs 377 tests
-   (138 + 239) and the CI command runs 416 (138 + 239 + 39).
+   (158 + 239) and the CI command runs 436 (158 + 239 + 39).
 2. `assembleRelease` falls back to the debug key when the local-only, gitignored
    `keystore.properties` is absent (`.github/workflows/rig.yml:36-38`,
    `app/build.gradle.kts:15-33`). That is a build-integrity check, not a
@@ -103,13 +104,13 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **138 protocol + 239 app + 39 harness = 416 tests,
+Result: `BUILD SUCCESSFUL`, **158 protocol + 239 app + 39 harness = 436 tests,
 0 failures, 0 errors, 0 skipped**, read from the XML result files under each
 module's `build/test-results/test/`. Provenance: the 2026-11-25 date belongs to
 the earlier 302-test baseline and the stale-XML incident in §8, not to the
 courier counts. The fresh run after the 2026-11-30 CLI layer recorded
 136 + 210 + 32 = 378; the run after the 2026-12-01 App layer recorded 396; the
-latest fresh run, after the app QA fixes, recorded 416. The `--rerun-tasks`
+latest fresh run, after the QR codec layer, recorded 436. The `--rerun-tasks`
 flag was deliberate: an earlier invocation
 reported all test tasks `UP-TO-DATE` and left XML from an older class layout in
 place (see §8). The 302-test baseline was green at `72225f8`; the added cases
@@ -162,7 +163,7 @@ run. These classes carry no device evidence.
 
 #### Protocol QA addition — 2 cases
 
-The case below is part of the 416 baseline, not of the 82-protocol / 302-total
+The case below is part of the 436 baseline, not of the 82-protocol / 302-total
 baseline. It comes from the same fresh `--rerun-tasks` run as the app and harness
 QA additions below. It carries no device evidence.
 
@@ -170,19 +171,18 @@ QA additions below. It carries no device evidence.
 | --- | --- | --- |
 | `CourierAuthorizationTest` (new) | 2 | `seal` refuses a recipient certificate whose fingerprint differs from `toFp`; `open` yields signature-valid non-member JOIN and REKEY events that the app and CLI gates must refuse. |
 
-#### QR parcel additions — counts TBD
+#### QR parcel additions — 20 cases
 
 The two classes below belong to the 2026-12-03 QR parcel codec layer. Both are
 JVM-pure, live in `app.flit.share.protocol.parcel` and carry no device evidence.
-Their counts are **TBD** until the classes land and a fresh `--rerun-tasks` run
-records them; they are added on top of the 138 protocol / 416 rig baseline
-above, so §2, §3 and §10 move up by their combined count once known. No camera,
-Android, socket or persistence claim is made here.
+Counts come from a fresh `--rerun-tasks` run: 14 in `ParcelCodecTest` and 6 in
+`ParcelCodecTamperTest`, moving protocol from 138 to 158 and the rig from 416
+to 436. No camera, Android, socket or persistence claim is made here.
 
 | Class | # | What it pins |
 | --- | --- | --- |
-| `ParcelCodecTest` (new) | TBD | Frame grammar of one opaque UTF-8 `String` per QR frame with `FRAME_MAGIC = "FLITPARCEL1"`, CRC32 per frame and caps `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`; `parse` yields a `FrameDescriptor(parcelId, seq, count, totalBytes, crc)` on framed input and `null` on malformed input; `encodeParcel` uses `CourierEnvelope.seal`, `complete` verifies frames/CRC/sequence/count/digest/recipient and opens through `CourierEnvelope.open`, returning the exact `ParcelPayload(parcelId, recipientFp, signerFp, sha256, bytes)`; round-trips over single-frame and multi-frame payloads with scrambled frame order. |
-| `ParcelCodecTamperTest` (new) | TBD | Refusals at the frame seam: a changed byte under the per-frame CRC, bad magic or scheme, out-of-range `seq`/`count`/chunk and byte caps, a missing frame, a whole-parcel digest mismatch, a forged envelope signature and a wrong recipient fingerprint all return `null` from `parse`/`complete` with no bytes released; a pairing-code string is never accepted as a parcel. |
+| `ParcelCodecTest` (new) | 14 | Frame grammar of one opaque UTF-8 `String` per QR frame with `FRAME_MAGIC = "FLITPARCEL1"`, CRC32 per frame and caps `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`; `parse` yields a `FrameDescriptor(parcelId, seq, count, totalBytes, crc)` on framed input and `null` on malformed input; `encodeParcel` uses `CourierEnvelope.seal`, `complete` verifies frames/CRC/sequence/count/digest/recipient and opens through `CourierEnvelope.open`, returning the exact `ParcelPayload(parcelId, recipientFp, signerFp, sha256, bytes)`; round-trips over single-frame and multi-frame payloads with scrambled frame order. |
+| `ParcelCodecTamperTest` (new) | 6 | Refusals at the frame seam: a changed byte under the per-frame CRC, bad magic or scheme, out-of-range `seq`/`count`/chunk and byte caps, a missing frame, a whole-parcel digest mismatch, a forged envelope signature and a wrong recipient fingerprint all return `null` from `parse`/`complete` with no bytes released; a pairing-code string is never accepted as a parcel. |
 
 ### 4.2 App — 239 tests (210 baseline + 18 courier + 11 QA)
 
@@ -232,7 +232,7 @@ a counted runtime case: an old-style call without it must still resolve.
 
 #### App QA additions — 11 cases
 
-The cases below are part of the current 239 app / 416 rig baseline, added after
+The cases below are part of the current 239 app / 436 rig baseline, added after
 the 2026-12-01 App layer. They are counted from the JUnit XML, not from a target
 figure, and carry no device evidence.
 
@@ -269,7 +269,7 @@ on one box.
 
 #### Harness QA additions — 7 cases
 
-The cases below are part of the current 39 harness / 416 rig baseline, added
+The cases below are part of the current 39 harness / 436 rig baseline, added
 after the 2026-11-30 CLI layer. They are counted from the JUnit XML and carry no
 device evidence — the bag moves between directories on one box.
 
@@ -556,8 +556,7 @@ written: 30 at B0, 76 at milestone 1, 86 at milestone D, 115 at milestone E,
 then 121, 126, 145, 183, 231, 286 and 302 at `72225f8`, 356 after the
 2026-11-27 protocol layer (136 + 210 + 10), 378 after the 2026-11-30 CLI layer
 (136 + 210 + 32), 396 after the 2026-12-01 App layer (136 + 228 + 32) and 416
-after the app QA fixes (138 + 239 + 39). The two QR parcel protocol classes in
-§4.1 are pending with TBD counts on top of that 416 baseline; no figure is
-claimed for them until a fresh `--rerun-tasks` run records one. The CI workflow
+after the app QA fixes (138 + 239 + 39) and 436 after the 2026-12-03 QR codec
+layer (158 + 239 + 39). The CI header is updated to 158/239/32 as well. The CI workflow
 header (`.github/workflows/rig.yml:1-3`) still quotes 36/67/4; that line is
 stale.

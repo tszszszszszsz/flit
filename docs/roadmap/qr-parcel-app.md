@@ -10,12 +10,12 @@ The app shows a signed air-gap parcel as a sequence of QR frames and folds frame
 
 - 2026-11-27 Protocol — courier envelope and carry core, for the signed payload and per-recipient wrap a parcel carries.
 - 2026-12-01 App — courier sync and file-card states, for the inbound path a verified parcel joins.
-- 2026-12-03 Protocol — QR parcel frame codec, for the frame text grammar and the decode/verify entry point.
+- 2026-12-03 Protocol — QR parcel frame codec, for the frame text grammar and the `parse`/`complete` entry points.
 - 2026-12-04 CLI — parcel encode and decode, for the same frame round-trip driven from the box.
 
 ## Scope
 
-A parcel is a small signed payload that travels as an ordered list of QR frame strings with no radio link. The sender's screen cycles those frames; the receiver's camera reads them and the app puts the frames back in order until the codec can verify the whole payload. This piece adds only the display and intake surfaces plus the app-side bookkeeping between a scanned frame and the codec. The frame grammar, the signature and the payload wrap belong to the protocol layer of 2026-12-03 and are consumed here unchanged.
+A parcel is a small signed payload that travels as an ordered list of QR frame strings with no radio link. The sender's screen cycles those frames; the receiver's camera reads them and the app puts the frames back in order until the codec can verify the whole payload. This piece adds only the display and intake surfaces plus the app-side bookkeeping between a scanned frame and the codec. The frame grammar, the signature, the payload wrap and the frame caps (`MAX_FRAMES`, `MAX_AIR_GAP_PARCEL_BYTES`, `MAX_CHUNK_BYTES`) belong to the protocol layer of 2026-12-03 and are consumed here unchanged; the app restates none of them.
 
 ## Design
 
@@ -24,9 +24,9 @@ Two composables and one pure state holder are added under `app/src/main/kotlin/a
 - `QrParcelUi.kt` — `ParcelShowCard` and `ParcelScanCard`, plus a private camera view that follows the `CameraQrView` analyzer shape in `QrUi.kt`.
 - `ParcelScanState.kt` — an Android-free state machine that accepts one frame string at a time and reports progress and a completed payload.
 
-`ParcelShowCard` takes the immutable `List<String>` of frames from the codec and renders each one through `QrCanvas`. `ParcelScanCard` takes a callback that receives the verified payload and hands it to the same inbound path courier mode uses: `FlitEngine.publishReceived` for a file, or the Circle/courier feed for a message. The camera path reuses the existing `Manifest.permission.CAMERA` ask, `LifecycleCameraController`, the ~8 fps throttle, the Y-plane copy with row/pixel strides and `Qr.decodeYPlane`. A denied camera leaves a paste field that accepts newline-separated frame strings and feeds the same state holder.
+`ParcelShowCard` takes the immutable `List<String>` of frames returned by `ParcelCodec.encodeParcel` and renders each one through `QrCanvas`. `ParcelScanCard` takes a callback that receives the verified `ParcelPayload` and hands its `bytes` to the same inbound path courier mode uses: `FlitEngine.publishReceived` for a file, or the Circle/courier feed for a message. Reassembly closes with `ParcelCodec.complete(frames, identity.fingerprint, identity)`, so the receiving identity's fingerprint is the recipient gate and the identity itself supplies the private key for the codec's `CourierEnvelope.open` call. The camera path reuses the existing `Manifest.permission.CAMERA` ask, `LifecycleCameraController`, the ~8 fps throttle, the Y-plane copy with row/pixel strides and `Qr.decodeYPlane`. A denied camera leaves a paste field that accepts newline-separated frame strings and feeds the same state holder.
 
-Frame text is opaque to the UI. The codec exposes a parser that yields a frame descriptor with `parcelId`, `seq`, `count` and a verify/complete call; the app stores the frame text and the parsed descriptor and never interprets payload bytes itself. Progress is `frame i of n`, where `n` is the descriptor's `count` once known and `?` before the first accepted frame.
+Frame text is opaque to the UI. The codec exposes `ParcelCodec.parse(frame): FrameDescriptor?`; the descriptor carries `parcelId`, `seq`, `count`, `totalBytes` and `crc`, and the app reads only `parcelId`, `seq` and `count` for gating and progress. The original opaque frame strings are stored; payload bytes, CRC and magic are never interpreted or rewritten by the UI. Assembly closes through `ParcelCodec.complete(frames, recipientFp, identity): ParcelPayload?`, passing the app's own `TlsIdentity` beside the recipient fingerprint so the codec can open the envelope; it folds CRC, sequence, count, digest, envelope signature and recipient check into one call, so there is no separate verify entry point. A `ParcelPayload` carries `parcelId`, `recipientFp`, `signerFp`, `sha256` and `bytes`. Progress is `frame i of n`, where `n` is the descriptor's `count` once known and `?` before the first accepted frame.
 
 ### Constants owned here
 
@@ -36,6 +36,8 @@ Frame text is opaque to the UI. The codec exposes a parser that yields a frame d
 | `MAX_PARCEL_FRAMES` | `64` | Hard cap on frames the app will display or assemble. |
 | `PARCEL_FRAME_SIZE_PX` | `240` | `Qr.encode` side for a rendered parcel frame. |
 | `PARCEL_PASTE_MAX_CHARS` | `16_000` | Cap on the paste field's newline-separated frame text. |
+
+The frame grammar and its caps are owned by the 2026-12-03 codec and are not redefined here. The app consumes `MAX_FRAMES = 64`, `MAX_AIR_GAP_PARCEL_BYTES = 131072` and `MAX_CHUNK_BYTES = 512`; `MAX_PARCEL_FRAMES` above is set to the same 64 as `MAX_FRAMES`, so the app cannot be handed a sequence it refuses to display. With 512-byte chunks and 64 frames the largest reachable payload is 32 KiB, inside the codec's 128 KiB defensive cap. `FRAME_MAGIC = "FLITPARCEL1"` and per-frame CRC32 stay inside the codec; the app never reads or rewrites them.
 
 ### State ownership
 
@@ -50,7 +52,7 @@ Frame text is opaque to the UI. The codec exposes a parser that yields a frame d
 3. A frame whose `count` disagrees with the first accepted frame for the same `parcelId` is ignored.
 4. Stored frames never exceed `MAX_PARCEL_FRAMES`; an excess frame is ignored and progress stays at the cap.
 5. A frame carrying a different `parcelId` while another parcel is in progress is ignored rather than replacing the current assembly.
-6. `complete()` returns a payload only when the accepted frames cover every `seq` in `1..count` exactly once and the codec's verify passes; otherwise it returns null and frames stay for another scan attempt.
+6. `ParcelScanState.complete()` returns a `ParcelPayload` only when the accepted frames cover every `seq` in `1..count` exactly once and `ParcelCodec.complete(frames, recipientFp, identity)` verifies CRC, digest, envelope signature and recipient and returns a payload; otherwise it returns null and frames stay for another scan attempt.
 7. A verified payload is handed to the inbound callback exactly once; a second `complete()` call returns null.
 8. Closing the scan dialog drops every in-memory frame and writes no file, ledger row or delivery record.
 
@@ -64,15 +66,15 @@ Frame text is opaque to the UI. The codec exposes a parser that yields a frame d
 | Mixed `parcelId` in one scan | Ignore the foreign frame | Current assembly kept | The foreign frame | `PURE` test |
 | Count mismatch or sequence past `MAX_PARCEL_FRAMES` | Refuse the malformed sequence | Current assembly kept | The offending frame | `PURE` test |
 | User closes with an incomplete sequence | Conclude incomplete | Nothing durable | All in-memory frames | `PURE` test |
-| Codec verify fails | Conclude not from a claimed signer; log the line | Nothing durable | All frames and payload | `PURE` test |
+| `ParcelCodec.complete` returns null (CRC, digest, signature or recipient mismatch) | Conclude not from a claimed signer; log the line | Nothing durable | All frames and payload | `PURE` test |
 | Complete verified payload | Hand to the inbound path once | Landed file or feed row survives | Transient frames | `PURE` test; `DEVICE` walk belongs to 2026-12-08 |
 
 ## Tests
 
 Pure tests first, in `app/src/test/kotlin/app/flit/share/`, JVM-only and Android-free as the app suite requires:
 
-- `ParcelScanStateTest` — in-order, out-of-order, duplicate, missing, mixed-id, count-mismatch, over-cap, verify-fail and double-complete paths. Each case asserts the exact accepted frame set and whether `complete()` yields a payload.
-- A rendered-frame case alongside `FlitQrTest` that takes a codec-produced frame at `PARCEL_FRAME_SIZE_PX`, renders it through `Qr.encode`/`Qr.gray` and decodes it back through `Qr.decodeGray`, and decodes the same frame from a simulated CameraX Y plane with row/pixel strides and one rotation step. This is the pixel proof that a frame fits a QR at the size the UI draws.
+- `ParcelScanStateTest` — in-order, out-of-order, duplicate, missing, mixed-id, count-mismatch, over-cap, `complete`-null (CRC/digest/signature/recipient) and double-complete paths. Each case asserts the exact accepted frame set and whether `complete()` yields a `ParcelPayload`. These tests drive the real `ParcelCodec.complete` with a recipient fingerprint and the receiving `TlsIdentity`; the codec's own CRC, digest and signature cases stay in the 2026-12-03 protocol suite and are not duplicated here.
+- A rendered-frame case alongside `FlitQrTest` that takes a codec-produced frame at `PARCEL_FRAME_SIZE_PX`, renders it through `Qr.encode`/`Qr.gray` at the codec's EC level `M` and margin `2`, and decodes it back through `Qr.decodeGray`, and decodes the same frame from a simulated CameraX Y plane with row/pixel strides and one rotation step. This is the pixel proof that a frame fits a QR at the size the UI draws.
 - A small UI-state test for the display index wrap at the last frame and the progress label format. No Android framework import, no Robolectric, no engine start.
 
 Harness: none in this layer. The 2026-12-04 CLI piece owns the box-side encode/decode round-trip; this piece's decode path is exercised on the same `Qr` seam the camera uses, in pure JVM tests.
