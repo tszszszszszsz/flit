@@ -312,6 +312,67 @@ class DropKeyCoreTest {
         )
     }
 
+    // ---- explicit fingerprint/certificate binding --------------------------
+
+    @Test
+    fun `wrapVerified binds each wrap to the certificate's own fingerprint`() {
+        val first = TlsIdentity.generate()
+        val second = TlsIdentity.generate()
+        val key = DropKeyCore.mint().bytes
+        val wrapped = DropKeyCore.wrapVerified(
+            key,
+            mapOf(
+                first.fingerprint to first.certificate,
+                second.fingerprint to second.certificate,
+            ),
+        )
+        assertEquals(setOf(first.fingerprint, second.fingerprint), wrapped.keys)
+        assertContentEquals(key, DropKeyCore.unwrap(wrapped, first))
+        assertContentEquals(key, DropKeyCore.unwrap(wrapped, second))
+        // A lowercase claim still binds: normalisation is the same as wrap's.
+        val lower = DropKeyCore.wrapVerified(
+            key,
+            mapOf(first.fingerprint.lowercase() to first.certificate),
+        )
+        assertEquals(setOf(first.fingerprint), lower.keys)
+    }
+
+    @Test
+    fun `wrapVerified refuses a fingerprint misbound to a foreign certificate`() {
+        val recipient = TlsIdentity.generate()
+        val claim = "F".repeat(64) // not the certificate's SHA-256 DER fingerprint
+        val key = DropKeyCore.mint().bytes
+        val wrapped = DropKeyCore.wrapVerified(key, mapOf(claim to recipient.certificate))
+
+        // Total refusal: no wrap is produced and the call never throws, so the
+        // mislabelled key cannot be handed to this certificate's private key.
+        assertTrue(wrapped.isEmpty(), "a misbound roster must yield no wrap")
+        assertNull(DropKeyCore.unwrap(wrapped, recipient))
+    }
+
+    @Test
+    fun `wrapVerified of a mixed roster keeps only correctly bound entries`() {
+        val good = TlsIdentity.generate()
+        val stranger = TlsIdentity.generate()
+        val key = DropKeyCore.mint().bytes
+        val wrapped = DropKeyCore.wrapVerified(
+            key,
+            mapOf(
+                good.fingerprint to good.certificate,
+                "B".repeat(64) to stranger.certificate,
+            ),
+        )
+        assertEquals(setOf(good.fingerprint), wrapped.keys)
+        assertContentEquals(key, DropKeyCore.unwrap(wrapped, good))
+        assertNull(DropKeyCore.unwrap(wrapped, stranger))
+        assertTrue(wrapped.values.all { it.length <= DropKeyCore.MAX_WRAPPED_CHARS })
+
+        // Bounded: a roster above the cap is still refused outright, not trimmed.
+        val overCap = LinkedHashMap<String, X509Certificate>()
+        repeat(DropKeyCore.MAX_WRAPS + 1) { overCap["%064X".format(it)] = good.certificate }
+        assertTrue(runCatching { DropKeyCore.wrapVerified(key, overCap) }.isFailure)
+    }
+
     // ---- keyId ------------------------------------------------------------
 
     @Test

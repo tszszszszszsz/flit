@@ -80,6 +80,10 @@ object DropKeyCore {
      * [MAX_WRAPS] is refused rather than trimmed. A fingerprint whose
      * certificate cannot encrypt (for example a non-RSA key) gets no entry;
      * there is no group-key fallback or escrow.
+     *
+     * This primitive trusts the caller's map key as the fingerprint. When the
+     * key is not already known to be [TlsIdentity.fingerprintOf] of its cert,
+     * use [wrapVerified] instead so a mislabelled roster cannot seal a key.
      */
     fun wrap(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String> {
         require(recipients.size <= MAX_WRAPS) { "recipient roster exceeds MAX_WRAPS" }
@@ -94,6 +98,26 @@ object DropKeyCore {
             out[fp] = wrapped
         }
         return out
+    }
+
+    /**
+     * Explicitly bound variant of [wrap]: every map key must be the SHA-256 DER
+     * fingerprint of its own certificate ([TlsIdentity.fingerprintOf]), not just
+     * a label the caller claims. A misbound entry is refused with no wrap at
+     * all — a *total* refusal (a mismatch never throws) and a *bounded* one
+     * (at most [MAX_WRAPS] entries, each check O(1)). Correctly bound inputs
+     * keep exactly the [wrap] behaviour and wire form.
+     */
+    fun wrapVerified(key: ByteArray, recipients: Map<String, X509Certificate>): Map<String, String> {
+        require(recipients.size <= MAX_WRAPS) { "recipient roster exceeds MAX_WRAPS" }
+        val verified = LinkedHashMap<String, X509Certificate>()
+        for ((fingerprint, cert) in recipients) {
+            val claimed = fingerprint.trim().uppercase()
+            val actual = runCatching { TlsIdentity.fingerprintOf(cert) }.getOrNull() ?: continue
+            if (!actual.equals(claimed, ignoreCase = true)) continue
+            verified[claimed] = cert
+        }
+        return wrap(key, verified)
     }
 
     /**

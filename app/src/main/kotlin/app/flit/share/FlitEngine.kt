@@ -1027,7 +1027,10 @@ val share: StateFlow<ShareIntake?> = _share
                 if (certFp.equals(fp, ignoreCase = true)) certs[fp] = cert
             }
             val key = DropKeyCore.mint()
-            val wraps = DropKeyCore.wrap(key.bytes, certs)
+            // Bind each wrap key to its certificate's own digest: a pinned or
+            // signed-in-hand cert already passed this check, but the core keeps
+            // the binding explicit so a mislabelled roster can never seal a key.
+            val wraps = DropKeyCore.wrapVerified(key.bytes, certs)
             if (wraps.isEmpty()) {
                 logLine("circle drop: no recipient key material — not posted")
                 return@launch // source spool kept
@@ -2267,7 +2270,11 @@ val share: StateFlow<ShareIntake?> = _share
         }
         // Milestone E: the relay is the last candidate, never the first.
         // A direct answer above always won; only an owed peer nobody on the
-        // direct routes knows gets one register through the typed relay.
+        // direct routes knows gets one register through the typed relay — and
+        // only when that device opted in, exactly like a file send, a Circle
+        // dial or a panic fan-out. An unknown or opted-out fingerprint never
+        // leaks a register through the blind relay.
+        if (!relayHuntAllowed(_knownDevices.value.firstOrNull { it.fingerprint.equals(fp, true) })) return
         val relay = relayConfig() ?: return
         val answered = probeRelay(cli, self, seq, fp, relay) ?: return
         if (!FlitRoute.accepts(answered.fingerprint, fp)) return
@@ -2277,6 +2284,19 @@ val share: StateFlow<ShareIntake?> = _share
         huntLogged.remove(fp)
         touchPeerViaRelay(relay.host, answered)
     }
+
+    /**
+     * Pure gate for the last-resort relay hunt probe: the per-device switch is
+     * the authority, the same one that gates file sends, Circle dials and panic
+     * fan-out. No Known entry, an opted-out device or a policy that excludes
+     * relay means the hunter never sends a `register` for that fingerprint.
+     * Null is refused (fail closed); only an explicit opt-in with AUTO or
+     * RELAY_ONLY allows the probe.
+     */
+    internal fun relayHuntAllowed(device: FlitKnown.Device?): Boolean =
+        device?.relayFor == true &&
+            (device.routePolicy == FlitKnown.RoutePolicy.AUTO ||
+                device.routePolicy == FlitKnown.RoutePolicy.RELAY_ONLY)
 
     /** The one typed relay from Options; null means E is off and invisible. */
     private fun relayConfig(): RelayConfig? {

@@ -139,6 +139,26 @@ class FlitEngineTest {
         assertEquals(setOf("REAL_FP", "manual@onion"), out.keys)
     }
 
+    @Test
+    fun `relay hunt last resort needs an explicit relayFor and an allowing policy`() {
+        fun device(relayFor: Boolean, policy: FlitKnown.RoutePolicy) = FlitKnown.Device(
+            fingerprint = "A".repeat(64),
+            alias = "peer",
+            relayFor = relayFor,
+            routePolicy = policy,
+        )
+        // No Known entry, an opted-out device, or a policy that excludes relay
+        // never gets a register through the blind relay (fail closed).
+        assertFalse(FlitEngine.relayHuntAllowed(null))
+        assertFalse(FlitEngine.relayHuntAllowed(device(false, FlitKnown.RoutePolicy.AUTO)))
+        assertFalse(FlitEngine.relayHuntAllowed(device(true, FlitKnown.RoutePolicy.WIFI_ONLY)))
+        assertFalse(FlitEngine.relayHuntAllowed(device(true, FlitKnown.RoutePolicy.BLUETOOTH_ONLY)))
+        // Explicit opt-in with AUTO or RELAY_ONLY is the same gate that allows
+        // file sends, Circle dials and panic fan-out to use the relay.
+        assertTrue(FlitEngine.relayHuntAllowed(device(true, FlitKnown.RoutePolicy.AUTO)))
+        assertTrue(FlitEngine.relayHuntAllowed(device(true, FlitKnown.RoutePolicy.RELAY_ONLY)))
+    }
+
     // ==== per-drop keyed file drops =============================================
     //
     // The engine builds one signed `file` body per drop and, on the receive
