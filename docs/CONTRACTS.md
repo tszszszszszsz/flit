@@ -876,8 +876,7 @@ trust and replay reasoning in [Security](SECURITY.md).
 The last full green JUnit XML records 443 protocol + 167 core + 254 app + 108
 harness = 972 tests with zero failures, zero errors and zero skipped
 (`docs/TESTING.md` §1). That result covers the four test tasks only; the release
-assembly rerun behind the R8 keep-rule change was still pending, so no green
-claim is made for it. The 769 figure (359 + 323 + 87), the 714 figure
+release assembly is green after the R8 keep-rule change. The 769 figure (359 + 323 + 87), the 714 figure
 (330 + 309 + 75) and the four-module 778 projection are historical. These are
 test counts, not a device claim for the UI or CLI layers.
 
