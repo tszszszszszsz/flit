@@ -26,7 +26,7 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 
 Working name. Rename is a 15-minute chore before Play listing (no trademark reuse of "LocalSend").
 
-## Current capabilities (verified on device)
+## Current capabilities
 
 - **No Wi‑Fi network? The roster keeps working.** The engine flips Bluetooth LE
   discovery on at the exact no-AP moment (mobile data only, dead access point) and the
@@ -72,9 +72,10 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   and a device that joins later sees the card but not the old bytes. The founder is
   owner and can appoint admins; leave or kick rotates the key and the host refuses the
   departed device's later sync. No accounts, no server, no remote actions.
-  Two-node join/post/leave were walked on device; the multi-member mesh and
-  phone→host fan-out remain listed as limitations — see
-  [the Circle design and evidence](docs/circle.md).
+  The 2026-11-26 device walk covered a three-identity Circle — one phone host and
+  two CLI bots — with join, post, poll/vote, a hash-exact file landing and
+  kick/rekey. A larger mesh is the unverified case; phone→host fan-out stays
+  test-evidenced only — see [the Circle design and evidence](docs/circle.md).
 - **"Open file" is a detour, not an exit:** a Circle file card offers Open only
   when a local copy with that SHA-256 is present; the chooser carries a valid
   FileProvider grant, and returning from an external viewer leaves the feed and
@@ -91,7 +92,12 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   verified payload, and hands the bytes to the existing receive path. No file name travels in a
   frame; the save name is local. This is code and JVM-tested only, with no camera or device walk
   claimed.
-- **Signed delivery receipts (protocol layer):** a Circle member can acknowledge a named file
+- **Signed Circle admission and officer-only rekey:** a JOIN carries a short-lived
+  signed proof bound to the host, circle, invite and the joining fingerprint, so an
+  invited party cannot impersonate another device at admission; a rekey folds only
+  from a current owner or admin, never from a departing officer. No new route or
+  wire field, and no device walk is claimed.
+- **Signed delivery receipts:** a Circle member can acknowledge a named file
   drop with a signed `receipt` event whose body is the closed set `{dropId, sha256, keyId}` —
   the acknowledged drop's id, the landed plaintext digest, and the per-drop key identifier
   (provenance only, with no second time field or local status). The protocol module gates that
@@ -99,8 +105,9 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   at most one per member by canonical order. A receipt proves that the bytes landed hash-exact
   on the signing member's own side; it says nothing about delivery to other members and does
   not replace the sender-local delivery record. It rides the existing signed Circle log with no
-  new route, header or DTO field. This is JVM-pure on 2026-12-11: code and pure-tested only, with
-  no device walk claimed.
+  new route, header or DTO field. The 2026-12-14 layer wired it into the app and `flit-cli`:
+  the engine mints and tallies a receipt on a hash-exact landing, and the CLI exposes
+  `circle receipt`, both on that same signed log. No device walk is claimed.
 - **Shared Circle pad (protocol layer):** members can keep one shared, line-oriented text pad as
   signed `pad` events in the Circle's existing event log — each event is a `put` or `del` of a line
   key with a closed body shape and a strict gate. The protocol module folds those events into one
@@ -176,7 +183,7 @@ rig, shipped under a name that doesn't wear test-bench vocabulary.
 
 ```bash
 ./install-cli.sh                            # build from source → ~/.local/bin/flit-cli
-./install-cli.sh --zip flit-cli-0.3.0.zip   # or install a CI artifact directly
+./install-cli.sh --zip flit-cli-0.3.1.zip   # or install a CI artifact directly
 ```
 
 Common `flit-cli` commands (run `flit-cli` with no arguments for the complete

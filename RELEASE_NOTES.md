@@ -1,5 +1,38 @@
 # Flit — release notes
 
+## v0.3.1
+
+A signed JOIN proof closes fingerprint impersonation at admission. A joining
+member signs a stateless proof bound to the host fingerprint, circle id, invite,
+its own fingerprint and a five-minute clock bucket; the host recomputes it from
+the request before admitting anyone. An invited party that cannot prove it holds
+the claimed fingerprint is refused, and a client that still sends a pre-proof
+JOIN is refused with an exact reason. The routes, headers, DTO fields and v2.2
+status codes are unchanged.
+
+A shared authority gate makes rekey officer-only. The app, the CLI and the host
+fold an answer by one rule: a JOIN is never folded out of a host answer, a REKEY
+is folded only when its author is a current owner or admin, and ordinary events
+fold only inside their own circle. A departing officer cannot hand the group key
+to a remaining member in the same batch, and a forced rotation on departure
+outranks a rekey admitted alongside it.
+
+The replay guard is restored on app ingress. The app verifies a signed event
+before reserving its id, dedups by id in canonical order and keeps the batch and
+log caps, so a forgery cannot burn a valid event's id and a replay cannot be
+folded twice.
+
+The CLI verifies host answers with `--host-fp`. The fingerprint printed by
+`serve` is pinned at join, and every later answer must be signed by that host;
+rotated keys are learned only from host-signed REKEY events in the signed log
+and installed by generation. A key carried in an unverified answer or a sync
+response is never adopted.
+
+Wire routes, headers, DTOs and status codes are unchanged by this release; only
+the admission proof and the shared fold rule are added, and pre-proof JOIN
+clients are refused. No device walk is claimed: the evidence is JVM-pure
+protocol tests plus in-process app and CLI harness tests from the green rig.
+
 ## v0.3.0
 
 * **Circle pad.** A Circle can keep one shared, line-oriented text pad in the
@@ -19,7 +52,9 @@
   from a camera feed without a network between devices. The frame codec and the
   courier carry path stay inside the existing v2.2 wire rules.
 * **Courier carry.** An offline member's signed events can travel through a
-  second device. Carry is opt-in and bounded by the existing replay window.
+  second device. Carry is used only by an explicit peer-to-peer handoff; there
+  is no user-facing opt-in setting. Parcels expire on their own 24 h TTL, not
+  the Circle replay window.
 * **Small surface additions.** Fingerprint fallback labels use a derived short
   code, pad search runs on the pad card, and the shipped BLE duty cycle is
   checked at start-up as an observation only; a violation is logged and does

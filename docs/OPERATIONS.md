@@ -3,11 +3,12 @@
 > Part of the Flit design set. [Transport ladder and index](transport-bluetooth.md) ·
 > [README](../README.md).
 
-The rig's final green standard is **714 tests, 0 failures** (330 protocol + 309
-app + 75 harness), from a green `--rerun-tasks` run. Earlier docs quote older
-counts (76, 115, 302, 396, 588) and the CI workflow comment quotes 36/67/4;
-those are historical snapshots of the same suite at earlier layers, not the
-current inventory. The current inventory is in [TESTING.md](TESTING.md).
+The rig's final green standard is **769 tests, 0 failures** (359 protocol + 323
+app + 87 harness), from a green `--rerun-tasks` run with zero errors, zero
+skipped tests and all assemblies green. Earlier docs quote older counts (76,
+115, 302, 396, 588, 714); those are historical snapshots of the same suite at
+earlier layers, not the current inventory. The CI workflow comment now quotes
+359 + 323 + 87. The current inventory is in [TESTING.md](TESTING.md).
 The v0.2.0 baseline was `72225f8` (Open-file crash + sharing restore), preceded
 by `2034fa6` (Circle file delivery + quality pass); later layers are recorded
 under `docs/completions/`.
@@ -19,7 +20,7 @@ Three modules, three roles ([README](../README.md#repo-layout)):
 | Module | Role | Runs on |
 | --- | --- | --- |
 | `protocol/` | JVM-pure wire engine (JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client, relay core) | JVM only; no Android dependency |
-| `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.3.0` (code 3), minSdk 26, compile/targetSdk 36 | Phone |
+| `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.3.1` (code 4), minSdk 26, compile/targetSdk 36 | Phone |
 | `harness/` | Desktop companion shipped as `flit-cli`; doubles as the interop and device-walk rig | Linux box with JDK 21 |
 
 Toolchain lives outside the repo in `~/.local/`; `env.sh` pins JDK 21
@@ -40,7 +41,7 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDe
 A plain `flit-cli` binary can be reached two ways: from the built distribution
 (`harness/build/install/flit-cli/bin/flit-cli`) or installed to `~/.local/bin`
 via `install-cli.sh`. The installer also accepts a CI zip:
-`./install-cli.sh --zip flit-cli-0.3.0.zip`, and an alternate root with
+`./install-cli.sh --zip flit-cli-0.3.1.zip`, and an alternate root with
 `--prefix DIR`. It gates both build and launch on Java 21 with one readable line
 (`flit-cli needs JDK 21 … set JAVA_HOME or put java 21 first on PATH`) rather
 than a JVM class-file stack trace (install-cli.sh:1-70).
@@ -81,8 +82,8 @@ The `courier` surface is detailed in §2.4 and `parcel` in §11.
 Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:73-78):
 `--alias --port --dir --dest --udp-port --wait --pin --parallel --announce-to
 --bytes --sender --token --park-timeout --relay --text --circle --invite --file
---target --option --host --role --bag --to --cert --ttl --out --sha --drop-id
---key`.
+--target --option --host --host-fp --role --bag --to --cert --ttl --out --sha
+--drop-id --key`.
 Everything else is a presence flag. Defaults come from `Protocol.DEFAULT_PORT
 = 53317` and `MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay
 default is `DEFAULT_PORT + 1 = 53318` (Harness.kt:706). `--bag --to --cert
@@ -188,7 +189,7 @@ host, members, events JSON, rekeyGen). Subcommands:
 | Subcommand | Required flags | Effect |
 | --- | --- | --- |
 | `create` | optional `--circle`, `--invite`, `--host` | mints id/invite/key, prints the matching `serve --circle … --invite …` line |
-| `join` | `--host ip[:port]`, `--circle ID`, `--invite TOKEN` | authenticated TLS join; stores key, members, log; refuses with the host's reason |
+| `join` | `--host ip[:port]`, `--circle ID`, `--invite TOKEN`, `--host-fp FP` | authenticated TLS join with a signed JOIN proof; stores key, members, log and the host fingerprint; refuses with the host's reason |
 | `post` | `--text NOTE` **or** `--file PATH` | signed message, or a file-drop **announcement only** (`{name,size,sha256}`) |
 | `file` | `--file PATH` | announcement **and** real bytes to every current member via `sendFiles`; local-only status |
 | `poll` | `--text QUESTION`, `--option A,B,…` | signed poll event |
@@ -199,6 +200,15 @@ host, members, events JSON, rekeyGen). Subcommands:
 | `sync` | a joined `--host` | pulls the full bounded log, prints feed, poll tally and confirmed count for keyed drops |
 | `receipt` | `--sha SHA`; optional `--drop-id ID`, `--host ip[:port]` | publishes a signed receipt for a keyed drop |
 | `pad` | `put` needs `--key K --text T`; `del` needs `--key K`; `show` needs neither | `put`/`del` publish a signed pad event on the existing Circle routes; `show` prints the local view |
+
+`join` signs a short-lived proof bound to the host fingerprint, circle id,
+invite, joining fingerprint and a five-minute bucket; the host recomputes it
+before admission, so an invited peer cannot claim another fingerprint, and a
+pre-proof client is refused with `join proof required`, `invalid join proof` or
+`join proof replay`. `--host-fp` takes the fingerprint printed by `serve` and is
+stored with `circle.state`; every later answer must be signed by that host, and
+a rotated key is adopted only from a host-signed REKEY event in the signed log,
+installed by generation. This adds no route, header, DTO field or v2.2 status.
 
 `file --file` is deliberately different from `post --file`: a plain post never
 moves bytes. The announcement body is the closed `{name,size,sha256}` shape with
@@ -617,10 +627,11 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDe
     :app:assembleRelease :harness:installDist
 ```
 
-Expected: 714 tests, 0 failures (330 protocol + 309 app + 75 harness) at the
-final green `--rerun-tasks` run; debug and release APKs plus the CLI distribution
-produced. CI runs the superset at .github/workflows/rig.yml:35-49 and uploads the
-CLI zip as artifact `flit-cli`.
+Expected: 769 tests, 0 failures (359 protocol + 323 app + 87 harness) at the
+final green `--rerun-tasks` run, with zero errors, zero skipped tests and debug
+and release APKs plus the CLI distribution produced. CI runs the same task set
+at .github/workflows/rig.yml:35-49 and uploads the CLI zip as artifact
+`flit-cli`.
 
 ### 6.2 Box serve + discover + send (interop baseline, harness evidence)
 
@@ -791,7 +802,8 @@ The box logs `panic from <fp12> (ip): <text> [hops=0]`; a phone-sent alert
 produced a box log with the sender fingerprint, and a box-sent alert produced a
 phone banner with alias, note and safety copy. Acknowledge / Dismiss / Forward
 are explicit; Forward re-signs with the forwarder's identity while `originFp`
-preserves the author, and `forward` returns null at `DEFAULT_MAX_HOPS = 3`
+preserves the author, and `forward` refuses the next hop when `hops + 1 >= 3`
+(`DEFAULT_MAX_HOPS = 3`), i.e. returns null at `hops = 2`
 ([qr-only-and-panic.md](qr-only-and-panic.md)).
 
 ### 6.10 Bluetooth opt-in and permission gate (single-phone walk only)
@@ -967,15 +979,16 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
   re-check the APK signer before sideloading.
 - **Provenance:** development was private; the repository is published with its
   full commit history (scaffolding, milestones, regressions and fixes), not as
-  a reconstructed snapshot. The release point is `v0.3.0`; the tag is applied at
-  push.
+  a reconstructed snapshot. The historical release point is `v0.3.0` (tagged at
+  push); the current in-tree version is `0.3.1`.
 - **Store metadata:** `fastlane/metadata/android/en-US/` holds title,
   short/full description and `changelogs/1.txt` ("First release").
-  `RELEASE_NOTES.md` carries a v0.3.0 section plus the v0.2.0 notes and a dated
+  `RELEASE_NOTES.md` carries the current v0.3.1 section, the historical v0.3.0
+  section, the v0.2.0 notes and a dated
   2026-11-25 correction: the original "no new settings/vocabulary" copy was
   superseded by the opt-in **Transfer over Bluetooth** option on 2026-11-24.
 - **Version identity:** namespace/applicationId `app.flit.share`, versionName
-  `0.3.0`, versionCode 3, minSdk 26, compile/targetSdk 36. The app is
+  `0.3.1`, versionCode 4, minSdk 26, compile/targetSdk 36. The app is
   `allowBackup=false`; identity lives in `filesDir/flit-identity.p12`.
 - **Play listing / data safety:** zero collection, no accounts, no cloud, no
   ads, no telemetry, no phone-home SDKs; see
@@ -1010,6 +1023,10 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
   (§2.3), the help text and parser decide.
 - Manual air-gap carry by QR frames is an operator procedure with its own size,
   acknowledgement and evidence limits (§11); no device walk is part of it.
+- The signed JOIN proof, the officer-only rekey gate and the `--host-fp`
+  host-answer pin have no device walk: they are JVM-pure and in-process
+  harness-evidenced only ([TESTING.md](TESTING.md#4-test-inventory-by-module-and-class),
+  §4.8).
 
 ### 10.1 Keyed Circle drops (operator limits)
 
