@@ -234,7 +234,7 @@ class DropKeyCryptoTest {
 
     @Test
     fun `canonical vectors for every existing verb are byte-identical`() {
-        assertEquals(CircleEvent.TYPES, GOLDEN.keys, "goldens cover exactly the eleven existing verbs")
+        assertEquals(CircleEvent.TYPES - CircleEvent.PAD, GOLDEN.keys, "goldens cover exactly the eleven pre-pad verbs")
         for ((type, expectedHex) in GOLDEN) {
             val event = CircleEvent(
                 id = "id-1",

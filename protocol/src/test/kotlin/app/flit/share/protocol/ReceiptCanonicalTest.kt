@@ -51,12 +51,12 @@ class ReceiptCanonicalTest {
     fun `canonical vectors for the ten pre-receipt verbs are byte-identical`() {
         assertEquals(
             PRE_RECEIPT + CircleEvent.RECEIPT,
-            CircleEvent.TYPES,
+            CircleEvent.TYPES - CircleEvent.PAD,
             "RECEIPT must be additive to TYPES",
         )
         assertEquals(
             PRE_RECEIPT,
-            CircleEvent.TYPES - CircleEvent.RECEIPT,
+            CircleEvent.TYPES - CircleEvent.RECEIPT - CircleEvent.PAD,
             "adding the receipt verb removed no existing verb",
         )
         for ((type, expectedHex) in GOLDEN) {
