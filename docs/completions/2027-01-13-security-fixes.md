@@ -17,7 +17,7 @@ Counts come from the JUnit XML of the last full four-module run, cross-checked
 with source `@Test` annotations. That run recorded 443 protocol + 167 core +
 254 app + 108 harness = 972 cases with zero failures, zero errors and zero
 skipped cases. The figures are historical for this layer because the release
-assembly rerun after the R8 keep-rule fix has not produced a result yet.
+assembly is green after the R8 keep-rule fix.
 
 ## Pin flooding
 

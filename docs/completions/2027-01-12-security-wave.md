@@ -16,8 +16,7 @@ Counts below are read from the JUnit XML of the last full four-module run under
 `harness/build/test-results/test/`, cross-checked against `@Test` annotations
 in source. That run recorded 443 protocol + 167 core + 254 app + 108 harness =
 972 cases with zero failures, zero errors and zero skipped cases. These counts
-are historical for this layer. The release assembly rerun after the R8
-keep-rule fix is verified by a green assembly result.
+are historical for this layer. The release assembly is green after the R8 keep-rule fix.
 
 ## Core trust gates
 

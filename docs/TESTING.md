@@ -708,8 +708,9 @@ the last full green test XML (§1, §3). The numbers below are XML case counts
 and match the `@Test` annotations in the named source files. They are part of
 the 972-test inventory, not additions on top of it. Where a class also appears
 in §4.1–§4.3, its row there is the earlier historical count and the row here is
-the current one. All are JVM-pure or in-process; no device walk, new route,
-header, DTO field or v2.2 status is claimed for this wave.
+the current one. All are JVM-pure or in-process; no device walk or v2.2 status change is
+claimed for this wave. The security wave does add Flit-only headers and DTO
+fields, recorded in `docs/CONTRACTS.md` §26.
 
 | Class | # | Module | What it pins |
 | --- | --- | --- | --- |

@@ -11,7 +11,7 @@
 > to audit.
 
 - **Code reality** — traced to specific files and lines; no execution implied.
-- **Pure-test evidence** — JVM tests in `protocol/src/test`, `app/src/test`.
+- **Pure-test evidence** — JVM tests in `protocol/src/test`, `core/src/test`, `app/src/test`.
 - **Harness/sim evidence** — `flit-cli` and in-process endpoints over
   `Link`/`LinkProvider`, `bt-sim`, relay over loopback.
 - **On-device evidence** — the rig phone (Redmi Note 10S / API 36) and the CLI
@@ -20,9 +20,8 @@
 
 Rig status: 443 protocol + 167 core + 254 app + 108 harness = 972 tests, 0
 failures, 0 errors, 0 skipped in the last full green test XML (2026-11-28,
-`docs/TESTING.md` §1). That result covers the four test tasks only; the release
-assembly is green after the R8 keep-rule change
-written, so no green claim is made for it. The 714 figure (330 + 309 + 75), the
+`docs/TESTING.md` §1). That result covers the four test tasks; the release assembly is also green
+after the R8 keep-rule change. The 714 figure (330 + 309 + 75), the
 769 figure (359 + 323 + 87) and the four-module 778 projection are historical.
 Properties asserted only by a code comment or an unrun path are marked "not
 verified".

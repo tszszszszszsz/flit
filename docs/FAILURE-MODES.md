@@ -15,9 +15,8 @@
 
 Current rig state: **443 protocol + 167 core + 254 app + 108 harness = 972
 tests, 0 failures, 0 errors, 0 skipped**, from the last full green test XML
-(2026-11-28, `docs/TESTING.md` §1). That result covers the four test tasks only;
-the release assembly is green after the R8 keep-rule change, so
-no green claim is made for it. The 769 figure (359 + 323 + 87), the 714 figure
+(2026-11-28, `docs/TESTING.md` §1). That result covers the four test tasks; the release assembly is also green
+after the R8 keep-rule change. The 769 figure (359 + 323 + 87), the 714 figure
 (330 + 309 + 75) and the three-module 778 projection are historical; the older
 302-test figure was green at `72225f8` and is historical too. The non-profit constraint holds
 throughout: no accounts, no cloud, no ads, no telemetry, no phone-home SDKs;

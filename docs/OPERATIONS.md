@@ -9,8 +9,8 @@ projection of 362 protocol + 112 core + 212 app + 92 harness. After the security
 closeout wave the last recorded four-module test XML is **972 tests**, split as
 443 protocol + 167 core + 254 app + 108 harness, with zero failures, zero errors
 and zero skipped cases. That XML is the current inventory and the projected split
-for this layout; a release assembly rerun after an R8 keep-rule fix is still in
-the background, so no finished-release claim is made here. Earlier counts (76,
+for this layout; the release assembly is green after the R8 keep-rule fix, and
+no finished-release claim follows from it. Earlier counts (76,
 115, 302, 396, 588, 714, 769, 778) are historical snapshots of the same suite at
 earlier layers. The full inventory is in [TESTING.md](TESTING.md).
 The v0.2.0 baseline was `72225f8` (Open-file crash + sharing restore), preceded
