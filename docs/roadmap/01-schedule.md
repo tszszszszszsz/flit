@@ -56,6 +56,10 @@ The 2026-12-17 device layer has no commit. No physical walk was available for
 this run, so the date moves under the rule below and no placeholder commit is
 made. The flows are covered by the in-process rig recorded in `docs/TESTING.md`.
 
+The 2026-12-22, 2026-12-23, 2026-12-24 and 2026-12-28 layers are built ahead of
+their dates. The JOIN proof, Circle authority gate, replay guard, CLI parity and
+the associated documentation are written now; the commits stay on those dates.
+
 ## Dates
 
 | Date | Layer | Commit scope |
@@ -79,6 +83,10 @@ made. The flows are covered by the in-process rig recorded in `docs/TESTING.md`.
 | 2026-12-17 | Device | Full feature walk — deferred until a physical walk is available |
 | 2026-12-18 | Release | Final rig, docs consolidation, v0.3.0 |
 | 2026-12-21 | Integration | Three reviewed ideas in app surfaces, tests |
+| 2026-12-22 | Protocol | JOIN proof core, Circle authority gate, replay caller, tests |
+| 2026-12-23 | Integration | JOIN proof and authority enforcement in app and CLI, tests |
+| 2026-12-24 | Docs | Security disclosure update, final rig record, completion notes |
+| 2026-12-28 | Release | v0.3.1 tag and release notes |
 
 ## Rules for a day
 

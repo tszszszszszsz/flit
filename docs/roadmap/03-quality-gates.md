@@ -39,5 +39,6 @@ is not acceptable; a refusal or a limit is logged or shown.
 
 ## Release
 
-`v0.3.0` is tagged only after the final rig and the full feature walk on
-2026-12-18. The release notes describe what was walked and what was not.
+`v0.3.0` was tagged after the final rig on 2026-12-18; the tag followed the rig
+only. The full feature walk planned for 2026-12-17/2026-12-18 was deferred. The
+release notes describe what was walked and what was not.

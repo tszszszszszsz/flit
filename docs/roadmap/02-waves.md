@@ -45,6 +45,10 @@ runs now, but the commit stays on 2026-12-16; no earlier wave carries it.
 The 2026-12-21 Integration wave is built ahead. Three reviewed ideas are integrated
 now, but the commit stays on 2026-12-21; no earlier wave carries it.
 
+The 2026-12-22 through 2026-12-28 waves are built ahead. The JOIN proof, Circle
+authority gate, replay guard, CLI parity and documentation are written now, but
+the commits stay on their assigned dates.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator
@@ -73,6 +77,10 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2026-12-17 | Device | Full feature walk deferred — no physical walk was available, so no wave ran and no evidence note was added |
 | 2026-12-18 | Release | Rig runners, docs consolidators, release notes, tag and asset checks |
 | 2026-12-21 | Integration | Eight tasks: three approved ideas across pad UI, circle UI, activity labels, BLE audit, tests and two read-only reviews |
+| 2026-12-22 | Protocol | 16 tasks across the JOIN proof core, Circle authority gate, replay caller, route gate and pure tests |
+| 2026-12-23 | Integration | 16 tasks across app sync/store/host, CLI host and commands, courier and harness tests |
+| 2026-12-24 | Docs | 16 tasks across security disclosure, contracts, failure modes, test inventory and completion notes |
+| 2026-12-28 | Release | 16 tasks across release notes, tag checks and final rig record |
 
 ## Integration gate
 

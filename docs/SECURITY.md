@@ -53,10 +53,10 @@ deliberately symmetric: every row states both the guarantee and the gap.
 | On-path / rogue relay | TLS runs end-to-end inside the pipe; the relay never sees a protocol byte, a fingerprint in the log, or a finished hash; a signed host answer binds the key to the QR host | a relay can refuse, delay, drop or partition a pair; it is a single point of failure the user owns |
 | Malicious courier carrier | holds only AES-GCM ciphertext, an IV and an RSA-wrapped key; cannot decrypt, forge the sender signature, or redirect a blob to a different `toFp`/`circleId` without breaking the cipher or the signature | can refuse, delay, drop, duplicate or partition parcels; a held parcel stays a stored copy until the 24 h TTL expiry; sees addressee fingerprint, timing and size |
 | Air-gap frame carrier | a sealed parcel is released only when `complete` checks the recipient and the frames, CRC, sequence, count and digest; the bytes are AES-GCM ciphertext behind an RSA-OAEP-wrapped key, signed with the sender's cert-bound key | can copy, delay, reorder, drop, duplicate or photograph frames and can alter one, but a bad frame fails CRC and a bad parcel fails signature, digest or recipient check; sees frame metadata and ciphertext, not plaintext |
-| Forged fingerprint | an attacker certificate lands under the attacker's own SHA-256 DER fingerprint; a **signed** event naming a victim's `senderFp`/`authorFp` fails without that victim's private key, so signed events cannot be forged | a Circle `JOIN` is not signed: it is gated by invite + `memberFp`, and the member certificate DER is public in Circle events. An invite holder can replay a member's certificate in `X-Flit-Circle-Cert`, name that member's `memberFp`, and take its roster slot and route; no private-key proof is demanded |
+| Forged fingerprint | an attacker certificate lands under the attacker's own SHA-256 DER fingerprint; a **signed** event naming a victim's `senderFp`/`authorFp` fails without that victim's private key, so signed events cannot be forged | the member certificate DER is public in Circle events and in `X-Flit-Circle-Cert`; the header alone remains a name claim. Possession of the key behind `memberFp` is now checked by the signed JOIN proof described below |
 | Stolen QR photo (pairing) | pinning for an IP-bearing code happens only after a live `register` answers with the exact fingerprint in the code | the photo is a bearer hint: whoever shows it to a device that answers correctly gets trusted. A relay-only/MAC-only code has no probe and pins directly from the code — the human eyeball is the only check |
-| Stolen Circle invite (v3 QR) | the code carries no group key; the key arrives only inside a TLS session to the host named in the QR, and the answer is signed by that host | the invite token is a bearer credential: whoever holds the photo can complete a JOIN while it is valid, including under another member's `memberFp` and route. Retiring a suspicious code means starting a new Circle |
-| Compromised circle member | cannot forge another member's **signed events** (signature + cert pin), cannot inject `JOIN` or `REKEY` through `SYNC`, cannot inject a `parcel` into another device's bag unless it is a current roster member, cannot read a key the host never sends in a sync answer | can read the whole plaintext log and can emit signed events as itself; with the invite it can JOIN as another member and redirect that member's route to itself; earlier events already stored on a departed device cannot be erased |
+| Stolen Circle invite (v3 QR) | the code carries no group key; the key arrives only inside a TLS session to the host named in the QR, and the answer is signed by that host. A JOIN also needs one signed JOIN event carrying a proof minted with the private key for the claimed `memberFp`, so the photo alone cannot claim another member's identity | the invite token remains a bearer credential: whoever holds it can join under their own key while it is valid. A captured proof is a bearer token until its bucket rolls over; the host reserves its id once in-process, but a restart or another process has no memory of that reservation. Retiring a suspicious code means starting a new Circle |
+| Compromised circle member | cannot forge another member's **signed events** (signature + cert pin), cannot mint a proof for another fingerprint, cannot inject `JOIN` or `REKEY` through `SYNC` or a parcel, cannot inject a `parcel` into another device's bag unless it is a current roster member, cannot read a key the host never sends in a sync answer | can read the whole plaintext log and can emit signed events as itself; with the invite and its own key it can join under its own fingerprint and have that route remembered; earlier events already stored on a departed device cannot be erased |
 | Malicious panic sender | must own the private key for the claimed `senderFp`; hops and author are signed; recipient gates on the original `originFp` being QR-known; dedup stops replays | any QR-known device can send a loud banner; panic is informational and never wipes, locks or acts on the recipient |
 | Local attacker with device access | no cloud copy to pull, no account to reset, `android:allowBackup="false"` | can read the app's plaintext state, preferences, spool and ledger; there is no content cipher and no screen lock of its own |
 | Malicious external viewer | Flit hands one content URI with a scoped read grant, never the private key or the whole spool | whatever the user chooses to do with that file is outside Flit's control |
@@ -83,15 +83,15 @@ no hostname to validate.
   (`protocol/.../client/PeerHttpClient.kt:19-21`). The key manager ignores the
   peer's `certificate_authorities` list so stock SunX509 still selects the
   self-signed client cert (`TlsIdentity.kt:81-140`).
-- **Invariant (with one exception):** TLS provides confidentiality and transport
-  integrity; it does **not** by itself establish *which* device is on the other
-  end. For a TLS session, identity rests on the announced fingerprint matching
-  one obtained out of band (QR scan) or from a pinned roster row; for a signed
-  event, the signature must verify under the pinned certificate, so a peer that
-  cannot present the private key for a fingerprint cannot sign as it. The
-  exception is Circle `JOIN`: the certificate DER is public in Circle events,
-  and a header carrying it is not proof of private-key possession (see
-  "Signatures and cert-in-event").
+- TLS provides confidentiality and transport integrity; it does **not** by
+  itself establish *which* device is on the other end. For a TLS session,
+  identity rests on the announced fingerprint matching one obtained out of band
+  (QR scan) or from a pinned roster row; for a signed event, the signature must
+  verify under the pinned certificate, so a peer that cannot present the private
+  key for a fingerprint cannot sign as it. A Circle `JOIN` uses the same
+  primitive: it carries one signed JOIN event whose embedded certificate is
+  bound to that fingerprint by its own digest, so an invite holder without the
+  private key cannot mint a valid proof (see "Signatures and cert-in-event").
 - OS Bluetooth bond state is **not** a Flit trust anchor. The system pairing
   sheet may appear on an incoming RFCOMM, but accepting it does not pin anything
   in Flit; trust is still QR-invite fingerprint pinning
@@ -166,18 +166,26 @@ in the body: `ServerCore.panicRoute` decodes `X-Panic-Cert`, pins it under its
 own digest, requires that digest to equal `alert.senderFp`, and verifies the
 signature (`protocol/.../server/ServerCore.kt:902-945`). Circle routes require
 `X-Flit-Circle-Cert` and compare its digest to `memberFp`
-(`ServerCore.kt:971-997`), but that check is **not** proof of private-key
-possession: the certificate DER is public in every signed Circle event, so
-anyone who can read a Circle log can replay a member's certificate in the
-header and name that member's `memberFp`. `ServerCore` only pins the header
-certificate and compares its own digest to the claimed `memberFp`; the host
-admits a `JOIN` on invite + `memberFp`, with no nonce and no signature over the
-JOIN (`FlitCircleHost.kt:119-144`, `FlitEngine.kt:1110-1125`). An invite holder
-can therefore claim another member's fingerprint and route: the host adds that
-`memberFp` to the roster and remembers the requester's IP as the route back to
-it. This remains an open impersonation gap; a header requirement alone did not
-close it. Signing a nonce-bound JOIN is a future protocol change, not a current
-guarantee.
+(`ServerCore.kt:971-997`). That header check remains only a name claim: the
+certificate DER is public in every signed Circle event. Proof of the private
+key comes from the JOIN event in the request's existing `events` field. A JOIN
+must carry one signed JOIN event whose body is exactly `{"proof":"…"}`. The
+`proof` value is the unpadded Base64URL SHA-256 of a `FLITJOIN1`-domain nonce:
+length-prefixed UTF-8 fields for host fingerprint, circle id, invite, member
+fingerprint, followed by the index of a five-minute bucket
+(`CircleCore.joinProofNonce`, `CircleCore.kt:485-502`; `joinProofBody`, `:514-526`).
+The host recomputes that digest from its own fingerprint and the request; only
+the holder of the private key behind `memberFp` can sign a JOIN carrying a
+matching proof (`CircleCore.joinProofFailure`, `:566-595`). `CircleCore.verify`
+binds the embedded certificate to its own SHA-256 DER digest before checking the
+signature and pins it only on success, so a JOIN naming a victim cannot borrow
+the victim's pin (`:196-211`). The route refuses a proof-less, malformed or
+stale JOIN with a host-signed 200 before the delegate sees it, so old clients
+that send only the invite cannot join (`ServerCore.kt:1001-1016`). The host
+accepts the current bucket with a one-bucket tolerance, and reserves the proof
+event's id once in its bounded in-process seen set, so the verbatim event is
+single-use in that process and stops working when the bucket grid rolls over.
+That reservation is process memory: a restart forgets it.
 
 The host signs every Circle answer; a joiner verifies it against the host
 fingerprint from the QR via `CircleResponse.verify(response, host)` before
@@ -188,11 +196,17 @@ Pure-test evidence: `PanicTest.kt:103-133` (any edit or forged `senderFp`
 breaks verification and the route answers 403), `CircleHardeningTest.kt:180-219`
 (embedded cert bound to `authorFp`, rejected signature never pins the stranger),
 `CircleCoreTest.kt:145` and `FlitCircleHostTest.kt` (real signed identities,
-not mocks). Harness evidence: 403 refusal branches for missing, malformed and
+not mocks), `JoinProofTest.kt` (golden-vector nonce framing; a minted proof that
+verifies and passes the host gate; refusals for a missing or legacy body, a
+changed host/circle/invite/member/bucket, a tampered signature or swapped
+certificate, and a proof replayed in a later bucket or twice in one request),
+`CircleAuthorityTest.kt` (JOIN never folds, REKEY only from OWNER/ADMIN), and
+`FlitCircleSyncTest.kt` (the client mints a proof the host's stateless verifier
+admits). Harness evidence: 403 refusal branches for missing, malformed and
 mismatched cert headers are exercised through `ServerCore` in
-`CircleHardeningTest.kt:362-441` (pure route, production code). Those are
-header-shape and digest-comparison refusals only; no test demonstrates a JOIN
-that proves possession of the member's private key.
+`CircleHardeningTest.kt:362-441` (pure route, production code), and an
+in-process TLS walk refuses a proof-less JOIN and a proof for another host while
+admitting the rightful member's signed proof (`CircleHarnessTest.kt`).
 
 ## Replay guards
 
@@ -215,10 +229,16 @@ Decision precedence and atomicity:
   tiny FIFO that evicts the oldest id past `MAX_SEEN` (`:148-161`).
 - `CircleCore.evaluate` checks `Invalid` (shape) → `OutsideWindow` →
   `Duplicate` → `Accept` and reserves the id atomically; `accept` is an alias of
-  `evaluate`, and `fresh` shares the same set
-  (`CircleCore.kt:326-387`). The production order is
-  `validShape → verify → evaluate → store`: reserve **after** crypto, so a
-  forgery cannot burn the id of a legitimate event (`:331-337`).
+  `evaluate`, and `fresh` shares the same set (`CircleCore.kt:612-658`). The
+  production order is `validShape → verify → evaluate → store`: reserve **after**
+  crypto, so a forgery cannot burn the id of a legitimate event (`:605-640`).
+  The app peer fold follows that order in `FlitCircleSync.fresh`
+  (`:992-1031`): shape, circle and `CircleAuthority.foldable`, type-specific
+  body gates, then `CircleCore.verify` before any id is reserved. Two dedup
+  layers follow — the local log's id set (restart-safe) and `CircleCore`'s
+  bounded accept-memory — and the last stage is `CircleCore.accept(nowMs)` on
+  the survivors. The app host's `SYNC` path runs the same ordering with `accept`
+  last (`FlitCircleHost.kt:156-192`).
 - The Circle window compares two positive timestamps by subtraction, never
   `now ± window`, so an extreme clock cannot overflow into a false Accept
   (`CircleCore.kt:358-359`).
@@ -228,7 +248,7 @@ Decision precedence and atomicity:
   server (`CircleCore.kt:189-219`).
 - Bounded store-and-forward: every `SYNC` posts the full bounded local log, so a
   lost one-shot is repaired by the next post or tick. The relay is never given
-  storage (`docs/circle.md:145-158`).
+  storage (`docs/circle.md:176-184`).
 - Courier deliberately uses a longer, bounded replay window: the **24 h parcel
   TTL** (`MAX_PARCEL_TTL_MS`), not `CircleCore.REPLAY_WINDOW_MS` (6 h). Both
   `CourierEnvelope.open` and `CourierCarryCore.evaluate` apply it to `createdMs`
@@ -236,10 +256,14 @@ Decision precedence and atomicity:
   and carrier blindness".
 
 **Failure modes and limits.** The seen sets are process memory, not durable
-state; a restart forgets them, and the six-hour window is the backstop. A
-legitimate event delayed more than six hours is stale replay and is refused. A
-forwarded panic that has already been delivered once returns 200 on the wire but
-is not delivered again to the delegate (`ServerCore.kt:941-944`) — the quiet
+state; a restart forgets them, and the six-hour window is the backstop. The
+JOIN proof reserves its event id in that same set, so its single-use property is
+process-local: the verbatim event is refused a second time in this process, but
+a fresh process has no memory of it, and the five-minute bucket is the stateless
+backstop. A legitimate event delayed more than six hours is stale replay and
+is refused. A forwarded panic that has already been delivered once returns 200
+on the wire but is not delivered again to the delegate
+(`ServerCore.kt:941-944`) — the quiet
 200 is deliberate so senders do not retry forever. A spent-hop alert likewise
 gets 200 but is dropped before the delegate.
 
@@ -305,19 +329,21 @@ default and the gates are opt-in.
 A v3 QR is a **bearer invite**: whoever holds the photo can present the token.
 It is not the group key and it does not reveal the key without a TLS session to
 the host named in the code. The UI says this plainly and a suspicious code is
-retired by starting a new Circle (`docs/circle.md:96-108`, `:335-337`).
+retired by starting a new Circle (`docs/circle.md:106-133`, `:359-367`).
 
 The timing of persistence is load-bearing:
 
-- The host admits a JOIN only when the presented invite equals its own invite
-  (case-insensitive) and the requester's `memberFp` equals the digest of the
-  certificate in `X-Flit-Circle-Cert` (`FlitCircleHost.kt:119-144`,
-  `ServerCore.kt:971-997`). That is a string-and-public-certificate comparison,
-  not proof of the private key: an invite holder can present another member's
-  public certificate, claim that member's `memberFp`, and have the host
+- The host checks the presented invite against its own (case-insensitive) and
+  the `X-Flit-Circle-Cert` digest against `memberFp`, then requires the signed
+  JOIN proof before any state changes. `ServerCore.circleRoute` answers with a
+  host-signed refusal when `CircleCore.joinProofFailure` reports a missing,
+  invalid or replayed proof (`ServerCore.kt:1001-1016`, `CircleCore.kt:566-595`);
+  proof-less old clients do not reach the delegate. The proof binds host,
+  circle, invite, member and bucket, and the JOIN event's signature proves the
+  private key behind `memberFp`. Only then does the host add the member and
   remember the requester's IP as that fingerprint's route
-  (`FlitEngine.kt:1118-1125`). Roster growth is capped at `MAX_MEMBERS = 500`
-  (`FlitCircleHost.kt:48`, `:131-134`).
+  (`FlitCircleHost.kt:122-146`, `FlitEngine.kt:1402-1428`). Roster growth is
+  capped at `MAX_MEMBERS = 500` (`FlitCircleHost.kt:48`, `:131-134`).
 - Only a successful JOIN answer carries the group key; a SYNC answer never does,
   even to an already-known member (`FlitCircleHost.kt:196-203`).
 - The joiner verifies the answer's signature against the host fingerprint from
@@ -329,7 +355,7 @@ The timing of persistence is load-bearing:
   the write — a deliberate seam, not a claim about device behavior.
 - A 2026-11-25 fix addressed a real bug here: the invite token had been
   memory-only, so a host could not admit members after a restart; it is now
-  persisted (`docs/circle.md:343-352`).
+  persisted (`docs/circle.md:369-378`).
 
 **Failure modes:** a wrong invite gets `ok=false, reason="bad invite"`; a
 departed or never-joined fingerprint gets `"not-a-member"`; a wrong-circle id
@@ -339,29 +365,51 @@ refusal from a dead carrier (`ServerCore.kt:947-1007`,
 
 ## Circle wire authority, roles and rekey
 
-Beyond the cert-header binding already described — which proves possession of a
-public certificate, not of its private key — the host state machine is the
-authority for Circle membership and key rotation:
+Fold-time authority is one shared, JVM-pure decision in
+`CircleAuthority.foldable` (`protocol/.../circle/CircleAuthority.kt:33-43`). It
+reads only circle id, event type, author fingerprint and a caller-supplied
+fingerprint-to-role map; it verifies no signature, reads no clock and keeps no
+state. The rules:
 
-- `SYNC` is roster-gated and rejects events not authored by the requester's own
-  fingerprint. It filters out injected `JOIN`, out-of-circle events, oversized
-  bodies, non-`FILE_BODY_KEYS` file bodies, and member-supplied `REKEY`; only
-  OWNER/ADMIN may contribute a rekey. It then verifies signatures and applies
-  both dedup layers **last**, so a forged event cannot reserve a legitimate id
-  (`FlitCircleHost.kt:146-185`).
-- Every membership change triggers a rekey: a fresh 32-byte `SecureRandom` key
-  plus a signed `rekey` event, with the generation bumped by the store reducer
-  (`FlitCircleHost.kt:206-242`). A later SYNC from the departed fingerprint is
-  refused at the roster gate. Roles are local authority labels pinned to a
-  fingerprint, not accounts: only OWNER appoints/removes ADMIN, an ADMIN (or
-  OWNER) kicks a non-owner, and nobody appoints a second OWNER
-  (`docs/circle.md:58-94`, `app/.../FlitCircleStore.kt:288-362`).
-- The group key is **membership/rekey material, not a content cipher**. There is
-  no encryption path for event bodies. Confidentiality on the wire is TLS;
-  integrity and authorship are signatures plus the cert pin
-  (`docs/circle.md:119-125`). Leaving a Circle deletes the local key and hides
-  the feed; it cannot wipe or change another device, and earlier events on the
-  departed device stay plaintext (`docs/circle.md:49-56`, `:127-129`).
+- `JOIN` is never foldable. It is a host-routed handshake admitted by the invite
+  and proof gate, not a log entry a peer can contribute.
+- `REKEY` is foldable only when the author holds `OWNER` or `ADMIN` in the roles
+  supplied by the caller. With no roles — the courier and CLI folds pass an
+  empty map — governance is refused, so neither verb can enter from a parcel or
+  a member-supplied batch. Any other known verb folds once the circle matches;
+  a blank author, unknown or blank type, or foreign circle is refused.
+
+The gate is applied at every fold site rather than only the host: the app host's
+`SYNC` admission (`FlitCircleHost.kt:169-192`), the app peer fold
+(`FlitCircleSync.fresh`, `:1011-1030`), the store reducer
+(`FlitCircleStore.applyRekey`, `:444-477`), the CLI/harness host fold
+(`Harness.kt:382`) and the courier fold (`CourierCli.kt:441-447`,
+`FlitCircleSync.kt:924-937`). Author fingerprints and role values are trimmed
+and uppercased before lookup, so casing does not change the decision. `SYNC` is
+roster-gated and rejects events not authored by the requester's own fingerprint;
+oversized, out-of-circle and malformed bodies are filtered before verification.
+
+A rekey changes the group key, so two further rules bound it. The store takes an
+immutable roster snapshot when a batch starts and checks authority against that
+snapshot, so folding a `leave` before or after the rekey cannot change the
+decision; a signer whose fingerprint is in the batch's leavers is refused even
+when the snapshot grants it a role, so an officer cannot hand off a chosen key
+on the way out (`FlitCircleStore.kt:444-477`). Independently, any departure in a
+batch forces the host to rotate to a fresh host-minted key with a generation
+above any key admitted in that batch, so neither a hand-off attempt nor a
+staying officer's key already known to the leaver is reused
+(`FlitCircleHost.kt:195-222`). A later `SYNC` from the departed fingerprint is
+refused at the roster gate. Roles remain local authority labels pinned to a
+fingerprint, not accounts: only OWNER appoints/removes ADMIN, an ADMIN (or
+OWNER) kicks a non-owner, and nobody appoints a second OWNER
+(`docs/circle.md:58-104`).
+
+The group key is **membership/rekey material, not a content cipher**. There is
+no encryption path for event bodies. Confidentiality on the wire is TLS;
+integrity and authorship are signatures plus the cert pin
+(`docs/circle.md:144-150`). Leaving a Circle deletes the local key and hides
+the feed; it cannot wipe or change another device, and earlier events on the
+departed device stay plaintext (`docs/circle.md:49-56`, `:152-154`).
 
 ## Courier: recipient-cert encryption and carrier blindness
 
@@ -939,7 +987,7 @@ exact killed prefix.
 ## File announcements: the no-path rule and local-only status
 
 A Circle file drop is two separate things and the announcement proves nothing
-was delivered (`docs/circle.md:162-166`):
+was delivered (`docs/circle.md:189-193`):
 
 - The published event body is **exactly** `{name, size, sha256}` — no bytes, no
   spool path, no queue token. `CircleCore.FILE_BODY_KEYS` is the closed set
@@ -951,12 +999,12 @@ was delivered (`docs/circle.md:162-166`):
 - The bytes go by a direct per-member `sendFiles` call from the sender's private
   spool (`cacheDir/circle/...`), never on the send-later/bulk queue, and the
   landing is accepted only when its hash matches the announced SHA-256
-  (`docs/circle.md:162-180`, `:206-209`).
+  (`docs/circle.md:189-207`, `:233-235`).
 - Delivery status is **sender-local only**. One record per member holds
   `pending`, `sent`, `refused` or `failed`; `sent`/`refused`/`failed` are
   terminal and `pending` is the only owed state. Status is not an event, is not
   gossiped, and a recipient's card cannot claim the bytes are missing
-  (`docs/circle.md:181-204`). A later joiner folds the signed announcement but
+  (`docs/circle.md:208-231`). A later joiner folds the signed announcement but
   gets no backfill of old bytes.
 - The Open affordance has three states: disabled "Opening…" while the
   hash resolves, "Landed here" + "Open file" only when a local copy with that
@@ -1480,22 +1528,23 @@ The app asks for the minimum local capabilities and exposes almost nothing:
   received files are ordinary files in `Downloads/Flit/` or a chosen SAF tree.
   TLS protects them in transit and signatures authenticate authorship, but
   anyone with access to the device state can read them. Do not put secrets in
-  Circle messages (`docs/circle.md:110-129`, `:330-334`).
+  Circle messages (`docs/circle.md:135-154`, `:359-363`).
 
 ## Limitations
 
 1. **No content encryption at rest.** The group key is membership/rekey
    material, not a cipher. A member in the roster can read everything; a
    departed device keeps earlier plaintext events already stored.
-2. **Bearers are bearers; JOIN proves no key possession.** A photographed
+2. **Bearer invite and process-local JOIN proof replay.** A photographed
    pairing QR or Circle invite can be used by whoever holds it. Pairing pins
    only after a matching live answer for IP codes; relay/MAC-only codes pin
-   directly from the code. A Circle `JOIN` carries no nonce and no signature:
-   `X-Flit-Circle-Cert` is a public certificate that anyone can copy from a
-   Circle event, and the host gates on invite + `memberFp` only. An invite
-   holder can therefore claim another member's fingerprint and route. A signed,
-   nonce-bound JOIN that proves private-key possession is a future protocol
-   change, not a delivered guarantee.
+   directly from the code. A Circle JOIN carries one signed JOIN event with a
+   `FLITJOIN1` proof bound to host, circle, invite, member and a five-minute
+   bucket, so the invite alone cannot claim another member's fingerprint or
+   route. A proof captured on the wire is a bearer token until its bucket rolls
+   over: the host reserves its id in a bounded in-process set, so the verbatim
+   event is refused a second time in that process, but a restart forgets the
+   reservation and another process has no memory of it.
 3. **TLS trust is fingerprint-based, not CA-based.** Trust-all managers and no
    hostname verification are deliberate. The security of a session rests on the
    out-of-band fingerprint check, not on a certificate authority or a DNS name.
@@ -1577,6 +1626,7 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | --- | --- | --- | --- | --- |
 | Fingerprint pinning, pin cache | `TlsIdentity.kt` | `PinCacheTest` (6) | TLS parity suite | QR v2 paste logged `code verified` |
 | Cert-in-event / pin-after-verify | `CircleCore.kt`, `CircleWire.kt`, `ServerCore.kt` | `CircleHardeningTest`, `CircleCoreTest`, `FlitCircleHostTest` | circle harness two-node walk | Circle join + inbound event rendered in feed |
+| JOIN proof / Circle authority | `CircleCore.joinProofFailure`, `CircleAuthority.kt`, `ServerCore.circleRoute`, `FlitCircleSync.fresh` | `JoinProofTest`, `CircleAuthorityTest`, `FlitCircleSyncTest` | proof-less and wrong-host refusals, rightful signed join (in-process TLS) | no device walk |
 | Replay / hop guards | `PanicCore.kt`, `CircleCore.kt` | `PanicTest`, `CircleHardeningTest` | panic via `LinkServer`; Circle full-log empty-delta pull | panic banner box↔phone; full-log repair line in log |
 | QR authority / invite | `Qr.kt`, `FlitEngine.kt`, `FlitCircleSync.kt` | `FlitQrTest` | invite text/HTML pushed to Downloads | QR v3 join, full leave discards key |
 | Relay blindness / opt-in | `RelayCore.kt`, `RelayEndpoints.kt`, `FlitEngine.kt` | `RelayCoreTest` (11) | `RelayServerTest` over production endpoints | 200 MiB cross + 300 MiB kill/resume |
@@ -1600,7 +1650,7 @@ that walk, so outbound phone→host fan-out was not exercised.
 
 Device walks not verified: a Circle mesh beyond those three identities; a real
 phone-to-phone RFCOMM transfer; phone→host Circle fan-out with a clean peer-side
-confirmation (still test-evidenced only — `docs/circle.md:310-319`, `:343-361`);
+confirmation (still test-evidenced only — `docs/circle.md:336-343`, `:369-387`);
 Wi-Fi Aware on this rig; any multi-member panic-hop walk beyond the
 one-phone-plus-box case; a courier parcel offered through a carrier to an absent
 member. For that last case an OK answer is acceptance of the offer, not a
@@ -1613,7 +1663,7 @@ with the focused docs.
 
 1. **`CircleCore.validFileBody` KDoc is stale.** `protocol/.../CircleCore.kt:312`
    says recipients locate bytes "by `sha256` through the bulk queue". The
-   correction in `docs/circle.md:162-209` says bytes are **not**
+   correction in `docs/circle.md:189-235` says bytes are **not**
    on the send-later/bulk queue; they go by a direct per-member `sendFiles` call
    from the sender's spool. `CircleEvent.kt:27-32` similarly calls `sendFiles`
    "the bulk transfer path". The enforcement code (`validFileBody`) is correct;

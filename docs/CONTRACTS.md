@@ -18,7 +18,9 @@ Sources, in order of authority for a contract question:
 ## 1. Exact constants and route strings
 
 All values below are declared in `protocol/.../Protocol.kt` unless another file
-is named. Line references are to the files as of commit `72225f8`.
+is named. Line references are to files that existed as of commit `72225f8`;
+files added later (the courier and QR-parcel layers) are referenced by their
+current line numbers.
 
 | Contract | Value | Source |
 | --- | --- | --- |
@@ -115,6 +117,9 @@ is named. Line references are to the files as of commit `72225f8`.
 | `MAX_SIG_CHARS` / `MAX_CERT_CHARS` | `1024` / `8 KiB` | `CircleCore.kt:41,44` |
 | `MAX_EVENTS_PER_REQUEST` | `1024` | `CircleCore.kt:47` |
 | `MAX_REQUEST_BYTES` | `8 MiB` | `CircleCore.kt:50` |
+| `JOIN_PROOF_TAG` / `JOIN_PROOF_BUCKET_MS` | `"FLITJOIN1"` / `5 min` (`= CLOCK_SKEW_MS`, `300_000` ms) | `CircleCore.kt` (§7.8) |
+| `JOIN_PROOF_BODY_KEYS` / proof value | `{"proof"}` / 32-byte SHA-256 as unpadded Base64URL (43 chars) | `CircleCore.kt` (§7.8) |
+| `CircleAuthority.KEY_ROLES` | `{OWNER, ADMIN}` | `CircleAuthority.kt` (§7.9) |
 | `FlitCircleStore.EVENT_CAP` | `500` | `FlitCircleStore.kt:72` |
 | `FlitCircleHost.MAX_MEMBERS` | `500` | `FlitCircleHost.kt:49` |
 | `FlitCircleHost.MAX_BODY_CHARS` | `8 KiB` (defensive) | `FlitCircleHost.kt:52` |
@@ -512,10 +517,13 @@ CircleResponse(ok, key = "", members = [], events = [],
 
 A refused join/sync is a well-formed **`200`** with `ok = false` and a human
 `reason` — a caller can tell "not enabled / bad invite" from a dead carrier.
-The group `key` is only ever in a successful JOIN answer; a SYNC answer carries
-`key = ""` even for an already-known member (`FlitCircleHost.kt:193-203`). The
-QR is a bearer invite, never a key; the key travels inside the pinned TLS
-session.
+A JOIN-level proof refusal is signed the same way (§7.5, §7.8). The group
+`key` is only ever in a successful JOIN answer; a SYNC answer carries
+`key = ""` even for an already-known member (`FlitCircleHost.kt:193-203`), and
+a later rotation travels in a signed `rekey` event rather than in the answer.
+The QR is a bearer invite, never a key; the key travels inside the pinned TLS
+session. The CLI pins the host fingerprint with `--host-fp` at join, keeps it
+in `circle.state`, and verifies every answer before any merge (§7.10).
 
 ### 7.2 Host-signed answers (`CircleWire.kt:60-108`)
 
@@ -541,7 +549,8 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 | `file` | `{"name":"...","size":<non-negative integer>,"sha256":"..."}` — **exactly** `FILE_BODY_KEYS`, no `token`, `path` or `spoolPath` |
 | `poll` | `{"pollId":"...","question":"...","options":["a","b"]}` |
 | `vote` | `{"pollId":"...","option":<int>}` or `{"kickId":"...","approve":<bool>}` (app also emits `{"targetFp":"...","approve":<bool>}`) |
-| `join` | `{"alias":"..."}` (host-routed; members cannot inject it) |
+| `join` | `{"alias":"..."}` for the ordinary join verb (host-routed; members cannot inject it). |
+| `join` (handshake proof) | `{"proof":"<43-char Base64URL SHA-256>"}` — closed `JOIN_PROOF_BODY_KEYS = {"proof"}`; carried as a signed JOIN event in `CircleRequest.events` on a join request, not as a foldable log entry (§7.8). |
 | `leave` | `{"memberFp":"..."}` |
 | `kick` | `{"kickId":"...","targetFp":"...","mode":"admin"|"vote","approve":<bool>}` (field set varies by phase) |
 | `role` | `{"targetFp":"...","role":"OWNER"|"ADMIN"|"MEMBER"}` |
@@ -580,8 +589,13 @@ an answer appends a history event without double-counting (`:221-289`).
 Route checks, in order: body capped at `8 MiB`; `action` in `{join, sync}`;
 `circleId` non-blank; `events.size <= 1024` and every event `validShape`;
 `X-Flit-Circle-Cert` present and decodable; `memberFp` equal to that cert's own
-fingerprint. A rejected shape is `400`, a bad identity `403`, a throwing
-delegate `500`; every real decision is a signed `200`.
+fingerprint; and, for JOIN only, `CircleCore.joinProofFailure` (§7.8). A
+rejected shape is `400`, a bad identity `403`, a throwing delegate `500`;
+every real decision is a signed `200`. A proof failure is answered *at the
+route* with a host-signed `200` refusal whose `reason` is one of `join proof
+required`, `invalid join proof` or `join proof replay`; it never reaches the
+delegate and never yields a key. The caller verifies that signature with
+`CircleResponse.verify` before treating even a refusal as authoritative.
 
 Host `onRequest` first refuses a wrong `circleId`. JOIN is exempt from the
 roster gate but not from the invite: a case-insensitive invite match, a valid
@@ -589,14 +603,20 @@ fingerprint, a non-blank key and room below `MAX_MEMBERS = 500` are required;
 the answer carries the key, the authoritative roster and the ordered seed log,
 with no synthetic join event (only the joiner can sign its own join)
 (`FlitCircleHost.kt:119-144`). SYNC is roster-gated and filters every incoming
-event: correct circle, known type, bounded body, `validFileBody` for files,
-`authorFp == requester`, no injected JOIN, REKEY only from owner/admin, a
-verifiable cert and signature, then log-id dedup and `CircleCore.accept`.
-A departure without a rekey event triggers a fresh 32-byte random key and a
-signed `rekey` event; a later sync from a departed fingerprint is refused
-(`FlitCircleHost.kt:146-242`). Roles are local, fingerprint-pinned authority
-labels; an `ADMIN` (or `OWNER`) can kick a non-owner, a plain member can only
-open a vote-kick, and nobody can appoint a second `OWNER`.
+event through `CircleAuthority.foldable` (§7.9): correct circle, known type,
+JOIN excluded, REKEY only from an OWNER/ADMIN author, bounded body,
+`validFileBody` for files, `authorFp == requester`, a verifiable cert and
+signature, then log-id dedup and `CircleCore.accept`. A departure **always**
+triggers a fresh 32-byte random key and a signed `rekey` event, even when the
+same batch carried an admitted REKEY: the forced generation is placed above
+the greatest generation that batch was allowed to install, so a peer folding
+the answer in another order cannot treat the fresh key as stale replay. A
+signer who also submitted a `leave` in the batch is vetoed as a REKEY author,
+so a departing officer cannot hand off its chosen key. A later sync from a
+departed fingerprint is refused (`FlitCircleHost.kt:146-242`). Roles are
+local, fingerprint-pinned authority labels; an `ADMIN` (or `OWNER`) can kick a
+non-owner, a plain member can only open a vote-kick, and nobody can appoint a
+second `OWNER`.
 
 ### 7.6 Sync wire shape: delta vs full log
 
@@ -631,6 +651,105 @@ event and never gossiped. A later joiner folds the announcement and sees the
 card but receives no old bytes (no backfill); its card says
 "file drop · open to view if it arrived".
 
+### 7.8 JOIN proof — the stateless handshake
+
+The QR invite is a bearer token, so a JOIN must also prove that the caller owns
+the private key behind `memberFp`. The joiner mints one signed JOIN event in
+`CircleRequest.events`; this adds no route, header, DTO field or status code.
+Its body has the closed key set `JOIN_PROOF_BODY_KEYS = {"proof"}`: a 32-byte
+SHA-256 digest written as unpadded Base64URL, exactly 43 characters, decoding
+to 32 bytes. The gate refuses an extra key, padding (`=`), the standard `+`/
+`/` alphabet, whitespace, a non-string value and anything over
+`MAX_FIELD_CHARS`. The earlier `{"alias":"..."}` body remains the ordinary
+join verb body; it is not a proof.
+
+The digest is over a domain-tagged nonce using the same 4-byte big-endian
+UTF-8 length-prefixed `field` framing as event canonical bytes, followed by an
+8-byte big-endian bucket. The field order is `field("FLITJOIN1")`,
+`field(hostFp)`, `field(circleId)`, `field(invite)`, `field(memberFp)`,
+`writeLong(bucket)`. Each string is trimmed and uppercased with `Locale.ROOT`
+before framing, so casing and whitespace differences between devices cannot
+change the bytes, and a `FLITCIRCLE1` event signature can never double as a
+proof. The signing domain is separate: `FLITJOIN1`.
+
+`JOIN_PROOF_BUCKET_MS = CLOCK_SKEW_MS = 5 min` (`300_000` ms) and
+`joinProofBucket(createdMs) = floorDiv(createdMs, JOIN_PROOF_BUCKET_MS)`. The
+host admits a proof whose event bucket is the current bucket or one bucket on
+either side (a ±1-bucket tolerance); a proof outside that band is a replay and
+stops working once the grid rolls past it. The digest itself is not a secret —
+authorship comes from the signed JOIN event, whose embedded certificate is
+bound to its own SHA-256 DER and pinned only after `CircleCore.verify` passes.
+
+`CircleCore.joinProofFailure(req, hostFp, nowMs)` is total and stateless apart
+from the shared bounded seen-id set. A non-JOIN action returns null (SYNC needs
+no proof). For JOIN the refusal precedence is:
+
+| Reason | Meaning |
+| --- | --- |
+| `join proof required` | No JOIN event in `events`, or no JOIN event carries a `proof` key. |
+| `invalid join proof` | Bad body; a JOIN event whose author or circle does not match `memberFp`/`circleId`; a forged or unparseable signature; a digest that does not match this host, circle, invite and member. |
+| `join proof replay` | A bucket outside the ±1 tolerance, the same proof presented twice in one request, or an id already reserved by `fresh`/`accept`. |
+
+The route answers each refusal as a host-signed `200` (§7.5), so a joiner can
+pin the host before treating a refusal as authoritative. The app and the CLI
+mint the proof from their own identity and refuse to dial when the claimed
+`memberFp` differs from that identity's certificate fingerprint.
+
+### 7.9 CircleAuthority.foldable — the shared fold-time gate
+
+`CircleAuthority.foldable(event, circleId, roles)` is JVM-pure: it reads only
+`circleId`, `type` and `authorFp` plus a caller-supplied fingerprint→role map,
+verifies no signature, reads no clock, owns no state and keeps no memory
+between calls. Its rules are three: `join` is never foldable (a handshake, not
+a log entry); `rekey` is foldable only when the trimmed, uppercased author
+holds `OWNER` or `ADMIN` in the map (role values are also trimmed and
+uppercased); every other known verb folds when the circle matches. An unknown
+or blank type, a blank author or a foreign circle is refused. Non-authority
+fields (`id`, `body`, `sig`, `lamport`, `createdMs`, `cert`) do not affect the
+decision.
+
+Every fold site reaches the same answer from the same inputs:
+
+| Site | Authority context |
+| --- | --- |
+| App host (`FlitCircleHost.onRequest`, SYNC filter) | One immutable pre-batch map built from the roster, applied before signature verification and id reservation. A signer who also leaves in the batch is excluded; a departure forces a host-minted rotation above any admitted generation. |
+| App fresh (`FlitCircleSync.fresh`) | The roster's fingerprint→role map, applied as a stage of the inbound pipeline. |
+| Store reducer (`FlitCircleStore.applyRekey` / `merge`) | One snapshot of the roster as it stood before the batch, so fold order cannot promote a signer or demote one mid-flight. Authors of every `leave` in the batch are vetoed as REKEY signers whether their rekey is folded before or after the leave. |
+| CLI host (`Harness.CircleHostState.onCircle`) | The same pre-batch roster snapshot; a REKEY from a same-batch leaver is removed from the admitted set and a departure forces a monotonic rotation. |
+| Courier (`FlitCircleSync.courierReceive`, `CourierCli` opened-event gate) | An **empty** role map: no parcel can fold a JOIN or a REKEY even when the sealed signer is an OWNER; membership and signature checks still apply. |
+
+The app's `fresh` pipeline, in code order, is: pure shape and circle gates;
+`CircleAuthority.foldable`; type-specific body gates (`validFileBody`,
+`validParcelBody`, bounded readable JSON); `CircleCore.verify` — no replay id
+is reserved before the signature passes, so a forgery cannot burn a valid
+event's id; deterministic `CircleCore.order` and `CircleCore.dedup`; a hash set
+of local log ids; the bounded `FlitCircleStore.EVENT_CAP` (500); and finally
+`CircleCore.accept` at an injectable `nowMs`. Only events that survive every
+stage reserve an id.
+
+A REKEY that fails the gate is still inert log history: it is appended but
+installs no key and never raises `rekeyGen`. A successful install requires a
+non-negative `gen` no older than the local generation, so a stale rekey cannot
+roll the live key back.
+
+### 7.10 CLI host pinning and repeated options
+
+`flit-cli circle join` takes `--host-fp FP` (the fingerprint printed by
+`serve`), mints the §7.8 proof for it, and stores the pin in `circle.state`
+(eighth line; a legacy seven-line file loads but forces a verified join).
+Every later `sync`, `post`, `file`, `receipt`, `leave` and roster refresh calls
+`CircleResponse.verify` on the answer with that fingerprint before any merge;
+an unsigned or differently signed answer is reported as a host-answer failure
+and leaves local state unchanged. Since a SYNC answer carries `key = ""`, the
+CLI adopts group-key material only from a verified JOIN answer or from the
+newest generation of a verified `rekey` event in the signed log.
+
+`ParsedArgs` keeps both `flags` (last value wins) and `repeated` (every
+occurrence in argv order, read through `opts(k)`). `circle poll --option A
+--option B --option C` therefore collects all three options and still accepts
+the comma form `--option A,B,C` through a flat-map split; single-value callers
+continue to read the last occurrence with `opt(k)`.
+
 ## 8. QR pairing codes (`Qr.kt`)
 
 `flit://add?...` (also tolerates `flit://pair`), parsed with any parameter
@@ -662,6 +781,7 @@ A v3 tap-to-join link (`flit://add?v=3&…&circle=…&invite=…`) is handled by
 | partial | `200 PartialInfo` / `404 {}` | Prefix held / start over. |
 | panic | `400` / `403` / `200` | Bad wire / bad identity or forgery / accepted (also duplicates and stale). |
 | circle | `400` / `403` / `500` / `200` | Bad shape or size / cert mismatch / delegate error / signed decision (including refusal). |
+| circle join proof | host-signed `200` | Proof refused at the route before the delegate: `join proof required`, `invalid join proof`, or `join proof replay` (§7.8). |
 | relay | `OK` / `ERR <reason>` | Paired / refused (`bad-hello`, `bad-token`, `timeout`, `partner-gone`); then blind copy. |
 
 Full retry/keep/drop conclusions are in [Failure modes](FAILURE-MODES.md);
@@ -672,15 +792,15 @@ trust and replay reasoning in [Security](SECURITY.md).
 | Claim tier | What is actually established |
 | --- | --- |
 | **Code reality** | Every constant, route string, header, DTO shape, canonical byte layout, pairing state machine and policy rule listed above. |
-| **Pure-test JVM** | Canonical/sign/verify for panic and Circle, forged-author rejection, replay and dedup windows, Lamport convergence, both `Content-Range` spellings, restart probe/attach, failed-chunk-then-resume, relay pairing/isolation/token, DTO and `LinkServer` parity over the in-memory duplex pipe through the real hand-HTTP + TLS stack. |
-| **Harness/sim** | `flit-cli relay` pairs a real 3 MB protocol send hash-exact with TLS inside the pipe; wrong token refused; unpaired subscription times out; dead dial surfaces `TransferUnreachable`. Two in-process TLS Circle nodes sync message, poll re-vote, file drop and kick/rekey; `bt-sim` runs the production client over the pipe carrier. |
+| **Pure-test JVM** | Canonical/sign/verify for panic and Circle, forged-author rejection, replay and dedup windows, Lamport convergence, both `Content-Range` spellings, restart probe/attach, failed-chunk-then-resume, relay pairing/isolation/token, DTO and `LinkServer` parity over the in-memory duplex pipe through the real hand-HTTP + TLS stack; JOIN proof framing, bucket tolerance and refusal precedence, the `CircleAuthority.foldable` truth table, and the app receive-side fold gate. |
+| **Harness/sim** | `flit-cli relay` pairs a real 3 MB protocol send hash-exact with TLS inside the pipe; wrong token refused; unpaired subscription times out; dead dial surfaces `TransferUnreachable`. Two in-process TLS Circle nodes sync message, poll re-vote, file drop and kick/rekey; `bt-sim` runs the production client over the pipe carrier. The CLI host gate refuses unauthorised REKEY and same-batch hand-off keys and pins the signed answer with `--host-fp`. |
 | **On-device** | Panic QR-v2 pairing and one-phone↔box banner exchange; relay dial/subscribe with a 200 MiB camera shot and a 300 MiB mid-body relay kill resuming hash-exact from the exact prefix; Circle two-node join/message/leave and phone-as-host; the 2026-11-26 three-node baseline walk, which is DEVICE evidence for a 3-identity Circle (phone plus two CLI identities); file-drop landing hash-exact; QR v3 tap-to-join. |
-| **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. |
+| **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. No device walk is attached to the JOIN proof, the fold-time authority gate or the CLI host pin. |
 
-The current rig baseline is 714 tests = 330 protocol + 309 app + 75 harness,
-read from a green `--rerun-tasks` run of `:protocol:test`,
-`:app:testDebugUnitTest` and `:harness:test`, with zero failures. That is a test
-count, not a device claim for the UI or CLI layers.
+The JUnit XML in the tree records 359 protocol + 323 app + 87 harness = 769
+tests with zero failures for the JOIN-proof and authority layers. The earlier
+714 figure (330 + 309 + 75) was the 2026-12-18/12-21 inventory and is
+historical. These are test counts, not a device claim for the UI or CLI layers.
 
 ## 11. Cross-links
 
@@ -886,9 +1006,12 @@ state transitions, status output and the one-shot command. Encryption stays in
 `protocol/.../courier/CourierEnvelope.kt`; the parcel codec, expiry and quota
 stay in `protocol/.../courier/CourierCarryCore.kt` (§13). The CLI imports no
 Android class and adds no route, header, DTO field or status code. It parses its
-arguments only through `ParsedArgs` from `Harness.kt`, loads identity through
-`loadOrCreateIdentity()`, and roots every path in `harnessHome()`, so
-`FLIT_HARNESS_HOME` isolates two nodes on one box as it does for `circle`.
+arguments only through `ParsedArgs` from `Harness.kt`, which keeps every
+occurrence of a value flag in `repeated` (read with `opts(k)`) as well as the
+last-value-wins `flags`/`opt(k)` pair; `circle poll --option A --option B` uses
+that repeated form (§7.10). It loads identity through `loadOrCreateIdentity()`,
+and roots every path in `harnessHome()`, so `FLIT_HARNESS_HOME` isolates two
+nodes on one box as it does for `circle`.
 
 `run(args: ParsedArgs): Int` does one operation — load state, act, save state —
 and returns a process code: `0` on success, `EXIT_BAD_ARGS = 2` for a bad
@@ -1176,13 +1299,17 @@ so the two limits are never confused.
 | `MAX_FRAMES` | `64` | Defensive wire cap on `count`; `seq` space is `1..64`. Same as the app's `MAX_PARCEL_FRAMES = 64`, so the codec emits no sequence the app refuses to display. |
 | `MAX_CHUNK_BYTES` | `512` | Largest raw chunk bytes in one frame. |
 | `MAX_AIR_GAP_PARCEL_BYTES` | `131072` (128 KiB) | Defensive wire cap on framed bytes, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` (12 * 1024). It bounds malformed input; it is not a reachable size. |
+| `MAX_AIR_GAP_PAYLOAD_BYTES` | `5120` | The real ceiling on the raw payload accepted by `encodeParcel`: `MAX_ENVELOPE_CHARS * 3 / 4` bounds envelope plaintext at 9216 bytes, and 5120 leaves room for the CircleEvent JSON wrapper, envelope fields, signer certificate and signature. A larger or empty payload yields no frames. |
 | `FRAME_MAGIC` | `"FLITPARCEL1"` | Domain tag for the per-frame CRC canonical bytes. |
 
 The effective ceiling comes from `CourierEnvelope.MAX_ENVELOPE_CHARS = 12 * 1024`:
 the sealed envelope is at most 12288 Base64 characters, which at 512 bytes per
-chunk is about 24 frames and, with the signature, wrapped key and certificate
-included, roughly 5 KiB of payload. The 64-frame and 128 KiB limits above are
-defensive wire caps that bound malformed input, not sizes a sender can reach.
+chunk is about 24 frames and includes the signature, wrapped key and
+certificate. The raw payload accepted for encoding is separately and firmly
+capped at `MAX_AIR_GAP_PAYLOAD_BYTES = 5120` bytes; an empty or larger payload
+returns no frames and the CLI reports it as a bad-argument refusal before any
+rendering. The 64-frame and 128 KiB limits above are defensive wire caps that
+bound malformed input, not sizes a sender can reach.
 
 ### 16.4 API (`ParcelCodec.kt`)
 
@@ -1310,10 +1437,17 @@ certificate object is then passed directly as
 identity)`; the codec's own cert-fingerprint binding in `CourierEnvelope.seal`
 applies unchanged.
 
-Each returned frame string is rendered with zxing `QRCodeWriter` as a
-768 × 768 PNG at error correction `M`, margin `2` and UTF-8, into
-`frame-0001.png`, `frame-0002.png`, … in codec order (1-based, four digits, so
-file-name order is frame order). Encode writes no other file into `--dir`.
+Before rendering, encode checks the source file against
+`ParcelCodec.MAX_AIR_GAP_PAYLOAD_BYTES` (5120 bytes); an empty or larger payload
+exits `2` with no PNG written. Each returned frame string is rendered with
+zxing `QRCodeWriter` as a 768 × 768 PNG at error correction `M`, margin `2` and
+UTF-8, into `frame-0001.png`, `frame-0002.png`, … in codec order (1-based, four
+digits, so file-name order is frame order). Every frame is decoded back to a
+string to prove the round-trip before any PNG is staged; a failure escalates
+the *whole* set to 1024 × 1024, then to 1536 × 1536, and a failure at all three
+sizes exits `2` with nothing written. Frame strings are never edited or
+re-encoded — only their pixel size changes. Encode writes no other file into
+`--dir`.
 
 ### 17.5 Decode path
 
@@ -1384,7 +1518,8 @@ two navigation routes, and no Circle or transfer behavior changes.
 display every sequence the codec emits. `MAX_AIR_GAP_PARCEL_BYTES` (131072 /
 128 KiB) and `MAX_CHUNK_BYTES` (512) are read from §16.3, never restated; both
 are defensive wire caps, while the effective parcel size is set by the 12 KiB
-sealed-envelope Base64 cap (about 24 frames, roughly 5 KiB of payload). The
+sealed-envelope Base64 cap (about 24 frames) and the codec's hard
+`MAX_AIR_GAP_PAYLOAD_BYTES = 5120` payload ceiling. The
 ~8 fps analyzer throttle is the reused
 `QrUi.kt` behavior (a 120 ms gate), not a new constant here.
 

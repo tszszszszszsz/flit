@@ -13,9 +13,11 @@
 | **SIM/HARN** | Harness test or `bt-sim` run against the production client/server over in-process pipes or loopback TLS. The dated roadmap and CLI tables write this tag as SIM-HARN. |
 | **DEVICE** | Observed on the Redmi Note 10S (API 36) and/or the `flit-cli` box on the rig. The dated walks are cited; nothing else is claimed as walked. |
 
-Current rig state: **330 protocol + 309 app + 75 harness = 714 tests, 0
-failures** after the final green `--rerun-tasks` run. The older 302-test figure was
-green at `72225f8` and is historical. The non-profit constraint holds
+Current rig state: **359 protocol + 323 app + 87 harness = 769 tests, 0
+failures**, read from the JUnit XML in the tree for the JOIN-proof and authority
+layers. The 714 figure (330 + 309 + 75) was the 2026-12-18/12-21 inventory and
+is historical; the older 302-test figure was green at `72225f8` and is
+historical too. The non-profit constraint holds
 throughout: no accounts, no cloud, no ads, no telemetry, no phone-home SDKs;
 every recovery path below is local.
 
@@ -84,7 +86,8 @@ shape.
 | bag `MAX_SEEN` | 4096 | `CourierCarryCore.kt` | Bag id reservation shared by `evaluate` and `fresh`, separate from the Circle set |
 | courier `open` window / skew | 24 h / 5 min | `CourierEnvelope.kt`, `CourierCarryCore.kt` | Past side is the parcel TTL (`MAX_PARCEL_TTL_MS`), future side is `CircleCore.CLOCK_SKEW_MS`; compared by subtraction, no second replay set |
 | app parcel display / paste caps | `MAX_PARCEL_FRAMES` 64, `PARCEL_PASTE_MAX_CHARS` 16 000, `PARCEL_FRAME_INTERVAL_MS` 400L, `PARCEL_FRAME_SIZE_PX` 240 | `ParcelUi` (roadmap "Constants owned here") | Display cap equals codec `MAX_FRAMES`; cadence and render side are configured values, not measured timing |
-| QR parcel frame caps consumed unchanged | `MAX_FRAMES` 64, `MAX_CHUNK_BYTES` 512, `MAX_AIR_GAP_PARCEL_BYTES` 131072 | `ParcelCodec.kt:50`, `:56`, `:53` | 64 frames and 128 KiB are defensive wire caps; the effective ceiling is the 12 KiB sealed-envelope Base64 cap (about 24 frames, roughly 5 KiB payload); the app defines no second grammar |
+| QR parcel frame caps consumed unchanged | `MAX_FRAMES` 64, `MAX_CHUNK_BYTES` 512, `MAX_AIR_GAP_PARCEL_BYTES` 131072, `MAX_AIR_GAP_PAYLOAD_BYTES` 5120 | `ParcelCodec.kt:50`, `:56`, `:53`, `:61` | 64 frames and 128 KiB are defensive wire caps; the real payload ceiling is 5120 bytes inside the 12 KiB sealed-envelope Base64 cap (about 24 frames); the app defines no second grammar |
+| JOIN proof bucket / body | `JOIN_PROOF_BUCKET_MS` 300 000 (5 min), `FLITJOIN1` tag, `{"proof"}` with a 43-char Base64URL SHA-256 | `CircleCore.kt` | a proof is admitted in the current bucket ±1; stale, future or duplicate is `join proof replay` |
 
 ---
 
@@ -115,6 +118,13 @@ Read this first; the sections below unfold each row.
 | Circle pad: malformed body / wrong circle / replayed id / over-cap / torn snapshot | no | ignored, deduped or bounded; view unchanged | previous view and signed log unchanged | bad, foreign, repeat, over-cap or unmatched snapshot events | CODE / PURE |
 | Circle pad app/CLI: malformed key/text / over-cap / failed post / stale view | no | refused before signing or kept in the signed log for repair; unchanged pad is not republished | previous view and signed log unchanged | rejected input, over-cap body, failed fan-out or stale derived view | CODE / PURE |
 | Circle leave/kick | no | membership removed, generation bumped, key rotated | local earlier log stays plaintext | roster entry + old key material | CODE / PURE / SIM / DEVICE |
+| Circle JOIN with no JOIN event / only an alias body | no | host-signed `200` refusal `join proof required` | no key, roster unchanged | the bare request | CODE `CircleCore.joinProofFailure`, `ServerCore.circleRoute`; PURE `JoinProofTest` |
+| Circle JOIN with malformed, forged or wrongly bound proof | no | host-signed `200` refusal `invalid join proof` | no key; a failed cert is not pinned | the proof event | CODE / PURE `JoinProofTest` |
+| Circle JOIN in a stale/future bucket or duplicated | no | host-signed `200` refusal `join proof replay` | no key | the captured or repeated proof | CODE / PURE `JoinProofTest` |
+| Circle SYNC REKEY from a non-OWNER/ADMIN | no | inert history; key and generation unchanged | roster and live key unchanged | the unauthorised rekey | CODE `CircleAuthority.foldable`, `FlitCircleSync.fresh`, `FlitCircleStore.applyRekey`; PURE `CircleAuthorityTest`, `FlitCircleSyncTest` |
+| Circle SYNC same-batch leave + officer rekey | no | officer's rekey refused; host mints a fresh key above the batch generation | old key material dropped on rotation | the officer's hand-off key | CODE host/store/CLI; PURE `FlitCircleHostTest`, `FlitCircleStoreTest`; SIM/HARN `CircleHarnessTest` |
+| Circle answer not signed by the pinned host | no | refused before merge; reported as a host-answer failure | local Circle state unchanged | the unsigned answer | CODE `CircleResponse.verify`, CLI `circleAnswerSigned`; SIM/HARN `CircleHarnessTest` |
+| QR parcel encode: a frame fails its QR round-trip at every size | no | whole set escalated 768 → 1024 → 1536 px, then exit `2` with nothing staged | source file untouched | no PNG written | CODE `ParcelCli.renderFrames`; PURE `ParcelCliTest` |
 | Drop key: no usable recipient cert, or no wrap for the reader | no | no wrap entry / `unwrap` null; no plaintext | source or caller's sealed bytes stay | that entry or the plaintext | CODE / PURE |
 | Drop key: roster above `MAX_WRAPS` (32), or wrap over `MAX_WRAPPED_CHARS` (512) | no | `wrap` refuses the whole map; body gate false | source bytes stay with the caller | over-cap map / over-cap body | CODE / PURE |
 | Drop key: partial, extra or mistyped keyed body | no | `validFileBody` false; `parseFileKeyBody` null | caller keeps the bytes | the malformed body | CODE / PURE |
@@ -388,13 +398,15 @@ landed hash-exact on the phone (`c421969b…`), card showed "Landed here", tap
 opened `ChooserActivity` with the process alive, back returned to the feed,
 `am force-stop` + relaunch restored sharing from the persisted flag
 ([open-file doc](open-file-and-sharing-restore.md#device-evidence-2026-11-25-final-build)).
-**Two distinct device drops, both verified:** the earlier `2034fa6` walk landed
-an **8 MiB** Circle drop on the phone with matching sha256 and `sent=2`
-(commit record); the final Open-file walk used a fresh **35 B** drop
-(`open-check.txt`, `c421969b…`) to exercise the chooser path. The harness uses
-8192 B (`CircleHarnessTest.kt:405`). `8 MiB` is also the value of
-`TURBO_CHUNK_BYTES`, but the device claim comes from the `2034fa6` walk, not
-from that constant.
+**One device drop, plus in-process harness evidence:** the only documented
+on-device drop is the fresh **35 B** drop (`open-check.txt`, `c421969b…`) in
+the final Open-file walk, which exercised the chooser path. The hash-exact
+Circle file delivery is shown in-process by the harness with an **8192 B**
+payload (`CircleHarnessTest.kt:409-467`), which checks the sha256 and the
+`sent` status transition. The earlier `2034fa6` commit record claims an
+**8 MiB** drop with matching sha256 and `sent=2`, but no 8 MiB drop is verified
+on device here — `8 MiB` is the value of `TURBO_CHUNK_BYTES` — and §8 treats
+that claim as "not verified".
 
 ### 3.2 Event log, replay, governance — what is dropped and what is kept
 
@@ -404,10 +416,14 @@ from that constant.
   `validShape → verify → evaluate → store`, so a forgery cannot reserve a
   legitimate id (`:327-359`).
 - **Host gate:** wrong circle, unknown type, oversized body, wrong cert binding,
-  member trying to inject JOIN, or a non-owner/owner REKEY are skipped
-  (`FlitCircleHost.kt:146-185`); every event is signature-verified and the
-  requester's cert must bind to `memberFp`. A departed fingerprint is refused at
-  the roster gate (`:147-151`) and a later SYNC cannot fetch new events.
+  a JOIN injected through SYNC, or a REKEY whose author is not OWNER/ADMIN on the
+  pre-batch roster are skipped (`FlitCircleHost.kt:146-185`); the authority
+  decision is `CircleAuthority.foldable`, applied before signature verification
+  and id reservation. Every event is signature-verified and the requester's
+  cert must bind to `memberFp`. A departed fingerprint is refused at the roster
+  gate (`:147-151`) and a later SYNC cannot fetch new events. A signer who also
+  submits a `leave` in the same batch is vetoed as a REKEY author in either fold
+  order.
 - **Full-log repair:** every SYNC/post/tick carries the bounded log; a lost
   one-shot is repaired by the next post or tick. Posts use per-peer watermarks
   and deltas; the calm tick deliberately ignores watermarks and re-offers the
@@ -415,10 +431,15 @@ from that constant.
   does not advance the watermark, so it is offered again.
 - **Leave / kick / rekey:** `depart()` removes the roster entry and saturates the
   generation (`FlitCircleStore.kt:479-488`); the host mints one fresh random
-  key and signs a `rekey` event (`:213-242`). A member-supplied rekey is
-  rejected; `applyRekey` only accepts a known signer and a non-decreasing gen
-  (`:386-398`). Earlier events already stored on a departed device **stay
-  plaintext** — there is no content cipher to erase
+  key and signs a `rekey` event (`:213-242`). A departure always forces that
+  rotation, even when the batch carried an admitted REKEY, and the forced
+  generation is placed above the greatest generation the batch was allowed to
+  install. `applyRekey` no longer accepts a merely "known" signer: authority is
+  `CircleAuthority.foldable` against the pre-batch roster, so membership, log
+  authorship and a departed signer carry no key power, and a same-batch leaver
+  is vetoed. The generation must still be non-negative and no older than the
+  local one (`:386-398`). Earlier events already stored on a departed device
+  **stay plaintext** — there is no content cipher to erase
   ([Circle](circle.md#threat-model-and-safety-rails)).
 - **Vote-kick:** one latest vote per current member; a changed vote can block a
   kick before it lands; strict majority of current members decides
@@ -581,8 +602,10 @@ object ParcelCodec {
                              val totalBytes: Int, val crc: Long)
   fun parse(frame: String): FrameDescriptor?
   fun encodeParcel(payload: ByteArray, parcelId: String, recipientFp: String,
-                   signerFp: String, identity: TlsIdentity): List<String>
-  fun complete(frames: List<String>, recipientFp: String): ParcelPayload?
+                   recipientCert: X509Certificate, signerFp: String,
+                   identity: TlsIdentity): List<String>
+  fun complete(frames: List<String>, recipientFp: String,
+               identity: TlsIdentity): ParcelPayload?
   data class ParcelPayload(val parcelId: String, val recipientFp: String,
                            val signerFp: String, val sha256: String,
                            val bytes: ByteArray)
@@ -624,9 +647,14 @@ DER certificate for one encode invocation; the object is parsed with
 strings opaque and calls `ParcelCodec.complete` with the local fingerprint and
 identity, then writes `ParcelPayload.bytes` to `--out` only on success. No file
 name travels in a frame; the operator names the output
-and the CLI reports signer, recipient, SHA-256 and byte count. Exit codes are
-`2` for bad arguments or a missing cert/dir/out, `3` for a verification
-failure, and `0` for success.
+and the CLI reports signer, recipient, SHA-256 and byte count. Encode refuses a
+payload above `ParcelCodec.MAX_AIR_GAP_PAYLOAD_BYTES` (5120 bytes) before
+rendering; the larger 128 KiB `MAX_AIR_GAP_PARCEL_BYTES` is a defensive wire
+cap, not the payload limit. Every frame is decoded back to a string before any
+PNG is staged, with whole-set escalation through 768, 1024 and 1536 px. Exit
+codes are `2` for bad arguments, an oversized payload, an unreadable
+certificate or a missing dir/out, `3` for a verification failure, and `0` for
+success.
 
 The exact CLI API is:
 
@@ -649,6 +677,9 @@ object ParcelCli {
 | A `frame-*.png` is absent, or its QR does not decode | `complete` requires every `seq` in `1..count`; verification failure, exit `3`, no output file | all remaining frames on disk | assembled bytes in memory | CODE `ParcelCli.parcelDecode` + `ParcelCodec.complete` sequence gate; PURE missing-`seq` codec case; SIM-HARN `ParcelCliHarnessTest` (one frame removed) |
 | Decode with an identity other than the addressed recipient: `complete(frames, identity.fingerprint, identity)` returns null, or the returned `ParcelPayload.recipientFp` is not the local fingerprint | exit `3`; no output file; signer and recipient fingerprints printed | frames unchanged | opened bytes | CODE `ParcelCli.parcelDecode` recipient gate + `ParcelCodec.complete`; PURE wrong-identity codec case; SIM-HARN `ParcelCliHarnessTest` (two temp homes, wrong recipient) |
 | `--out` missing, already present, or its parent cannot be written | exit `2`; refuse before writing; frames untouched | existing output file and every frame in `--dir` | nothing | CODE `ParcelCli.run` / `parcelDecode` argument gate; PURE `ParcelCliTest` (flag cases) |
+| Payload empty or above `ParcelCodec.MAX_AIR_GAP_PAYLOAD_BYTES` (5120) | exit `2` before any rendering; no PNG staged | source file untouched | nothing | CODE `ParcelCli.parcelEncode` cap gate; PURE `ParcelCliTest` (one byte over the cap) |
+| A dense frame fails its own QR round-trip | whole frame set escalated 768 → 1024 → 1536 px; frame strings stay byte-identical | source file and accepted frames in memory | nothing staged until every frame round-trips | CODE `ParcelCli.renderFrames` |
+| A frame still fails at 1536 px | exit `2`; nothing further written | source file untouched | no PNG written | CODE `ParcelCli.renderFrames` final refusal |
 
 The rows above are CODE from the frozen CLI API and the adapter at the harness
 seam, PURE from the inherited codec tests and the flag/cert-gate tests, and
@@ -978,8 +1009,9 @@ Panic is informational: nothing is wiped or changed remotely
   user chooses Acknowledge / Dismiss / Forward; **all three are local actions**.
 - **Forward:** explicit tap only. `PanicCore.forward` re-signs the original
   alert with the forwarder's identity, preserves `id`, `note` and `originFp`,
-  and returns `null` at `hops >= DEFAULT_MAX_HOPS` (3); the UI toasts the hop
-  limit (`PanicCore.kt:168-186`; `FlitEngine.kt:434-452`). Because `hops` is
+  and refuses the next hop when `hops + 1 >= 3` (with `DEFAULT_MAX_HOPS = 3`),
+  returning `null` at `hops = 2`; the UI toasts the hop limit
+  (`PanicCore.kt:168-186`; `FlitEngine.kt:434-452`). Because `hops` is
   inside the signed bytes, a bumped count cannot be forged. Looped alerts are
   deduplicated by `id`, not re-shown as new.
 - **Replay / invalid:** `evaluate` returns `Invalid`, `HopLimit`,

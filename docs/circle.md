@@ -63,15 +63,20 @@ the rig; the phone also runs a **real host**, rather than a read-only
 event vending machine.
 
 - **Phone as host.** The app's host path (`FlitCircleHost`, wired from
-  `FlitEngine.onCircleRequest`) does not just hand out stored events. For every
-  incoming request it verifies each event through `CircleCore` with the
-  event's signer certificate pinned to the author; a `memberFp` that is not in
-  the roster is refused (except a `JOIN` carrying the correct invite). `JOIN`
-  admits the member and returns the key plus the ordered log inside the
-  authenticated TLS session; `SYNC` folds verified events through the
-  `FlitCircleStore` reducers. A leave or kick rekeys the group, and a later
-  `SYNC` from a departed fingerprint is refused. Wrong-circle and bad-invite
-  requests get refusal reasons, not silent success.
+  `FlitEngine.onCircleRequest`) does not just hand out stored events. The shared
+  route checks the `X-Flit-Circle-Cert` header digest against `memberFp` and
+  runs `CircleCore.joinProofFailure` before the delegate sees a JOIN; a
+  proof-less or stale JOIN gets a host-signed refusal, so old clients must
+  upgrade. A JOIN then admits the member and returns the key plus the ordered
+  log inside the authenticated TLS session. For `SYNC` the host verifies each
+  event through `CircleCore` with the signer certificate pinned to the author,
+  applies the shared `CircleAuthority.foldable` rule (JOIN never folds; REKEY
+  only from OWNER/ADMIN), then runs two dedup layers and `CircleCore.accept`
+  last before folding through the `FlitCircleStore` reducers. A `memberFp` not
+  in the roster is refused. A leave or kick rekeys the group and any departure
+  forces a fresh host-minted rotation; a later `SYNC` from a departed
+  fingerprint is refused. Wrong-circle and bad-invite requests get refusal
+  reasons, not silent success.
 - **The remembered return route is TCP/IP only.** The host stores a return route
   only for an accepted `JOIN` that arrived with an IP, as `ip:53317` TLS TCP
   (`FlitRoster.rememberRoute` with `Protocol.DEFAULT_PORT`); a `SYNC` alone
@@ -85,9 +90,14 @@ event vending machine.
   controls on the member sheet invoke it, and the store's `applyRole` reducer
   enforces it. Nobody, not even the owner, can appoint a second `OWNER`; an
   `ADMIN` (or the `OWNER`) can kick
-  a non-owner member, and a plain member can only open a vote-kick. Roles are
-  local authority labels pinned to a fingerprint, **not** cloud identities or
-  accounts — nothing is registered anywhere.
+  a non-owner member, and a plain member can only open a vote-kick. The same
+  role map feeds `CircleAuthority.foldable` at every fold site — app host, app
+  peer fold, store reducer, CLI host and courier — so a REKEY from anyone other
+  than OWNER/ADMIN is refused, and a courier fold with no role data refuses both
+  REKEY and JOIN. A signer leaving in the same batch cannot hand off a key, and
+  any departure forces the host to mint a fresh key. Roles are local authority
+  labels pinned to a fingerprint, **not** cloud identities or accounts — nothing
+  is registered anywhere.
 - **Local, not remote.** Every governance change is applied to each device's own
   view of the log; no action is pushed onto another device. A departed device is
   refused at the host's roster gate and is not handed the rotated key material —
@@ -103,9 +113,24 @@ using the fingerprint from the code, presents the invite token and receives the
 group key *inside that session*. A relay or a network observer sees only
 TLS-opaque bytes — the secrecy here is the transport's, not a group-key cipher.
 
+The invite alone is not a JOIN. The joiner sends one signed JOIN event in the
+request's existing `events` field; its body is exactly `{"proof":"…"}`, the
+unpadded Base64URL SHA-256 of a `FLITJOIN1` nonce over the host fingerprint,
+circle id, invite, member fingerprint and the index of a five-minute bucket.
+The event is signed by the member's own `TlsIdentity`, and `CircleCore.verify`
+binds its embedded certificate to that fingerprint by the certificate's own
+SHA-256 DER digest before checking the signature. The host recomputes the digest
+from its own fingerprint and accepts only the current bucket with a one-bucket
+tolerance. The route answers with a host-signed refusal for a proof-less,
+malformed or stale JOIN, so old clients that send only the invite cannot join.
+Within one host process the proof's id is reserved in a bounded set, making the
+verbatim event single-use there; a restart forgets that reservation, and a
+captured proof remains usable elsewhere until its bucket rolls over.
+
 The QR is therefore a bearer invite, not the key itself: a photographed code
-can be used by whoever holds it. That is stated in the UI; suspicious
-codes are retired by starting a new Circle.
+can be used by whoever holds it together with the private key for the
+fingerprint they claim. That is stated in the UI; suspicious codes are retired
+by starting a new Circle.
 
 ## Threat model and safety rails
 
@@ -113,8 +138,8 @@ codes are retired by starting a new Circle.
 | --- | --- | --- |
 | Passive network observer | event traffic is TLS-protected; signatures prove authorship | sees IPs/MACs, timing and byte counts; stored event bodies are plaintext JSON (authenticated, **not encrypted at rest**) |
 | Malicious relay | pairs blindly, never reads content | shipped CLI logs only timestamps and opaque pairing ticket ids — no fingerprint, no byte count; never content (TLS) |
-| Stolen QR photo | bearer invite can join | does not reveal the group key without a TLS session to the host |
-| Compromised member | can read the plaintext log and emit as that member | cannot forge another fingerprint (signature + pinning) |
+| Stolen QR photo | bearer invite plus a proof signed by the key behind the claimed fingerprint can join | does not reveal the group key without a TLS session to the host; the photo alone cannot claim another member's fingerprint |
+| Compromised member | can read the plaintext log, emit signed events as that member, and join under its own fingerprint with the invite and a fresh proof | cannot forge another fingerprint's JOIN proof (signature, cert-digest binding, and host/circle/invite/bucket scope), cannot inject JOIN or REKEY through SYNC or a parcel, and cannot erase earlier plaintext events stored on a departed device |
 
 **What "the group key" is — and is not.** It is shared membership/rekey material
 distributed only inside the authenticated TLS join session and rotated when a
@@ -134,7 +159,9 @@ changes another device. There is no remote auto-action of any kind.
 
 Here `body` is a small plaintext JSON object whose shape depends on `type`
 (`message`, `file`, `poll`, `vote`, `join`, `leave`, `kick`, `role`, `rekey`); it
-is signed but not encrypted.
+is signed but not encrypted. A `join` is the one handshake verb: its body is
+exactly `{"proof":"…"}` and it is admitted at the host, never folded into the
+log by a peer.
 
 - **Canonical bytes** cover every field except `sig` **and `cert`**; the author
   signs them with its `TlsIdentity`, and `verify` binds the omitted certificate to
@@ -256,9 +283,9 @@ demands them.
   > event delta and checks the stored event comes back; it does not drive a relay,
   > so the verified catch-up path is the empty-delta pull above.
 - **Host state machine:** a pure, deterministic host verifies every incoming
-  event against the roster, admits `JOIN` only with the right invite, folds
-  `SYNC` through the store reducers, and refuses departed members and
-  wrong-circle requests.
+  event against the roster, admits `JOIN` only with the right invite and a valid
+  signed proof, folds `SYNC` through the store reducers and the shared authority
+  gate, and refuses departed members and wrong-circle requests.
 - **Device:** the two-node walk above. A genuine multi-member mesh needs
   hardware that is not on this rig; it stays a listed limitation.
 
@@ -329,9 +356,11 @@ have been removed — the feed content, not those lines, is the evidence.
   stored log is readable by anyone with access to the device's state, and a
   member in the roster can read everything. The shared key is membership/rekey
   material, not a cipher. Do not put secrets in Circle messages.
-- **Bearer invite:** the QR is a bearer token — whoever holds the photo can join.
-  It does not reveal the group key without a TLS session to the host; retire a
-  suspicious code by starting a new Circle.
+- **Bearer invite:** the QR is a bearer token — whoever holds the photo can join
+  only with the private key behind the fingerprint claimed in a signed JOIN
+  proof. It does not reveal the group key without a TLS session to the host. A
+  captured proof is single-use only in the host process and stops working when
+  its bucket rolls over; retire a suspicious code by starting a new Circle.
 - **Blind relay:** store-and-forward is app-layer and bounded; the relay itself
   stores nothing and has no discovery, so peers must be configured by hand — a
   Known-device entry with an address/token and `relayFor` on is required before
