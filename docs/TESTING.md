@@ -15,8 +15,8 @@ Rules applied here:
   four modules' `build/test-results/.../TEST-*.xml` files): **443 protocol +
   167 core + 254 app + 108 harness = 972 tests, 0 failures, 0 errors,
   0 skipped**. This green result covers the four test tasks only. A background
-  rerun of the rig (tests plus assemblies) follows the R8 keep-rule change, and
-  no green claim is made here for it (§2, §3). Every smaller total —
+  full rig rerun (tests plus assemblies) is green after the R8 keep-rule change
+  (§2, §3). Every smaller total —
   778, 773, 769 and the per-layer figures — is historical, and the four-module
   778 split was a source-level projection, not a green result.
 - No device walk is claimed that did not happen. A direction proved only by a
@@ -135,7 +135,7 @@ The R8 keep-rule change has been verified by a full rig run of tests plus assemb
 | `core/` | JVM shared seams: BLE policy, QR and parcel frames, route, speed, spool and subnet reducers, trust and announce-admission gates, crush intake | **167** | `:core:test` | JVM only (JDK 21 toolchain, `core/build.gradle.kts:6-8`) |
 | `app/` | Android shell (Compose), `app.flit.share`, version 0.3.1, minSdk 26, compile/targetSdk 36 | **254** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
 | `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **108** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Four modules, four roles | **972** | see §3 | last full green test XML (2026-11-28); test tasks only, rig rerun result not recorded |
+| **Total** | Four modules, four roles | **972** | see §3 | last full green test XML (2026-11-28); test tasks only, assemblies green in the full rig rerun |
 
 The 2026-12-04 CLI layer's two harness classes added 12 cases, moving harness
 from 39 to 51 and the total from 436 to 448 at that layer's green
@@ -206,8 +206,8 @@ over ktor's 4.2.2.Final request. `app/proguard-rules.pro:21-28` keeps
 of Netty bytecode caused an ART `VerifyError` during buffer init in release
 builds while the unminified debug jars ran clean, so only app code shrinks.
 `gradle.properties:6-10` also leaves R8 full mode off as a defensive default.
-The full rig rerun named in §1 and §3 is the check on that keep-rule
-change; its result is not recorded here.
+The full rig rerun named in §1 and §3 passed after that keep-rule
+change, including both assemblies.
 
 ## 3. Exact rig command
 
@@ -274,8 +274,8 @@ result and the current inventory (§1, §2); the earlier four-module 778 was a
 source-level projection and is historical. The assembly tasks
 (`:app:assembleDebug`, `:app:assembleRelease`, `:harness:installDist` and
 `:harness:distZip`) are not covered by that XML: a background rerun of the full
-rig (tests plus assemblies) follows the R8 keep-rule change (§2), and no green
-result is recorded here for it.
+rig (tests plus assemblies) passed after the R8 keep-rule change (§2); that
+result is outside the XML and is recorded in the rig log.
 
 Provenance: the 2026-11-25
 date belongs to the earlier 302-test baseline and the stale-XML incident in §8,
@@ -1055,4 +1055,4 @@ case. Neither layer claims a device walk. The layer record is
 `:core` left the total at the historical 778 with the projected split
 362 + 112 + 212 + 92 recorded in §4.9; the current four-module green test XML is
 443 + 167 + 254 + 108 = 972 (§1, §2, §4.10), with the full rig rerun
-result not recorded here (§3).
+green after the R8 keep-rule change (§3).

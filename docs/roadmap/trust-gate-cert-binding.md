@@ -54,10 +54,12 @@ behavior stays the shipped default until a gate is enabled.
 
 Both designs were reviewed before implementation. Option A is feasible with
 the pinned dependency versions but needs carrier surgery across three
-transports and several compatibility tests. Option B is smaller but changes the
-prepare request's header set and still relies on an opt-in gate. No concrete
-requirement currently justifies either wire change, and neither design should
-be shipped on the strength of a design review alone. The work is parked here.
+transports and several compatibility tests. Option B is smaller and changes the
+prepare request's header set. That disposition was recorded before the security
+wave. Option B was subsequently implemented as the prepare certificate and
+signature binding: see `docs/roadmap/security-hardening.md` and
+`docs/completions/2027-01-13-security-fixes.md`. The binding remains opt-in;
+the default path keeps the declared-fingerprint behavior.
 
 If the requirement returns, Option B is the first candidate: it reuses an
 existing primitive, keeps the normal refusal shape, and is testable at the
