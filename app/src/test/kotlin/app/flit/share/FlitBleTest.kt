@@ -1,5 +1,9 @@
 package app.flit.share
 
+import app.flit.share.protocol.ideas.noisebudget.NoiseBudget
+import app.flit.share.protocol.ideas.noisebudget.NoiseBudget.Kind
+import app.flit.share.protocol.ideas.noisebudget.NoiseBudget.Reason
+import app.flit.share.protocol.ideas.noisebudget.NoiseBudget.Status
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -12,6 +16,11 @@ import kotlin.test.assertTrue
  * budgets, roundtrips in both record kinds, codepoint-safe alias clipping,
  * garbage filtering, self-ghost checks, and the dormancy arbiter's truth
  * table (access point owns the roster; hidden mode listens, never announces).
+ *
+ * The last group pins the NoiseBudget contract the duty wiring leans on: the
+ * shipped 10 s-on / 45 s-off cadence validates over a 55 s period, a hostile
+ * schedule is rejected, and validation is pure — it only logs, so the radio's
+ * stance never changes because a report said so.
  */
 class FlitBleTest {
 
@@ -311,4 +320,122 @@ class FlitBleTest {
             "a stale manual stub must not hide a live real row",
         )
     }
+
+    @Test
+    fun `shipped duty schedule validates against the noise ceiling`() {
+        val r = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, FlitBle.DUTY_CEILING_BPS, FlitBle.shippedDutyWindows())
+        assertEquals(Status.OK, r.status)
+        assertTrue(r.ok)
+        assertEquals(FlitBle.DUTY_PERIOD_MS, r.periodMillis, "the cycle is the shipped 55 s")
+        assertEquals(FlitBle.DUTY_CEILING_BPS, r.ceilingBps)
+        assertEquals(11_000L, r.allowedMillis, "20% of 55 s is 11 s")
+        assertEquals(FlitBle.DUTY_ON_MS, r.activeMillis, "only the 10 s on-window occupies the radio")
+        assertEquals(1_818, r.usedBps, "10 of 55 s is ~18.2%")
+        assertEquals(0L, r.excessMillis)
+        assertEquals(1, r.acceptedWindows)
+        assertEquals(1, r.acceptedAnnounce)
+        assertEquals(0, r.acceptedScan)
+        assertTrue(r.violations.isEmpty(), r.violations.toString())
+        assertTrue(r.explanations.isEmpty(), r.explanations.toString())
+    }
+
+    @Test
+    fun `shipped duty windows are one ten second radio span`() {
+        // The shipped schedule charges one 10 s on-window, not two overlapping
+        // radio windows counted twice.
+        val r = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, 10_000, FlitBle.shippedDutyWindows())
+        assertEquals(FlitBle.DUTY_ON_MS, r.activeMillis)
+        assertEquals(1, r.acceptedWindows)
+        assertEquals(Status.OK, r.status)
+    }
+
+    @Test
+    fun `shipped duty ratio sits just under a fixed ceiling`() {
+        // Pins the exact 10/55 ratio: 1819 bps tolerates it, 1818 bps does not.
+        val justAbove = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, 1_819, FlitBle.shippedDutyWindows())
+        val justBelow = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, 1_818, FlitBle.shippedDutyWindows())
+        assertEquals(Status.OK, justAbove.status)
+        assertEquals(Status.OVER_BUDGET, justBelow.status)
+    }
+
+    @Test
+    fun `hostile always-on schedule is rejected with an over-budget violation`() {
+        val hostile = NoiseBudget.window(Kind.SCAN, 0L, FlitBle.DUTY_PERIOD_MS)
+        val r = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, FlitBle.DUTY_CEILING_BPS, listOf(hostile))
+        assertEquals(Status.OVER_BUDGET, r.status)
+        assertFalse(r.ok)
+        assertEquals(FlitBle.DUTY_PERIOD_MS, r.activeMillis)
+        assertEquals(11_000L, r.allowedMillis)
+        assertEquals(44_000L, r.excessMillis)
+        assertEquals(10_000, r.usedBps)
+        assertEquals(Reason.OVER_BUDGET, r.violations.single().reason)
+        assertTrue(r.explanations.single().contains("above ceiling"), r.explanations.single())
+    }
+
+    @Test
+    fun `structurally hostile schedules are rejected without throwing`() {
+        val badStart = FlitBle.validateDutySchedule(
+            FlitBle.DUTY_PERIOD_MS, 10_000,
+            listOf(NoiseBudget.window(Kind.ANNOUNCE, -1L, 10L)),
+        )
+        assertEquals(Status.INVALID, badStart.status)
+        assertEquals(Reason.NEGATIVE_START, badStart.violations.single().reason)
+
+        val crosses = FlitBle.validateDutySchedule(
+            FlitBle.DUTY_PERIOD_MS, 10_000,
+            listOf(NoiseBudget.window(Kind.SCAN, FlitBle.DUTY_PERIOD_MS - 1L, 10L)),
+        )
+        assertEquals(Status.INVALID, crosses.status)
+        assertEquals(Reason.CROSSES_CYCLE, crosses.violations.single().reason)
+
+        val flood = FlitBle.validateDutySchedule(
+            FlitBle.DUTY_PERIOD_MS, 10_000,
+            List(NoiseBudget.MAX_WINDOWS + 1) { NoiseBudget.window(Kind.ANNOUNCE, 0L, FlitBle.DUTY_ON_MS) },
+        )
+        assertEquals(Status.INVALID, flood.status)
+        assertEquals(Reason.TOO_MANY_WINDOWS, flood.violations.first().reason)
+    }
+
+    @Test
+    fun `noise validation is pure and never changes carrier behavior`() {
+        val hostile = listOf(NoiseBudget.window(Kind.SCAN, 0L, FlitBle.DUTY_PERIOD_MS))
+        val first = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, FlitBle.DUTY_CEILING_BPS, hostile)
+        val second = FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, FlitBle.DUTY_CEILING_BPS, hostile)
+        assertEquals(first, second, "no hidden state: equal input yields an equal report")
+        assertEquals(Status.OVER_BUDGET, second.status, "the hostile schedule stays rejected")
+
+        // Carrier behavior is a function of the world, never of a budget report.
+        // A violation is log-only: the duty arbiter still wakes for two ticks
+        // and rests for nine, sampled before and after the hostile validation.
+        fun stanceAt(tick: Long) = FlitBle.stance(
+            apUp = false, perms = true, radioOn = true, hidden = false, tick = tick,
+        )
+        val before = stanceAt(0L) to stanceAt(FlitBle.DUTY_ON_TICKS)
+        FlitBle.validateDutySchedule(FlitBle.DUTY_PERIOD_MS, FlitBle.DUTY_CEILING_BPS, hostile)
+        val after = stanceAt(0L) to stanceAt(FlitBle.DUTY_ON_TICKS)
+        assertEquals(before, after, "a rejected schedule leaves the radio untouched")
+        assertEquals(FlitBle.Stance(advertise = true, scan = true), before.first)
+        assertEquals(FlitBle.Stance(advertise = false, scan = false), before.second)
+    }
+    @Test
+    fun `audit writes violation lines to the supplied sink only`() {
+        val lines = mutableListOf<String>()
+        val hostile = listOf(NoiseBudget.window(Kind.SCAN, 0L, FlitBle.DUTY_PERIOD_MS))
+        val bad = FlitBle.auditDutySchedule(
+            periodMs = FlitBle.DUTY_PERIOD_MS,
+            ceilingBps = FlitBle.DUTY_CEILING_BPS,
+            windows = hostile,
+            sink = lines::add,
+        )
+        assertEquals(Status.OVER_BUDGET, bad.status)
+        assertEquals(FlitBle.dutyViolationLines(bad), lines)
+        assertTrue(lines.all { it.startsWith("ble duty budget: ") }, lines.toString())
+
+        lines.clear()
+        val good = FlitBle.auditDutySchedule(sink = lines::add)
+        assertEquals(Status.OK, good.status)
+        assertTrue(lines.isEmpty(), "healthy schedule stays silent")
+        assertEquals(FlitBle.validateDutySchedule(), good)
+    }
+
 }

@@ -1,6 +1,8 @@
 package app.flit.share
 
+import app.flit.share.protocol.ideas.noisebudget.NoiseBudget
 import java.util.UUID
+import java.util.logging.Logger
 
 /**
  * Direct-peer discovery over Bluetooth LE — the engine layer no setting ever
@@ -24,6 +26,9 @@ import java.util.UUID
  *    live peer — deciding advertise and/or scan. Turning dark is a decision
  *    this returns; the no-AP radio rests 45 s of every 55 s and stops scanning
  *    outright once a real peer row exists. [phaseOn] is the injectable clock.
+ *  - [auditDutySchedule]: an observational check of that same cycle against a
+ *    duty-cycle ceiling. A finding becomes a log line and nothing else; the
+ *    arbiter and the radio controls never read the result.
  *
  * Nothing here is user-facing: no strings, no settings, no new vocabulary.
  */
@@ -165,6 +170,67 @@ object FlitBle {
     const val DUTY_ON_MS = DUTY_ON_TICKS * DUTY_TICK_MS
     const val DUTY_OFF_MS = DUTY_OFF_TICKS * DUTY_TICK_MS
     const val DUTY_PERIOD_MS = DUTY_PERIOD_TICKS * DUTY_TICK_MS
+
+    // ---- noise budget: observation only -------------------------------------
+
+    /**
+     * Duty-cycle ceiling for the shipped schedule, in basis points. One cycle
+     * occupies [DUTY_ON_MS] of [DUTY_PERIOD_MS] (about 1,818 bps); 2,000 bps
+     * leaves a small margin. It is a policy input, not a measurement.
+     */
+    const val DUTY_CEILING_BPS: Int = 2_000
+
+    private val dutyAuditLog: Logger = Logger.getLogger(FlitBle::class.java.name)
+
+    /**
+     * The shipped cycle expressed as [NoiseBudget] windows. Announce and scan
+     * share one radio inside the on window, so a single
+     * [NoiseBudget.Kind.ANNOUNCE] window describes the whole occupied span;
+     * the 45 s rest is the remaining part of the period.
+     */
+    fun shippedDutyWindows(): List<NoiseBudget.Window> = listOf(
+        NoiseBudget.window(NoiseBudget.Kind.ANNOUNCE, 0L, DUTY_ON_MS),
+    )
+
+    /**
+     * Pure check of [windows] over [periodMs] against [ceilingBps]. Defaults
+     * describe the shipped schedule. No clock, no state, no radio: a hostile
+     * schedule cannot change a [stance] or the carrier.
+     */
+    fun validateDutySchedule(
+        periodMs: Long = DUTY_PERIOD_MS,
+        ceilingBps: Int = DUTY_CEILING_BPS,
+        windows: List<NoiseBudget.Window> = shippedDutyWindows(),
+    ): NoiseBudget.Report = NoiseBudget.validate(periodMs, ceilingBps, windows)
+
+    /**
+     * One log line per finding, in the report's stable order. Empty when the
+     * schedule is OK, so a healthy cycle stays silent.
+     */
+    fun dutyViolationLines(report: NoiseBudget.Report): List<String> =
+        if (report.ok) emptyList()
+        else report.violations.zip(report.explanations).map { (finding, text) ->
+            "ble duty budget: ${finding.reason} — $text"
+        }
+
+    /**
+     * Checks the schedule and emits log lines for violations through [sink];
+     * the returned report is informational. A caller may pass its own sink (the
+     * engine's log line, a test collector, or nothing at all). The default goes
+     * to the JVM platform logger, so this needs no Android class. Nothing here
+     * calls [stance], [phaseOn] or any radio code — findings never steer the
+     * carrier, they only log.
+     */
+    fun auditDutySchedule(
+        periodMs: Long = DUTY_PERIOD_MS,
+        ceilingBps: Int = DUTY_CEILING_BPS,
+        windows: List<NoiseBudget.Window> = shippedDutyWindows(),
+        sink: (String) -> Unit = { line -> dutyAuditLog.warning(line) },
+    ): NoiseBudget.Report {
+        val report = validateDutySchedule(periodMs, ceilingBps, windows)
+        dutyViolationLines(report).forEach(sink)
+        return report
+    }
 
     /**
      * The phase itself: on for the first [onTicks] ticks of every [periodTicks]

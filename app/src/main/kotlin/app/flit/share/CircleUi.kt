@@ -35,6 +35,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.ButtonDefaults
@@ -71,6 +72,8 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.circle.PadView
+import app.flit.share.protocol.ideas.peeralias.PeerAlias
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -96,6 +99,33 @@ import kotlinx.serialization.json.JsonPrimitive
  * File cards report delivery counts from the device's local record only; a
  * file event with no local record says so instead of pretending bytes landed.
  */
+
+// ---- identity labels --------------------------------------------------------
+
+/**
+ * A roster alias is assigned by the user, so it stays authoritative: it is
+ * shown verbatim and never replaced by a derived label. Only a blank alias
+ * falls back to [PeerAlias.of], a stable label derived from the whole
+ * fingerprint. An unusable fingerprint degrades to a plain placeholder rather
+ * than a raw prefix that could collide with a different peer.
+ */
+private fun peerLabel(fp: String, rosterAlias: String): String {
+    val assigned = rosterAlias.takeIf { it.isNotBlank() }
+    if (assigned != null) return assigned
+    return PeerAlias.of(fp)?.text ?: "peer"
+}
+
+/**
+ * Two-part caption: the authoritative name plus the fingerprint's short label
+ * for comparison. When the name already is that label — [PeerAlias.matches] is
+ * case-insensitive and shape-aware — the duplicate half is dropped instead of
+ * printing the same token twice.
+ */
+private fun peerCaption(fp: String, rosterAlias: String): String {
+    val label = peerLabel(fp, rosterAlias)
+    val derived = PeerAlias.of(fp)?.text ?: return label
+    return if (PeerAlias.matches(fp, label)) label else "$label · $derived"
+}
 
 @Composable
 fun CircleScreen(
@@ -140,6 +170,17 @@ fun CircleScreen(
      * The no-op default keeps older call sites compiling and rendering.
      */
     onCourierDrop: (String) -> Unit = {},
+    // ---- additive Circle pad surface (defaults keep older callers) ----
+    /**
+     * Derived pad state supplied by FlitEngine (rebuilt from the signed `pad`
+     * events on every store fold). Defaults to an empty view so a caller that
+     * predates pad support still compiles and the feed renders unchanged.
+     */
+    padView: PadView = PadView(emptyList()),
+    /** Publish a signed `pad` put for (key, text). No-op keeps old callers compiling. */
+    onPadPut: (String, String) -> Unit = { _, _ -> },
+    /** Publish a signed `pad` del for key. No-op keeps old callers compiling. */
+    onPadDel: (String) -> Unit = {},
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
@@ -148,6 +189,9 @@ fun CircleScreen(
     var question by remember { mutableStateOf("") }
     var choices by remember { mutableStateOf("") }
     var showMembers by remember { mutableStateOf(false) }
+    // The pad is its own surface, opened from the top bar and dismissed through
+    // PadCard's onClose. It never reads the store: the caller supplies the view.
+    var showPad by remember { mutableStateOf(false) }
     // Identity loads asynchronously, so meFp can briefly be blank. The store
     // keeps exactly one OWNER — this device — so that roster entry is a safe
     // fallback for recognising our own events during that window.
@@ -212,6 +256,9 @@ fun CircleScreen(
                     color = cs.onSurfaceVariant,
                 )
             }
+            IconButton(onClick = { showPad = true }) {
+                Icon(Icons.Default.Edit, contentDescription = "Circle pad")
+            }
             IconButton(onClick = { showMembers = true }) {
                 Icon(Icons.Default.Person, contentDescription = "Circle members")
             }
@@ -236,7 +283,7 @@ fun CircleScreen(
                         },
                 ) {
                     Text(
-                        text = "${m.alias.ifBlank { m.fp.take(6) }} · ${m.fp.take(6)}",
+                        text = peerCaption(m.fp, m.alias),
                         style = typ.labelMedium,
                         color = cs.onSurfaceVariant,
                         maxLines = 1,
@@ -294,8 +341,9 @@ fun CircleScreen(
                         event = event,
                         body = body,
                         mine = event.authorFp == selfFp && selfFp.isNotBlank(),
-                        author = members.firstOrNull { it.fp == event.authorFp }?.alias
-                            ?: event.authorFp.take(8),
+                        author = members.firstOrNull { it.fp == event.authorFp }
+                            ?.let { peerLabel(it.fp, it.alias) }
+                            ?: peerLabel(event.authorFp, ""),
                         members = members,
                         meFp = selfFp,
                         handoffs = handoffs,
@@ -428,6 +476,17 @@ fun CircleScreen(
             onQr = { onQr(); showMembers = false },
             onLeave = { onLeave(); showMembers = false },
             onCourierDrop = onCourierDrop,
+        )
+    }
+
+    if (showPad) {
+        // Pure presentation: PadCard reads only the supplied view and routes
+        // every edit/delete back through the caller's signed publish callbacks.
+        PadCard(
+            view = padView,
+            onPut = onPadPut,
+            onDel = onPadDel,
+            onClose = { showPad = false },
         )
     }
 }
@@ -860,7 +919,7 @@ private fun KickCard(
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text(
-                text = "Kick vote · ${target?.alias?.ifBlank { target.fp.take(8) } ?: body.targetFp.take(8)}",
+                text = "Kick vote · ${target?.let { peerLabel(it.fp, it.alias) } ?: peerLabel(body.targetFp, "")}",
                 style = typ.titleSmall,
                 color = cs.onSurface,
             )
@@ -1003,8 +1062,8 @@ private fun MemberSheet(
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                text = if (self) "${m.alias.ifBlank { m.fp.take(8) }} · you"
-                                else "${m.alias.ifBlank { m.fp.take(8) }} · ${m.fp.take(8)}",
+                                text = if (self) "${peerLabel(m.fp, m.alias)} · you"
+                                else peerCaption(m.fp, m.alias),
                                 style = typ.bodyMedium,
                                 color = cs.onSurface,
                                 modifier = Modifier.weight(1f),

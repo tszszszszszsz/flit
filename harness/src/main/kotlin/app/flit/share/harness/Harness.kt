@@ -4,6 +4,8 @@ import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.circle.DropKeyCore
+import app.flit.share.protocol.circle.PadCore
+import app.flit.share.protocol.circle.PadView
 import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendReport
@@ -76,7 +78,7 @@ internal class ParsedArgs(argv: Array<String>) {
             "--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin",
             "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
             "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host", "--role",
-            "--bag", "--to", "--cert", "--ttl", "--out", "--sha", "--drop-id",
+            "--bag", "--to", "--cert", "--ttl", "--out", "--sha", "--drop-id", "--key",
         )
     }
 }
@@ -157,12 +159,13 @@ bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pi
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
-circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt> [--circle ID] [--invite TOKEN]
+circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad> [--circle ID] [--invite TOKEN]
        [--text TEXT] [--file PATH] [--target FP] [--role ADMIN|MEMBER] [--option N]
        [--host ip[:port]] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
        receipt --sha SHA [--drop-id ID] [--host ip[:port]] — signed acknowledgement of a keyed drop
+       pad put --key K --text T | pad del --key K | pad show — shared line pad over the signed log
 courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
 parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs back into bytes, offline
 """
@@ -171,7 +174,7 @@ parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs bac
 
 private fun circleUsage() {
     println(
-        """circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt>
+        """circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad>
   create          mint a circle id + invite token; print the host command
   join            --host ip[:port] --circle ID --invite TOKEN — fetch the group key
   post            --text NOTE — signed message; --file PATH — file-drop ANNOUNCEMENT only
@@ -188,6 +191,8 @@ private fun circleUsage() {
   sync            pull the shared log and print the feed + poll tally + confirmed counts
   receipt         --sha SHA [--drop-id ID] [--host ip[:port]] — signed ack of a keyed drop
                   resolves dropId and keyId from the signed keyed file event; no key, no event
+  pad             put --key K --text T — publish one signed line; del --key K — tombstone it;
+                  show — print the live lines folded from the local signed log
 """
     )
 }
@@ -1489,6 +1494,43 @@ private suspend fun circle(args: ParsedArgs) {
             st.events.add(ev)
             pushCircleEvent(st, identity, ev)
         }
+        "pad" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            // The signed log is the only pad state. put/del publish a pad event
+            // on the existing SYNC route; show folds the local log with PadCore.
+            when (args.positional.drop(2).firstOrNull()) {
+                "put" -> {
+                    val key = args.opt("--key")
+                        ?: run { println("!! pad put needs --key K"); return }
+                    val text = args.opt("--text")
+                        ?: run { println("!! pad put needs --text T"); return }
+                    val body = try {
+                        PadCore.padPutBody(key, text)
+                    } catch (e: IllegalArgumentException) {
+                        println("!! ${e.message}"); return
+                    }
+                    val ev = circleEvent(st, identity, CircleEvent.PAD, body)
+                    st.events.add(ev)
+                    pushCircleEvent(st, identity, ev)
+                    println("${ts()} pad put $key")
+                }
+                "del" -> {
+                    val key = args.opt("--key")
+                        ?: run { println("!! pad del needs --key K"); return }
+                    val body = try {
+                        PadCore.padDelBody(key)
+                    } catch (e: IllegalArgumentException) {
+                        println("!! ${e.message}"); return
+                    }
+                    val ev = circleEvent(st, identity, CircleEvent.PAD, body)
+                    st.events.add(ev)
+                    pushCircleEvent(st, identity, ev)
+                    println("${ts()} pad del $key")
+                }
+                "show" -> printCirclePad(st)
+                else -> circleUsage()
+            }
+        }
         else -> circleUsage()
     }
 }
@@ -1521,6 +1563,17 @@ private fun printCircleFeed(st: CircleCliState) {
         val tally = CircleCore.tally(st.events, pid, st.members)
         println("  tally $pid: ${tally.entries.sortedBy { it.key }}")
     }
+}
+
+/** One printed line per live PadView line: key then text, already lexicographic from PadCore. */
+internal fun padViewLines(view: PadView): List<String> =
+    view.lines.map { "  ${it.key}  ${it.text}" }
+
+/** Show the pad folded from the local signed log; no second persisted copy. */
+private fun printCirclePad(st: CircleCliState) {
+    val lines = padViewLines(PadCore.view(st.events, st.circleId))
+    println("${ts()} circle ${st.circleId} pad: ${lines.size} line(s)")
+    lines.forEach { println(it) }
 }
 
 /** One count line for one drop; the authors are derived from the signed log. */

@@ -2,6 +2,7 @@ package app.flit.share
 
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.circle.PadCore
 import app.flit.share.protocol.courier.CarryState
 import app.flit.share.protocol.courier.CourierCarryCore
 import app.flit.share.protocol.courier.CourierEnvelope
@@ -178,6 +179,10 @@ internal fun circleBodyValid(type: String, body: String): Boolean {
         // bounds belong to CircleCore; this gate delegates to it and never
         // restates those rules.
         CircleEvent.RECEIPT -> CircleCore.validReceiptBody(body)
+        // A pad carries one of two closed shapes from PadCore. The gate and its
+        // builders live in that one JVM-pure file, so this side only delegates;
+        // no route, header or wire field is added for the pad verb.
+        CircleEvent.PAD -> PadCore.validPadBody(body)
         else -> false
     }
 }
@@ -580,6 +585,24 @@ object FlitCircleSync {
         val state = storedState() ?: return
         val event = emit(context(), state, type, body) ?: return
         fanout(state, listOf(event))
+    }
+
+    /**
+     * Publish one pad line edit as a signed `pad` event. The body comes only
+     * from [PadCore.padPutBody], so the closed shape and the key/text bounds
+     * stay owned by the pure core; a refusal ends here before anything is
+     * signed. Signing, persisting and the `/circle/sync` fan-out are exactly
+     * [post]'s — this adds no route, header, DTO field or store field.
+     */
+    internal suspend fun postPadPut(key: String, text: String) {
+        val body = runCatching { PadCore.padPutBody(key, text) }.getOrNull() ?: return
+        post(CircleEvent.PAD, body)
+    }
+
+    /** Publish one pad line deletion; mirrors [postPadPut] with a `del` body. */
+    internal suspend fun postPadDel(key: String) {
+        val body = runCatching { PadCore.padDelBody(key) }.getOrNull() ?: return
+        post(CircleEvent.PAD, body)
     }
 
     /** Changeable poll answer: a new vote event, the old one stays in history. */

@@ -3,13 +3,18 @@ package app.flit.share
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.circle.DropKeyCore
+import app.flit.share.protocol.circle.PadCore
+import app.flit.share.protocol.model.CircleRequest
+import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.tls.TlsIdentity
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
@@ -647,5 +652,247 @@ class FlitEngineTest {
             FlitCircleStore.setDeliveryStatus(updated, "unknown-sha", stranger.fingerprint, FlitCircleStore.CircleDelivery.SENT).deliveries,
             "an unknown sha creates no confirmation row",
         )
+    }
+
+    // ==== circle pad: view rebuild and exact publish bodies =====================
+    //
+    // The engine keeps no second copy of the pad: its `padView` StateFlow is
+    // rebuilt from the signed log through PadCore.view on every store fold.
+    // A put/del is a signed `pad` event posted through FlitCircleSync's existing
+    // /circle/sync fan-out — no new route, header, DTO field or store field.
+    // These cases drive the real publish seam with injected fakes (no socket,
+    // no Android context) and the same pure fold the engine uses for the view.
+
+    private fun padPutEvent(
+        signer: TlsIdentity,
+        key: String,
+        text: String,
+        id: String,
+        lamport: Long,
+        circleId: String = "c1",
+    ): CircleEvent = CircleCore.create(
+        circleId, signer.fingerprint, signer, CircleEvent.PAD,
+        PadCore.padPutBody(key, text), lamport, 1_800_000_000_000L + lamport,
+    )
+
+    private fun padDelEvent(
+        signer: TlsIdentity,
+        key: String,
+        id: String,
+        lamport: Long,
+        circleId: String = "c1",
+    ): CircleEvent = CircleCore.create(
+        circleId, signer.fingerprint, signer, CircleEvent.PAD,
+        PadCore.padDelBody(key), lamport, 1_800_000_000_000L + lamport,
+    )
+
+    private class PadSeam {
+        val upserted = mutableListOf<CircleEvent>()
+        val sent = mutableListOf<CircleRequest>()
+        var current: CircleState = CircleState(
+            id = "c1",
+            keyB64 = "key",
+            role = Role.OWNER,
+            members = listOf(Member("ME", "", Role.OWNER), Member("AABB", "", Role.MEMBER)),
+        )
+    }
+
+    /** Real sync-worker seams with a fake carrier: nothing here opens a socket. */
+    private fun installPadSeam(signer: TlsIdentity): PadSeam {
+        FlitCircleSync.resetForTest()
+        val seam = PadSeam()
+        FlitCircleSync.stateHook = { seam.current }
+        FlitCircleSync.meHook = { "ME" }
+        FlitCircleSync.identityHook = { signer }
+        FlitCircleSync.clockHook = { 1_000L }
+        FlitCircleSync.logHook = { }
+        FlitCircleSync.upsertHook = { events ->
+            seam.upserted += events
+            seam.current = seam.current.copy(events = seam.current.events + events)
+        }
+        FlitCircleSync.dialHook = { fp ->
+            FlitCircleSync.Route(
+                fp,
+                sync = { request -> seam.sent += request; CircleResponse(true) },
+                join = { CircleResponse(false, reason = "unused") },
+            )
+        }
+        return seam
+    }
+
+    @Test
+    fun `pad view rebuilds from signed events with dedup and conflict resolution`() {
+        val alice = TlsIdentity.generate()
+        val bob = TlsIdentity.generate()
+        val events = listOf(
+            padPutEvent(alice, "alpha", "first", "e1", 5L),
+            padPutEvent(bob, "alpha", "stale", "e2", 1L), // older put, inert
+            padDelEvent(bob, "alpha", "e3", 2L),          // older del, inert
+            padPutEvent(alice, "beta", "gone", "e4", 3L),
+            padDelEvent(bob, "beta", "e5", 6L),           // greater del tombstones beta
+            padPutEvent(alice, "gamma", "three", "e6", 7L),
+            padPutEvent(alice, "gamma", "three", "e6", 7L), // replayed id folds once
+            padPutEvent(bob, "delta", "foreign", "e7", 9L, circleId = "other"),
+            CircleCore.create(
+                "c1", alice.fingerprint, alice, CircleEvent.MESSAGE,
+                PadCore.padPutBody("epsilon", "wrong verb"), 8L, 1_800_000_008_000L,
+            ),
+            CircleCore.create(
+                "c1", alice.fingerprint, alice, CircleEvent.PAD,
+                """{"op":"put","key":"zeta"}""", 9L, 1_800_000_009_000L,
+            ),
+        )
+
+        val view = PadCore.view(events, "c1")
+
+        assertEquals(
+            listOf("alpha" to "first", "gamma" to "three"),
+            view.lines.map { it.key to it.text },
+            "live keys are lexicographic; tombstoned, foreign, malformed and stale keys are absent",
+        )
+        assertTrue(view.winners.getValue("beta").deleted, "the greater del is kept as a tombstone")
+        assertEquals(
+            view,
+            PadCore.view(events.shuffled(), "c1"),
+            "a rebuild from the same log is byte-identical regardless of arrival order",
+        )
+        assertEquals(
+            view,
+            PadCore.view(events + events.take(3), "c1"),
+            "re-folding events already present leaves the view unchanged",
+        )
+    }
+
+    @Test
+    fun `engine padView flow rebuilds from a folded store snapshot`() {
+        val alice = TlsIdentity.generate()
+        val snapshot = CircleState(
+            id = "c1",
+            keyB64 = "key",
+            role = Role.OWNER,
+            members = emptyList(),
+            events = listOf(
+                padPutEvent(alice, "alpha", "one", "e1", 2L),
+                padDelEvent(alice, "beta", "e2", 3L),
+                padPutEvent(alice, "gamma", "three", "e3", 4L),
+            ),
+        )
+        // foldPad is the engine's private projection from the signed log into
+        // the StateFlow; driving it here avoids an Android context while still
+        // asserting the flow itself, not just the pure fold it delegates to.
+        val fold = assertNotNull(
+            runCatching { FlitEngine.javaClass.getDeclaredMethod("foldPad", CircleState::class.java) }.getOrNull(),
+            "the engine must project pad state through foldPad",
+        )
+        fold.isAccessible = true
+        fold.invoke(FlitEngine, snapshot)
+
+        assertEquals(
+            listOf("alpha" to "one", "gamma" to "three"),
+            FlitEngine.padView.value.lines.map { it.key to it.text },
+            "the engine flow is rebuilt from the store snapshot, never a second copy",
+        )
+
+        fold.invoke(FlitEngine, snapshot.copy(events = emptyList()))
+        assertTrue(FlitEngine.padView.value.lines.isEmpty(), "a store with no pad events yields an empty flow")
+    }
+
+    @Test
+    fun `postPadPut signs and fans out the exact PadCore put body`() = runBlocking {
+        val signer = TlsIdentity.generate()
+        val seam = installPadSeam(signer)
+        try {
+            FlitCircleSync.postPadPut("topic", "hello pad")
+
+            val event = assertNotNull(seam.upserted.singleOrNull(), "one signed event is committed")
+            assertEquals(CircleEvent.PAD, event.type)
+            assertEquals("c1", event.circleId)
+            assertTrue(event.authorFp.equals(signer.fingerprint, ignoreCase = true))
+            assertTrue(CircleCore.verify(event), "the pad event verifies with its own cert")
+            assertEquals(PadCore.padPutBody("topic", "hello pad"), event.body, "body is the pure builder's bytes")
+            assertTrue(PadCore.validPadBody(event.body))
+            val fields = assertNotNull(runCatching { Json.parseToJsonElement(event.body).jsonObject }.getOrNull())
+            assertEquals(PadCore.PAD_PUT_KEYS, fields.keys, "the put body has exactly three keys")
+            assertEquals("put", fields.getValue("op").jsonPrimitive.content)
+            assertEquals("topic", fields.getValue("key").jsonPrimitive.content)
+            assertEquals("hello pad", fields.getValue("text").jsonPrimitive.content)
+
+            val request = assertNotNull(seam.sent.singleOrNull(), "the event goes out on the existing sync route")
+            assertEquals(CircleRequest.ACTION_SYNC, request.action)
+            assertEquals(listOf(event), request.events, "peers are offered the newly emitted pad event")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `postPadDel signs and fans out the exact PadCore del body`() = runBlocking {
+        val signer = TlsIdentity.generate()
+        val seam = installPadSeam(signer)
+        try {
+            FlitCircleSync.postPadDel("topic")
+
+            val event = assertNotNull(seam.upserted.singleOrNull(), "one signed event is committed")
+            assertEquals(CircleEvent.PAD, event.type)
+            assertEquals("c1", event.circleId)
+            assertTrue(CircleCore.verify(event))
+            assertEquals(PadCore.padDelBody("topic"), event.body, "body is the pure builder's bytes")
+            val fields = assertNotNull(runCatching { Json.parseToJsonElement(event.body).jsonObject }.getOrNull())
+            assertEquals(PadCore.PAD_DEL_KEYS, fields.keys, "the del body has exactly two keys")
+            assertEquals("del", fields.getValue("op").jsonPrimitive.content)
+            assertEquals("topic", fields.getValue("key").jsonPrimitive.content)
+            assertFalse("text" in fields, "a del carries no text")
+
+            val request = assertNotNull(seam.sent.singleOrNull())
+            assertEquals(CircleRequest.ACTION_SYNC, request.action)
+            assertEquals(listOf(event), request.events)
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `pad publish refuses blank and oversized fields before signing or fanning out`() = runBlocking {
+        val signer = TlsIdentity.generate()
+        val seam = installPadSeam(signer)
+        try {
+            FlitCircleSync.postPadPut("  ", "text")
+            FlitCircleSync.postPadPut("key", "  ")
+            FlitCircleSync.postPadPut("x".repeat(PadCore.MAX_KEY_CHARS + 1), "text")
+            FlitCircleSync.postPadPut("key", "x".repeat(PadCore.MAX_TEXT_CHARS + 1))
+            FlitCircleSync.postPadDel("  ")
+            FlitCircleSync.postPadDel("x".repeat(PadCore.MAX_KEY_CHARS + 1))
+
+            assertTrue(seam.upserted.isEmpty(), "a refused body signs no event")
+            assertTrue(seam.sent.isEmpty(), "a refused body never reaches a peer")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `published pad bodies rebuild into the exact live view`() = runBlocking {
+        val signer = TlsIdentity.generate()
+        val seam = installPadSeam(signer)
+        try {
+            FlitCircleSync.postPadPut("alpha", "one")
+            FlitCircleSync.postPadDel("beta")
+            FlitCircleSync.postPadPut("beta", "later")
+            FlitCircleSync.postPadPut("alpha", "final")
+
+            assertEquals(4, seam.upserted.size)
+            assertTrue(seam.upserted.all { it.type == CircleEvent.PAD && CircleCore.verify(it) })
+            assertEquals(
+                listOf("alpha" to "final", "beta" to "later"),
+                PadCore.view(seam.upserted, seam.current.id).lines.map { it.key to it.text },
+                "the view folds the published log: a put after a del wins by order",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
     }
 }

@@ -2,6 +2,7 @@ package app.flit.share
 
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.ideas.peeralias.PeerAlias
 import app.flit.share.protocol.parcel.ParcelCodec
 import app.flit.share.protocol.tls.TlsIdentity
 import android.Manifest
@@ -407,7 +408,7 @@ class MainActivity : ComponentActivity() {
                 val raw = intent.getStringExtra(FlitShortcuts.EXTRA_PEER_FP)
                     ?: intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID)
                 val fp = raw?.takeIf { FlitRoster.pinned(it) }
-                if (fp != null) android.util.Log.i("FlitSend", "share-in: direct target ${FlitRoster.alias(fp) ?: fp.take(8)}")
+                if (fp != null) android.util.Log.i("FlitSend", "share-in: direct target ${FlitRoster.alias(fp) ?: PeerAlias.of(fp)?.text ?: fp}")
                 autoPeerFp.value = fp
                 FlitEngine.handleShareIntent(intent, referrerHost = referrer?.host)
                 // Funnel every Activity-originated start through the one
@@ -558,6 +559,9 @@ class MainActivity : ComponentActivity() {
         val panicEvents by FlitEngine.panicEvents.collectAsState()
         val circleState by FlitEngine.circleState.collectAsState()
         val circleEvents by FlitEngine.circleEvents.collectAsState()
+        // Shared pad: a derived view rebuilt by the engine on every store fold,
+        // never a second persisted copy. The UI only renders and sends callbacks.
+        val padView by FlitEngine.padView.collectAsState()
         // Only shas with a copy actually openable on THIS device get an Open action.
         val landedShas by FlitEngine.circleLandedShas.collectAsState()
         // Process-local courier outcomes keyed by SHA-256; the file card reads its carry line from this.
@@ -1543,6 +1547,10 @@ class MainActivity : ComponentActivity() {
                                         landedSha256 = landedShas,
                                         openingSha256 = openingSha256,
                                         courierHandoffs = courierHandoffs,
+                                        // ---- pad surface: view from the engine, actions back to it ----
+                                        padView = padView,
+                                        onPadPut = { key, text -> FlitEngine.circlePadPut(key, text) },
+                                        onPadDel = { key -> FlitEngine.circlePadDel(key) },
                                     )
                                     snackbarHost(
                                         Modifier
@@ -2411,7 +2419,7 @@ class MainActivity : ComponentActivity() {
                         title = "Mirror to",
                         subtitle = when (val fp = mirrorTarget) {
                             null -> "choose a trusted device — new camera shots go to it"
-                            else -> FlitRoster.aliasFor(fp) ?: fp.take(12)
+                            else -> FlitRoster.aliasFor(fp) ?: PeerAlias.of(fp)?.text ?: fp
                         },
                         onClick = { showMirrorPicker = true },
                     )
@@ -2431,7 +2439,7 @@ class MainActivity : ComponentActivity() {
                                         } else {
                                             pinned.forEach { p ->
                                                 Text(
-                                                    p.alias.ifBlank { p.fingerprint.take(12) },
+                                                    p.alias.ifBlank { PeerAlias.of(p.fingerprint)?.text ?: p.fingerprint },
                                                     style = MaterialTheme.typography.bodyLarge,
                                                     modifier = Modifier
                                                         .fillMaxWidth()
@@ -2789,7 +2797,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun PanicBanner(event: FlitEngine.PanicEvent) {
         val cs = MaterialTheme.colorScheme
-        val from = event.alias?.takeIf { it.isNotBlank() } ?: event.senderFp.take(12)
+        val from = event.alias?.takeIf { it.isNotBlank() } ?: PeerAlias.of(event.senderFp)?.text ?: event.senderFp
         Surface(
             shape = RoundedCornerShape(FlitCorner.large),
             color = cs.errorContainer,
@@ -2871,7 +2879,7 @@ class MainActivity : ComponentActivity() {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            device.alias.ifBlank { fp.take(12) },
+                                            device.alias.ifBlank { PeerAlias.of(fp)?.text ?: fp },
                                             style = MaterialTheme.typography.titleSmall,
                                             fontWeight = FontWeight.SemiBold,
                                         )

@@ -22,6 +22,8 @@ import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.circle.DropKeyCore
+import app.flit.share.protocol.circle.PadCore
+import app.flit.share.protocol.circle.PadView
 import app.flit.share.protocol.courier.CourierCarryCore
 import app.flit.share.protocol.courier.CourierEnvelope
 import app.flit.share.protocol.model.CircleRequest
@@ -385,6 +387,14 @@ val share: StateFlow<ShareIntake?> = _share
     val circleEvents: StateFlow<List<CircleEvent>> = _circleEvents
 
     /**
+     * Derived shared pad. The signed `pad` events in the store are the only
+     * durable state; this flow is a projection rebuilt from them on every
+     * store fold, never a second persisted copy.
+     */
+    private val _padView = MutableStateFlow(PadView(emptyList()))
+    val padView: StateFlow<PadView> = _padView
+
+    /**
      * The announced material of one keyed drop, read from a signed `file` body.
      * The content key is never held here — only its wrapped form and the two
      * digests, so a restart leaves nothing but the wrapped key in the log.
@@ -518,12 +528,40 @@ val share: StateFlow<ShareIntake?> = _share
         FlitCircleSync.handoffPublishHook = null
     }
 
+    /** Rebuild the derived pad view from a folded store snapshot. */
+    private fun foldPad(st: FlitCircleStore.CircleState?) {
+        _padView.value = PadCore.view(st?.events.orEmpty(), st?.id.orEmpty())
+    }
+
+    /**
+     * Deterministic digest of the derived pad, part of the Circle signature:
+     * an edit (or a tombstone) republishes the flows even when the bounded log
+     * evicts as it appends, so its size and last id alone would not move.
+     */
+    private fun padDigest(view: PadView): String {
+        val canonical = buildString {
+            view.lines.forEach {
+                append(it.key).append('\u001f').append(it.text).append('\u001f')
+                    .append(it.lamport).append('\u001f').append(it.authorFp).append('\u001f')
+                    .append(it.id).append('\n')
+            }
+            append('\u001e')
+            view.winners.entries.sortedBy { it.key }.forEach { (key, line) ->
+                append(key).append('\u001f').append(line.text).append('\u001f')
+                    .append(line.lamport).append('\u001f').append(line.authorFp).append('\u001f')
+                    .append(line.id).append('\u001f').append(line.deleted).append('\n')
+            }
+        }
+        return sha256Hex(canonical.toByteArray(Charsets.UTF_8))
+    }
+
     private fun refreshCircle() {
         if (!::appCtx.isInitialized) return
         // The invite is a bearer token but it is this device's own circle;
         // persisting it keeps the host able to admit members after a restart.
         circleInvite = prefs().getString("circleInvite", null)
         val st = FlitCircleStore.load(appCtx)
+        foldPad(st)
         val signature = listOf(
             st?.id.orEmpty(), st?.keyB64.orEmpty(),
             st?.events?.size.toString(), st?.events?.lastOrNull()?.id.orEmpty(),
@@ -535,6 +573,8 @@ val share: StateFlow<ShareIntake?> = _share
             _courierHandoffs.value.entries
                 .sortedBy { it.key }
                 .joinToString(";") { "${it.key}:${it.value.outcome}" },
+            // A pad edit publishes even when the log size and last id do not move.
+            padDigest(_padView.value),
         ).joinToString("|")
         if (signature == lastCircleSignature) return // no-op tick: do not invalidate Compose
         lastCircleSignature = signature
@@ -913,6 +953,24 @@ val share: StateFlow<ShareIntake?> = _share
         val body = buildJsonObject { put("text", JsonPrimitive(text)) }.toString()
         runCatching { FlitCircleSync.post("message", body) }
             .onFailure { logLine("circle post failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    /**
+     * Publish one pad line through the signed sync path. The body and its
+     * bounds come from [PadCore.padPutBody] in the sync layer; no local pad
+     * state is written here — the fold of the signed event rebuilds [padView].
+     */
+    fun circlePadPut(key: String, text: String) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.postPadPut(key, text) }
+            .onFailure { logLine("circle pad put failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    /** Tombstone one pad line through the same signed sync path. */
+    fun circlePadDel(key: String) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.postPadDel(key) }
+            .onFailure { logLine("circle pad del failed: ${it.message}") }
         refreshCircle()
     }
 
@@ -1362,6 +1420,7 @@ val share: StateFlow<ShareIntake?> = _share
             _circleState.value = next
             _circleEvents.value = CircleCore.order(next.events)
             rebuildDropKeyIndex(_circleEvents.value)
+            foldPad(next)
         }
         if (host.isEvidence(answer, st) && ::appCtx.isInitialized) {
             logLine("circle host: ${req.action} ${req.memberFp.take(12)} — ${answer.events.size} event(s)")
@@ -1638,6 +1697,9 @@ val share: StateFlow<ShareIntake?> = _share
         if (_state.value.running || _state.value.starting) return
         appCtx = ctx.applicationContext
         FlitRoster.init(appCtx)
+        // Observation only: validate the shipped BLE duty cycle and log any
+        // violation. The report never reaches the carrier arbiter.
+        FlitBle.auditDutySchedule { line -> logLine(line) }
         _queue.value = FlitRoster.queued() // pick up send-later entries from a previous run
         addManualStubs() // previously added by-address devices stay listed
         // Test-only dead-link emulation (see PeerHttpClient.testAbortBytes).
