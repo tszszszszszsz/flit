@@ -532,6 +532,97 @@ class FlitCircleStoreTest {
     }
 
     @Test
+    fun `a same batch promotion cannot turn a member kick into an admin kick in either order`() {
+        val promote = event(
+            "r-promote", "fp-owner", "role", """{"targetFp":"fp-member","role":"ADMIN"}""",
+        )
+        val kick = event(
+            "k-exec", "fp-member", "kick",
+            """{"kickId":"k-exec","targetFp":"fp-admin","mode":"admin"}""", lamport = 2,
+        )
+        for (batch in listOf(listOf(promote, kick), listOf(kick, promote))) {
+            val merged = FlitCircleStore.merge(state(), batch)
+            assertEquals(
+                FlitCircleStore.Role.ADMIN,
+                merged.members.first { it.fp == "fp-member" }.role,
+            )
+            assertEquals(3, merged.members.size, "the member's admin kick must not execute")
+            assertEquals(0, merged.rekeyGen)
+            assertEquals(batch.map { it.id }, merged.events.map { it.id })
+        }
+    }
+
+    @Test
+    fun `role authority comes from the pre batch roster not the folded roster`() {
+        val newcomer = FlitCircleStore.Member("fp-new", "New", FlitCircleStore.Role.MEMBER, 4)
+        val start = state(members = roster + newcomer)
+        val promote = event(
+            "r-promote", "fp-owner", "role", """{"targetFp":"fp-member","role":"ADMIN"}""",
+        )
+        val selfServe = event(
+            "r-self", "fp-member", "role", """{"targetFp":"fp-new","role":"ADMIN"}""", lamport = 2,
+        )
+        for (batch in listOf(listOf(promote, selfServe), listOf(selfServe, promote))) {
+            val merged = FlitCircleStore.merge(start, batch)
+            assertEquals(
+                FlitCircleStore.Role.MEMBER,
+                merged.members.first { it.fp == "fp-new" }.role,
+                "a same-batch promotion cannot vouch for the promoted member's own role event",
+            )
+            assertEquals(
+                FlitCircleStore.Role.ADMIN,
+                merged.members.first { it.fp == "fp-member" }.role,
+            )
+            assertEquals(4, merged.members.size)
+        }
+    }
+
+    @Test
+    fun `a same batch demotion does not strip an officer kick authority`() {
+        val demote = event(
+            "r-demote", "fp-owner", "role", """{"targetFp":"fp-admin","role":"MEMBER"}""",
+        )
+        val kick = event(
+            "k-officer", "fp-admin", "kick",
+            """{"targetFp":"fp-member","mode":"admin"}""", lamport = 2,
+        )
+        for (batch in listOf(listOf(demote, kick), listOf(kick, demote))) {
+            val merged = FlitCircleStore.merge(state(), batch)
+            assertEquals(
+                listOf("fp-owner", "fp-admin"),
+                merged.members.map { it.fp },
+                "the officer's executive kick survives a same-batch demotion",
+            )
+            assertEquals(1, merged.rekeyGen)
+        }
+    }
+
+    @Test
+    fun `two argument applyRole and applyKick still use the state roster`() {
+        val promoted = FlitCircleStore.reduce(
+            state(), event("r-1", "fp-owner", "role", """{"targetFp":"fp-member","role":"ADMIN"}"""),
+        )
+        val directKick = FlitCircleStore.applyKick(
+            promoted, event("k-1", "fp-member", "kick", """{"targetFp":"fp-admin","mode":"admin"}"""),
+        )
+        assertEquals(listOf("fp-owner", "fp-member"), directKick.members.map { it.fp })
+        assertEquals(1, directKick.rekeyGen)
+
+        val byAdmin = FlitCircleStore.applyRole(
+            state(), event("r-2", "fp-admin", "role", """{"targetFp":"fp-member","role":"ADMIN"}"""),
+        )
+        assertEquals(FlitCircleStore.Role.MEMBER, byAdmin.members.first { it.fp == "fp-member" }.role)
+
+        // The explicit snapshot wins over what the folded state currently says.
+        val stale = FlitCircleStore.applyRole(
+            promoted,
+            event("r-3", "fp-member", "role", """{"targetFp":"fp-admin","role":"MEMBER"}"""),
+            mapOf("FP-MEMBER" to "MEMBER"),
+        )
+        assertEquals(FlitCircleStore.Role.ADMIN, stale.members.first { it.fp == "fp-admin" }.role)
+    }
+
+    @Test
     fun `wrong circle events are ignored and the log is bounded`() {
         val alien = event("x-1", "fp-owner", "message").copy(circleId = "other")
         assertEquals(state(), FlitCircleStore.reduce(state(), alien))

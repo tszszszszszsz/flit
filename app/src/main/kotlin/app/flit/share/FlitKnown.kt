@@ -87,8 +87,40 @@ object FlitKnown {
     private fun save(store: Store, devices: List<Device>) =
         store.putString(KEY_DEVICES, encode(devices))
 
-    /** One row per fingerprint: re-adding a device refreshes its record. */
+    /**
+     * One row per fingerprint. A re-scan refreshes the device details (alias,
+     * address, relay, token, scanned time) but must not erase the preferences
+     * this device owner chose locally: route policy, relay-forward and
+     * panic-forward flags, and the free-form label. Those are merged from the
+     * existing row whenever the incoming value is absent or left at its
+     * default, so scanning the same QR twice is idempotent for settings.
+     * An explicitly non-default policy/capability in [device] still wins; use
+     * [replace] when a caller needs to write an explicit false/blank value.
+     */
     fun put(store: Store, device: Device) {
+        val existing = all(store).firstOrNull { it.fingerprint == device.fingerprint }
+        val merged = if (existing == null) device else device.copy(
+            alias = device.alias.ifBlank { existing.alias },
+            label = device.label.ifBlank { existing.label },
+            mac = device.mac?.takeIf { it.isNotBlank() } ?: existing.mac,
+            relay = device.relay?.takeIf { it.isNotBlank() } ?: existing.relay,
+            token = device.token?.takeIf { it.isNotBlank() } ?: existing.token,
+            routePolicy = if (device.routePolicy == RoutePolicy.AUTO) {
+                existing.routePolicy
+            } else device.routePolicy,
+            relayFor = device.relayFor || existing.relayFor,
+            panicForward = device.panicForward || existing.panicForward,
+            scannedMs = maxOf(device.scannedMs, existing.scannedMs),
+        )
+        replace(store, merged)
+    }
+
+    /**
+     * Explicit whole-row write for settings controls that must be able to
+     * clear a value (turn relayFor off, blank a label, reset a policy). QR
+     * intake uses [put] so a re-scan never clobbers those local choices.
+     */
+    fun replace(store: Store, device: Device) {
         val next = all(store).filterNot { it.fingerprint == device.fingerprint } + device
         save(store, next)
     }
@@ -121,6 +153,8 @@ object FlitKnown {
     fun all(ctx: Context): List<Device> = all(store(ctx))
 
     fun put(ctx: Context, device: Device) = put(store(ctx), device)
+
+    fun replace(ctx: Context, device: Device) = replace(store(ctx), device)
 
     fun forget(ctx: Context, fp: String) = forget(store(ctx), fp)
 

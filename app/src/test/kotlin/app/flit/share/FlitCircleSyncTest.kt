@@ -273,6 +273,9 @@ class FlitCircleSyncTest {
         FlitCircleSync.clockHook = now
         FlitCircleSync.logHook = { logs.add(it) }
         FlitCircleSync.dialHook = dial
+        // The carrier fakes in this file are unsigned by construction. Adversarial
+        // tests replace this with the real CircleResponse.verify gate.
+        FlitCircleSync.responseVerifyHook = { _, _ -> true }
     }
 
     private fun route(
@@ -1173,7 +1176,15 @@ class FlitCircleSyncTest {
             "c1", sender.fingerprint, sender, CircleEvent.REKEY,
             """{"keyB64":"newkey","gen":9}""", 3L, COURIER_NOW,
         )
-        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(file, join, rekey))
+        val role = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.ROLE,
+            """{"targetFp":"AABB","role":"ADMIN"}""", 4L, COURIER_NOW,
+        )
+        val kick = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.KICK,
+            """{"targetFp":"AABB","mode":"admin"}""", 5L, COURIER_NOW,
+        )
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(join, rekey))
         // The roster deliberately omits sender. A validly sealed and signed
         // parcel still may not rewrite our roster or group key once opened.
         var current = courierState(recipient.fingerprint, "AABB")
@@ -1769,6 +1780,75 @@ class FlitCircleSyncTest {
         }
     }
 
+    @Test
+    fun `fresh refuses role kick rekey and join from a non member author`() {
+        FlitCircleSync.resetForTest()
+        val officer = TlsIdentity.generate()
+        val outsider = TlsIdentity.generate()
+        val st = state(officer.fingerprint).copy(
+            members = listOf(Member(officer.fingerprint, "", Role.OWNER)),
+        )
+        val join = signedEvent("nm-join", outsider, 1L, CircleEvent.JOIN, """{"alias":"ghost"}""")
+        val role = signedEvent(
+            "nm-role", outsider, 2L, CircleEvent.ROLE,
+            """{"targetFp":"${officer.fingerprint}","role":"MEMBER"}""",
+        )
+        val kick = signedEvent(
+            "nm-kick", outsider, 3L, CircleEvent.KICK,
+            """{"targetFp":"${officer.fingerprint}","mode":"admin"}""",
+        )
+        val rekey = signedEvent(
+            "nm-rekey", outsider, 4L, CircleEvent.REKEY,
+            circleRekeyBody("newkey", 1, emptyList()),
+        )
+        val ordinary = signedEvent("nm-message", outsider, 5L)
+        try {
+            assertEquals(
+                listOf(ordinary),
+                FlitCircleSync.fresh(st, listOf(rekey, kick, role, join, ordinary), COURIER_NOW),
+                "governance verbs need a current member author; ordinary verbs do not",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
+    @Test
+    fun `fresh drops a member admin kick but admits an officer admin kick and a member vote kick`() {
+        FlitCircleSync.resetForTest()
+        val owner = TlsIdentity.generate()
+        val admin = TlsIdentity.generate()
+        val member = TlsIdentity.generate()
+        val st = state(owner.fingerprint).copy(
+            members = listOf(
+                Member(owner.fingerprint, "", Role.OWNER),
+                Member(admin.fingerprint, "", Role.ADMIN),
+                Member(member.fingerprint, "", Role.MEMBER),
+            ),
+        )
+        val memberAdminKick = signedEvent(
+            "bad-kick", member, 1L, CircleEvent.KICK,
+            """{"targetFp":"${admin.fingerprint}","mode":"admin"}""",
+        )
+        val officerKick = signedEvent(
+            "ok-kick", admin, 2L, CircleEvent.KICK,
+            """{"targetFp":"${member.fingerprint}","mode":"admin"}""",
+        )
+        val voteKick = signedEvent(
+            "vote-kick", member, 3L, CircleEvent.KICK,
+            """{"targetFp":"${admin.fingerprint}","mode":"vote"}""",
+        )
+        try {
+            assertEquals(
+                listOf(officerKick, voteKick),
+                FlitCircleSync.fresh(st, listOf(memberAdminKick, officerKick, voteKick), COURIER_NOW),
+                "admin mode needs an officer; a member may only open a vote-kick",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+    }
+
     // ==== join proof: the signed bearer handshake ================================
 
     @Test
@@ -1864,13 +1944,24 @@ class FlitCircleSyncTest {
         val me = recipient.fingerprint
         val file = courierFileEvent(officer, "ordinary-sha")
         // Same officer who is a current OWNER in the roster: role data is NOT
-        // supplied to the authority gate here, so neither verb may be folded.
+        // supplied to the authority gate here, so none of the four privileged
+        // verbs may be folded.
         val join = signedEvent("sealed-join", officer, 2L, CircleEvent.JOIN, """{"alias":"owner"}""")
         val rekey = signedEvent(
             "sealed-rekey", officer, 3L, CircleEvent.REKEY,
             circleRekeyBody("newkey", 9, emptyList()),
         )
-        val (parcelEvent, _) = sealedParcel(officer, recipient, listOf(file, join, rekey), toFp = me)
+        val role = signedEvent(
+            "sealed-role", officer, 4L, CircleEvent.ROLE,
+            """{"targetFp":"$me","role":"ADMIN"}""",
+        )
+        val kick = signedEvent(
+            "sealed-kick", officer, 5L, CircleEvent.KICK,
+            """{"targetFp":"$me","mode":"admin"}""",
+        )
+        val (parcelEvent, _) = sealedParcel(
+            officer, recipient, listOf(file, role, kick), toFp = me,
+        )
         var current = courierState(me, "AABB").copy(
             members = listOf(
                 Member(me, "", Role.MEMBER),
@@ -1897,10 +1988,243 @@ class FlitCircleSyncTest {
             assertEquals(
                 listOf(file),
                 upserted,
-                "a sealed JOIN/REKEY is refused even when its author is an officer",
+                "sealed JOIN/ROLE/KICK/REKEY are refused even from an OWNER author",
             )
             assertTrue(bagWrites.isNotEmpty(), "the parcel itself is still held")
             assertTrue(logs.any { it.contains("rejected 2 opened event(s)") }, logs.toString())
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    // ==== answer signature gate on sync and fan-out =============================
+
+    /** Install the real CircleResponse.verify gate with the dialed peer as host. */
+    private fun strictAnswerVerify() {
+        FlitCircleSync.responseVerifyHook = { response, fp -> CircleResponse.verify(response, fp) }
+    }
+
+    /**
+     * A live parcel addressed to the peer we dial, so a successful answer would
+     * select it for handoff; a signed MESSAGE in the answer would be folded if
+     * the answer were trusted. Both effects are observable through pure seams.
+     */
+    private class AnswerFixture(
+        val host: TlsIdentity,
+        val parcelEvent: CircleEvent,
+        val incoming: CircleEvent,
+        val initial: CircleState,
+        val next: CircleState,
+        val e1: CircleEvent,
+        val e2: CircleEvent,
+    )
+
+    private fun answerFixture(sha: String, foldText: String): AnswerFixture {
+        val host = TlsIdentity.generate()
+        val sender = TlsIdentity.generate()
+        val e1 = event("e1", 1L)
+        val e2 = event("e2", 2L)
+        val incoming = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.MESSAGE,
+            """{"text":"$foldText"}""", 5L, 1_000L,
+        )
+        val inner = courierFileEvent(sender, sha)
+        val (parcelEvent, _) = sealedParcel(sender, host, listOf(inner), toFp = host.fingerprint)
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
+        val initial = courierState("ME", host.fingerprint, parcel).copy(events = listOf(e1))
+        return AnswerFixture(host, parcelEvent, incoming, initial, initial.copy(events = listOf(e1, e2)), e1, e2)
+    }
+
+    @Test
+    fun `fanout refuses a forged ok answer without advancing watermark handoff or fold`() = runBlocking {
+        CourierCarryCore.clear()
+        val fx = answerFixture("forged-handoff-sha", "forged fan-out fold")
+        val sent = mutableListOf<CircleRequest>()
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        installSeam(fx.initial, dial = { fp ->
+            route(fp) { req ->
+                sent += req
+                // A convincing OK with a foldable, properly signed event — but
+                // no host signature over the answer itself.
+                CircleResponse(true, events = listOf(fx.incoming))
+            }
+        })
+        var current = fx.initial
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { s, outcome -> outcomes += s to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.courierTrack(fx.parcelEvent.id, listOf("forged-handoff-sha"))
+        strictAnswerVerify()
+        try {
+            FlitCircleSync.fanout(fx.initial, listOf(fx.e1))
+
+            assertEquals(1, sent.size)
+            assertTrue(fx.e1 in sent.single().events, "the delta was still offered")
+            assertTrue(upserted.isEmpty(), "a forged answer must not fold its events")
+            assertTrue(bagWrites.isEmpty(), "a forged answer must not ack the courier bag")
+            assertTrue(outcomes.isEmpty(), "a forged answer must publish no handoff outcome")
+
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `fanout folds a correctly signed answer and advances watermark and handoff`() = runBlocking {
+        CourierCarryCore.clear()
+        val fx = answerFixture("signed-handoff-sha", "signed fan-out fold")
+        val answer = CircleResponse.sign(CircleResponse(true, events = listOf(fx.incoming)), fx.host)
+        val sent = mutableListOf<CircleRequest>()
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        installSeam(fx.initial, dial = { fp -> route(fp) { req -> sent += req; answer } })
+        var current = fx.initial
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { s, outcome -> outcomes += s to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.courierTrack(fx.parcelEvent.id, listOf("signed-handoff-sha"))
+        strictAnswerVerify()
+        try {
+            FlitCircleSync.fanout(fx.initial, listOf(fx.e1))
+
+            assertEquals(listOf(fx.incoming), upserted, "a signed answer still folds its events")
+            assertEquals(listOf("signed-handoff-sha" to "handed"), outcomes)
+            assertTrue(bagWrites.isNotEmpty(), "a successful handoff acks the bag")
+            assertTrue(
+                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().isEmpty(),
+                "the handed parcel is removed from the bag",
+            )
+
+            current = fx.next.copy(courierBag = current.courierBag)
+            sent.clear()
+            FlitCircleSync.fanout(fx.next, listOf(fx.e2))
+            assertEquals(listOf(fx.e2), sent.single().events, "the signed OK advanced the watermark")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `sync refuses a forged ok answer without advancing watermark handoff or fold`() = runBlocking {
+        CourierCarryCore.clear()
+        val fx = answerFixture("forged-sync-sha", "forged sync fold")
+        val sent = mutableListOf<CircleRequest>()
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        installSeam(fx.initial, dial = { fp ->
+            route(fp) { req ->
+                sent += req
+                CircleResponse(true, events = listOf(fx.incoming))
+            }
+        })
+        var current = fx.initial
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { s, outcome -> outcomes += s to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.courierTrack(fx.parcelEvent.id, listOf("forged-sync-sha"))
+        strictAnswerVerify()
+        try {
+            FlitCircleSync.sync()
+
+            assertEquals(1, sent.size)
+            assertTrue(upserted.isEmpty(), "a forged answer must not fold its events")
+            assertTrue(bagWrites.isEmpty(), "a forged answer must not ack the courier bag")
+            assertTrue(outcomes.isEmpty(), "a forged answer must publish no handoff outcome")
+
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `sync folds a correctly signed answer and advances watermark and handoff`() = runBlocking {
+        CourierCarryCore.clear()
+        val fx = answerFixture("signed-sync-sha", "signed sync fold")
+        val answer = CircleResponse.sign(CircleResponse(true, events = listOf(fx.incoming)), fx.host)
+        val sent = mutableListOf<CircleRequest>()
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        installSeam(fx.initial, dial = { fp -> route(fp) { req -> sent += req; answer } })
+        var current = fx.initial
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { s, outcome -> outcomes += s to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.courierTrack(fx.parcelEvent.id, listOf("signed-sync-sha"))
+        strictAnswerVerify()
+        try {
+            FlitCircleSync.sync()
+
+            assertEquals(listOf(fx.incoming), upserted, "a signed sync answer still folds")
+            assertEquals(listOf("signed-sync-sha" to "handed"), outcomes)
+            assertTrue(bagWrites.isNotEmpty())
+            assertTrue(
+                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().isEmpty(),
+                "the handed parcel is removed from the bag",
+            )
+
+            current = fx.next.copy(courierBag = current.courierBag)
+            sent.clear()
+            FlitCircleSync.fanout(fx.next, listOf(fx.e2))
+            assertEquals(listOf(fx.e2), sent.single().events, "the signed repair sets the watermark")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `fanout refuses a signed answer whose signer is not the host we dialed`() = runBlocking {
+        CourierCarryCore.clear()
+        val fx = answerFixture("wrong-host-sha", "wrong host fold")
+        val impostor = TlsIdentity.generate()
+        val answer = CircleResponse.sign(CircleResponse(true, events = listOf(fx.incoming)), impostor)
+        val upserted = mutableListOf<CircleEvent>()
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        val sent = mutableListOf<CircleRequest>()
+        installSeam(fx.initial, dial = { fp -> route(fp) { req -> sent += req; answer } })
+        var current = fx.initial
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { s, outcome -> outcomes += s to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.courierTrack(fx.parcelEvent.id, listOf("wrong-host-sha"))
+        strictAnswerVerify()
+        try {
+            FlitCircleSync.fanout(fx.initial, listOf(fx.e1))
+
+            assertEquals(1, sent.size)
+            assertTrue(upserted.isEmpty(), "a wrong-host signature must not fold its events")
+            assertTrue(bagWrites.isEmpty(), "a wrong-host signature must not ack the bag")
+            assertTrue(outcomes.isEmpty(), "a wrong-host signature must publish no handoff")
         } finally {
             FlitCircleSync.resetForTest()
         }

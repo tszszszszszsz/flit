@@ -48,6 +48,9 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
@@ -172,6 +175,16 @@ data class ShareIntake(
 
 private val _share = MutableStateFlow<ShareIntake?>(null)
 val share: StateFlow<ShareIntake?> = _share
+
+    /**
+     * UI preselection only. An external intent may highlight a peer row; it
+     * never authorizes a send. Dispatch continues to require an explicit
+     * [sendShare] call from a user tap, and EXTRA_SHORTCUT_ID is never read as
+     * a trust statement (see [preselectedPeerFromIntent]).
+     */
+    private val _preselectedPeer = MutableStateFlow<String?>(null)
+    val preselectedPeer: StateFlow<String?> = _preselectedPeer
+    fun clearPreselectedPeer() { _preselectedPeer.value = null }
 
     private val _state = MutableStateFlow(EngineState())
     val state: StateFlow<EngineState> = _state
@@ -584,13 +597,39 @@ val share: StateFlow<ShareIntake?> = _share
         _circleDeliveries.value = st?.deliveries.orEmpty()
     }
 
+    /**
+     * Pure trust decision for an incoming alert. A forward is re-signed by the
+     * relay, so `senderFp` is only the last hop. When the code declares an
+     * origin, `PanicCore.verifyOrigin` binds that string to the certificate
+     * that signed hop zero; only then is it used as the trust anchor. A raw
+     * `originFp` is never trusted on its own, and a failed origin check is a
+     * refusal even if the last hop's sender is itself known. Legacy alerts
+     * with no originFp fall back to the sender, whose signature is verified
+     * against its own pinned certificate.
+     */
+    internal fun trustedPanicOrigin(
+        alert: PanicAlert,
+        verifySender: (PanicAlert) -> Boolean = { PanicCore.verify(it) },
+        verifyOrigin: (PanicAlert) -> Boolean = { PanicCore.verifyOrigin(it) },
+    ): String? {
+        if (!verifySender(alert)) return null
+        val declared = alert.originFp.trim()
+        if (declared.isEmpty()) {
+            return alert.senderFp.trim().takeIf { it.isNotBlank() }?.uppercase(Locale.ROOT)
+        }
+        if (!verifyOrigin(alert)) return null
+        return declared.uppercase(Locale.ROOT)
+    }
+
     /** Incoming alert: signed, from a QR-known device, deduped, never auto-acting. */
     internal fun onPanicReceived(alert: PanicAlert, ip: String) {
-        // A forward is re-signed by an intermediary; the ORIGINAL author is
-        // the trust anchor, so gate on originFp (defaulting to senderFp).
-        val origin = alert.originFp.ifBlank { alert.senderFp }
-        if (!PanicCore.verify(alert) || !knownFingerprint(origin)) {
-            logLine("panic: ignored unverified or QR-unknown origin ${origin.take(12)}")
+        // The origin is the verified digest, never the declared originFp.
+        val origin = trustedPanicOrigin(alert) ?: run {
+            logLine("panic: ignored unverified origin ${alert.originFp.take(12)}")
+            return
+        }
+        if (!persistedKnownFingerprint(origin)) {
+            logLine("panic: ignored QR-unknown origin ${origin.take(12)}")
             return
         }
         if (_panicEvents.value.any { it.id == alert.id }) return
@@ -656,7 +695,13 @@ val share: StateFlow<ShareIntake?> = _share
                 val r = runCatching { FlitRoster.routeFor(d.fingerprint) }.getOrNull()
                 if (r != null && !r.isBluetooth && r.port in 1..65535) {
                     sent = runCatching {
-                        client?.sendPanic(SendTarget(r.host, r.port, r.tls), alert) == true
+                        client?.sendPanic(
+                            SendTarget(
+                                r.host, r.port, r.tls,
+                                expectServerFp = persistedPinFor(d.fingerprint),
+                            ),
+                            alert,
+                        ) == true
                     }.getOrDefault(false)
                 }
             }
@@ -664,7 +709,13 @@ val share: StateFlow<ShareIntake?> = _share
             if (!sent && (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY)) {
                 if (!d.mac.isNullOrBlank() && btClient != null) {
                     sent = runCatching {
-                        btClient!!.sendPanic(SendTarget(d.mac, 0, tls = true), alert) == true
+                        btClient!!.sendPanic(
+                            SendTarget(
+                                d.mac, 0, tls = true,
+                                expectServerFp = persistedPinFor(d.fingerprint),
+                            ),
+                            alert,
+                        ) == true
                     }.getOrDefault(false)
                 }
             }
@@ -678,7 +729,11 @@ val share: StateFlow<ShareIntake?> = _share
                         d.fingerprint, d.token ?: relayConfig()?.token, relay.first, relay.second,
                     )
                     if (dialer != null) {
-                        val target = SendTarget(relay.first, relay.second, tls = true, relayFor = d.fingerprint)
+                        val pin = persistedPinFor(d.fingerprint)
+                        val target = SendTarget(
+                            relay.first, relay.second, tls = true,
+                            relayFor = pin ?: d.fingerprint, expectServerFp = pin,
+                        )
                         sent = runCatching { dialer.sendPanic(target, alert) == true }.getOrDefault(false)
                     }
                 }
@@ -940,6 +995,13 @@ val share: StateFlow<ShareIntake?> = _share
     }
 
     fun joinCircle(code: QrAdd) {
+        // A v3 invite arrives as a deep link: its ip/relay fields are just as
+        // untrusted as a scanned code's. Never dial off-LAN from a link.
+        if (!code.lanOnly) {
+            logLine("circle join: code points off the local network — refused")
+            toast("that invite points outside the local network")
+            return
+        }
         if (!::appCtx.isInitialized) return
         // Never persist a bearer invite before the host proves it accepted.
         scope.launch(Dispatchers.IO) {
@@ -1072,6 +1134,39 @@ val share: StateFlow<ShareIntake?> = _share
     internal fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
+    /**
+     * Resolve an announced name to a direct child of [dir]. The protocol's
+     * [DropKeyCore.safeLandingName] rejects separators, `..`, controls and
+     * device names; this seam re-checks it at write time and rejects any name
+     * that would resolve to anything other than one child of the directory.
+     */
+    internal fun landingFileFor(dir: File, name: String): File? {
+        if (!DropKeyCore.safeLandingName(name)) return null
+        val child = File(dir, name)
+        if (child.name != name || child.parentFile?.absolutePath != dir.absolutePath) return null
+        return child
+    }
+
+    /**
+     * Exclusive, no-follow landing write: CREATE_NEW fails on an existing file
+     * or symlink, NOFOLLOW_LINKS keeps a racing symlink from being traversed,
+     * and a symlinked parent directory is refused outright. Returns the file
+     * only when fresh plaintext was written inside [dir], else null.
+     */
+    internal fun writeLandingFile(dir: File, name: String, bytes: ByteArray): File? {
+        val target = landingFileFor(dir, name) ?: return null
+        val parent = target.parentFile ?: return null
+        if (Files.isSymbolicLink(parent.toPath()) || Files.isSymbolicLink(target.toPath())) return null
+        return runCatching {
+            Files.newOutputStream(
+                target.toPath(),
+                StandardOpenOption.CREATE_NEW,
+                LinkOption.NOFOLLOW_LINKS,
+            ).use { it.write(bytes) }
+            target
+        }.getOrNull()
+    }
+
     /** One open attempt against the announced material of a keyed drop. */
     internal sealed interface KeyedDropOpen {
         data class Opened(val name: String, val sha256: String, val plaintext: ByteArray) : KeyedDropOpen
@@ -1135,9 +1230,18 @@ val share: StateFlow<ShareIntake?> = _share
             return true
         }
         val good = opened as KeyedDropOpen.Opened
-        val plainFile = File(landed.parentFile, name)
-        if (!runCatching { plainFile.writeBytes(good.plaintext) }.isSuccess) {
-            logLine("circle drop: cannot open $name (write failed)")
+        // The body parser already refused an unsafe announced name; re-check
+        // it here because the material came from an in-memory index that can
+        // outlive a code change, and because name is a write-time input.
+        if (!DropKeyCore.safeLandingName(material.name)) {
+            logLine("circle drop: unsafe announced landing name — refused")
+            runCatching { landed.delete() }
+            return true
+        }
+        val dir = landed.parentFile
+        val plainFile = if (dir == null) null else writeLandingFile(dir, material.name, good.plaintext)
+        if (plainFile == null) {
+            logLine("circle drop: cannot open $name (landing write refused)")
             runCatching { landed.delete() }
             return true
         }
@@ -1368,12 +1472,21 @@ val share: StateFlow<ShareIntake?> = _share
         if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.WIFI_ONLY) {
             val r = runCatching { FlitRoster.routeFor(fp) }.getOrNull()
             if (r != null && !r.isBluetooth && r.port in 1..65535 && client != null) {
-                return CircleRoute(client!!, SendTarget(r.host, r.port, r.tls))
+                return CircleRoute(
+                    client!!,
+                    SendTarget(
+                        r.host, r.port, r.tls,
+                        expectServerFp = persistedPinFor(fp),
+                    ),
+                )
             }
         }
         if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY) {
             if (!known?.mac.isNullOrBlank() && btClient != null) {
-                return CircleRoute(btClient!!, SendTarget(known!!.mac, 0, tls = true))
+                return CircleRoute(
+                    btClient!!,
+                    SendTarget(known!!.mac, 0, tls = true, expectServerFp = persistedPinFor(fp)),
+                )
             }
         }
         // The per-device switch is the authority: an opted-out device never
@@ -1388,9 +1501,13 @@ val share: StateFlow<ShareIntake?> = _share
                 val dialer = relayClientFor(
                     fp, known.token ?: relayConfig()?.token, relay.first, relay.second,
                 ) ?: return null
+                val pin = persistedPinFor(fp)
                 return CircleRoute(
                     dialer,
-                    SendTarget(relay.first, relay.second, tls = true, relayFor = fp),
+                    SendTarget(
+                        relay.first, relay.second, tls = true,
+                        relayFor = pin ?: fp, expectServerFp = pin,
+                    ),
                 )
             }
         }
@@ -1515,6 +1632,173 @@ val share: StateFlow<ShareIntake?> = _share
 
     private val delegate = FlitDelegate()
 
+    /**
+     * The app's prepare gate as a JVM-pure seam: the only inputs are the two
+     * fingerprints, the two runtime flags and two read-only store callbacks.
+     * No context, socket, clock or certificate bytes are involved, so the
+     * decision can be exercised without an Android device. The delegate below
+     * supplies the persisted rows; TrustGate owns the decision itself.
+     */
+    internal fun evaluatePrepareOffer(
+        declaredFp: String?,
+        presentedFp: String?,
+        onlyTrusted: Boolean,
+        qrOnly: Boolean,
+        pinned: (String) -> Boolean,
+        known: (String) -> Boolean,
+    ): TrustGate.Result = TrustGate.evaluate(
+        declaredFp,
+        presentedFp,
+        TrustGate.Config(onlyTrusted = onlyTrusted, qrOnly = qrOnly),
+        object : TrustGate.Stores {
+            override fun pinned(fp: String): Boolean = pinned(fp)
+            override fun known(fp: String): Boolean = known(fp)
+        },
+    )
+
+    /** QR-known rows are read from the persisted store, never the UI cache. */
+    internal fun persistedKnownFingerprint(fp: String): Boolean {
+        val ctx = if (::appCtx.isInitialized) appCtx else bootCtx
+        val devices = if (ctx != null) FlitKnown.all(ctx) else _knownDevices.value
+        return devices.any { it.fingerprint.equals(fp, ignoreCase = true) }
+    }
+
+    // ==== TLS pin for every peer-derived target ==================================
+
+    /**
+     * Pure pin selection. The expected certificate digest comes from a trust
+     * store, never from the peer info that rode the wire: a spoofed PeerInfo
+     * can only ever look up its own claimed string, and a claim that is not in
+     * [trusted] yields null (legacy unpaired peer, not a trust anchor).
+     */
+    internal fun expectedPinFor(
+        claimedFp: String?,
+        trusted: Collection<String>,
+    ): String? {
+        val claim = claimedFp?.trim()?.uppercase(Locale.ROOT).orEmpty()
+        if (claim.isBlank()) return null
+        return trusted.firstOrNull { item -> item.equals(claim, ignoreCase = true) }
+            ?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
+    }
+
+    /** Persisted trust rows only: Known devices plus the pinned-roster entries. */
+    internal fun persistedTrustedFingerprints(): List<String> {
+        val ctx = if (::appCtx.isInitialized) appCtx else bootCtx
+        if (ctx == null) return _knownDevices.value.map { it.fingerprint }
+        return runCatching { FlitKnown.all(ctx).map { it.fingerprint } }.getOrDefault(emptyList()) +
+            runCatching { FlitRoster.all().map { it.fingerprint } }.getOrDefault(emptyList())
+    }
+
+    /** The pin to put on a target derived from a claimed peer fingerprint. */
+    internal fun persistedPinFor(claimedFp: String?): String? =
+        expectedPinFor(claimedFp, persistedTrustedFingerprints())
+
+    /**
+     * One pure target builder for dispatch: host/port/scheme come from the
+     * route, but [expectServerFp] comes only from the injected trust set. This
+     * is the seam tests use to prove a spoofed PeerInfo cannot move the pin.
+     */
+    internal fun targetForPeer(
+        host: String,
+        port: Int,
+        tls: Boolean,
+        claimedFp: String?,
+        trusted: Collection<String> = persistedTrustedFingerprints(),
+        relayFor: String? = null,
+    ): SendTarget = SendTarget(
+        ip = host,
+        port = port,
+        tls = tls,
+        relayFor = relayFor,
+        expectServerFp = expectedPinFor(claimedFp, trusted),
+    )
+
+    // ==== UDP announce admission ================================================
+    //
+    // The socket hands one decoded announce to onPeerDiscovered; the gate runs
+    // before that callback so a refused datagram never touches the registry,
+    // routes, pins or the send-later queue. AnnounceAdmission is a pure core
+    // function; the two seams below keep its inputs and verdict testable on
+    // the JVM without a socket or an Android context.
+
+    /** Flatten one announce + its datagram source to the pure core's input. */
+    internal fun announceInfoOf(info: PeerInfo, sourceIp: String?): AnnounceInfo =
+        AnnounceInfo(
+            fingerprint = info.fingerprint,
+            alias = info.alias,
+            port = info.port,
+            protocol = info.protocol,
+            sourceIp = sourceIp,
+        )
+
+    /** Trimmed uppercase 64-hex form, or null; bounded before any trim. */
+    internal fun canonicalFingerprint(fp: String?): String? {
+        if (fp == null || fp.length > 256) return null
+        val trimmed = fp.trim()
+        if (trimmed.length != 64) return null
+        if (trimmed.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) return null
+        return trimmed.uppercase(Locale.ROOT)
+    }
+
+    /** Pure verdict plus the canonical key a caller records on acceptance. */
+    internal data class AnnounceDecision(
+        val admitted: Boolean,
+        val canonicalFp: String?,
+        val nowMs: Long,
+    )
+
+    /**
+     * [gate] is injectable from tests; production passes the core gate by
+     * default. No clock, socket or state is owned here: [nowMs] and [seen] come
+     * from the caller and the same arguments give the same verdict.
+     */
+    internal fun decideAnnounce(
+        info: AnnounceInfo,
+        ownFp: String?,
+        nowMs: Long,
+        seen: Map<String, Long>,
+        gate: (AnnounceInfo, String, Long, Map<String, Long>) -> Boolean =
+            { i, o, n, s -> AnnounceAdmission.admit(i, o, n, s) },
+    ): AnnounceDecision {
+        if (ownFp.isNullOrBlank()) return AnnounceDecision(false, null, nowMs)
+        val fp = canonicalFingerprint(info.fingerprint)
+            ?: return AnnounceDecision(false, null, nowMs)
+        if (!gate(info, ownFp, nowMs, seen)) return AnnounceDecision(false, null, nowMs)
+        return AnnounceDecision(true, fp, nowMs)
+    }
+
+    /** Caller-owned replay/capacity state: canonical fingerprint -> last ms. */
+    private val announceSeen = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Source address -> the admitted announce's claimed fingerprint. The value
+     * is only a lookup key into persisted trust; register-back uses it to pin
+     * the TLS leaf to a stored fingerprint, never to the announce's own claim.
+     */
+    private val announceFpBySource = ConcurrentHashMap<String, String>()
+
+    /** Injectable clock for the replay window; production uses wall time. */
+    internal var announceClockMs: () -> Long = { System.currentTimeMillis() }
+
+    /** Ingest path: pure decision first, then one state write on acceptance. */
+    internal fun admitAnnounceForIngest(
+        info: PeerInfo,
+        sourceIp: String?,
+        ownFp: String? = identity?.fingerprint,
+    ): Boolean {
+        val decision = decideAnnounce(
+            announceInfoOf(info, sourceIp), ownFp, announceClockMs(), announceSeen,
+        )
+        if (!decision.admitted) return false
+        val fp = decision.canonicalFp ?: return false
+        announceSeen[fp] = decision.nowMs
+        val source = sourceIp?.trim().orEmpty()
+        if (source.isNotBlank() && announceFpBySource.size < AnnounceAdmission.MAX_PEERS) {
+            announceFpBySource[source] = fp
+        }
+        return true
+    }
+
     private class FlitDelegate : ServerDelegate {
 
         // one receive session at a time; ledger set at prepare, nulled at session end
@@ -1535,25 +1819,41 @@ val share: StateFlow<ShareIntake?> = _share
         override fun onCircle(request: CircleRequest, ip: String): CircleResponse =
             FlitEngine.onCircleRequest(request, ip)
 
-        override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
-            // QR-only is a carrier gate, not just a discoverability setting:
-            // a device that never entered the graph by QR never gets a send.
-            if (qrOnly() && !knownFingerprint(request.info.fingerprint)) {
-                logLine("declined QR-unknown device ${request.info.alias} (${request.info.fingerprint.take(12)})")
-                return PrepareDecision.Decline
-            }
-            // Trust gate (Options): an untrusted offer is declined outright —
-            // the sender's UI shows it the way people expect a refusal to
-            // show. Only the sender's fingerprint decides, never its IP.
-            if (prefs().getBoolean("onlyTrusted", false) &&
-                !FlitRoster.pinned(request.info.fingerprint)
-            ) {
-                logLine("declined offer from ${request.info.alias} ($peerIp) — device not trusted")
+        /** Old two-arg callers have no presented certificate; the gate decides. */
+        override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision =
+            onPrepare(request, peerIp, null)
+
+        /**
+         * [presentedFp] is the digest the route derived from the prepare
+         * certificate. It is the only identity bound to the wire; the declared
+         * fingerprint in [request] is a claim. TrustGate compares the two and
+         * consults the persisted trust lists whenever a gate is enabled.
+         */
+        override fun onPrepare(
+            request: PrepareUploadRequest,
+            peerIp: String,
+            presentedFp: String?,
+        ): PrepareDecision {
+            val verdict = FlitEngine.evaluatePrepareOffer(
+                declaredFp = request.info.fingerprint,
+                presentedFp = presentedFp,
+                onlyTrusted = FlitEngine.prefs().getBoolean("onlyTrusted", false),
+                qrOnly = FlitEngine.qrOnly(),
+                pinned = { fp -> FlitRoster.all().any { it.fingerprint.equals(fp, ignoreCase = true) } },
+                known = { fp -> FlitEngine.persistedKnownFingerprint(fp) },
+            )
+            if (!verdict.accept) {
+                // Reason + 12-char code only: never a name, address, declared
+                // string, certificate or its DER bytes in a refusal log.
+                logLine("prepare declined: ${verdict.reason?.name ?: "unknown"} ${verdict.code}")
                 return PrepareDecision.Decline
             }
             FlitEngine.logLine("offer from ${request.info.alias} ($peerIp): ${request.files.size} file(s)")
             rxFiles = request.files.values.associate { it.fileName to it.size }
-            rxSenderFp = request.info.fingerprint
+            // A presented certificate digest, when the route supplied one, is
+            // the identity the transfer is actually bound to; the declared
+            // string is only the fallback for old v2.2 senders.
+            rxSenderFp = presentedFp?.takeIf { it.isNotBlank() } ?: request.info.fingerprint
             rxBegun = false
             rxProgress = null
             return PrepareDecision.Accept(request.files.keys)
@@ -1715,6 +2015,8 @@ val share: StateFlow<ShareIntake?> = _share
 
     fun stop() {
         startSeq++
+        announceSeen.clear() // a fresh socket starts with a fresh replay window
+        announceFpBySource.clear()
         clearCourierHooks()
         _courierHandoffs.value = emptyMap()
         courierParcelShas.clear()
@@ -1814,6 +2116,12 @@ val share: StateFlow<ShareIntake?> = _share
                     // files for pinned peers' custom folders still take the
                     // file path so publishReceived can copyToTree them.
                     incomingSink = { _, info -> openIncomingSink(info, receiveTreeFor(delegate.rxSenderFp)) },
+                    // The supplier is read per prepare, so toggling either gate
+                    // in Options takes effect without restarting the server.
+                    // Both gates need the certificate digest to bind identity.
+                    requirePrepareCert = {
+                        prefs().getBoolean("onlyTrusted", false) || qrOnly()
+                    },
                 ),
             )
             srv.start()
@@ -1845,9 +2153,20 @@ val share: StateFlow<ShareIntake?> = _share
             val disc = UdpDiscovery(
                 udpPort = Protocol.MULTICAST_PORT,
                 own = srv::selfInfo,
-                onPeerDiscovered = ::touchPeer,
+                onPeerDiscovered = { ip, info ->
+                    if (admitAnnounceForIngest(info, ip.hostAddress, id.fingerprint)) {
+                        touchPeer(ip, info)
+                    } else {
+                        logLine("announce: refused ${info.fingerprint.take(12)} from ${ip.hostAddress.orEmpty().take(24)}")
+                    }
+                },
                 registerPoster = { ip, port, protocol, self ->
-                    val t = SendTarget(ip, port, protocol == "https")
+                    // The announced fingerprint is only a lookup key into the
+                    // persisted trust store; a stranger's announce yields null.
+                    val t = SendTarget(
+                        ip, port, protocol == "https",
+                        expectServerFp = persistedPinFor(announceFpBySource[ip]),
+                    )
                     try {
                         cli.register(t, self) ?: logLine("register to $ip:$port failed")
                     } catch (e: Exception) {
@@ -2046,7 +2365,7 @@ val share: StateFlow<ShareIntake?> = _share
             if (seq != startSeq) return
             if (now < (sweepKeptNextAt[fp] ?: 0L)) continue
             sweepKeptNextAt[fp] = now + SWEEP_KEEP_INTERVAL_MS
-            val real = sweepProbe(cli, self, seq, host)
+            val real = sweepProbe(cli, self, seq, host, fp)
             if (real != null) {
                 sweepKeptMisses.remove(fp)
                 if (real.fingerprint != fp) {
@@ -2135,7 +2454,10 @@ val share: StateFlow<ShareIntake?> = _share
         self: PeerInfo,
         seq: Int,
         host: String,
-    ): PeerInfo? = probeRoute(cli, self, seq, FlitRoute.Route(host, Protocol.DEFAULT_PORT, true))
+        fp: String? = null,
+    ): PeerInfo? = probeRoute(
+        cli, self, seq, FlitRoute.Route(host, Protocol.DEFAULT_PORT, true), fp,
+    )
 
     /**
      * One knock to a known route — the sweeper's dial-then-register, but
@@ -2148,18 +2470,26 @@ val share: StateFlow<ShareIntake?> = _share
         self: PeerInfo,
         seq: Int,
         route: FlitRoute.Route,
+        fp: String? = null,
     ): PeerInfo? {
         if (seq != startSeq) return null
+        val pin = persistedPinFor(fp)
         if (route.isBluetooth) {
             val dialer = btClient ?: return null
             return runCatching {
-                dialer.register(SendTarget(route.host, 0, tls = true), self, timeoutMs = 4_000)
+                dialer.register(
+                    SendTarget(route.host, 0, tls = true, expectServerFp = pin),
+                    self, timeoutMs = 4_000,
+                )
             }.getOrNull()
         }
         if (!tcpOpen(route.host, route.port)) return null
         for (tls in if (route.tls) booleanArrayOf(true, false) else booleanArrayOf(false, true)) {
             try {
-                cli.register(SendTarget(route.host, route.port, tls), self, timeoutMs = 400)
+                cli.register(
+                    SendTarget(route.host, route.port, tls, expectServerFp = pin),
+                    self, timeoutMs = 400,
+                )
                     ?.let { return it }
             } catch (t: Throwable) {
                 // The next scheme — or, after the second, nothing.
@@ -2250,7 +2580,7 @@ val share: StateFlow<ShareIntake?> = _share
         }
         for (route in cands) {
             if (seq != startSeq) return
-            val answer = probeRoute(cli, self, seq, route) ?: continue
+            val answer = probeRoute(cli, self, seq, route, fp) ?: continue
             // The fingerprint is the whole accept rule: a reassigned address
             // that serves a stranger is simply not this peer's route.
             if (!FlitRoute.accepts(answer.fingerprint, fp)) continue
@@ -2297,6 +2627,24 @@ val share: StateFlow<ShareIntake?> = _share
         device?.relayFor == true &&
             (device.routePolicy == FlitKnown.RoutePolicy.AUTO ||
                 device.routePolicy == FlitKnown.RoutePolicy.RELAY_ONLY)
+
+    /**
+     * The file-send relay leg uses the same gate as the hunter, panic fan-out
+     * and Circle dials. An absent Known row, a false `relayFor`, or a policy
+     * that excludes relay never puts bytes on a relay — a stale route mark is
+     * not consent.
+     */
+    internal fun relayDispatchAllowed(
+        known: FlitKnown.Device?,
+        relayAvailable: Boolean,
+    ): Boolean {
+        val device = known ?: return false
+        if (!device.relayFor) return false
+        if (device.routePolicy != FlitKnown.RoutePolicy.AUTO &&
+            device.routePolicy != FlitKnown.RoutePolicy.RELAY_ONLY
+        ) return false
+        return relayAvailable || device.routePolicy == FlitKnown.RoutePolicy.RELAY_ONLY
+    }
 
     /** The one typed relay from Options; null means E is off and invisible. */
     private fun relayConfig(): RelayConfig? {
@@ -2347,8 +2695,12 @@ val share: StateFlow<ShareIntake?> = _share
     ): PeerInfo? {
         if (seq != startSeq) return null
         return runCatching {
+            val pin = persistedPinFor(fp)
             cli.register(
-                SendTarget(cfg.host, cfg.port, tls = true, relayFor = fp),
+                SendTarget(
+                    cfg.host, cfg.port, tls = true,
+                    relayFor = pin ?: fp, expectServerFp = pin,
+                ),
                 self,
                 timeoutMs = 5_000,
             )
@@ -2881,14 +3233,14 @@ val share: StateFlow<ShareIntake?> = _share
     fun setKnownAlias(fp: String, alias: String) {
         if (!::appCtx.isInitialized) return
         val d = FlitKnown.all(appCtx).firstOrNull { it.fingerprint == fp } ?: return
-        FlitKnown.put(appCtx, d.copy(alias = alias.trim().ifBlank { d.alias }))
+        FlitKnown.replace(appCtx, d.copy(alias = alias.trim().ifBlank { d.alias }))
         refreshKnown()
     }
 
     fun setRoutePolicy(fp: String, policy: FlitKnown.RoutePolicy) {
         if (!::appCtx.isInitialized) return
         val d = FlitKnown.all(appCtx).firstOrNull { it.fingerprint == fp } ?: return
-        FlitKnown.put(appCtx, d.copy(routePolicy = policy))
+        FlitKnown.replace(appCtx, d.copy(routePolicy = policy))
         refreshKnown()
         logLine("route for ${d.alias.ifBlank { fp.take(12) }}: ${policy.name}")
     }
@@ -2896,7 +3248,9 @@ val share: StateFlow<ShareIntake?> = _share
     fun setRelayFor(fp: String, on: Boolean) {
         if (!::appCtx.isInitialized) return
         val d = FlitKnown.all(appCtx).firstOrNull { it.fingerprint == fp } ?: return
-        FlitKnown.put(appCtx, d.copy(relayFor = on))
+        // A settings toggle must be able to write false; put() deliberately
+        // preserves an existing opt-in when a re-scan carries the default.
+        FlitKnown.replace(appCtx, d.copy(relayFor = on))
         refreshKnown()
     }
 
@@ -2973,66 +3327,140 @@ val share: StateFlow<ShareIntake?> = _share
 
     /** A scanned QR is the only way a device enters the known-devices graph. */
     fun addFromScan(code: QrAdd) {
-        val fp = code.fingerprint.trim().uppercase()
+        // The code is an untrusted routing instruction. Dialing an off-LAN
+        // address or relay name would turn a scanned code into a port probe.
+        if (!code.lanOnly) {
+            logLine("scan: code points off the local network — refused")
+            toast("that code points outside the local network")
+            return
+        }
+        val fp = code.fingerprint.trim().uppercase(Locale.ROOT)
         if (fp.isBlank()) {
             logLine("scan: code carries no fingerprint — not a pairing")
             toast("that code has no device identity")
             return
         }
-        val known = FlitKnown.Device(
-            fingerprint = fp,
-            alias = code.alias.trim(),
-            mac = code.mac?.trim()?.ifBlank { null },
-            relay = code.relay?.trim()?.ifBlank { null },
-            token = code.token?.trim()?.ifBlank { null },
-            scannedMs = System.currentTimeMillis(),
+        val probe = scanProbeFor(
+            code,
+            relayAvailable = runCatching { relayConfig() != null }.getOrDefault(false) ||
+                code.relay?.isNotBlank() == true,
+            bluetoothAvailable = btClient != null,
         )
-        // Relay-only / MAC-only codes have no address to probe: the QR itself
-        // is the human-eyeball verification, so the fingerprint pins directly.
-        if (code.ip.isBlank()) {
-            if (!::appCtx.isInitialized) return
-            FlitKnown.put(appCtx, known)
-            refreshKnown()
-            FlitRoster.pin(fp, known.alias)
-            logLine("scan: known ${fp.take(12)} via ${if (known.relay != null) "relay" else "bluetooth"} (QR verified)")
-            toast("device added from code")
+        if (probe == null) {
+            // An address-less code is not self-authenticating. Nothing may be
+            // pinned or persisted until a probe answers over TLS bound to the
+            // code's own fingerprint; with no such carrier, fail closed.
+            logLine("scan: no certificate-bound probe path for ${fp.take(12)} — not paired")
+            toast("could not verify that device over the local network — nothing was added")
             return
         }
-        val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }
-        val host = code.ip
-        if (FlitRoster.addManual("$host:${code.port}")) insertManualStub(host, code.port)
-        logLine("scan $host:${code.port}\u2026")
         scope.launch(Dispatchers.IO) {
             val self = server?.selfInfo() ?: run {
                 logLine("scan: not serving yet")
                 return@launch
             }
-            val real = try {
-                cli.register(SendTarget(host, code.port, true), self, timeoutMs = 4_000)
-            } catch (e: Exception) {
-                logLine("scan $host:${code.port} unreachable (${e.message ?: e.javaClass.simpleName})")
-                null
+            // expectServerFp binds the TLS leaf certificate to the code before
+            // a single request byte goes out; the answered fingerprint is
+            // checked again below before ANY local state is touched.
+            val target = when (probe.kind) {
+                ScanProbe.Kind.DIRECT -> SendTarget(probe.host, probe.port, tls = true, expectServerFp = fp)
+                ScanProbe.Kind.RELAY -> SendTarget(
+                    probe.host, probe.port, tls = true,
+                    relayFor = fp, expectServerFp = fp,
+                )
+                ScanProbe.Kind.BLUETOOTH -> SendTarget(probe.host, 0, tls = true, expectServerFp = fp)
             }
-            if (real == null) return@launch
-            touchPeer(host, real)
-            if (code.fingerprint.isNotBlank() && real.fingerprint != code.fingerprint) {
-                logLine("scan: $host:${code.port} answers as ${real.fingerprint.take(12)}, code said ${code.fingerprint.take(12)} \u2014 NOT trusted")
-                toast("device answered, but its fingerprint changed \u2014 verify with the code again")
+            val dialer = when (probe.kind) {
+                ScanProbe.Kind.RELAY -> relayClientFor(
+                    fp, code.token?.trim()?.ifBlank { null }
+                        ?: runCatching { relayConfig()?.token }.getOrNull(),
+                    probe.host, probe.port,
+                )
+                ScanProbe.Kind.BLUETOOTH -> btClient
+                ScanProbe.Kind.DIRECT -> client
+            } ?: run {
+                logLine("scan: no carrier for ${probe.kind.name.lowercase(Locale.ROOT)} probe")
+                toast("could not verify that device over the local network — nothing was added")
                 return@launch
             }
-            if (code.fingerprint.isNotBlank()) {
-                FlitRoster.pin(real.fingerprint, real.alias)
-                FlitRoster.markScanned(real.fingerprint)
-                if (::appCtx.isInitialized) {
-                    FlitKnown.put(
-                        appCtx,
-                        known.copy(fingerprint = real.fingerprint, alias = real.alias),
-                    )
-                    refreshKnown()
+            val real = try {
+                dialer.register(target, self, timeoutMs = 4_000)
+            } catch (e: Exception) {
+                logLine("scan: ${probe.kind.name.lowercase(Locale.ROOT)} probe for ${fp.take(12)} failed (${e.message ?: e.javaClass.simpleName})")
+                null
+            }
+            if (real == null) {
+                toast("could not verify that device over the local network — nothing was added")
+                return@launch
+            }
+            // The order is the fix: compare BEFORE touchPeer, manual stub,
+            // rememberRoute, pin, Known write or a queue flush. A mismatch
+            // changes nothing at all — not even a stale manual row.
+            if (!fp.equals(real.fingerprint.trim(), ignoreCase = true)) {
+                logLine("scan: ${probe.host}:${probe.port} answers as ${real.fingerprint.take(12)}, code said ${fp.take(12)} — NOT trusted")
+                toast("device answered, but its fingerprint changed — verify with the code again")
+                return@launch
+            }
+            val known = FlitKnown.Device(
+                fingerprint = fp,
+                alias = real.alias.ifBlank { code.alias.trim() },
+                mac = code.mac?.trim()?.ifBlank { null },
+                relay = code.relay?.trim()?.ifBlank { null },
+                token = code.token?.trim()?.ifBlank { null },
+                scannedMs = System.currentTimeMillis(),
+            )
+            if (probe.kind == ScanProbe.Kind.DIRECT) {
+                if (FlitRoster.addManual("${probe.host}:${probe.port}")) {
+                    insertManualStub(probe.host, probe.port)
                 }
-                logLine("scan: pinned ${real.alias} (code verified)")
+                touchPeer(probe.host, real) // binds the roster route to the verified fingerprint
+            }
+            FlitRoster.pin(fp, known.alias)
+            FlitRoster.markScanned(fp)
+            if (::appCtx.isInitialized) {
+                FlitKnown.put(appCtx, known) // merge: local policy/flags survive a re-scan
+                refreshKnown()
+            }
+            logLine("scan: pinned ${known.alias.ifBlank { fp.take(12) }} (code verified via ${probe.kind.name.lowercase(Locale.ROOT)})")
+            toast("device added from code")
+        }
+    }
+
+    /** The one carrier a scanned code may use, chosen without dialing anything. */
+    internal data class ScanProbe(
+        val kind: Kind,
+        val host: String,
+        val port: Int,
+    ) {
+        enum class Kind { DIRECT, RELAY, BLUETOOTH }
+    }
+
+    /**
+     * Pure route choice for a scanned code: a LAN address first, then a LAN
+     * relay literal, then a Bluetooth MAC. A code with no usable carrier has
+     * no verified probe path and must fail closed (null).
+     */
+    internal fun scanProbeFor(
+        code: QrAdd,
+        relayAvailable: Boolean,
+        bluetoothAvailable: Boolean,
+    ): ScanProbe? {
+        if (!code.lanOnly || code.fingerprint.isBlank()) return null
+        if (code.ip.isNotBlank()) {
+            val port = code.port.takeIf { it in 1..65_535 } ?: return null
+            return ScanProbe(ScanProbe.Kind.DIRECT, code.ip.trim(), port)
+        }
+        code.relay?.trim()?.takeIf { it.isNotBlank() }?.let { raw ->
+            val relay = FlitRoute.parseRelay(raw)
+            if (relayAvailable && relay != null && relay.second in 1..65_535) {
+                return ScanProbe(ScanProbe.Kind.RELAY, relay.first, relay.second)
             }
         }
+        val mac = code.mac?.trim()?.takeIf { it.isNotBlank() }
+        if (mac != null && bluetoothAvailable) {
+            return ScanProbe(ScanProbe.Kind.BLUETOOTH, mac, 0)
+        }
+        return null
     }
 
     // ==== sending ===============================================================
@@ -3262,27 +3690,34 @@ val share: StateFlow<ShareIntake?> = _share
             val relay = relayRouteFor[peer.info.fingerprint]
             val known = _knownDevices.value.firstOrNull { it.fingerprint.equals(peer.info.fingerprint, true) }
             val policy = known?.routePolicy ?: FlitKnown.RoutePolicy.AUTO
+            // Read trust once, from persisted rows. The announced PeerInfo is
+            // only a lookup key; it can never supply its own expected pin.
+            val trusted = persistedTrustedFingerprints()
+            val claimed = peer.info.fingerprint
+            val pin = expectedPinFor(claimed, trusted)
             val dialer: ProtocolClient
             val target = when {
                 policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY ||
                     (peer.kind == FlitRoute.Kind.BLUETOOTH && policy != FlitKnown.RoutePolicy.WIFI_ONLY) -> {
                     dialer = btClient ?: throw IOException("Bluetooth link is off")
-                    SendTarget(peer.ip, 0, tls = true)
+                    targetForPeer(peer.ip, 0, true, claimed, trusted)
                 }
-                known?.relayFor != false && (relay != null || policy == FlitKnown.RoutePolicy.RELAY_ONLY) -> {
+                // Same explicit opt-in as the hunter, panic fan-out and Circle
+                // gates: an absent Known row or a false flag never relays bytes.
+                relayDispatchAllowed(known, relay != null) -> {
                     val address = known?.relay?.let { FlitRoute.parseRelay(it) }
                     val host = address?.first ?: relay?.host ?: relayConfig()?.host
                         ?: throw IOException("relay is not configured")
                     val port = address?.second ?: relay?.port ?: relayConfig()?.port
                         ?: throw IOException("relay is not configured")
                     dialer = relayClientFor(
-                        peer.info.fingerprint, known?.token ?: relayConfig()?.token, host, port,
+                        pin ?: claimed, known?.token ?: relayConfig()?.token, host, port,
                     ) ?: cli
-                    SendTarget(host, port, tls = true, relayFor = peer.info.fingerprint)
+                    targetForPeer(host, port, true, claimed, trusted, relayFor = pin ?: claimed)
                 }
                 else -> {
                     dialer = cli
-                    SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
+                    targetForPeer(peer.ip, peer.info.port, peer.info.protocol == "https", claimed, trusted)
                 }
             }
             prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
@@ -3434,8 +3869,12 @@ val share: StateFlow<ShareIntake?> = _share
 
     /** Turn a queue token (spool path or durable SAF uri) into a local file. */
     private fun spoolFileFor(token: String, tag: String): SpooledFile? {
-        val f = File(token)
-        if (f.isFile) return SpooledFile(f, f.name, guessMime(f.name))
+        // A token is untrusted persisted text. Only a spool-minted direct
+        // child of our cache — with no symlink in the path — may be opened as
+        // a file; everything else falls through to the SAF-uri branch.
+        val cache = runCatching { appCtx.cacheDir }.getOrNull()
+        val f = if (cache != null) FlitSpool.spoolPath(token, cache) else null
+        if (f != null && f.isFile) return SpooledFile(f, f.name, guessMime(f.name))
         val uri = runCatching { Uri.parse(token) }.getOrNull() ?: run {
             logLine("$tag: unreadable token — $token")
             return null
@@ -3458,22 +3897,81 @@ val share: StateFlow<ShareIntake?> = _share
     /** Bumped whenever the intake lifecycle changes hands (new share, discard). */
     private val intakeGen = java.util.concurrent.atomic.AtomicLong(0)
 
+    /** Hard caps on one share-sheet intake; bounds work before any byte is copied. */
+    internal const val MAX_SHARE_ITEMS = 32
+    internal const val MAX_SHARE_BYTES = 256L * 1024 * 1024
+
+    /**
+     * Erased generics make `extras[EXTRA_STREAM] as? List<Uri>` a lie: an
+     * ArrayList<String> passes the cast and only fails at the element cast in
+     * the loop, outside the old try. Read as List<*>, keep only real Uris, and
+     * cap the count here. Generic in the element type so tests use a JVM value
+     * class instead of Android's Uri.
+     */
+    internal fun <T : Any> readIntakeList(
+        raw: Any?,
+        type: Class<T>,
+        cap: Int = MAX_SHARE_ITEMS,
+    ): List<T> {
+        val list = raw as? List<*> ?: return emptyList()
+        return list.filterIsInstance(type).take(cap.coerceAtLeast(0))
+    }
+
+    /** Second line of defence: stop staging once count or cumulative bytes hit the cap. */
+    internal fun intakeBudgetAllows(count: Int, bytes: Long): Boolean =
+        count < MAX_SHARE_ITEMS && bytes < MAX_SHARE_BYTES
+
+    /**
+     * Pure intent hint. EXTRA_SHORTCUT_ID is deliberately ignored: any app can
+     * set it and it is not a trust statement. Only our own EXTRA_PEER_FP extra
+     * can preselect a row, and only when that fingerprint is already pinned.
+     * This is a UI hint — it never dispatches bytes; [sendShare] still needs a
+     * user tap.
+     */
+    internal fun preselectedPeerFromIntent(
+        peerFpExtra: String?,
+        shortcutId: String?,
+        pinned: (String) -> Boolean,
+    ): String? {
+        @Suppress("UNUSED_PARAMETER")
+        val ignoredShortcutId = shortcutId
+        val fp = peerFpExtra?.trim()?.uppercase(Locale.ROOT).orEmpty()
+        if (fp.length != 64 || fp.any { it !in '0'..'9' && it !in 'A'..'F' }) return null
+        return fp.takeIf { candidate -> runCatching { pinned(candidate) }.getOrDefault(false) }
+    }
+
     /** Called by MainActivity for ACTION_SEND / ACTION_SEND_MULTIPLE intents. */
     fun handleShareIntent(intent: Intent?, referrerHost: String?) {
         if (intent == null) return
         intakeGen.incrementAndGet()
-        val uris: List<Uri> = when (intent.action) {
-            Intent.ACTION_SEND -> {
-                val u = intent.extras?.get(Intent.EXTRA_STREAM) as? Uri
-                if (u != null) listOf(u) else emptyList()
+        val parsed = runCatching {
+            val uris: List<Uri> = when (intent.action) {
+                Intent.ACTION_SEND -> {
+                    val u = intent.extras?.get(Intent.EXTRA_STREAM) as? Uri
+                    if (u != null) listOf(u) else emptyList()
+                }
+                Intent.ACTION_SEND_MULTIPLE ->
+                    readIntakeList(intent.extras?.get(Intent.EXTRA_STREAM), Uri::class.java)
+                else -> emptyList()
             }
-            Intent.ACTION_SEND_MULTIPLE -> {
-                @Suppress("UNCHECKED_CAST")
-                intent.extras?.get(Intent.EXTRA_STREAM) as? List<Uri> ?: emptyList()
-            }
-            else -> emptyList()
+            val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+            val preselect = preselectedPeerFromIntent(
+                peerFpExtra = runCatching { intent.getStringExtra(FlitShortcuts.EXTRA_PEER_FP) }.getOrNull(),
+                shortcutId = runCatching { intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID) }.getOrNull(),
+                pinned = { fp -> runCatching { FlitRoster.pinned(fp) }.getOrDefault(false) },
+            )
+            Triple(uris, text, preselect)
+        }.getOrNull()
+        if (parsed == null) {
+            // A hostile or broken intent must never leave a ready=false banner
+            // wedged on screen with no way to finish staging.
+            _share.value = null
+            _preselectedPeer.value = null
+            logLine("share: could not read the incoming intent — nothing staged")
+            return
         }
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        val (uris, text, preselect) = parsed
+        _preselectedPeer.value = preselect
         if (uris.isEmpty() && text.isNullOrBlank()) return
         _share.value = ShareIntake(ready = false, files = emptyList(), text = text, sourceApp = referrerHost)
         spoolIntake(uris, text)
@@ -3499,13 +3997,37 @@ val share: StateFlow<ShareIntake?> = _share
             }
             val spooled = mutableListOf<SpooledFile>()
             var dropped = 0
-            for (uri in uris) {
-                try {
-                    spooled += spoolUri(uri, "share")
-                } catch (e: Exception) {
-                    dropped++
-                    logLine("cannot read shared file (${e.message ?: e.javaClass.simpleName})")
+            var bytes = 0L
+            try {
+                // The whole iteration is guarded. A provider that throws an
+                // Error, or an extra that defeats the filter, clears the
+                // banner instead of wedging it at ready = false forever.
+                for (uri in uris) {
+                    try {
+                        if (!intakeBudgetAllows(spooled.size + dropped, bytes)) {
+                            dropped++
+                            continue
+                        }
+                        val copy = spoolUri(uri, "share")
+                        if (bytes + copy.size > MAX_SHARE_BYTES) {
+                            runCatching { copy.f.delete() }
+                            dropped++
+                            logLine("share: skipped a file above the intake byte cap")
+                            continue
+                        }
+                        bytes += copy.size
+                        spooled += copy
+                    } catch (e: Exception) {
+                        dropped++
+                        logLine("cannot read shared file (${e.message ?: e.javaClass.simpleName})")
+                    }
                 }
+            } catch (t: Throwable) {
+                if (t is java.util.concurrent.CancellationException) throw t
+                spooled.forEach { runCatching { it.f.delete() } }
+                _share.value = null
+                logLine("share: could not prepare the files (${t.message ?: t.javaClass.simpleName}) — nothing staged")
+                return@launch
             }
             if ((dropped == uris.size || uris.isEmpty()) && spooled.isEmpty() && text.isNullOrBlank()) {
                 _share.value = null
@@ -3520,21 +4042,61 @@ val share: StateFlow<ShareIntake?> = _share
         }
     }
 
+    /**
+     * A provider-declared size is checked before the stream is opened. A
+     * negative value means "unknown" and is allowed here — the copy loop
+     * below still enforces the same cap before every write.
+     */
+    internal fun intakeDeclaredSizeAllowed(bytes: Long): Boolean =
+        bytes < 0 || bytes <= MAX_SHARE_BYTES
+
     /** Copy one shared stream into app cache; returns the local, grant-proof file. */
     private fun spoolUri(uri: Uri, tag: String): SpooledFile {
         val resolver = appCtx.contentResolver
         val mime = runCatching { resolver.getType(uri) }.getOrNull() ?: "application/octet-stream"
-        val displayName = runCatching {
-            resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getString(0) else null
+        val columns = runCatching {
+            resolver.query(
+                uri,
+                arrayOf(
+                    android.provider.OpenableColumns.DISPLAY_NAME,
+                    android.provider.OpenableColumns.SIZE,
+                ),
+                null, null, null,
+            )?.use { c ->
+                if (!c.moveToFirst()) null to -1L else {
+                    val nameIdx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    val name = if (nameIdx >= 0 && !c.isNull(nameIdx)) c.getString(nameIdx) else null
+                    val size = if (sizeIdx >= 0 && !c.isNull(sizeIdx)) c.getLong(sizeIdx) else -1L
+                    name to size
+                }
             }
         }.getOrNull()
+        val declaredSize = columns?.second ?: -1L
+        // Refuse before any byte is copied; a lying provider is caught by the
+        // running budget in the loop below.
+        if (!intakeDeclaredSizeAllowed(declaredSize)) {
+            throw IOException("shared file exceeds the intake byte cap")
+        }
+        val displayName = columns?.first
         val stamp = System.currentTimeMillis()
         val safe = (displayName ?: "shared").replace(Regex("[\\/:*?\"<>|]"), "_").takeLast(80)
         val f = File(appCtx.cacheDir, "$tag-$stamp-${spoolSeq.incrementAndGet()}-$safe")
         try {
             resolver.openInputStream(uri)?.use { input ->
-                f.outputStream().use { input.copyTo(it) }
+                f.outputStream().use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    var copied = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        if (copied + n > MAX_SHARE_BYTES) {
+                            throw IOException("shared file exceeds the intake byte cap")
+                        }
+                        out.write(buf, 0, n)
+                        copied += n
+                    }
+                }
             } ?: throw IllegalStateException("no stream for $uri")
         } catch (t: Throwable) {
             // A copy that died (ENOSPC on a full phone is the real one) must
@@ -3807,7 +4369,9 @@ val share: StateFlow<ShareIntake?> = _share
     /** Logcat-visible early (boot receiver calls this pre-engine). */
     fun logLine(text: String) {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        android.util.Log.i("FlitSend", text)
+        // JVM unit tests run against mocked android.jar; a stubbed Log must
+        // never break the in-memory log (or the gate that just called it).
+        runCatching { android.util.Log.i("FlitSend", text) }
         _log.update { list -> (list + LogLine(ts, text)).takeLast(60) }
     }
 

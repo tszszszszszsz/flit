@@ -47,6 +47,10 @@ fun reduce(state: CircleState, event: CircleEvent): CircleState =
  *            ADMIN/OWNER author with mode `admin` kicks at once; any other
  *            author (or explicit mode `vote`) opens a vote-kick instead.
  * - `role`   `{"targetFp": "...", "role": "ADMIN"|"MEMBER"}` — OWNER only.
+ *
+ * Both governance verbs, like REKEY, read the actor from the *pre-batch* roster
+ * snapshot: a same-batch promotion cannot turn a member's kick into an
+ * executive kick just because the role event was folded first.
  * - `vote`   `{"kickId": "...", "approve": true}` (or `{"targetFp":...,"approve":...}`)
  *            for a kick; `{"pollId":..., "option": n}` for a poll. Votes are
  *            changeable: the latest vote per member wins.
@@ -316,12 +320,13 @@ object FlitCircleStore {
 
     /**
      * Deterministic fold; each event is applied once, in the given order.
-     * Rekey authority is decided from one immutable snapshot of the roster as
-     * it stood before the batch, never from the partially folded roster: fold
-     * order alone cannot promote a signer or let one hand off a key while
-     * leaving. The authors of every `leave` in the batch are vetoed as rekey
-     * signers as well, so a departing officer cannot install its own key even
-     * when its rekey is folded before its leave.
+     * Authority for every governance verb — `role`, `kick` and `rekey` — is
+     * decided from one immutable snapshot of the roster as it stood before the
+     * batch, never from the partially folded roster: fold order alone cannot
+     * promote a signer, turn a member's kick into an executive kick, or let one
+     * hand off a key while leaving. The authors of every `leave` in the batch
+     * are vetoed as rekey signers as well, so a departing officer cannot
+     * install its own key even when its rekey is folded before its leave.
      */
     fun merge(state: CircleState, events: List<CircleEvent>): CircleState {
         val roles = rolesOf(state.members)
@@ -337,7 +342,8 @@ object FlitCircleStore {
      *
      * The two-argument form is the single-event entry point: it takes its
      * authority snapshot from [state] and has no same-batch leavers. [merge]
-     * supplies the batch-wide context through the four-argument form.
+     * supplies the batch-wide context through the four-argument form, including
+     * the pre-batch roles used by `role`, `kick` and `rekey`.
      */
     fun reduce(state: CircleState, event: CircleEvent): CircleState =
         reduce(state, event, rolesOf(state.members), emptySet())
@@ -355,8 +361,8 @@ object FlitCircleStore {
         return when (event.type.trim().lowercase(Locale.ROOT)) {
             "join" -> applyJoin(state, event)
             "leave" -> applyLeave(state, event)
-            "kick" -> applyKick(state, event)
-            "role" -> applyRole(state, event)
+            "kick" -> applyKick(state, event, preBatchRoles)
+            "role" -> applyRole(state, event, preBatchRoles)
             "rekey" -> applyRekey(state, event, preBatchRoles, batchLeavers)
             "vote" -> applyVote(state, event)
             else -> append(state, event)
@@ -389,19 +395,34 @@ object FlitCircleStore {
     fun applyLeave(state: CircleState, event: CircleEvent): CircleState =
         depart(append(state, event), event.authorFp)
 
+    /** Single-event form: the actor's authority comes from this state's roster. */
+    fun applyKick(state: CircleState, event: CircleEvent): CircleState =
+        applyKick(state, event, rolesOf(state.members))
+
     /**
      * ADMIN/OWNER kicks execute at once; a kick opened by a plain member (or
      * with `"mode":"vote"`) only starts a vote-kick and is finalised by votes.
-     * OWNER is never kickable, nobody kicks themselves, and an explicit
-     * `"approve":false` opener is inert rather than a decision.
+     * The actor and the target's OWNER protection are read from [preBatchRoles],
+     * the immutable snapshot taken at [merge] entry, so a same-batch promotion
+     * cannot make a member's kick executive. Nobody kicks themselves, and an
+     * explicit `"approve":false` opener is inert rather than a decision.
      */
-    fun applyKick(state: CircleState, event: CircleEvent): CircleState {
+    fun applyKick(
+        state: CircleState,
+        event: CircleEvent,
+        preBatchRoles: Map<String, String>,
+    ): CircleState {
         val next = append(state, event)
         val body = bodyOf(event) ?: return next
         if (body.containsKey("approve") && !body.bool("approve")) return next
         val target = body.target() ?: return next
         if (target.equals(event.authorFp, ignoreCase = true)) return next
-        val actor = next.members.firstOrNull { it.fp == event.authorFp }?.role ?: return next
+        val actor = when (roleOfSnapshot(preBatchRoles, event.authorFp)) {
+            "OWNER" -> Role.OWNER
+            "ADMIN" -> Role.ADMIN
+            "MEMBER" -> Role.MEMBER
+            else -> return next
+        }
         val isVote = body.str("mode")?.lowercase(Locale.ROOT) == "vote" || actor == Role.MEMBER
         if (isVote) {
             val kickId = body.kickId() ?: event.id
@@ -409,15 +430,29 @@ object FlitCircleStore {
         }
         if (actor != Role.OWNER && actor != Role.ADMIN) return next
         val member = next.members.firstOrNull { it.fp == target } ?: return next
-        if (member.role == Role.OWNER) return next
+        if (roleOfSnapshot(preBatchRoles, target) == CircleAuthority.OWNER_ROLE) return next
         return depart(next, target)
     }
 
-    /** OWNER appoints/removes ADMIN; nobody (not even OWNER) appoints an OWNER. */
-    fun applyRole(state: CircleState, event: CircleEvent): CircleState {
+    /** Single-event form: authority comes from this state's own roster. */
+    fun applyRole(state: CircleState, event: CircleEvent): CircleState =
+        applyRole(state, event, rolesOf(state.members))
+
+    /**
+     * OWNER appoints/removes ADMIN; nobody (not even OWNER) appoints an OWNER.
+     * The author's OWNER authority comes from [preBatchRoles], not from the
+     * partially folded roster, so a same-batch promotion cannot vouch for
+     * itself. Target lookup, self-fingerprint inference and the local role
+     * update still use [state] and `next`.
+     */
+    fun applyRole(
+        state: CircleState,
+        event: CircleEvent,
+        preBatchRoles: Map<String, String>,
+    ): CircleState {
         val next = append(state, event)
         val body = bodyOf(event) ?: return next
-        if (next.members.firstOrNull { it.fp == event.authorFp }?.role != Role.OWNER) return next
+        if (roleOfSnapshot(preBatchRoles, event.authorFp) != CircleAuthority.OWNER_ROLE) return next
         val target = body.target() ?: return next
         val member = next.members.firstOrNull { it.fp == target } ?: return next
         if (member.role == Role.OWNER) return next
@@ -605,6 +640,15 @@ object FlitCircleStore {
     /** Canonical fingerprint → role map expected by [CircleAuthority.foldable]. */
     private fun rolesOf(members: Collection<Member>): Map<String, String> =
         members.associate { it.fp.trim().uppercase(Locale.ROOT) to it.role.name }
+
+    /**
+     * One authority lookup in the pre-batch snapshot. Fingerprint and role are
+     * normalised exactly as in [rolesOf]; a blank entry carries no authority.
+     * Shared by kick and role so the two reducers cannot normalise differently.
+     */
+    private fun roleOfSnapshot(roles: Map<String, String>, fp: String): String? =
+        roles[fp.trim().uppercase(Locale.ROOT)]
+            ?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
 
     /** Uppercased authors of every leave in a batch, for the same-batch veto. */
     private fun leavingAuthors(events: List<CircleEvent>): Set<String> =

@@ -100,6 +100,78 @@ class FlitKnownTest {
     }
 
     @Test
+    fun `a re-scan merges local choices and refreshes the device details`() {
+        val prefs = MemoryStore()
+        FlitKnown.put(prefs, device(policy = RoutePolicy.RELAY_ONLY).copy(scannedMs = 100L))
+        val scanned = FlitKnown.Device(
+            fingerprint = "fp-1",
+            alias = "New alias",
+            mac = "11:22:33:44:55:66",
+            relay = "10.0.0.2:4337",
+            token = "new-token",
+            scannedMs = 200L,
+        )
+        FlitKnown.put(prefs, scanned)
+
+        val row = FlitKnown.all(prefs).single()
+        assertEquals("fp-1", row.fingerprint)
+        assertEquals("New alias", row.alias)
+        assertEquals("desk", row.label, "a QR has no label — keep the local note")
+        assertEquals(RoutePolicy.RELAY_ONLY, row.routePolicy, "local route choice survives a re-scan")
+        assertTrue(row.relayFor, "an opt-in is not silently cleared by a scan")
+        assertTrue(row.panicForward)
+        assertEquals(200L, row.scannedMs)
+        assertEquals("11:22:33:44:55:66", row.mac)
+        assertEquals("10.0.0.2:4337", row.relay)
+        assertEquals("new-token", row.token)
+    }
+
+    @Test
+    fun `an older or blank re-scan never rolls back saved fields`() {
+        val prefs = MemoryStore()
+        FlitKnown.put(prefs, device(policy = RoutePolicy.BLUETOOTH_ONLY).copy(scannedMs = 900L))
+        FlitKnown.put(
+            prefs,
+            FlitKnown.Device(
+                fingerprint = "fp-1",
+                alias = "",
+                label = "",
+                mac = null,
+                relay = null,
+                token = null,
+                scannedMs = 10L,
+            ),
+        )
+        val row = FlitKnown.all(prefs).single()
+        assertEquals("Ada's phone", row.alias)
+        assertEquals("desk", row.label)
+        assertEquals("AA:BB:CC:DD:EE:FF", row.mac)
+        assertEquals("relay.example:4337", row.relay)
+        assertEquals("pair-token", row.token)
+        assertEquals(RoutePolicy.BLUETOOTH_ONLY, row.routePolicy)
+        assertTrue(row.relayFor)
+        assertTrue(row.panicForward)
+        assertEquals(900L, row.scannedMs, "an older scan time must not rewind the row")
+    }
+
+    @Test
+    fun `replace writes explicit false and blank values a settings toggle needs`() {
+        val prefs = MemoryStore()
+        FlitKnown.put(prefs, device())
+        val current = FlitKnown.all(prefs).single()
+        FlitKnown.replace(
+            prefs,
+            current.copy(relayFor = false, panicForward = false, label = "", routePolicy = RoutePolicy.WIFI_ONLY),
+        )
+        val row = FlitKnown.all(prefs).single()
+        assertFalse(row.relayFor)
+        assertFalse(row.panicForward)
+        assertEquals("", row.label)
+        assertEquals(RoutePolicy.WIFI_ONLY, row.routePolicy)
+        assertEquals(1, FlitKnown.all(prefs).size, "merge and replace both keep one row per fingerprint")
+    }
+
+    @Test
     fun `forget drops only the named device`() {
         val prefs = MemoryStore()
         FlitKnown.put(prefs, device())

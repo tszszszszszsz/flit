@@ -353,6 +353,15 @@ object FlitCircleSync {
     /** Receives a typed handoff built from an opened file event (pure tests). */
     internal var handoffPublishHook: ((CourierCardUi.CourierHandoff) -> Unit)? = null
 
+    /**
+     * Test seam for the answer signature gate. Production always calls
+     * [CircleResponse.verify] against the fingerprint of the peer it dialed —
+     * the same normalised fingerprint source join uses for its QR host. Pure
+     * carrier fakes are unsigned by construction, so they install a permissive
+     * verifier; the adversarial tests install the real one.
+     */
+    internal var responseVerifyHook: ((CircleResponse, String) -> Boolean)? = null
+
     /** Test-only: drop fakes and rate-limit state so tests cannot leak into each other. */
     internal fun resetForTest() {
         dialHook = null
@@ -366,6 +375,7 @@ object FlitCircleSync {
         bagPersistHook = null
         handoffHook = null
         handoffPublishHook = null
+        responseVerifyHook = null
         parcelShas.clear()
         CircleCore.clear() // the fold-time replay set must not leak between tests
         nextDialAt.clear()
@@ -394,6 +404,20 @@ object FlitCircleSync {
         ?: identity()?.fingerprint?.let(::circleFp)
 
     private fun nowMs(): Long = clockHook?.invoke() ?: System.currentTimeMillis()
+
+    /**
+     * The single gate for an incoming answer. [fp] is the fingerprint we dialed,
+     * normalised exactly like the QR host in [join]; nothing from the answer's
+     * own body or headers may stand in for it. A missing, malformed or
+     * wrong-host signature refuses the whole answer before any of its fields
+     * (ok, events, watermarks, handoffs) are read.
+     */
+    private fun answerVerified(response: CircleResponse, fp: String): Boolean {
+        val expectedHostFp = circleFp(fp)
+        val verifier = responseVerifyHook
+        return if (verifier != null) verifier(response, expectedHostFp)
+        else CircleResponse.verify(response, expectedHostFp)
+    }
 
     private fun log(line: String) {
         val hook = logHook
@@ -461,7 +485,7 @@ object FlitCircleSync {
         // refusal: a rogue relay must not be able to block a join by forging
         // an unsigned rejection. Protocol suites own signature verification;
         // the pure sync seam returns synthetic answers with no Android keystore.
-        if (joinPersistHook == null && !CircleResponse.verify(response, host)) {
+        if (joinPersistHook == null && !answerVerified(response, host)) {
             log("circle: host answer was not signed by ${host.take(12)} — not joined")
             return
         }
@@ -573,8 +597,22 @@ object FlitCircleSync {
                 return@dialBounded
             }
             val response = runCatching { route.sync(request) }.getOrNull()
-            if (response == null || !response.ok) {
-                log("circle sync: ${fp.take(12)} refused ${response?.reason ?: "no answer"}")
+            if (response == null) {
+                log("circle sync: ${fp.take(12)} refused no answer")
+                concludeHandoff(selected, ok = false)
+                noteFailure(fp, now)
+                return@dialBounded
+            }
+            // An unsigned or wrong-host answer is not from this peer at all:
+            // refuse it before reading ok/events, advancing a watermark or
+            // concluding any courier handoff.
+            if (!answerVerified(response, fp)) {
+                log("circle sync: ${fp.take(12)} answer not signed by host — ignored")
+                noteFailure(fp, now)
+                return@dialBounded
+            }
+            if (!response.ok) {
+                log("circle sync: ${fp.take(12)} refused ${response.reason}")
                 concludeHandoff(selected, ok = false)
                 noteFailure(fp, now)
                 return@dialBounded
@@ -920,14 +958,16 @@ object FlitCircleSync {
         val state = storedState() ?: return
         // The envelope is ciphertext to every carrier but us, yet its author is
         // still untrusted once opened: even an OWNER could seal a self-signed
-        // JOIN or REKEY and rewrite our roster or group key. Foldability is the
-        // shared CircleAuthority decision with NO role data here — so neither
-        // privileged verb may enter from a parcel — while the membership check
-        // keeps a departed or never-member author out. fresh() still verifies
-        // every signature before anything is persisted.
+        // JOIN, ROLE, KICK or REKEY and rewrite our roster or group key. All four
+        // privileged verbs are refused explicitly, and foldability is the shared
+        // CircleAuthority decision with NO role data here — so neither a role
+        // snapshot from the parcel nor a claimed rank can promote the author —
+        // while the membership check keeps a departed or never-member author
+        // out. fresh() still verifies every signature before anything is persisted.
         val authors = state.members.map { circleFp(it.fp) }.toSet()
         val rejected = inner.filterTo(HashSet()) { event ->
-            circleFp(event.authorFp) !in authors ||
+            event.type.trim().lowercase(Locale.ROOT) in CircleAuthority.PRIVILEGED ||
+                circleFp(event.authorFp) !in authors ||
                 !CircleAuthority.foldable(event, state.id, emptyMap())
         }
         if (rejected.isNotEmpty()) {
@@ -994,16 +1034,19 @@ object FlitCircleSync {
      * parcel. The stages are deliberately ordered:
      *
      *  1. pure shape and circle gates;
-     *  2. [CircleAuthority.foldable] with the roster's fingerprint→role map —
-     *     a JOIN is a host-routed handshake, never a log entry, and a REKEY
-     *     needs an OWNER/ADMIN author;
-     *  3. type-specific body gates, then one bounded JSON object;
-     *  4. [CircleCore.verify] — no replay id is reserved before the signature
+     *  2. a membership gate for every privileged verb — JOIN, ROLE, KICK and
+     *     REKEY must be authored by a current roster member;
+     *  3. [CircleAuthority.foldable] with the roster's fingerprint→role map —
+     *     a JOIN is a host-routed handshake, ROLE needs an OWNER, KICK needs a
+     *     member (an officer for `"mode":"admin"`), and a REKEY needs an
+     *     OWNER/ADMIN author;
+     *  4. type-specific body gates, then one bounded JSON object;
+     *  5. [CircleCore.verify] — no replay id is reserved before the signature
      *     passes, so a forgery cannot burn a valid event's id;
-     *  5. deterministic [CircleCore.order] and [CircleCore.dedup];
-     *  6. a hash set of local log ids, so an already-stored event is not news;
-     *  7. the bounded [FlitCircleStore.EVENT_CAP]; and finally
-     *  8. [CircleCore.accept] at [nowMs] — the shared replay/skew window guard.
+     *  6. deterministic [CircleCore.order] and [CircleCore.dedup];
+     *  7. a hash set of local log ids, so an already-stored event is not news;
+     *  8. the bounded [FlitCircleStore.EVENT_CAP]; and finally
+     *  9. [CircleCore.accept] at [nowMs] — the shared replay/skew window guard.
      *
      * Only events that survive every stage reserve a replay id. [nowMs] is an
      * injectable clock so the window decision is testable without sleeping.
@@ -1015,9 +1058,12 @@ object FlitCircleSync {
     ): List<CircleEvent> {
         val localIds = state.events.mapTo(HashSet()) { it.id }
         val roles = state.members.associate { circleFp(it.fp) to it.role.name }
+        val members = state.members.mapTo(HashSet()) { circleFp(it.fp) }
         val candidates = events.filter { event ->
             CircleCore.validShape(event) &&
                 event.circleId == state.id &&
+                (event.type.trim().lowercase(Locale.ROOT) !in CircleAuthority.PRIVILEGED ||
+                    circleFp(event.authorFp) in members) &&
                 CircleAuthority.foldable(event, state.id, roles) &&
                 (event.type != CircleEvent.FILE || CircleCore.validFileBody(event.body)) &&
                 (event.type != CircleEvent.PARCEL || CourierCarryCore.validParcelBody(event.body)) &&
@@ -1087,17 +1133,30 @@ object FlitCircleSync {
                 return@dialBounded
             }
             val resp = runCatching { route.sync(request) }.getOrNull()
-            if (resp == null || !resp.ok) {
-                log("circle fan-out: ${fp.take(12)} refused ${resp?.reason ?: "no answer"}")
+            if (resp == null) {
+                log("circle fan-out: ${fp.take(12)} refused no answer")
                 concludeHandoff(selected, ok = false)
                 noteFailure(fp, now)
-            } else {
-                log("circle fan-out: ok to ${fp.take(12)} (${offered.size} event(s) offered)")
-                circleAckOf(delta)?.let { watermarks[fp] = it }
-                concludeHandoff(selected, ok = true)
-                courierReceive(state, resp.events)
-                noteSuccess(fp)
+                return@dialBounded
             }
+            // The same answer gate as sync and join: an unsigned or wrong-host
+            // OK must never advance the watermark, ack the bag or fold events.
+            if (!answerVerified(resp, fp)) {
+                log("circle fan-out: ${fp.take(12)} answer not signed by host — ignored")
+                noteFailure(fp, now)
+                return@dialBounded
+            }
+            if (!resp.ok) {
+                log("circle fan-out: ${fp.take(12)} refused ${resp.reason}")
+                concludeHandoff(selected, ok = false)
+                noteFailure(fp, now)
+                return@dialBounded
+            }
+            log("circle fan-out: ok to ${fp.take(12)} (${offered.size} event(s) offered)")
+            circleAckOf(delta)?.let { watermarks[fp] = it }
+            concludeHandoff(selected, ok = true)
+            courierReceive(state, resp.events)
+            noteSuccess(fp)
         }
     }
 

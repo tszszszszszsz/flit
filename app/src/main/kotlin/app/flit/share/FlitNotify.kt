@@ -3,6 +3,7 @@ package app.flit.share
 import android.app.NotificationManager
 import android.content.Context
 import androidx.core.app.NotificationCompat
+import app.flit.share.protocol.panic.PanicCore
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 
@@ -29,14 +30,17 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
 
         /** A panic alert is informational: no auto-action on the recipient's device. */
         fun panic(ctx: Context, e: FlitEngine.PanicEvent) {
+            // Even a relayed alert that passed the wire gate gets a bounded
+            // notification: a huge note must not become a huge BigTextStyle.
+            val text = e.text.take(PanicCore.MAX_TEXT_CHARS)
             val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.notify(
                 PANIC_ID,
                 NotificationCompat.Builder(ctx, CHANNEL_TRANSFERS)
                     .setSmallIcon(android.R.drawable.stat_notify_error)
                     .setContentTitle("Panic alert · ${e.alias ?: e.senderFp.take(12)}")
-                    .setContentText(e.text.ifBlank { "check in when you can" })
-                    .setStyle(NotificationCompat.BigTextStyle().bigText(e.text))
+                    .setContentText(text.ifBlank { "check in when you can" })
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(text))
                     .setContentIntent(FlitEngine.openAppIntent())
                     .setAutoCancel(true)
                     .build(),

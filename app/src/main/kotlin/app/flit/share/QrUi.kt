@@ -29,6 +29,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
@@ -55,6 +56,62 @@ import kotlinx.coroutines.delay
  * [Qr]/[parseAddCode], and adding happens via [FlitEngine.addFromScan], the
  * exact same entry point the paste fallback uses.
  */
+
+/**
+ * The facts a flit://add confirmation must put in front of the user before any
+ * pin or join. Deliberately excludes the invite token and any group key: a
+ * confirmation is an eyeball check, not a second copy of the secret.
+ */
+data class DeepLinkPrompt(
+    val host: String,
+    val fingerprintPrefix: String,
+    val circleId: String?,
+    val isInvite: Boolean,
+)
+
+/** Pure projection of an untrusted code into confirmation text. */
+fun describeDeepLink(code: QrAdd): DeepLinkPrompt {
+    val host = code.ip.takeIf { it.isNotBlank() }?.let { ip ->
+        if (code.port > 0) "$ip:${code.port}" else ip
+    } ?: code.relay?.trim()?.takeIf { it.isNotBlank() } ?: "unknown host"
+    val fp = code.fingerprint.trim().uppercase()
+    return DeepLinkPrompt(
+        host = host,
+        fingerprintPrefix = fp.take(12).ifBlank { "not provided" },
+        circleId = code.circle?.trim()?.takeIf { it.isNotBlank() },
+        isInvite = !code.circle.isNullOrBlank() || !code.invite.isNullOrBlank(),
+    )
+}
+
+/** Only the exact flit://add authority is accepted — lookalikes and the
+ *  retired flit://pair authority are refused. Pure: no Android, no engine. */
+fun isFlitAddAuthority(authority: String?): Boolean =
+    authority?.equals("add", ignoreCase = true) == true
+
+/**
+ * Sets FLAG_SECURE on whichever Window actually hosts this content. Compose's
+ * AlertDialog / Dialog create their own Window, so an Activity-only flag would
+ * leave QR codes, invites, circle feeds and alerts screenshot-able. Transparent
+ * to layout: it only wraps [content] in a lifecycle-bound window flag.
+ */
+@Composable
+fun SecureWindow(content: @Composable () -> Unit) {
+    val ctx = LocalContext.current
+    DisposableEffect(Unit) {
+        var c: android.content.Context? = ctx
+        var win: android.view.Window? = null
+        while (c != null && win == null) {
+            when (c) {
+                is android.app.Dialog -> win = c.window
+                is android.app.Activity -> win = c.window
+            }
+            c = (c as? android.content.ContextWrapper)?.baseContext
+        }
+        win?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        onDispose { win?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE) }
+    }
+    content()
+}
 
 /** Pure-white QR canvas: crisp modules at any DPI, no bitmap resampling. */
 @Composable
@@ -115,6 +172,7 @@ fun QrShowCard(onClose: () -> Unit, invite: QrAdd? = null) {
             .statusBarsPadding(),
         contentAlignment = Alignment.Center,
     ) {
+        SecureWindow { } // pairing codes and circle invites stay off screenshots
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp),
@@ -205,6 +263,7 @@ fun QrScanCard(onCode: (String) -> Unit, onClose: () -> Unit) {
     LaunchedEffect(Unit) { if (!granted) ask.launch(Manifest.permission.CAMERA) }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        SecureWindow { } // the scan surface is secret too
         if (granted) {
             CameraQrView(onCode = onCode, modifier = Modifier.fillMaxSize())
         } else {

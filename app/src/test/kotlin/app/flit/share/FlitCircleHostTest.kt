@@ -357,14 +357,17 @@ class FlitCircleHostTest {
     }
 
     @Test
-    fun `member signed role event is history only and never changes the owner`() {
+    fun `member signed role event is refused at the authority gate and never changes the owner`() {
         val h = host()
         val st = state(members = listOf(ownerMember, memberMember))
         val claim = signed(memberId, CircleEvent.ROLE, """{"targetFp":"$ownerFp","role":"ADMIN"}""")
 
         val result = h.onRequest(sync(memberFp, listOf(claim)), st)
         assertTrue(result.ok)
-        assertEquals(listOf(claim.id), result.events.map { it.id }) // recorded as history
+        assertTrue(
+            result.events.isEmpty(),
+            "ROLE needs an OWNER author at the shared fold gate, not just a member signature",
+        )
         val next = h.accept(result, st)
         assertEquals(FlitCircleStore.Role.OWNER, roleOf(next, ownerFp))
         assertEquals(FlitCircleStore.Role.MEMBER, roleOf(next, memberFp))
@@ -397,6 +400,41 @@ class FlitCircleHostTest {
         val removed = h.accept(h.onRequest(sync(ownerFp, listOf(demote)), kicked), kicked)
         assertEquals(FlitCircleStore.Role.MEMBER, roleOf(removed, memberFp))
         assertEquals(1, removed.rekeyGen) // demotion alone never rekeys
+    }
+
+    @Test
+    fun `a member admin mode kick never gains officer authority from a promoted peer`() {
+        val h = host()
+        val st = state(members = listOf(ownerMember, memberMember, newcomerMember))
+        val promote = signed(ownerId, CircleEvent.ROLE, """{"targetFp":"$memberFp","role":"ADMIN"}""")
+        val kick = signed(
+            memberId, CircleEvent.KICK,
+            """{"kickId":"k10","targetFp":"$newcomerFp","mode":"admin"}""",
+            lamport = 2L,
+        )
+        // A mixed-author answer can reach accept() even though SYNC itself only
+        // accepts events from the requester. Both folds must read the pre-batch
+        // roster: the member is still a MEMBER when its kick is judged.
+        for (batch in listOf(listOf(promote, kick), listOf(kick, promote))) {
+            val answer = CircleResponse(ok = true, events = batch)
+            val folded = h.accept(answer, st)
+            assertEquals(FlitCircleStore.Role.ADMIN, roleOf(folded, memberFp))
+            assertEquals(FlitCircleStore.Role.MEMBER, roleOf(folded, newcomerFp))
+            assertEquals(3, folded.members.size, "a same-batch promotion cannot execute the kick")
+        }
+
+        // Once the promotion is already folded, the same author is an officer
+        // and its executive kick lands — the original behaviour is intact.
+        val promoted = h.accept(h.onRequest(sync(ownerFp, listOf(promote)), st), st)
+        val later = signed(
+            memberId, CircleEvent.KICK,
+            """{"kickId":"k11","targetFp":"$newcomerFp","mode":"admin"}""",
+            lamport = 3L,
+        )
+        val answer = h.onRequest(sync(memberFp, listOf(later)), promoted)
+        assertTrue(answer.ok)
+        assertEquals(listOf(ownerFp, memberFp), answer.members)
+        assertEquals("not-a-member", h.onRequest(sync(newcomerFp), h.accept(answer, promoted)).reason)
     }
 
     @Test

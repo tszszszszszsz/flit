@@ -6,6 +6,7 @@ import app.flit.share.protocol.circle.DropKeyCore
 import app.flit.share.protocol.circle.PadCore
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
+import app.flit.share.protocol.model.PanicAlert
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.coroutines.runBlocking
@@ -16,6 +17,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
+import java.nio.file.Files
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
 import java.util.Base64
@@ -157,6 +159,136 @@ class FlitEngineTest {
         // file sends, Circle dials and panic fan-out to use the relay.
         assertTrue(FlitEngine.relayHuntAllowed(device(true, FlitKnown.RoutePolicy.AUTO)))
         assertTrue(FlitEngine.relayHuntAllowed(device(true, FlitKnown.RoutePolicy.RELAY_ONLY)))
+    }
+
+    // ==== prepare trust gate ====================================================
+    //
+    // The delegate reads prefs and persisted rows, which need an Android
+    // context; the decision itself is behind evaluatePrepareOffer, a pure seam
+    // with fake store callbacks. These cases run on the JVM with no device,
+    // socket or certificate bytes. The context-bound wiring (flag reads,
+    // ServerConfig.requirePrepareCert, rxSenderFp) stays CODE-only.
+
+    private val gateFpA = "A".repeat(64)
+    private val gateFpB = "B".repeat(64)
+
+    private fun gateDecision(
+        declared: String? = gateFpA,
+        presented: String? = gateFpA,
+        onlyTrusted: Boolean = false,
+        qrOnly: Boolean = false,
+        pinned: Set<String> = emptySet(),
+        known: Set<String> = emptySet(),
+        consulted: MutableList<String> = mutableListOf(),
+    ): TrustGate.Result = FlitEngine.evaluatePrepareOffer(
+        declaredFp = declared,
+        presentedFp = presented,
+        onlyTrusted = onlyTrusted,
+        qrOnly = qrOnly,
+        pinned = { fp -> consulted += "pinned:$fp"; fp in pinned },
+        known = { fp -> consulted += "known:$fp"; fp in known },
+    )
+
+    @Test
+    fun `both gates off accepts a sender with no certificate and reads no store`() {
+        val consulted = mutableListOf<String>()
+        val r = gateDecision(presented = null, consulted = consulted)
+        assertTrue(r.accept)
+        assertNull(r.reason)
+        assertEquals(TrustGate.CODE_CHARS, r.code.length)
+        assertEquals(gateFpA.take(TrustGate.CODE_CHARS), r.code)
+        assertTrue(consulted.isEmpty(), "v2.2 senders stay compatible: no gate consults nothing")
+    }
+
+    @Test
+    fun `gate on with no presented certificate refuses before consulting stores`() {
+        val consulted = mutableListOf<String>()
+        val r = gateDecision(presented = null, onlyTrusted = true, pinned = setOf(gateFpA), consulted = consulted)
+        assertFalse(r.accept)
+        assertEquals(TrustGate.Reason.CertAbsent, r.reason)
+        assertEquals(TrustGate.CODE_CHARS, r.code.length)
+        assertTrue(consulted.isEmpty())
+    }
+
+    @Test
+    fun `gate on refuses a declared fingerprint that differs from the presented digest`() {
+        val consulted = mutableListOf<String>()
+        val r = gateDecision(
+            presented = gateFpB,
+            onlyTrusted = true,
+            pinned = setOf(gateFpA, gateFpB),
+            consulted = consulted,
+        )
+        assertFalse(r.accept)
+        assertEquals(TrustGate.Reason.CertMismatch, r.reason)
+        assertEquals(gateFpA.take(TrustGate.CODE_CHARS), r.code, "the code labels the declared claim")
+        assertTrue(consulted.isEmpty(), "a mismatch never reaches the trust lists")
+    }
+
+    @Test
+    fun `onlyTrusted refuses a matching but unpinned sender`() {
+        val consulted = mutableListOf<String>()
+        val r = gateDecision(onlyTrusted = true, consulted = consulted)
+        assertFalse(r.accept)
+        assertEquals(TrustGate.Reason.NotTrusted, r.reason)
+        assertEquals(listOf("pinned:$gateFpA"), consulted)
+    }
+
+    @Test
+    fun `qrOnly refuses a matching but QR-unknown sender`() {
+        val consulted = mutableListOf<String>()
+        val r = gateDecision(qrOnly = true, consulted = consulted)
+        assertFalse(r.accept)
+        assertEquals(TrustGate.Reason.QrUnknown, r.reason)
+        assertEquals(listOf("known:$gateFpA"), consulted)
+    }
+
+    @Test
+    fun `both gates accept a bound sender that is pinned and QR-known`() {
+        val consulted = mutableListOf<String>()
+        // Wire fingerprints are canonicalised: a lowercase declaration of the
+        // same certificate passes both gates and the stores see uppercase hex.
+        val r = gateDecision(
+            declared = gateFpA.lowercase(),
+            onlyTrusted = true,
+            qrOnly = true,
+            pinned = setOf(gateFpA),
+            known = setOf(gateFpA),
+            consulted = consulted,
+        )
+        assertTrue(r.accept)
+        assertNull(r.reason)
+        assertEquals(gateFpA.take(TrustGate.CODE_CHARS), r.code)
+        assertEquals(listOf("pinned:$gateFpA", "known:$gateFpA"), consulted)
+    }
+
+    @Test
+    fun `a throwing store fails closed and hostile input never reaches the code`() {
+        val refused = FlitEngine.evaluatePrepareOffer(
+            declaredFp = gateFpA,
+            presentedFp = gateFpA,
+            onlyTrusted = true,
+            qrOnly = true,
+            pinned = { throw IllegalStateException("unavailable") },
+            known = { throw IllegalStateException("unavailable") },
+        )
+        assertFalse(refused.accept)
+        assertEquals(TrustGate.Reason.NotTrusted, refused.reason)
+
+        val hostile = "evil-cert-material\n".repeat(20)
+        val bounded = FlitEngine.evaluatePrepareOffer(
+            declaredFp = hostile,
+            presentedFp = null,
+            onlyTrusted = false,
+            qrOnly = true,
+            pinned = { true },
+            known = { true },
+        )
+        assertFalse(bounded.accept)
+        assertEquals(TrustGate.Reason.CertAbsent, bounded.reason)
+        assertEquals(TrustGate.CODE_CHARS, bounded.code.length)
+        assertTrue(bounded.code.all { it in "0123456789ABCDEF" })
+        assertFalse(bounded.code.contains("evil"), "no raw input, let alone certificate material, is echoed")
     }
 
     // ==== per-drop keyed file drops =============================================
@@ -914,5 +1046,287 @@ class FlitEngineTest {
             FlitCircleSync.resetForTest()
         }
         Unit
+    }
+
+    // ==== P0 pairing, announce, panic and landing gates ==========================
+
+    private fun tempDir(tag: String): File =
+        File(System.getProperty("java.io.tmpdir"), "flit-$tag-${System.nanoTime()}").also {
+            assertTrue(it.mkdirs(), "could not create $it")
+        }
+
+    @Test
+    fun `off-LAN pair codes and invites are refused before any state changes`() {
+        val fp = "A".repeat(64)
+        val knownBefore = FlitEngine.knownDevices.value
+        val peersBefore = FlitEngine.peers.value
+        val circleBefore = FlitEngine.circleState.value
+        val before = FlitEngine.log.value.size
+
+        FlitEngine.addFromScan(QrAdd(ip = "8.8.8.8", port = 53317, fingerprint = fp, alias = "attacker"))
+        FlitEngine.addFromScan(QrAdd(relay = "relay.example:4337", fingerprint = fp))
+        FlitEngine.joinCircle(
+            QrAdd(relay = "relay.example:4337", fingerprint = fp, v = 3, circle = "c1", invite = "bearer"),
+        )
+
+        assertEquals(knownBefore, FlitEngine.knownDevices.value)
+        assertEquals(peersBefore, FlitEngine.peers.value)
+        assertEquals(circleBefore, FlitEngine.circleState.value)
+        val added = FlitEngine.log.value.drop(before).map { it.text }
+        assertEquals(3, added.size)
+        assertTrue(added.all { it.contains("off the local network") })
+    }
+
+    @Test
+    fun `scanProbeFor fails closed with no verified carrier and never dials off-LAN`() {
+        val fp = "A".repeat(64)
+        val direct = QrAdd(ip = "192.168.1.9", port = 53317, fingerprint = fp)
+        assertEquals(FlitEngine.ScanProbe.Kind.DIRECT, FlitEngine.scanProbeFor(direct, false, false)?.kind)
+        assertEquals("192.168.1.9", FlitEngine.scanProbeFor(direct, false, false)?.host)
+        assertNull(FlitEngine.scanProbeFor(direct.copy(ip = "8.8.8.8"), true, true))
+
+        val relay = QrAdd(relay = "10.0.0.2:4337", fingerprint = fp)
+        assertNull(FlitEngine.scanProbeFor(relay, false, true), "no relay carrier means no probe")
+        val relayProbe = FlitEngine.scanProbeFor(relay, true, false)
+        assertEquals(FlitEngine.ScanProbe.Kind.RELAY, relayProbe?.kind)
+        assertEquals("10.0.0.2", relayProbe?.host)
+        assertEquals(4337, relayProbe?.port)
+
+        val mac = QrAdd(mac = "AA:BB:CC:DD:EE:FF", fingerprint = fp)
+        assertNull(FlitEngine.scanProbeFor(mac, true, false), "Bluetooth must be on for a MAC code")
+        assertEquals(FlitEngine.ScanProbe.Kind.BLUETOOTH, FlitEngine.scanProbeFor(mac, false, true)?.kind)
+        assertNull(FlitEngine.scanProbeFor(QrAdd(fingerprint = fp), true, true), "no carrier at all")
+        assertNull(FlitEngine.scanProbeFor(QrAdd(fingerprint = ""), true, true))
+    }
+
+    @Test
+    fun `announce decision refuses self stubs off-link ports and replays`() {
+        val self = "A".repeat(64)
+        val peer = "B".repeat(64)
+        fun info(fp: String = peer, port: Int = 53317, ip: String? = "192.168.1.9") =
+            AnnounceInfo(fp, "phone", port, "https", ip)
+
+        val first = FlitEngine.decideAnnounce(info(), self, 1_000L, emptyMap())
+        assertTrue(first.admitted)
+        assertEquals(peer, first.canonicalFp)
+        assertFalse(FlitEngine.decideAnnounce(info(), "", 1_000L, emptyMap()).admitted)
+        assertFalse(FlitEngine.decideAnnounce(info(fp = "manual@192.168.1.9"), self, 1_000L, emptyMap()).admitted)
+        assertFalse(FlitEngine.decideAnnounce(info(fp = self), self, 1_000L, emptyMap()).admitted)
+        assertFalse(FlitEngine.decideAnnounce(info(ip = "8.8.8.8"), self, 1_000L, emptyMap()).admitted)
+        assertFalse(FlitEngine.decideAnnounce(info(port = 0), self, 1_000L, emptyMap()).admitted)
+        assertFalse(FlitEngine.decideAnnounce(info(), self, 1_999L, mapOf(peer to 1_000L)).admitted)
+        assertTrue(FlitEngine.decideAnnounce(info(), self, 2_000L, mapOf(peer to 1_000L)).admitted)
+
+        var gateCalls = 0
+        val denied = FlitEngine.decideAnnounce(
+            info(), self, 1_000L, emptyMap(),
+            gate = { _, _, _, _ -> gateCalls++; false },
+        )
+        assertFalse(denied.admitted, "an injected gate can refuse the announce")
+        assertEquals(1, gateCalls)
+
+        assertEquals(peer, FlitEngine.canonicalFingerprint("  ${peer.lowercase()}  "))
+        assertNull(FlitEngine.canonicalFingerprint("b".repeat(63)))
+        assertNull(FlitEngine.canonicalFingerprint("z".repeat(64)))
+        val flat = FlitEngine.announceInfoOf(
+            PeerInfo(alias = "phone", version = "2.2", fingerprint = peer, port = 53317, protocol = "https"),
+            "192.168.1.9",
+        )
+        assertEquals(peer, flat.fingerprint)
+        assertEquals("192.168.1.9", flat.sourceIp)
+        assertEquals(53317, flat.port)
+    }
+
+    @Test
+    fun `panic origin is trusted only after its own signature verifies`() {
+        val origin = "A".repeat(64)
+        val sender = "B".repeat(64)
+        val alert = PanicAlert(
+            id = "panic-1", senderFp = sender, sentMs = 1_000L, text = "help",
+            originFp = origin, originSig = "origin-sig", originCert = "origin-cert",
+        )
+        var originChecks = 0
+        assertEquals(
+            origin,
+            FlitEngine.trustedPanicOrigin(
+                alert, verifySender = { true }, verifyOrigin = { originChecks++; true },
+            ),
+        )
+        assertEquals(1, originChecks)
+        assertNull(FlitEngine.trustedPanicOrigin(alert, verifySender = { true }, verifyOrigin = { false }))
+        assertNull(FlitEngine.trustedPanicOrigin(alert, verifySender = { false }, verifyOrigin = { true }))
+        assertEquals(
+            origin,
+            FlitEngine.trustedPanicOrigin(
+                alert.copy(originFp = "  ${origin.lowercase()}  "),
+                verifySender = { true }, verifyOrigin = { true },
+            ),
+            "the verified digest is canonicalised, never echoed raw",
+        )
+        assertEquals(
+            sender,
+            FlitEngine.trustedPanicOrigin(
+                alert.copy(originFp = ""), verifySender = { true },
+                verifyOrigin = { throw AssertionError("no declared origin to verify") },
+            ),
+            "legacy alerts fall back to the signature-verified sender",
+        )
+    }
+
+    @Test
+    fun `unsafe announced names never write outside the landing directory`() {
+        val outside = tempDir("outside")
+        val landing = tempDir("landing")
+        try {
+            val payload = "landed plaintext".toByteArray(Charsets.UTF_8)
+            assertNull(FlitEngine.landingFileFor(landing, "../escape.txt"))
+            assertNull(FlitEngine.landingFileFor(landing, "/tmp/escape.txt"))
+            assertNull(FlitEngine.writeLandingFile(landing, "../escape.txt", payload))
+            assertNull(FlitEngine.writeLandingFile(landing, "sub/escape.txt", payload))
+            assertTrue(outside.listFiles().isNullOrEmpty())
+
+            val landed = assertNotNull(FlitEngine.writeLandingFile(landing, "notes.gflit", payload))
+            assertEquals(landing, landed.parentFile)
+            assertContentEquals(payload, landed.readBytes())
+            assertNull(
+                FlitEngine.writeLandingFile(landing, "notes.gflit", "overwrite".toByteArray()),
+                "CREATE_NEW never clobbers an existing landing",
+            )
+
+            val link = File(landing, "link.txt")
+            Files.createSymbolicLink(link.toPath(), File(outside, "victim.txt").toPath())
+            assertNull(FlitEngine.writeLandingFile(landing, "link.txt", payload))
+            assertFalse(File(outside, "victim.txt").exists(), "a symlink child is never followed")
+
+            val dirLink = File(outside, "landing-link")
+            Files.createSymbolicLink(dirLink.toPath(), landing.toPath())
+            assertNull(FlitEngine.writeLandingFile(dirLink, "fresh.txt", payload))
+            assertFalse(File(landing, "fresh.txt").exists(), "a symlinked landing dir is refused")
+        } finally {
+            landing.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `dispatch relay leg needs the same explicit opt-in as hunter panic and circle`() {
+        fun device(relayFor: Boolean, policy: FlitKnown.RoutePolicy) = FlitKnown.Device(
+            fingerprint = "A".repeat(64), alias = "peer", relayFor = relayFor, routePolicy = policy,
+        )
+        assertFalse(FlitEngine.relayDispatchAllowed(null, true))
+        assertFalse(FlitEngine.relayDispatchAllowed(device(false, FlitKnown.RoutePolicy.AUTO), true))
+        assertFalse(FlitEngine.relayDispatchAllowed(device(true, FlitKnown.RoutePolicy.WIFI_ONLY), true))
+        assertFalse(FlitEngine.relayDispatchAllowed(device(true, FlitKnown.RoutePolicy.BLUETOOTH_ONLY), true))
+        assertTrue(FlitEngine.relayDispatchAllowed(device(true, FlitKnown.RoutePolicy.AUTO), true))
+        assertTrue(FlitEngine.relayDispatchAllowed(device(true, FlitKnown.RoutePolicy.RELAY_ONLY), false))
+    }
+
+    @Test
+    fun `erased share extras are filtered and count and byte caps are bounded`() {
+        val mixed: List<Any?> = listOf("a", 7, "b", null, "c")
+        assertEquals(listOf("a", "b", "c"), FlitEngine.readIntakeList(mixed, String::class.java))
+        assertEquals(emptyList<String>(), FlitEngine.readIntakeList("not a list", String::class.java))
+        assertEquals(emptyList<String>(), FlitEngine.readIntakeList(mixed, String::class.java, cap = 0))
+
+        val many = List(FlitEngine.MAX_SHARE_ITEMS + 5) { "uri-$it" }
+        val capped = FlitEngine.readIntakeList(many, String::class.java)
+        assertEquals(FlitEngine.MAX_SHARE_ITEMS, capped.size)
+        assertTrue(FlitEngine.intakeBudgetAllows(0, 0L))
+        assertFalse(FlitEngine.intakeBudgetAllows(FlitEngine.MAX_SHARE_ITEMS, 0L))
+        assertFalse(FlitEngine.intakeBudgetAllows(0, FlitEngine.MAX_SHARE_BYTES))
+        assertFalse(FlitEngine.intakeBudgetAllows(0, Long.MAX_VALUE))
+        assertTrue(FlitEngine.intakeDeclaredSizeAllowed(-1L), "unknown provider size is checked during copy")
+        assertTrue(FlitEngine.intakeDeclaredSizeAllowed(FlitEngine.MAX_SHARE_BYTES))
+        assertFalse(FlitEngine.intakeDeclaredSizeAllowed(FlitEngine.MAX_SHARE_BYTES + 1))
+    }
+
+    @Test
+    fun `a dispatch target pins the TLS leaf to the stored peer fingerprint`() {
+        val pinned = "A".repeat(64)
+        val target = FlitEngine.targetForPeer(
+            host = "192.168.1.9",
+            port = 53317,
+            tls = true,
+            claimedFp = pinned.lowercase(),
+            trusted = listOf(pinned, "C".repeat(64)),
+        )
+        assertEquals("192.168.1.9", target.ip)
+        assertEquals(53317, target.port)
+        assertTrue(target.tls)
+        assertEquals(pinned, target.expectServerFp, "the store's canonical fingerprint, not the wire string")
+    }
+
+    @Test
+    fun `a spoofed PeerInfo cannot change the expected pin`() {
+        val pinned = "A".repeat(64)
+        val spoof = "B".repeat(64)
+        val target = FlitEngine.targetForPeer(
+            host = "192.168.1.9", port = 53317, tls = true,
+            claimedFp = spoof, trusted = listOf(pinned),
+        )
+        assertNull(target.expectServerFp, "an unpaired claim gets no pin")
+        assertNull(
+            FlitEngine.targetForPeer(
+                "192.168.1.9", 53317, true, spoof, emptyList(),
+            ).expectServerFp,
+        )
+        assertNull(
+            FlitEngine.targetForPeer(
+                "192.168.1.9", 53317, true, null, listOf(pinned),
+            ).expectServerFp,
+            "an address-only legacy peer stays unpinned",
+        )
+        assertEquals(pinned, FlitEngine.expectedPinFor(pinned.lowercase(), listOf(pinned)))
+        assertNull(FlitEngine.expectedPinFor(spoof, listOf(pinned)))
+        val relay = FlitEngine.targetForPeer(
+            "10.0.0.2", 4337, true, spoof, listOf(pinned), relayFor = pinned,
+        )
+        assertEquals(pinned, relay.relayFor)
+        assertNull(relay.expectServerFp, "a relay-for hint never supplies the expected pin")
+    }
+
+    @Test
+    fun `intent preselection ignores shortcut id and never authorizes a send`() {
+        val fp = "A".repeat(64)
+        var pinnedCalls = 0
+        assertEquals(
+            fp,
+            FlitEngine.preselectedPeerFromIntent(
+                peerFpExtra = fp, shortcutId = fp, pinned = { pinnedCalls++; true },
+            ),
+        )
+        assertEquals(1, pinnedCalls)
+        assertNull(FlitEngine.preselectedPeerFromIntent(null, fp, { true }))
+        assertNull(FlitEngine.preselectedPeerFromIntent(fp.lowercase(), fp, { false }))
+        assertNull(FlitEngine.preselectedPeerFromIntent("not-a-fingerprint", fp, { true }))
+        assertEquals(fp, FlitEngine.preselectedPeerFromIntent("  ${fp.lowercase()}  ", null, { true }))
+    }
+
+    @Test
+    fun `announce ingest records only accepted fingerprints on the injected clock`() {
+        val clock = FlitEngine.announceClockMs
+        try {
+            val own = "C".repeat(64)
+            val peer = "D".repeat(64)
+            val info = PeerInfo(
+                alias = "phone", version = "2.2", fingerprint = peer,
+                port = 53317, protocol = "https",
+            )
+            FlitEngine.announceClockMs = { 5_000L }
+            assertTrue(FlitEngine.admitAnnounceForIngest(info, "192.168.1.9", own))
+            assertFalse(FlitEngine.admitAnnounceForIngest(info, "192.168.1.9", own), "same-ms replay")
+            FlitEngine.announceClockMs = { 5_999L }
+            assertFalse(FlitEngine.admitAnnounceForIngest(info, "192.168.1.9", own), "still inside the window")
+            FlitEngine.announceClockMs = { 6_000L }
+            assertTrue(FlitEngine.admitAnnounceForIngest(info, "192.168.1.9", own), "at exactly 1000ms")
+            assertFalse(
+                FlitEngine.admitAnnounceForIngest(
+                    info.copy(fingerprint = "C".repeat(64)), "192.168.1.9", own,
+                ),
+                "our own announce is never an ingest",
+            )
+        } finally {
+            FlitEngine.announceClockMs = clock
+        }
     }
 }

@@ -11,6 +11,14 @@ import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
 
 /**
+ * Caller-declared shortcut extras (EXTRA_PEER_FP / EXTRA_SHORTCUT_ID) are
+ * preselection only. Accept a target if and only if it is already pinned; this
+ * never authorises a send. Pure so the decision can be pinned on the JVM.
+ */
+fun preselectPeerFp(rawFp: String?, isPinned: (String) -> Boolean): String? =
+    rawFp?.trim()?.takeIf { it.isNotBlank() && isPinned(it) }
+
+/**
  * Direct-share targets (Android Sharing Shortcuts): every pinned peer becomes
  * "Flit · peer" inside the system share sheet — Gallery → Share → "Flit ·
  * André" sends to André in one tap.

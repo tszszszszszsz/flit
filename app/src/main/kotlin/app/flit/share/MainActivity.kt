@@ -167,6 +167,24 @@ private const val FILE_PROVIDER_AUTHORITY = "app.flit.share.fileprovider"
 /** Saved-instance key: the share-sheet SEND was already consumed by this task. */
 private const val KEY_SHARE_CONSUMED = "shareIntentConsumed"
 
+/**
+ * Caller-declared extras on an external SEND, mirrored into a plain value so
+ * the target decision can be pinned on the JVM without an Android Intent. Own
+ * no Android/Compose references of its own.
+ */
+data class ShareTargetExtras(
+    val peerFp: String?,
+    val shortcutId: String?,
+) {
+    /**
+     * Only EXTRA_PEER_FP may preselect a peer. EXTRA_SHORTCUT_ID is ignored on
+     * purpose: FlitEngine ignores it too, so using it here would leave the two
+     * paths disagreeing about who the target is. A shortcut-id-only SEND
+     * preselects nobody.
+     */
+    fun preselection(): String? = peerFp
+}
+
 /** Newest signed file announcements one courier parcel carries. Each event
  *  carries a cert and signature, so the envelope's plaintext cap fits only a
  *  few; the engine re-verifies and refuses on any oversized seal. */
@@ -214,8 +232,11 @@ class MainActivity : ComponentActivity() {
     /** The latest ACTION_VIEW invite; a new link supersedes an in-flight join. */
     private var pendingCircleJoin: Job? = null
 
-    /** Direct-share target from the sheet: dispatch the intake to this fp the moment both it and the device are ready. */
-    private val autoPeerFp = mutableStateOf<String?>(null)
+    /** A flit://add link waits here until the user confirms host, fp and circle. */
+    private val deepLinkToConfirm = mutableStateOf<QrAdd?>(null)
+
+    /** Caller-declared share target: preselected only, never an automatic send. */
+    private val preselectedPeerFp = mutableStateOf<String?>(null)
 
     private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val peer = pendingPeer
@@ -402,15 +423,18 @@ class MainActivity : ComponentActivity() {
                 // a later re-entry may dispatch this same SEND a second time.
                 shareIntentConsumed = true
                 setIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER))
-                // The fp rides in our own extra; on some OEM sheets (MIUI)
-                // only the standard shortcut id survives — the id IS the
-                // fingerprint by contract, so both roads end at the truth.
-                val raw = intent.getStringExtra(FlitShortcuts.EXTRA_PEER_FP)
-                    ?: intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID)
-                val fp = raw?.takeIf { FlitRoster.pinned(it) }
-                if (fp != null) android.util.Log.i("FlitSend", "share-in: direct target ${FlitRoster.alias(fp) ?: PeerAlias.of(fp)?.text ?: fp}")
-                autoPeerFp.value = fp
-                FlitEngine.handleShareIntent(intent, referrerHost = referrer?.host)
+                // The fp rides in our own extra and is caller-declared: it only
+                // preselects a target in the banner, never dispatches bytes.
+                // EXTRA_SHORTCUT_ID is deliberately NOT a fallback — FlitEngine
+                // ignores it, so a shortcut-id-only SEND preselects nobody.
+                val extras = ShareTargetExtras(
+                    peerFp = intent.getStringExtra(FlitShortcuts.EXTRA_PEER_FP),
+                    shortcutId = intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID),
+                )
+                preselectedPeerFp.value = preselectPeerFp(extras.preselection()) { FlitRoster.pinned(it) }
+                // The referrer is caller-declared too: drop it rather than
+                // attribute the staged share to an unverified host.
+                FlitEngine.handleShareIntent(intent, referrerHost = null)
                 // Funnel every Activity-originated start through the one
                 // POST_NOTIFICATIONS-aware gate before the FGS is launched.
                 if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) askThenStart()
@@ -419,62 +443,86 @@ class MainActivity : ComponentActivity() {
                 // An invite replaces any share-sheet context: no stale
                 // auto-dispatch to a peer, no auto-finish mid-invite.
                 shareMode = false
-                autoPeerFp.value = null
+                preselectedPeerFp.value = null
                 val uri = intent.data ?: return
-                // The manifest filters flit://add, but an explicit intent can
-                // still arrive here. Check scheme and authority before the
-                // tolerant code parser sees a lookalike like flit://add.evil.
+                // An explicit intent can reach us with any authority. Check the
+                // scheme and the exact authority before the tolerant code parser
+                // sees a lookalike like flit://add.evil; flit://pair is retired.
                 if (!uri.scheme.equals("flit", ignoreCase = true)) return
-                val authority = uri.authority ?: return // e.g. flit:add?… has none
-                if (!authority.equals("add", ignoreCase = true) &&
-                    !authority.equals("pair", ignoreCase = true)
-                ) return
-                val link = uri.toString()
-                val code = runCatching { parseAddCode(link) }.getOrNull()
+                if (!isFlitAddAuthority(uri.authority)) return
+                val code = runCatching { parseAddCode(uri.toString()) }.getOrNull()
                 if (code == null) {
                     FlitEngine.toast("that is not a Flit invite")
                     return
                 }
-                // Latest link wins: a repeat or a recreation must not stack
-                // two joins on the same engine.
+                // Nothing is trusted on arrival: stage the link for an explicit
+                // confirmation naming host, fp prefix and circle id. No pin, no
+                // join and no sharing start happen before that confirmation.
                 pendingCircleJoin?.cancel()
                 pendingCircleJoin = null
-                if (code.circle.isNullOrBlank() || code.invite.isNullOrBlank()) {
-                    FlitEngine.addFromScan(code)
-                    return
-                }
-                // A Circle invite needs a live dialer; start through the same
-                // permission-aware gate, then join when identity is ready.
-                if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) askThenStart()
-                pendingCircleJoin = lifecycleScope.launch(openGuard) {
-                    var waited = 0
-                    while (isActive && !FlitEngine.state.value.running &&
-                        FlitEngine.state.value.error == null && waited < 100
-                    ) {
-                        delay(200)
-                        waited++
-                    }
-                    // lifecycleScope cancels on destroy; re-check in case the
-                    // destroy lands between the last delay and the join.
-                    if (!isActive || lifecycle.currentState == Lifecycle.State.DESTROYED) {
-                        pendingCircleJoin = null
-                        return@launch
-                    }
-                    if (!FlitEngine.state.value.running) {
-                        FlitEngine.toast("sharing did not start — open Flit and try the invite again")
-                        pendingCircleJoin = null
-                        return@launch
-                    }
-                    FlitEngine.joinCircle(code)
-                    pendingCircleJoin = null
-                }
-                // Clear the handle on every conclusion, including cancellation
-                // by a config change, without clobbering a newer invite.
-                pendingCircleJoin?.let { job ->
-                    job.invokeOnCompletion { if (pendingCircleJoin === job) pendingCircleJoin = null }
-                }
+                deepLinkToConfirm.value = code
             }
         }
+    }
+
+    /** Drops a staged deep link without trusting it or starting anything. */
+    private fun dismissDeepLink() {
+        deepLinkToConfirm.value = null
+        pendingCircleJoin?.cancel()
+        pendingCircleJoin = null
+        // Consume the link so a recreate cannot re-stage it behind the user.
+        setIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER))
+    }
+
+    /** Runs only from the explicit confirmation dialog; the link was inert until now. */
+    private fun confirmDeepLink(code: QrAdd) {
+        deepLinkToConfirm.value = null
+        setIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER))
+        if (code.circle.isNullOrBlank() || code.invite.isNullOrBlank()) {
+            FlitEngine.addFromScan(code)
+            return
+        }
+        // A Circle invite needs a live dialer. The user has just confirmed, so
+        // start through the same permission-aware gate, then join when ready.
+        if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) askThenStart()
+        pendingCircleJoin = lifecycleScope.launch(openGuard) {
+            var waited = 0
+            while (isActive && !FlitEngine.state.value.running &&
+                FlitEngine.state.value.error == null && waited < 100
+            ) {
+                delay(200)
+                waited++
+            }
+            if (!isActive || lifecycle.currentState == Lifecycle.State.DESTROYED) {
+                pendingCircleJoin = null
+                return@launch
+            }
+            if (!FlitEngine.state.value.running) {
+                FlitEngine.toast("sharing did not start — open Flit and try the invite again")
+                pendingCircleJoin = null
+                return@launch
+            }
+            FlitEngine.joinCircle(code)
+            pendingCircleJoin = null
+        }
+        pendingCircleJoin?.let { job ->
+            job.invokeOnCompletion { if (pendingCircleJoin === job) pendingCircleJoin = null }
+        }
+    }
+
+    /** The banner's explicit send: a preselected fp is never an auto-send. */
+    private fun sendStagedTo(fingerprint: String) {
+        val peer = FlitEngine.peers.value.values.firstOrNull { it.info.fingerprint == fingerprint }
+        val staged = FlitEngine.share.value
+        if (peer != null && staged?.ready == true && FlitEngine.readyForSend()) {
+            FlitShortcuts.reportUsed(this, fingerprint)
+            FlitEngine.sendShare(peer)
+        } else {
+            FlitEngine.toast(
+                "${FlitRoster.all().firstOrNull { it.fingerprint == fingerprint }?.alias ?: "that device"} is offline — tap it in the list to queue",
+            )
+        }
+        preselectedPeerFp.value = null
     }
 
     private fun startSharing() {
@@ -630,6 +678,24 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // QR codes, circle invites, the circle feed, panic alerts and deep-link
+        // confirmations carry secrets. Keep them out of screenshots, recents
+        // and non-secure overlays while (and only while) they are on screen.
+        val secureSurface = showQrDialog || showScanDialog || showCircleInvite ||
+            showCircle || showCircleStart || showCircleJoin || showCircleScan ||
+            showPanicDialog || showParcel || deepLinkToConfirm.value != null
+        DisposableEffect(secureSurface) {
+            val win = (ctx as android.app.Activity).window
+            if (secureSurface) {
+                win.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            } else {
+                win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            }
+            onDispose {
+                win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        }
+
         // Share-sheet mode: finish ONCE, and only from a live, unobstructed
         // screen. A backgrounded activity (external chooser) or a modal Circle
         // feed must never be finished by a stale intake clearing.
@@ -660,34 +726,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Direct-share target: the sheet aimed at a trusted peer. Dispatch the
-        // moment intake AND that device are ready — the second tap the sheet
-        // already paid for. Offline targets never auto-send: content would fly
-        // at a stale address; the user chooses manually instead.
-        val autoFp = this@MainActivity.autoPeerFp.value
-        if (autoFp != null) {
-            LaunchedEffect(autoFp) {
-                var waited = 0
-                while (waited < 15_000) {
-                    val s = FlitEngine.share.value
-                    if (s == null) return@LaunchedEffect // intake discarded mid-flight
-                    val peer = FlitEngine.peers.value.values.firstOrNull { it.info.fingerprint == autoFp }
-                    if (peer != null && s.ready && FlitEngine.readyForSend()) {
-                        android.util.Log.i("FlitSend", "direct-share dispatch to ${peer.displayName}")
-                        FlitShortcuts.reportUsed(ctx, autoFp)
-                        FlitEngine.sendShare(peer)
-                        this@MainActivity.autoPeerFp.value = null
-                        return@LaunchedEffect
-                    }
-                    delay(400)
-                    waited += 400
-                }
-                this@MainActivity.autoPeerFp.value = null
-                if (FlitEngine.share.value != null) {
-                    FlitEngine.toast("${FlitRoster.all().firstOrNull { it.fingerprint == autoFp }?.alias ?: "that device"} is offline — tap it in the list to queue")
-                }
-            }
-        }
+        // A caller-declared target only preselects the staged-share banner.
+        // No SEND intent may dispatch bytes on its own: the banner's Send button
+        // is the only road from an external share to FlitEngine.sendShare.
 
         // One owner per back press. Material dialogs register a handler too;
         // covering the gap where a sheet is up but nothing claims the event
@@ -696,11 +737,12 @@ class MainActivity : ComponentActivity() {
             showQrDialog || showScanDialog || showKnownDialog || showPanicDialog ||
             showRenameDialog || showThemeDialog || showBatteryDialog || showRelayDialog ||
             showParcel || showCircleStart || showCircleJoin || showCircleScan || showCircleInvite ||
-            peerMenuFor != null
+            deepLinkToConfirm.value != null || peerMenuFor != null
         BackHandler(enabled = showCircle) { showCircle = false } // Circle owns back while up
         BackHandler(enabled = !showCircle && overlayOpen) {
             // Dismiss only — never finish the activity out of a modal state.
             when {
+                deepLinkToConfirm.value != null -> dismissDeepLink()
                 showParcel -> showParcel = false
                 pendingCircleOpen -> pendingCircleOpen = false
                 peerMenuFor != null -> peerMenuFor = null
@@ -977,6 +1019,9 @@ class MainActivity : ComponentActivity() {
                                     // ---- staged share banner -----------------------------------
                                     share?.let { s ->
                                         val n = s.files.size + s.uris.size
+                                        // A caller-declared target is preselected here; it never
+                                        // sends on its own. The explicit Send button is the user tap.
+                                        val stagedTarget = preselectedPeerFp.value
                                         Surface(
                                             shape = RoundedCornerShape(FlitCorner.large),
                                             color = MaterialTheme.colorScheme.secondaryContainer,
@@ -1014,22 +1059,24 @@ class MainActivity : ComponentActivity() {
                                                         )
                                                     }
                                                 }
-                                                if (!s.text.isNullOrBlank() && n == 0) {
-                                                    Text(
-                                                        s.text.take(160),
-                                                        style = MaterialTheme.typography.bodySmall,
-                                                        fontSize = 12.sp,
-                                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                                    )
-                                                }
+                                                // Caller-controlled note text and referrer are
+                                                // deliberately not rendered here: only counts.
                                                 Text(
-                                                    if (s.ready) {
-                                                        "tap a device below to send" +
-                                                            (s.sourceApp?.let { " (from $it)" } ?: "")
-                                                    } else "copying shared files to a safe place…",
+                                                    if (s.ready) "tap a device below to send"
+                                                    else "copying shared files to a safe place…",
                                                     style = MaterialTheme.typography.bodySmall,
                                                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                                                 )
+                                                if (stagedTarget != null) {
+                                                    val label = FlitRoster.alias(stagedTarget) ?: "selected device"
+                                                    OutlinedButton(
+                                                        enabled = s.ready,
+                                                        onClick = { sendStagedTo(stagedTarget) },
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .padding(top = 8.dp),
+                                                    ) { Text("Send to $label") }
+                                                }
                                             }
                                         }
                                     }
@@ -1477,6 +1524,7 @@ class MainActivity : ComponentActivity() {
                                 dismissOnBackPress = false,
                             ),
                         ) {
+                            SecureWindow { } // the Circle feed's own window, not the Activity's
                             MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                                 Box(
                                     modifier = Modifier
@@ -1575,6 +1623,7 @@ class MainActivity : ComponentActivity() {
                                 dismissOnBackPress = false, // MainActivity's BackHandler owns back
                             ),
                         ) {
+                            SecureWindow { } // QR parcel frames ride this dialog's window
                             MaterialTheme(colorScheme = FlitThemeColors(theme)) {
                                 Box(
                                     modifier = Modifier
@@ -1802,6 +1851,40 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // A flit://add link is inert until this dialog is confirmed. It names
+        // exactly what the user is being asked to trust — nothing is pinned,
+        // joined, or started before the confirm button is tapped.
+        deepLinkToConfirm.value?.let { code ->
+            val prompt = describeDeepLink(code)
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
+                    onDismissRequest = { dismissDeepLink() },
+                    title = { Text(if (prompt.isInvite) "Join this Circle?" else "Add this device?") },
+                    text = {
+                        SecureWindow {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    "A flit:// link is untrusted. Check the details before Flit contacts this device.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text("Host: ${prompt.host}")
+                                Text("Fingerprint: ${prompt.fingerprintPrefix}…")
+                                prompt.circleId?.let { Text("Circle: $it") }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = { confirmDeepLink(code) }) {
+                            Text(if (prompt.isInvite) "Join" else "Add")
+                        }
+                    },
+                    dismissButton = {
+                        OutlinedButton(onClick = { dismissDeepLink() }) { Text("Cancel") }
+                    },
+                )
+            }
+        }
+
         if (showKnownDialog) {
             MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                 KnownDevicesSheet(devices = knownDevices, onClose = { showKnownDialog = false })
@@ -1815,18 +1898,20 @@ class MainActivity : ComponentActivity() {
                     onDismissRequest = { showPanicDialog = false },
                     title = { Text("Panic alert") },
                     text = {
-                        Column {
-                            Text(
-                                "Sends a short alert to your known devices. Nothing happens to this device automatically — recipients decide what to do; no files open and no settings change.",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            OutlinedTextField(
-                                value = note,
-                                onValueChange = { note = it.take(280) },
-                                label = { Text("Note (optional)") },
-                                minLines = 2,
-                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                            )
+                        SecureWindow {
+                            Column {
+                                Text(
+                                    "Sends a short alert to your known devices. Nothing happens to this device automatically — recipients decide what to do; no files open and no settings change.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                OutlinedTextField(
+                                    value = note,
+                                    onValueChange = { note = it.take(280) },
+                                    label = { Text("Note (optional)") },
+                                    minLines = 2,
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                )
+                            }
                         }
                     },
                     confirmButton = {
@@ -1965,20 +2050,22 @@ class MainActivity : ComponentActivity() {
                     onDismissRequest = { showCircleInvite = false },
                     title = { Text("Circle invite") },
                     text = {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            val invite = circleInvite
-                            if (invite != null) {
-                                QrCanvas(text = invite.uri(), side = 200.dp)
-                                Spacer(Modifier.height(12.dp))
-                                Text(
-                                    "Anyone who scans this can join until the circle is left. Treat it like a key to the door — a new circle retires it.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            } else {
-                                Text(
-                                    "Only the founder can show this circle's invite. To share a fresh one, start a new circle.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
+                        SecureWindow {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                val invite = circleInvite
+                                if (invite != null) {
+                                    QrCanvas(text = invite.uri(), side = 200.dp)
+                                    Spacer(Modifier.height(12.dp))
+                                    Text(
+                                        "Anyone who scans this can join until the circle is left. Treat it like a key to the door — a new circle retires it.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                } else {
+                                    Text(
+                                        "Only the founder can show this circle's invite. To share a fresh one, start a new circle.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
                             }
                         }
                     },
