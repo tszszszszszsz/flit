@@ -3,15 +3,16 @@
 > Part of the Flit design set. [Transport ladder and index](transport-bluetooth.md) ·
 > [README](../README.md).
 
-The historical full-suite count was **778 tests** split as 362 protocol + 324
-app + 92 harness. A JVM `:core` module now holds ten Android-free seams relocated
-from `:app`; with that move the projected split is 362 protocol + 112 core + 212
-app + 92 harness, still 778. These post-move numbers are a projection, not a
-measured result: a full rig run is in progress and no green run or failure count
-is claimed from this layer. Earlier docs quote smaller counts (76, 115, 302,
-396, 588, 714, 769); those are historical snapshots of the same suite at earlier
-layers, not the current inventory. The current inventory is in
-[TESTING.md](TESTING.md).
+The historical full-suite count was **778 tests**: 362 protocol + 324 app + 92
+harness in the three-module layout, and the same total in the first four-module
+projection of 362 protocol + 112 core + 212 app + 92 harness. After the security
+closeout wave the last recorded four-module test XML is **972 tests**, split as
+443 protocol + 167 core + 254 app + 108 harness, with zero failures, zero errors
+and zero skipped cases. That XML is the current inventory and the projected split
+for this layout; a release assembly rerun after an R8 keep-rule fix is still in
+the background, so no finished-release claim is made here. Earlier counts (76,
+115, 302, 396, 588, 714, 769, 778) are historical snapshots of the same suite at
+earlier layers. The full inventory is in [TESTING.md](TESTING.md).
 The v0.2.0 baseline was `72225f8` (Open-file crash + sharing restore), preceded
 by `2034fa6` (Circle file delivery + quality pass); later layers are recorded
 under `docs/completions/`.
@@ -22,25 +23,36 @@ Four modules, four roles ([README](../README.md#repo-layout)):
 
 | Module | Role | Runs on |
 | --- | --- | --- |
-| `protocol/` | JVM-pure wire engine (JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client, relay core) | JVM only; no Android dependency |
-| `core/` | JVM module holding the ten Android-free seams moved out of `:app`; projected 112 tests | JVM only; no Android dependency |
-| `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.3.1` (code 4), minSdk 26, compile/targetSdk 36 | Phone |
-| `harness/` | Desktop companion shipped as `flit-cli`; doubles as the interop and device-walk rig | Linux box with JDK 21 |
+| `protocol/` | JVM-pure wire engine (JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client, relay core); 443 tests in the last recorded XML | JVM only; no Android dependency |
+| `core/` | JVM module holding the ten Android-free seams moved out of `:app` plus the shared trust and admission reducers; 167 tests in the last recorded XML | JVM only; no Android dependency |
+| `app/` | Android shell (Jetpack Compose), package `app.flit.share`, version `0.3.1` (code 4), minSdk 26, compile/targetSdk 36; v0.3.2 is planned and build files are unchanged; 254 tests in the last recorded XML | Phone |
+| `harness/` | Desktop companion shipped as `flit-cli`; doubles as the interop and device-walk rig; 108 tests in the last recorded XML | Linux box with JDK 21 |
 
 The `:core` move was a relocation of source and tests, not a behaviour change.
 The ten seams are the Android-free models, codecs, reducers and policy helpers
 that had no Android dependency; their platform adapters, radio and camera code
-and Compose rendering stay in `:app`. Wire behaviour is unchanged: the routes,
-headers, DTO fields and v2.2 statuses are the same, and nothing on the wire is
-renamed or added. The `flit-cli` surface is unchanged: command names, flags,
-help text, output lines and exit codes stay as described in §2. The seams moved
-to a different module; the protocol and the CLI contract did not move with them.
+and Compose rendering stay in `:app`. The move itself changed no wire behaviour:
+the routes, headers, DTO fields and v2.2 statuses stayed the same. The later
+security closeout wave added Flit-only prepare headers and new `flit-cli` flags;
+the v2.2 wire surface and status codes stayed unchanged. Command names, flags,
+help text, output lines and exit codes in §2 describe the current CLI, including
+the relay bind default and the prepare gate flags.
 
 Toolchain lives outside the repo in `~/.local/`; `env.sh` pins JDK 21
 (`JAVA_HOME="$HOME/.local/jdks/temurin-21"`), and CI instead uses
 `actions/setup-java` Temurin 21 (rig.yml:20-24). The reference client used for
 interop is the official `localsend-cli` v1.18.2 at `~/.local/opt/localsend-cli`
 (interop/).
+
+Dependency pins live in `gradle/libs.versions.toml`: Kotlin 2.2.0,
+kotlinx-serialization 1.9.0, coroutines 1.10.2, Ktor 3.2.2, Bouncy Castle 1.87,
+Netty 4.2.21.Final, slf4j 2.0.17, AGP 8.13.2, Compose BOM 2026.06.00,
+activity-compose 1.13.0, ZXing 3.5.3 and CameraX 1.4.2. All `io.netty` modules
+resolve to one patch level with a floor of 4.2.18.Final, and `kotlin-reflect`
+is aligned to the Kotlin toolchain version (`build.gradle.kts:11-34`). BC 1.81.1
+was affected; 1.87 is the current release for both `bcprov-jdk18on` and
+`bcpkix-jdk18on`. A pin set is a point-in-time input, not a claim that the set
+is free of advisories.
 
 The pre-commit rig command (README "Dev quickstart", and the same task set in
 CI, rig.yml:35-49):
@@ -62,7 +74,7 @@ than a JVM class-file stack trace (install-cli.sh:1-70).
 ## 2. `flit-cli` reference
 
 The command list below is the no-argument output of `flit-cli` itself,
-defined by `usage()` at `Harness.kt:145-167`. The README's shorter list is a
+defined by `usage()` at `Harness.kt:193-217`. The README's shorter list is a
 user-facing summary; where the two differ, the help text and the arg parser
 decide.
 
@@ -75,7 +87,7 @@ discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
 bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pipe carrier
-relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
+relay [--port P] [--host IP] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 circle <create|join|post|poll|vote|role|kick|leave|sync|file|receipt|pad> [--circle ID] [--invite TOKEN]
@@ -92,22 +104,26 @@ parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs bac
 
 The `courier` surface is detailed in §2.4 and `parcel` in §11.
 
-Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:73-78):
+Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:91-97):
 `--alias --port --dir --dest --udp-port --wait --pin --parallel --announce-to
 --bytes --sender --token --park-timeout --relay --text --circle --invite --file
 --target --option --host --host-fp --role --bag --to --cert --ttl --out --sha
---drop-id --key`.
+--drop-id --key --only-trusted --qr-only --pinned --known`.
 Everything else is a presence flag. Defaults come from `Protocol.DEFAULT_PORT
 = 53317` and `MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay
-default is `DEFAULT_PORT + 1 = 53318` (Harness.kt:706). `--bag --to --cert
+default is `DEFAULT_PORT + 1 = 53318` (Harness.kt:956). `--bag --to --cert
 --ttl` belong to `courier` (§2.4), `--out` to `parcel` (§11), `--sha
---drop-id` to `circle receipt`, and `--key` to `circle pad` (§2.1). A relative
-`--bag` is rooted at `<identity home>` (`harnessHome()`); an absolute path is
-used as given. With no `--bag` the bag is `<identity home>/courier-bag`.
+--drop-id` to `circle receipt`, and `--key` to `circle pad` (§2.1). `--host`
+belongs to `relay`; `--only-trusted`, `--qr-only`, `--pinned` and `--known`
+belong to `serve` (§2.1). The prepare-gate flags are accepted by the parser but
+are not printed in the no-argument help line: a bare occurrence enables a gate,
+and `true`, `1` or `yes` also enable it. A relative `--bag` is rooted at
+`<identity home>` (`harnessHome()`); an absolute path is used as given. With no
+`--bag` the bag is `<identity home>/courier-bag`.
 
 ### 2.1 Commands, flags and observable output
 
-**`serve`** (Harness.kt:530-611) — run a production v2.2 receiver.
+**`serve`** (Harness.kt:749-847) — run a production v2.2 receiver.
 
 - `--alias N`: advertised name; default `Flit (<USER>)` or `Flit (dev)`.
 - `--port P`: TCP/TLS listener; default 53317.
@@ -127,10 +143,26 @@ used as given. With no `--bag` the bag is `<identity home>/courier-bag`.
   announces, a long-lived `RelaySubscriber` subscription that reconnects with a
   2 s backoff. TLS runs *inside* the pipe. A malformed address exits 2 with
   `!! bad --relay … (expected host:port)`.
+- `--only-trusted` / `--qr-only`: prepare-time gates, both off by default, so an
+  unmarked v2.2 sender keeps the auto-accept path. A bare flag enables a gate;
+  `true`, `1` or `yes` also enable it. With either gate on, the prepare route
+  requires `X-Flit-Prepare-Cert` and `X-Flit-Prepare-Sig`, verifies the signature
+  over the exact prepared body and binds the certificate's SHA-256 DER digest to
+  the fingerprint declared in the body before calling the delegate. A missing,
+  malformed, over-cap, wrongly signed or mismatched binding is a concluded 403
+  `Rejected`; Flit-marked senders also receive `X-Flit-Refusal: declined`.
+- `--pinned FP,FP,…` / `--known FP,FP,…`: comma-separated fingerprint lists for
+  the two gates. `--only-trusted` checks the pinned list and `--qr-only` checks
+  the QR-known list; both are read from the caller's persisted rows, never from
+  the presented certificate. A delegate refusal log line carries only a
+  12-character code, not the raw claim or certificate bytes; a binding that fails
+  at the route is answered before the delegate is called.
 
 Startup prints, in order: `HH:mm:ss serving https://0.0.0.0:<port>
 dir=<abs path>`, `fingerprint <fp>`, `circle <id> invite=<token> — join with:
-flit-cli circle join …`. In hidden mode an extra line explains stand-down.
+flit-cli circle join …`. In hidden mode an extra line explains stand-down. With
+a prepare gate on, a `HH:mm:ss prepare gate: onlyTrusted=<bool> qrOnly=<bool>
+pinned=<N> known=<N>` line is printed before the serving line.
 Ctrl+C runs the shutdown hook (`discovery.stop(); server.close()`) and prints
 `bye` (Harness.kt:604-607). In relay-only mode there is no shutdown hook around
 the subscribe loop; SIGINT/SIGTERM ends the process.
@@ -167,22 +199,36 @@ no-arg help string (`Harness.kt:154`). Exit codes: 1 when
 neither files nor `--bytes` are given, 2 if `/info` gets no answer, 3 if any file
 fails. This is **harness evidence**, not a radio walk.
 
-**`relay`** (Harness.kt:701-714; RelayServer.kt) — blind pairer.
+**`relay`** (Harness.kt:937-964; RelayServer.kt) — blind pairer.
 
-- `--port P`: default 53318.
+- `--port P`: default 53318 (`Protocol.DEFAULT_PORT + 1`).
+- `--host IP`: bind address; default `127.0.0.1`. Loopback needs no token. A
+  non-loopback bind without a strong token exits 2 with `!! refusing non-loopback
+  relay bind on <host>: <missing-token|weak-token> token (use a strong --token or
+  bind loopback)`; a strong token needs at least
+  12 characters, at least four distinct characters and a Shannon estimate of at
+  least 48 bits (`RelayCore.isStrongToken`). The same policy is enforced on every
+  hello after startup.
 - `--token T`: optional shared token gate, compared in constant time by
-  `RelayCore`; a wrong token is refused on the wire.
-- `--park-timeout S`: seconds a subscription waits for a partner; 0 (default)
-  means wait forever.
+  `RelayCore`; a wrong token gets `ERR bad-token` on the wire. Three wrong tokens
+  from one address open a per-IP backoff (`ERR throttled`); a good hello clears
+  that address's record.
+- `--park-timeout S`: seconds a subscription waits for a partner. The default is
+  300 (5 minutes, `RelayCore.DEFAULT_PARK_TIMEOUT_MS`). The accepted range is
+  0..604800 (one week); a malformed or out-of-range value exits 2 with `!! bad
+  --park-timeout …`. `0` keeps the old wait-forever option. On timeout the ticket
+  is withdrawn from the registry and the subscriber gets `ERR timeout`.
 
-Startup: `relaying on 0.0.0.0:<port> token=set|none` and `pairing requests and
+Startup: `relaying on <host>:<port> token=set|none` and `pairing requests and
 subscriptions by fingerprint; the pipe inside is opaque`. Pairing logs only
 `pair c3 + c4` and `pair c3 + c4 closed` — no fingerprint, no byte count, never
 content (milestone-e.md:14-28). A connection that fails its bounded hello gets
 `ERR bad-hello`; a timed-out subscription gets `ERR timeout`; a missing partner
 gets `ERR partner-gone`. The accept loop, hello parse (`RelayHello.MAX_LINE`
 bound), FIFO pairing and ghost-ticket `withdraw` are the same production core
-the app dials. Ctrl+C closes the server and all parked sockets and prints `bye`.
+the app dials. Parked tickets are capped globally at 1024
+(`RelayCore.DEFAULT_MAX_PARKED`) so a subscription flood cannot grow the registry
+without bound. Ctrl+C closes the server and all parked sockets and prints `bye`.
 There is no relay-side storage, queue or discovery.
 
 **`panic`** (Harness.kt:249-261) — `flit-cli panic <ip[:port]> [--text NOTE]`;
@@ -275,9 +321,10 @@ what can be counted are in §10.2.
   `!! <message> (set FLIT_TRACE=1 for a stack trace)`.
 - Exit codes, consolidated: **1** = generic top-level exception / no files found
   / bt-sim needs input / an unexpected `parcel` throwable; **2** = bad `--relay`
-  address, `discover` found nobody, `info` got no answer, bt-sim `/info` got no
-  answer, bad courier argument or missing `--bag`, or bad `parcel` arguments /
-  missing `--cert`, `--dir` or `--out`; **3** = at least one file failed to send,
+  address, a non-loopback relay bind with a missing or weak `--token`, a bad
+  `--park-timeout`, `discover` found nobody, `info` got no answer, bt-sim `/info`
+  got no answer, bad courier argument or missing `--bag`, or bad `parcel`
+  arguments / missing `--cert`, `--dir` or `--out`; **3** = at least one file failed to send,
   a courier parcel failed `open`, or `parcel` verification failed. Normal
   `exitProcess(0)` is implicit. The courier-specific codes are
   `EXIT_BAD_ARGS = 2` and `EXIT_OPEN_REFUSED = 3` (§2.4); `parcel` maps a
@@ -287,17 +334,22 @@ what can be counted are in §10.2.
 ### 2.3 Differences from the README summary
 
 1. `bt-sim --no-tls` is implemented (`BtSim.kt:49`) and appears in the `usage()`
-   line at `Harness.kt:154`; `/info` then reports `http`. It is a real,
+   line at `Harness.kt:202`; `/info` then reports `http`. It is a real,
    supported flag.
 2. The README list shows a reduced flag set (no `--alias`, `--port`, `--udp-port`,
    `--http`, `--announce-to`, `--dest`, `--sender`, `--circle`/`--invite` on
    `serve`, no `--alias` on `discover`/`send`, no per-subcommand Circle flags),
-   yet claims to be "every command and flag, from `flit-cli` with no arguments".
-   `usage()` prints the full list — including `--no-tls`, the `courier` flags
-   and the `parcel` line — so the README's reduced set is a summary only.
+   and points to `flit-cli` with no arguments for the complete list. `usage()`
+   prints the command lines — including `--no-tls`, the `courier` flags and the
+   `parcel` line — so the README's reduced set is a summary only.
 3. The README documents `relay --port 53318` as if it were a literal default in
    the help text; the code computes it as `Protocol.DEFAULT_PORT + 1` and the
    help string shows `--port P`. The effective default is still 53318.
+4. The prepare-gate flags `--only-trusted`, `--qr-only`, `--pinned` and `--known`
+   are accepted by `serve` and listed in `ParsedArgs.VALUE_FLAGS`, but they are
+   not printed in the no-argument help line. §2.1 is the reference for them.
+   The `relay` help line does include the new `--host IP`, whose default is
+   loopback.
 
 ### 2.4 Courier command reference
 
@@ -398,9 +450,11 @@ consolidated codes in §2.2 apply and a normal run exits 0.
    touch `~/.config/flit/flit-harness`, so fingerprints survive. This matters
    for QR-pinned peers and the Circle host roster.
 5. For a relay-only receiver, start `flit-cli relay --port 53318 [--token T]`
-   first, then `flit-cli serve --dir … --relay 127.0.0.1:53318 [--token T]`.
-   There is no direct listener and no announce; reachability is only through
-   the subscription.
+   first (it binds `127.0.0.1` unless `--host IP` is given), then
+   `flit-cli serve --dir … --relay 127.0.0.1:53318 [--token T]`. A non-loopback
+   bind needs a strong token; parked subscriptions wait 300 s by default
+   (`--park-timeout S` changes that). There is no direct listener and no announce;
+   reachability is only through the subscription.
 6. For interop against a reference client, `~/.local/opt/localsend-cli`
    (v1.18.2) is used by the `interop/` rig; the app and CLI are clean-room
    implementations of the v2.2 wire protocol, not copies of LocalSend source.
@@ -538,12 +592,14 @@ otherwise emits no log lines.
 | Line | Meaning |
 | --- | --- |
 | `HH:mm:ss serving <scheme>://0.0.0.0:<port> dir=<abs>` | server bound; scheme is `https` unless `--http` |
+| `HH:mm:ss prepare gate: onlyTrusted=<bool> qrOnly=<bool> pinned=<N> known=<N>` | `serve` started with at least one prepare gate on; both gates off prints no such line |
+| `HH:mm:ss offer refused <alias> (<ip>): <reason> code=<12>` | the prepare gate in the delegate refused an offer; the log carries only a short code, never the certificate or raw claim |
 | `HH:mm:ss fingerprint <fp>` | this CLI's stable identity; pin this on the phone |
 | `HH:mm:ss hidden: not announcing — …` | hidden serve; expect the phone's rescue sweep, not multicast, to find it |
 | `HH:mm:ss circle <id> invite=<token> — join with: …` | Circle host seeded; copy the join command |
 | `HH:mm:ss relay subscription host:port dir=<abs>` / `relay: <error> — retry in 2s` | relay-only receiver subscribing / reconnecting after a dropped pair |
 | `HH:mm:ss seen <alias> (ip:port) type=… proto=… v=…` | a peer registered (or answered an announce); deduped by fingerprint |
-| `HH:mm:ss offer from <alias> (ip): N file(s)` + indented `- <id> → <name> (<size> bytes, …)` | prepare; the harness **auto-accepts** — there is no trusted-senders gate on the CLI |
+| `HH:mm:ss offer from <alias> (ip): N file(s)` + indented `- <id> → <name> (<size> bytes, …)` | prepare; with both gates off the harness **auto-accepts**; with a gate on it accepts only after the cert binding and pinned/known checks pass |
 | `recv-start <name> id=<id>` | upload byte stream began |
 | `recv-resume <name> from <bytes> bytes` | attach to a kept prefix; the number is the exact `/partial` answer |
 | `recv-ok <name> → <path> (<bytes> bytes)` / `recv-ok … streamed` | hash-exact landing (classic two-step / direct-to-storage) |
@@ -553,7 +609,8 @@ otherwise emits no log lines.
 | `circle pad put` / `circle pad del` / `circle pad show` | write publishes a signed pad event through the existing Circle fan-out; `show` prints one line per live `PadView` key in key order |
 | confirmed count on `circle sync` / `circle file` | confirmed-author set size from `CircleCore.receiptAuthors` for a keyed drop; local send statuses stay unchanged |
 | `panic from <fp12> (ip): <text> [hops=N]` | signed alert arrived; `hops` is inside the signed canonical body |
-| `relaying on 0.0.0.0:<port> token=set|none` | relay listening; token gate on/off |
+| `relaying on <host>:<port> token=set|none` | relay listening on the bound address (loopback by default); token gate on/off |
+| `!! refusing non-loopback relay bind on <host>: <problem> token (use a strong --token or bind loopback)` | relay refused at startup; `<problem>` is `missing-token` or `weak-token` (exit 2) |
 | `pair c3 + c4` / `pair c3 + c4 closed` | opaque pairing ticket ids only — deliberately no fingerprint/byte count/content |
 | `!! <message>` (+ `set FLIT_TRACE=1 for a stack trace`) | top-level failure; exit code 1 unless a command-specific code applies |
 | `bye` | graceful shutdown hook ran (serve, relay) |
@@ -641,12 +698,12 @@ source env.sh && ./gradlew :protocol:test :core:test :app:testDebugUnitTest :app
     :app:assembleRelease :harness:installDist
 ```
 
-Projected inventory: 778 tests (362 protocol + 112 core + 212 app + 92 harness)
-after the relocation. The historical split was 362 protocol + 324 app + 92
-harness, also 778. These are projections: the full `--rerun-tasks` rig is still
-running and no green result, failure count or assembly result is claimed here.
-CI runs the same task set at .github/workflows/rig.yml:35-49 and uploads the CLI
-zip as artifact `flit-cli`.
+Projected/last-green inventory: 972 tests (443 protocol + 167 core + 254 app +
+108 harness) from the last recorded four-module test XML, with zero failures,
+zero errors and zero skipped cases. The earlier four-module projection (362 +
+112 + 212 + 92) and the three-module split (362 + 324 + 92) are historical, both
+778; the current split adds the security-wave cases. The release assembly is green after the R8 keep-rule fix; no finished-release claim follows from it. CI runs the same task set at
+.github/workflows/rig.yml:35-49 and uploads the CLI zip as artifact `flit-cli`.
 
 ### 6.2 Box serve + discover + send (interop baseline, harness evidence)
 
@@ -718,6 +775,10 @@ file pushed to the phone's `Download/`.
 flit-cli relay --port 53318 --token T                          # terminal A
 flit-cli serve --dir ~/Public --relay 127.0.0.1:53318 --token T # terminal B
 ```
+
+`relay` now binds `127.0.0.1` by default; the recorded walk used that address.
+The token gate is unchanged on the wire, and a parked subscription now times out
+after 300 s unless `--park-timeout` says otherwise.
 
 1. On the phone type the relay address into Options (empty by default, so E is
    invisible until configured); the Known device for the box must have
@@ -996,11 +1057,13 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
 - **Provenance:** development was private; the repository is published with its
   full commit history (scaffolding, milestones, regressions and fixes), not as
   a reconstructed snapshot. The historical release point is `v0.3.0` (tagged at
-  push); the current in-tree version is `0.3.1`.
+  push); the current in-tree version is `0.3.1`, and `v0.3.2` is planned for the
+  security closeout wave. Build files still declare `0.3.1`; no `v0.3.2` release
+  has been assembled here.
 - **Store metadata:** `fastlane/metadata/android/en-US/` holds title,
   short/full description and `changelogs/1.txt` ("First release").
-  `RELEASE_NOTES.md` carries the current v0.3.1 section, the historical v0.3.0
-  section, the v0.2.0 notes and a dated
+  `RELEASE_NOTES.md` carries a planned v0.3.2 security-closeout section, the
+  current v0.3.1 section, the historical v0.3.0 section, the v0.2.0 notes and a dated
   2026-11-25 correction: the original "no new settings/vocabulary" copy was
   superseded by the opt-in **Transfer over Bluetooth** option on 2026-11-24.
 - **Version identity:** namespace/applicationId `app.flit.share`, versionName

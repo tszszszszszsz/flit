@@ -1,5 +1,31 @@
 # Flit — release notes
 
+## Planned — v0.3.2 security closeout wave
+
+This section describes changes that have landed in source; it is not a finished
+release. Build files still declare `0.3.1` (code 4), and no `v0.3.2` artifact has
+been assembled here. The last recorded four-module test XML shows 972 tests (443
+protocol + 167 core + 254 app + 108 harness) with zero failures, zero errors and
+zero skipped cases; the release assembly is green after the R8 keep-rule fix.
+
+The prepare gate binds a Flit-marked sender's declared fingerprint to a signed
+certificate digest and checks it against persisted pinned or QR-known rows. The
+CLI exposes `--only-trusted`, `--qr-only`, `--pinned` and `--known` on `serve`;
+all are off by default, so v2.2 senders keep the auto-accept path. The send path
+can require the TLS peer certificate to match an expected fingerprint and refuses
+before any body leaves the sender when it does not match. Replay boundaries and
+announce admission were tightened. `flit-cli relay` binds loopback by default,
+requires a strong token for a non-loopback bind, backs off repeated wrong tokens
+per address, caps parked tickets and uses a finite park timeout. Dependency pins
+moved to Bouncy Castle 1.87 and a single Netty patch level, 4.2.21.Final, with a
+resolution floor of at least 4.2.18.Final.
+
+v2.2 routes, DTO fields and status codes are unchanged; the new prepare headers
+are Flit-only and are ignored when no gate is on. Evidence is JVM-pure and
+in-process harness; no device walk is claimed and no security proof is made. No account, cloud,
+advertisement, telemetry or phone-home dependency was added, and no desktop app
+is part of this planned release.
+
 ## v0.3.1
 
 A signed JOIN proof closes fingerprint impersonation at admission. A joining

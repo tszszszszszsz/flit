@@ -73,6 +73,11 @@ The 2027-01-11 Integration layer is built ahead of its scheduled day. The JVM
 112 tests are projected to land in `:core`. The code is written now, but the
 commit stays on 2027-01-11; no earlier date carries it.
 
+The 2027-01-12, 2027-01-13 and 2027-01-14 layers are built ahead of their
+scheduled days. The protocol security gates, the integration QA fixes and the
+documentation and release consolidation are written now, but the commits stay
+on 2027-01-12, 2027-01-13 and 2027-01-14; no earlier date carries them.
+
 ## Dates
 
 | Date | Layer | Commit scope |
@@ -109,6 +114,9 @@ commit stays on 2027-01-11; no earlier date carries it.
 | 2027-01-09 | Docs | Confidence assessment, desktop plan and remaining verification plan |
 | 2027-01-10 | Docs | Desktop planning wave summary and gated extraction order |
 | 2027-01-11 | Integration | JVM :core extraction: ten moved seams and 112 tests |
+| 2027-01-12 | Protocol | Security gates: prepare certificate and body signature, sender TLS pin, replay retention, pure tests |
+| 2027-01-13 | Integration | QA fixes in app and harness: trust-gate and pin wiring, release R8 keep rule, tests |
+| 2027-01-14 | Docs | Security closeout record, rig inventory update and release consolidation |
 
 ## Rules for a day
 

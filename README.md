@@ -26,6 +26,12 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 
 **Planned, not built:** a desktop GUI is planned; see [the desktop app roadmap](docs/roadmap/desktop-app.md). Implementation has not started.
 
+**Planned release:** `v0.3.2` is planned for the security closeout wave. Build files still
+declare `0.3.1` (code 4); no `v0.3.2` release has been assembled. The last recorded four-module
+test XML shows 972 tests (443 protocol + 167 core + 254 app + 108 harness) with zero failures,
+errors or skips, while the release assembly is green. No desktop app is
+part of this release.
+
 Working name. Rename is a 15-minute chore before Play listing (no trademark reuse of "LocalSend").
 
 ## Current capabilities
@@ -127,6 +133,16 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   a truncated fingerprint, and the shipped BLE duty schedule is checked at start-up as an
   observation only — findings are logged and the carrier arbiter never reads them, so carrier
   behavior is unchanged. These are code and JVM-tested additions; no device walk is claimed.
+- **Security closeout gates:** a Flit-marked prepare can bind the caller's declared fingerprint
+  to a signed certificate digest and check it against persisted pinned or QR-known rows; the
+  CLI exposes this with `flit-cli serve --only-trusted`, `--qr-only`, `--pinned FP,…` and
+  `--known FP,…`, all off by default so v2.2 senders keep the auto-accept path. The send path
+  can require the TLS peer certificate to match an expected fingerprint. `flit-cli relay` now
+  binds loopback by default, refuses a non-loopback bind without a strong token, caps parked
+  tickets, backs off repeated wrong tokens per address and uses a finite park timeout.
+  Announce admission and replay boundaries were tightened. Evidence is JVM-pure and in-process
+  harness with no device walk; this is not a security proof, and v2.2 routes, DTO fields and
+  status codes are unchanged.
 
 ## Documentation
 
@@ -146,10 +162,10 @@ Milestone status is in the [design index](docs/transport-bluetooth.md). Engineer
 ## Repo layout
 
 ```
-protocol/   wire protocol engine (pure Kotlin; JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client)
-core/       JVM module, present in the build — Android-free seams extracted from the app; 112 projected tests
-app/        Android shell (Jetpack Compose) — the phone app; 212 projected tests
-harness/    the desktop companion, shipped as flit-cli (doubles as the rig that verifies interop with official LocalSend)
+protocol/   wire protocol engine (pure Kotlin; JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client); 443 tests in the last recorded XML
+core/       JVM module, present in the build — Android-free seams extracted from the app plus shared trust/admission reducers; 167 tests
+app/        Android shell (Jetpack Compose) — the phone app; 254 tests
+harness/    the desktop companion, shipped as flit-cli (doubles as the rig that verifies interop with official LocalSend); 108 tests
 ```
 
 ## Dev quickstart
@@ -195,15 +211,22 @@ flag list; `docs/OPERATIONS.md` is the canonical reference):
 ```bash
 flit-cli serve --dir ~/Public [--relay host:port --token T]   # receive; announces on the LAN like the app
 flit-cli serve --dir ~/Public --hidden                      # receive; stays off other devices' rosters entirely
+flit-cli serve --dir ~/Public [--only-trusted] [--qr-only] [--pinned FP,…] [--known FP,…]  # optional prepare gates (off by default)
 flit-cli discover --wait 5                                  # who else is speaking v2.2 here?
 flit-cli send <ip[:port]|alias> <file...> [--parallel N] [--pin PIN] [--multi]
 flit-cli info <ip[:port]>
 flit-cli bt-sim [file...] [--bytes MB] [--no-tls]           # both ends in one process over the pipe carrier
-flit-cli relay --port 53318 [--token T] [--park-timeout S]  # blind pairer for peers that can't reach each other
+flit-cli relay --port 53318 [--host IP] [--token T] [--park-timeout S]  # blind pairer; binds loopback by default
 flit-cli panic <ip[:port]> [--text NOTE]                    # signed informational alert
 flit-cli parse-qr <image...>                                # decode pairing codes from screenshots
 flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>   # accountless group coordination
 ```
+
+The prepare-gate flags bind the declared fingerprint to a signed certificate digest and to the
+pinned/known rows; both gates are off by default, and a refusal is a concluded answer rather than
+a carrier death. `relay` binds `127.0.0.1` unless `--host IP` says otherwise; a non-loopback bind
+needs a strong `--token`, and parked subscriptions wait 300 s by default. See
+[Operations](docs/OPERATIONS.md#2-flit-cli-reference) for the full flag reference.
 
 - `courier` moves signed Circle events between machines as sealed parcels in a portable bag directory: `drop` seals an event for a recipient fingerprint, `carry` verifies the bag and marks parcels carried, `receive` opens parcels addressed to the local identity and folds them into local Circle state, and `status`/`sweep` report rows and expire or refuse undeliverable parcels. The bag is moved by directory copy (USB or any file copy); the CLI adds no transport of its own and no route to the v2.2 wire.
 - `parcel` folds one file into numbered QR frames and back, entirely offline: `encode <file> --dir DIR --to FP --cert PATH` seals the bytes for a recipient certificate supplied out of band (its fingerprint checked against `--to`) and writes `frame-0001.png`, `frame-0002.png`, … into `--dir` through the parcel codec; `decode --dir DIR --out PATH` reads those PNGs, verifies them through the same codec and writes the opened bytes to the explicitly named `--out`. No file name travels in a frame, and neither command opens a socket or uses a radio carrier.
@@ -212,8 +235,9 @@ Needs java 21 at run time — the installed launcher says so in one line if the
 ambient `java` is older (`JAVA_HOME` or PATH wins). Identity lives at
 `~/.config/flit/flit-harness` — stable across rebuilds and updates, so peers that
 trusted this machine keep trusting it. Edges: `serve`
-auto-accepts incoming offers (the app's trusted-senders gate has no CLI counterpart
-yet), and a machine hidden with `--hidden` is invisible to multicast discovery —
+auto-accepts incoming offers unless a prepare gate is enabled (the CLI's
+`--only-trusted` / `--qr-only` flags now cover the app's trusted-senders and
+QR-only gates), and a machine hidden with `--hidden` is invisible to multicast discovery —
 which is exactly the peer the phone app's rescue sweep exists to find. `relay` is
 the milestone-E pairer for peers that cannot open a route to each other: it pairs a
 sender's `req <fingerprint>` with a receiver's long-lived `sub <fingerprint>` and

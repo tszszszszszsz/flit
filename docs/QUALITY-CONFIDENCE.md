@@ -19,11 +19,12 @@ not turn it into evidence.
 | SIM-HARN | In-process runs over production endpoints — `ProtocolClient`, `ServerCore`/`LinkServer` and `RelayServer` with real TLS inside a pipe. PNG frames are rendered and decoded on one box. | A radio path, a second physical phone, a camera, or peer-side confirmation outside that box. A CLI-only exercise with no phone observation stays at this level. |
 | DEVICE | An observation on physical hardware with logcat, UI capture, state files or a digest read tied to a phone-centred walk. | Anything not captured in that run. The recorded walks use one phone, one build and one session; they do not establish a larger mesh, a second phone, timing, throughput or power beyond the specific figures captured. Absence of an expected line is an observation; absence of a whole step is recorded as not verified. |
 
-The current green figure is 778 tests — 362 protocol, 324 app, 92 harness — from a
-fresh, forced re-run of the three test tasks with zero failures, errors and
-skipped cases, with the assemblies green in the same run. That figure is PURE
-and SIM-HARN evidence for the seams and in-process paths; it is not a device
-observation. `docs/TESTING.md` §8 records a stale-output incident in which
+The current green test inventory is 972 tests — 443 protocol, 167 core, 254
+app, 108 harness — from the four test tasks with zero failures, errors and
+skipped cases. That figure is PURE and SIM-HARN evidence for the seams and
+in-process paths; it is not a device observation. The 778 figure from the
+three-module layout is historical, and the release assembly result is recorded
+separately in `docs/TESTING.md`. `docs/TESTING.md` §8 records a stale-output incident in which
 UP-TO-DATE tasks reported green against an older class layout, which is why the
 counts are read from the XML and cross-checked against source-level test
 annotations. Historical totals (302, 588, 714, 769, 773 and others) are
@@ -196,26 +197,21 @@ once in a process-local bounded seen set at `MAX_SEEN = 4096`, a restart or
 another process has no memory of the reservation, and eviction can forget an
 older id. There is no shared or durable replay store.
 
-**Trust gates still compare a declared fingerprint on the open default path.**
-`MainActivity.kt` initializes `onlyTrusted` to `false` and `FlitKnown.kt`
-initializes `known.qrOnly` to `false`. In `FlitEngine.onPrepare`, both gates
-compare `request.info.fingerprint` — a caller-declared, unsigned string in
-`PrepareUploadRequest.info` — against a persisted pin or Known row. A sender
-who knows a trusted fingerprint can pass either gate. The gates are opt-in and
-off by default; enabling one changes the decision but does not bind it to the
-TLS peer certificate.
+**Trust gates default off, and a bound prepare is the opt-in path.** When
+`onlyTrusted` and `qrOnly` are off, the shipped prepare flow keeps the v2.2
+declared-fingerprint behavior. When either gate is on, `ServerCore` requires a
+self-signed certificate header and a signature over the exact prepare body,
+binds the certificate digest to the declared fingerprint, and passes only the
+verified digest to `TrustGate`; `TrustGate` then checks the persisted pin or
+Known row. No route-level gate is applied when both flags are false.
 
-**Certificate binding is parked.** `docs/roadmap/trust-gate-cert-binding.md`
-evaluated Option A (ask for a client certificate during TLS, derive the DER
-digest and require it to equal both the declared fingerprint and a persisted
-pin) and Option B (carry a self-signed certificate header at prepare time and
-check its digest against the declaration). Neither was shipped in v0.3.1: the
-record notes carrier surgery across three transports for Option A and a changed
-prepare header set with an opt-in gate for Option B, and states that no concrete
-requirement justified either wire change. Option B is named as the first
-candidate if the requirement returns. Whichever option is chosen still needs
-tests for no certificate, claimed/presented mismatch, plain HTTP, Bluetooth,
-relay, restart and pin rotation, with only a short fingerprint code logged.
+**Binding has landed; durable trust anchors have not.** The prepare binding and
+the sender-side TLS peer pin are shipped, with tests for mismatch and plain
+HTTP refusal. The two-tier pin store and the reserved-until replay set are
+process-local: there is no durable certificate store, no hydration on restart,
+and no persisted replay ledger. `docs/roadmap/security-hardening.md` records
+the landed and still-open parts of each gap. No DEVICE observation exists for
+these gates, and no security proof is claimed.
 
 ## 6. What would raise confidence
 

@@ -53,6 +53,11 @@ The 2027-01-11 Integration wave is built ahead. The JVM `:core` extraction moves
 ten Android-free seams and 112 tests out of `:app`; implementation runs now, but
 the commit stays on 2027-01-11; no earlier wave carries it.
 
+The 2027-01-12 through 2027-01-14 security waves are built ahead. The protocol
+security gates, the integration QA fixes and the documentation and release
+consolidation are written now, but the commits stay on their assigned dates;
+no earlier wave carries them.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator
@@ -94,6 +99,9 @@ integrated as one commit after all 16 files are present and cross-checked.
 | 2027-01-09 | Docs | Confidence assessment, desktop plan, scope reversal, remaining verification plan |
 | 2027-01-10 | Docs | Twenty-task desktop planning wave: orchestrators, specialists, docs and QA |
 | 2027-01-11 | Integration | 16 tasks across the JVM :core extraction: ten seams moved out of :app with 112 tests |
+| 2027-01-12 | Protocol | 16 tasks across prepare certificate and body signature binding, sender TLS pin, replay retention and pure tests |
+| 2027-01-13 | Integration | 16 tasks across QA fixes in app and harness: trust-gate and pin wiring, release R8 keep rule and tests |
+| 2027-01-14 | Docs | 16 tasks across the security closeout record, rig inventory update and release consolidation |
 
 ## Integration gate
 

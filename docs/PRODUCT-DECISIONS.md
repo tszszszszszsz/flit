@@ -111,7 +111,19 @@ File drops push bytes through `sendFiles`; the signed announcement alone did not
 | Open-file / sharing restore | fixed and device-verified on the final build |
 | Wi‑Fi Aware | parked: hardware feature absent |
 | Multi-hop mesh, bonded carriers, offline bundle | parked or not built, named above |
+| Security closeout (`v0.3.2`) | planned; gates and relay defaults landed in source; build files still declare `0.3.1`; no finished release |
 | GUI desktop | planned, not built; the earlier scope cut is superseded by [docs/roadmap/desktop-app.md](roadmap/desktop-app.md); non-profit constraints apply unchanged |
+
+`v0.3.2` is the planned security closeout release, not a published one. The
+inventory at the last recorded four-module test XML is 972 tests (443 protocol +
+167 core + 254 app + 108 harness), zero failures, errors and skips; the release assembly is green after the R8 keep-rule fix. The prepare
+gate and relay defaults are opt-in or default-safe: both prepare gates stay off
+so v2.2 senders are unaffected, and `flit-cli relay` binds loopback unless a
+strong token and an explicit host are supplied. Dependency pins moved to
+Bouncy Castle 1.87 and a single Netty patch level, 4.2.21.Final. The evidence is JVM-pure and
+in-process harness; no device walk or security proof is claimed. The non-profit
+constraint in §1 applies unchanged: no accounts, no cloud, no ads, no telemetry
+and no SDK that phones home. No desktop app is included in this planned release.
 
 ## 8. Working practice
 

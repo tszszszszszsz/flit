@@ -5,7 +5,7 @@
 > [Open-file / sharing restore](open-file-and-sharing-restore.md) ·
 > [README](../README.md).
 
-Module/count inventory (projected): **362 protocol + 112 core + 212 app + 92 harness = 778 tests**. Ten Android-free seams moved from :app into a JVM :core module in wave 1; that changes module ownership only, and wire behavior and every timing claim in this document are unchanged. The split above is a projection, not a confirmed result: it is an inventory figure until a JUnit XML exists for the relocated layout, so no pass or failure count is asserted here. No benchmark was run for this documentation update, and the rig result is not known from this layer. Older docs quote older counts (76, 86, 115, 302) from the era in which they were written — those are historical, not current, figures.
+Module/count inventory (projected/last-green): **443 protocol + 167 core + 254 app + 108 harness = 972 tests**. The last recorded four-module JUnit XML shows zero failures, zero errors and zero skipped cases; the release assembly is green after the R8 keep-rule fix, so this document makes no finished-release claim. Ten Android-free seams moved from :app into a JVM :core module in wave 1; that move changed module ownership only, and wire behavior and every timing claim here are unchanged. The security closeout wave added protocol, core, app and harness cases plus structural bounds, listed below; it adds no timing measurement. The earlier four-module projection (362 + 112 + 212 + 92) and the three-module split (362 + 324 + 92), both 778, are historical. No benchmark was run for this documentation update. Older docs quote older counts (76, 86, 115, 302) from the era in which they were written — those are historical, not current, figures.
 
 There is **no power monitor, battery-current sample, profiler trace or frame-time capture anywhere in this repo**. Every energy statement below is duty-cycle arithmetic plus design intent, or an on-device observation (an idle soak, a log line), never a measured mAh or watt figure.
 
@@ -178,6 +178,15 @@ At this layer the API takes byte arrays, so the cost described is one cipher pas
 | TLS pin cache | 512 LRU | `TlsIdentity.MAX_PINS` (`:165-177`) |
 | One dispatch per peer | 1 | `dispatching` set, claimed *before* spooling (`FlitEngine.kt:2154-2166,2246`) |
 | One delivery pass per SHA | 1 | `circleDeliveryLocks` Mutex map (`FlitEngine.kt:374-377,557-560`) |
+| Relay parked tickets | 1024 global | `RelayCore.DEFAULT_MAX_PARKED`; wrong-token guesses back off per IP with 4096 tracked addresses |
+| Relay park wait | 300 s default; CLI range 0..604800 s | `RelayCore.DEFAULT_PARK_TIMEOUT_MS`; `0` keeps wait-forever, a timeout withdraws the ticket |
+| Announce registry | 256 peers, 1 s debounce | `AnnounceAdmission.MAX_PEERS` / `DEBOUNCE_MS`; a self, off-link or malformed announce is refused before dispatch |
+| Prepare cert / signature headers | 8 KiB / 2 KiB | `ServerCore.MAX_PREPARE_CERT_CHARS` / `MAX_PREPARE_SIG_CHARS`, parsed only with a prepare gate on |
+| Crush unpack ceiling | 512 MiB | `FlitCrush.MAX_UNPACK_BYTES`; a refused decode removes its partial output |
+
+The relay, announcement, prepare-header and crush bounds are structural constants
+or arithmetic from them, not measured working sets. No timing, allocation or
+byte sample was captured for these paths in the security wave.
 
 The client cap of four is what the README and Play listing mean by "up to four parallel streams". The server accepts up to six, but the shipped client never opens more than four; the measured 512 MiB multi run gained nothing over single stream, so the extra capacity is headroom, not a speed feature.
 

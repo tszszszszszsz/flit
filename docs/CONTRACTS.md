@@ -126,7 +126,15 @@ current line numbers.
 | Sync minimum interval | `30 s` | `FlitCircleSync.kt:41` |
 | Sync backoff | `5 s` base, `120 s` cap (`10,20,40,80,120 s` for attempts 1–5) | `FlitCircleSync.kt:48-54` |
 | Concurrent peer dials | `4` | `FlitCircleSync.kt:89` |
-| Identity pin cache | `512`, access-ordered LRU | `TlsIdentity.kt:165,274-301` |
+| Identity pin cache | `512` verified tier + `16` unverified tier, access-ordered LRU | `TlsIdentity.kt:189-209`, `:383-449` |
+| Prepare cert / signature headers | `X-Flit-Prepare-Cert`, `X-Flit-Prepare-Sig`; caps `8 KiB` / `2 KiB` | `Protocol.kt:60-74`, `ServerCore.kt:1311-1312` |
+| Panic origin fields | `originSig`, `originCert` on `PanicAlert`; hop-0 canonical | `model/PanicAlert.kt:17-37`, `PanicCore.kt:165-200` |
+| Circle replay reservation retain | `REPLAY_WINDOW_MS + CLOCK_SKEW_MS` = 6 h 5 min; `MAX_SEEN = 4096`; `Decision.Full` on saturation | `CircleCore.kt:32-37`, `:87-147` |
+| JOIN proof single-use key | `FLITJOIN1:<hex SHA-256 of proof digest>` in the shared bounded reservation set | `CircleCore.kt:649-685` |
+| CircleAuthority roles | `OWNER_ROLE = "OWNER"`, `OFFICER_ROLES = {OWNER, ADMIN}`, `PRIVILEGED = {JOIN, ROLE, KICK, REKEY}` | `CircleAuthority.kt:34-60` |
+| Relay policy caps | wrong-token backoff `3` failures / `1 s → 300 s`; `MAX_PARKED = 1024`; park TTL `300 s`; non-loopback token >= `12` chars / `48` bits | `RelayCore.kt:104-155` |
+| Announce admission | `MAX_PEERS = 256`, 64-hex fingerprint, alias `64`, 1 s repeat; wire listener 256 / 64 per source / 60 s TTL / 8 registers | `core/AnnounceAdmission.kt:56-223`, `UdpDiscovery.kt:220-340` |
+| Gzip unpack ceiling / keyed name | `MAX_UNPACK_BYTES = 512 MiB`; `MAX_NAME_CHARS = 256` | `core/FlitCrush.kt:28-63`, `DropKeyCore.kt:47-101` |
 
 ## 2. LocalSend v2.2 surface — untouched shapes
 
@@ -173,7 +181,7 @@ registers back.
 | --- | --- | --- |
 | `/info` | GET | `200` + `selfInfo().sansAnnounce()` JSON (`ServerCore.kt:283-285`). |
 | `/register` | GET, POST | Optional body decoded as `PeerInfo`; a non-blank fingerprint calls `delegate.onRegister(info, origin)`; `200` + self info either way (`ServerCore.kt:287-297`). A GET never decodes a body. |
-| `/prepare-upload` | POST | `400 Invalid body` on empty/invalid body or zero files; delegate decides; `403 Rejected` on decline; `204` when no accepted file survives path sanitising; `200` + `PrepareUploadResponse` with a fresh UUID session id and per-file UUID tokens (`ServerCore.kt:299-379`). |
+| `/prepare-upload` | POST | `400 Invalid body` on empty/invalid body or zero files; when `requirePrepareCert()` is on, `X-Flit-Prepare-Cert` must parse and its `X-Flit-Prepare-Sig` must verify over the exact body bytes and the derived digest must equal `info.fingerprint`, else `403` + refusal marker before the delegate; delegate decides; `403 Rejected` on decline; `204` when no accepted file survives path sanitising; `200` + `PrepareUploadResponse` with a fresh UUID session id and per-file UUID tokens (`ServerCore.kt:354-389`, `:463-493`). |
 | `/upload` | POST | Query `sessionId`, `fileId`, `token` all required or `400 Missing parameters`. Claim checks session id + sender origin + token + `settled`; bad claim `403 Invalid token or IP address`; resumed base no longer held `409 Resume base no longer held`. Digest mismatch `422`, success `200`, other error `500` (`ServerCore.kt:393-666`). |
 | `/cancel` | POST | Query `sessionId`; if it matches the live session for this origin, end it as cancelled; always `200` (`ServerCore.kt:1088-1100`). |
 | `/partial` | GET | Query `token`; `200 PartialInfo(size)` when the sender holds a resumable prefix, otherwise `404` with `{}` (`ServerCore.kt:1019-1034`). |
@@ -226,15 +234,24 @@ how RFCOMM and relay pipes speak the same wire TLS without a `java.net.Socket`.
 
 ```kotlin
 data class SendTarget(val ip: String, val port: Int, val tls: Boolean,
-                      val relayFor: String? = null)
+                      val relayFor: String? = null,
+                      val expectServerFp: String? = null)
 fun baseUrl(): String = "${if (tls) "https" else "http"}://$ip:$port"
 ```
 
 `relayFor` is milestone E's one extra field. When set, `host:port` names a
 relay and the hint names the peer fingerprint to pair with. Direct routes leave
-it `null` and are byte-for-byte unchanged. It is threaded through every
-`ProtocolClient` exchange (`info`, `register`, `prepare`, `upload`, `partial`,
-`cancel`, `sendPanic`, `circleJoin`, `circleSync`).
+it `null` and are byte-for-byte unchanged. `expectServerFp` is the sender-side
+anchor: when set, the TLS peer's leaf certificate must hash to that fingerprint,
+checked after the handshake and before the first request byte; a null pin keeps
+the legacy "any self-signed peer" behavior (`ProtocolClient.kt:31-50`). Both
+fields are threaded through every `ProtocolClient` exchange (`info`, `register`,
+`prepare`, `upload`, `partial`, `cancel`, `sendPanic`, `circleJoin`,
+`circleSync`). `TcpLinkProvider` refuses a pin on plain HTTP before opening a
+socket, `TlsLink` checks the piped-TLS peer after the handshake, and
+`PeerHttpClient` repeats the check on the link's `peerCertificate`, so a carrier
+that ignores the hint cannot smuggle a rogue certificate (`Link.kt:98`,
+`:150-171`, `PeerHttpClient.kt:80-92`, `TlsIdentity.kt:309-322`).
 
 ### 3.3 Route kinds and relay policy (app side)
 
@@ -411,6 +428,22 @@ ignores whatever arrived.
 - A token mismatch yields `Refused("bad-token")` before any parking.
 - `withdraw(ticket)` retires a dead parked connection so a ghost can never pair.
 - The ticket is caller-chosen; the core has no sockets, clocks or timeouts.
+- Adversarial-traffic policy: a caller-supplied `clientIp` records wrong-token
+  failures and refuses a guessed token from that address after
+  `DEFAULT_MAX_FAILURES = 3`, with a `DEFAULT_FAILURE_BACKOFF_MS = 1 s` step
+  doubling up to `300 s`; a good hello clears that address's state. The tracked
+  IP map is capped at `4096`. Parked subscriptions **and** queued requests share
+  a global `DEFAULT_MAX_PARKED = 1024` ceiling, and a ticket older than
+  `DEFAULT_PARK_TIMEOUT_MS = 300 s` is purged before any pairing decision
+  (`RelayCore.kt:104-155`, `:182-225`, `:257-298`).
+- `bindTokenProblem(token, loopback)` refuses a non-loopback bind with a missing
+  or weak token. A strong token is at least `MIN_STRONG_TOKEN_LENGTH = 12`
+  characters, has at least four distinct characters and an estimated
+  `MIN_STRONG_TOKEN_BITS = 48` bits (`RelayCore.kt:126-154`). `RelayServer.start`
+  checks the bind address before accepting and passes `requireStrongToken = true`
+  to the core for a non-loopback bind, so no hello can slip past the gate after
+  startup (`RelayServer.kt:24-42`, `:78-95`). Loopback without a token stays
+  available for local development and the harness; the wire grammar is unchanged.
 
 ### 5.3 Socket endpoints (`RelayEndpoints.kt`, `harness/.../RelayServer.kt`)
 
@@ -425,13 +458,15 @@ ignores whatever arrived.
   server-mode (`RelayEndpoints.kt:74-109`, `FlitEngine.kt:1723-1727`). One
   subscription serves one exchange; prepare, `/partial` and each chunk arrive
   on their own re-subscribed pipes.
-- `flit-cli relay [--port P] [--token T] [--park-timeout S]` is a thin wrapper
-  over the same core. It assigns tickets `c1`, `c2`, …, writes `OK` to both
+- `flit-cli relay [--port P] [--host IP] [--token T] [--park-timeout S]` is a
+  thin wrapper over the same core. It assigns tickets `c1`, `c2`, …, writes `OK` to both
   sides on a pair and `ERR <reason>` on rejection, then blind-copies bytes in
   both directions with 64 KiB buffers. Logs contain only timestamps and opaque
   ticket ids (`pair c3 + c4`, `pair c3 + c4 closed`) — no fingerprint, byte
-  count or content (`RelayServer.kt:75-198`). `parkTimeoutMs = 0` waits
-  forever; a bounded value retires an unpaired slot with `ERR timeout`.
+  count or content (`RelayServer.kt:75-198`). The default is 300 s; `0` is the explicit wait-forever opt-out and a bounded
+  value retires an unpaired slot with `ERR timeout`. A non-loopback bind needs a
+  strong token; per-IP wrong-token attempts are throttled and parked slots are
+  capped (`RelayCore.kt:147-154,184-225`).
 
 **Blindness invariant:** a malicious relay can refuse, delay, drop or pair
 connections; it cannot forge a fingerprint, a file or a finished hash, because
@@ -443,13 +478,19 @@ store-and-forward: both peers must be live, and the relay stores nothing.
 ### 6.1 Alert shape (`model/PanicAlert.kt`)
 
 ```
-PanicAlert(id, senderFp, sentMs, text, hops = 0, sig = "", originFp = "")
+PanicAlert(id, senderFp, sentMs, text, hops = 0, sig = "", originFp = "",
+           originSig = "", originCert = "")
 ```
 
 `id` is a UUID; `senderFp` is uppercase hex; `originFp` is the original author
-and is preserved across re-signed forwards. The alert is an additive wire type
-under `/api/flit/v1`; receiving it never acts on the device — it is delivered
-to `delegate.onPanic` and the app decides what a human sees.
+and is preserved across re-signed forwards. `originSig` and `originCert` are
+additive: `sig` covers the current hop and is replaced on forward, so a relay
+could otherwise name a trusted victim in `originFp` while signing as itself.
+The origin fields are excluded from `canonical`, are signed by the origin over
+the hop-zero bytes and ride through every forward unchanged
+(`model/PanicAlert.kt:17-37`). The alert is an additive wire type under
+`/api/flit/v1`; receiving it never acts on the device — it is delivered to
+`delegate.onPanic` and the app decides what a human sees.
 
 ### 6.2 Canonical bytes (`PanicCore.kt:48-83`)
 
@@ -464,7 +505,18 @@ writeLong(sentMs), field(text), writeInt(hops), field(originFp)
 no delimiter can be smuggled through a note. **Hops are inside the signed
 bytes**: a relay that bumps the count changes the signature and must re-sign
 with its own identity; a bumped count with the original signature fails
-verification. `sig` is excluded (it is the signature itself).
+verification. `sig`, `originSig` and `originCert` are excluded.
+
+`verifyOrigin(alert)` binds `originFp` to the key that signed the original
+hop-zero alert. It parses `originCert`, requires its own SHA-256 DER to equal
+`originFp`, rebuilds `canonical(id, originFp, sentMs, text, 0, originFp)` and
+verifies `originSig` under that certificate (`PanicCore.kt:165-200`). A relay
+copies the pair unchanged while re-signing only `sig`, so forwarded alerts still
+pass; a relay that rewrites the hop count or claims a different origin fails. A
+legacy alert with a blank `originFp` falls back to the verified sender. The
+route calls `verifyOrigin` before delivery, writes no pin on refusal, pins only
+after the verdict and delegate, and records the id only after a successful
+delivery (`ServerCore.kt:1049-1124`).
 
 ### 6.3 Create, verify, forward (`PanicCore.kt:85-190`)
 
@@ -491,11 +543,14 @@ verification. `sig` is excluded (it is the signature itself).
 
 The route decodes the JSON alert, rejects blank `id`/`senderFp`/`sig` or
 negative hops with `400`, requires a decodable `X-Flit-Panic-Cert` (else `403`),
-pins that cert and requires its own fingerprint to equal `senderFp` **and**
-`PanicCore.verify` to pass (else `403 Forged panic alert`). Then
-`PanicCore.accept()` decides; only `Accept` calls `delegate.onPanic`. **Every
-valid alert, including a duplicate or a stale one, gets a quiet `200`** so a
-sender never retries a delivered alert forever.
+requires its own fingerprint to equal `senderFp`, and checks both
+`PanicCore.verify` (current hop) and `PanicCore.verifyOrigin` (hop-zero origin)
+against the cert in hand before any pin write (else `403 Forged panic alert`).
+Then `PanicCore.evaluate()` decides; only `Accept` calls `delegate.onPanic` and
+pins the cert, and `PanicCore.accept()` records the id only after a successful
+delivery (`ServerCore.kt:1049-1124`). **Every valid alert, including a duplicate
+or a stale one, gets a quiet `200`** so a sender never retries a delivered alert
+forever.
 
 The app's `onPanicReceived` gates trust on `originFp` (not `senderFp`) being a
 QR-known fingerprint, dedups by id, renders alias/note/time in a banner, and
@@ -579,8 +634,11 @@ Ordering is deterministic: `(lamport, authorFp, id)`, then type, body,
 members converge without a server. `dedup()` keeps one event per id and chooses
 the winner by that order, not by arrival order (`:212-219`). `evaluate()`/`accept()`
 use the shared bounded `4096`-id set with precedence
-`Invalid → OutsideWindow → Duplicate → Accept`; callers **must verify first**
-because `evaluate()` reserves ids before crypto (`:326-387`). `tally()` and
+`Invalid → OutsideWindow → Duplicate → Full → Accept`; a reservation is retained
+for `REPLAY_WINDOW_MS + CLOCK_SKEW_MS` and only expired entries are purged, so a
+flood cannot evict a still-in-window id and a saturated set refuses the
+newcomer as `Full` (`CircleCore.kt:32-37`, `:87-147`, `:708-743`). Callers
+**must verify first** because `evaluate()` reserves ids before crypto. `tally()` and
 `kickTally()` count only each current member's latest signed vote, so changing
 an answer appends a history event without double-counting (`:221-289`).
 
@@ -606,7 +664,9 @@ with no synthetic join event (only the joiner can sign its own join)
 event through `CircleAuthority.foldable` (§7.9): correct circle, known type,
 JOIN excluded, REKEY only from an OWNER/ADMIN author, bounded body,
 `validFileBody` for files, `authorFp == requester`, a verifiable cert and
-signature, then log-id dedup and `CircleCore.accept`. A departure **always**
+signature, then log-id dedup and `CircleCore.accept`. A `Full` verdict from a
+saturated replay set leaves the log unchanged and can be retried after a slot
+expires. A departure **always**
 triggers a fresh 32-byte random key and a signed `rekey` event, even when the
 same batch carried an admitted REKEY: the forced generation is placed above
 the greatest generation that batch was allowed to install, so a peer folding
@@ -688,7 +748,17 @@ no proof). For JOIN the refusal precedence is:
 | --- | --- |
 | `join proof required` | No JOIN event in `events`, or no JOIN event carries a `proof` key. |
 | `invalid join proof` | Bad body; a JOIN event whose author or circle does not match `memberFp`/`circleId`; a forged or unparseable signature; a digest that does not match this host, circle, invite and member. |
-| `join proof replay` | A bucket outside the ±1 tolerance, the same proof presented twice in one request, or an id already reserved by `fresh`/`accept`. |
+| `join proof replay` | A bucket outside the ±1 tolerance, the same proof presented twice in one request, the digest already reserved, or a saturated replay set with no live slot to spare. |
+
+Single-use is keyed on the **domain-tagged proof digest**, not the carrying
+event id: the reservation key is `FLITJOIN1:<hex of the 32-byte digest>`, so a
+captured proof re-signed under a fresh UUID and a fresh signature is still
+`join proof replay` (`CircleCore.kt:674-683`). The reservation uses the same
+bounded set as `evaluate`/`fresh`, is retained for
+`REPLAY_WINDOW_MS + CLOCK_SKEW_MS` and fails closed when full; the certificate
+is pinned only after every gate and a successful reservation. The set is
+process memory: a restart forgets it and the five-minute bucket grid is the
+stateless backstop. No durable replay store is implemented.
 
 The route answers each refusal as a host-signed `200` (§7.5), so a joiner can
 pin the host before treating a refusal as authoritative. The app and the CLI
@@ -700,13 +770,19 @@ mint the proof from their own identity and refuse to dial when the claimed
 `CircleAuthority.foldable(event, circleId, roles)` is JVM-pure: it reads only
 `circleId`, `type` and `authorFp` plus a caller-supplied fingerprint→role map,
 verifies no signature, reads no clock, owns no state and keeps no memory
-between calls. Its rules are three: `join` is never foldable (a handshake, not
-a log entry); `rekey` is foldable only when the trimmed, uppercased author
-holds `OWNER` or `ADMIN` in the map (role values are also trimmed and
-uppercased); every other known verb folds when the circle matches. An unknown
-or blank type, a blank author or a foreign circle is refused. Non-authority
-fields (`id`, `body`, `sig`, `lamport`, `createdMs`, `cert`) do not affect the
-decision.
+between calls. `authorityOf(event)` classifies the authority a verb demands:
+`ROLE` is `OWNER`; `REKEY` is `OFFICER` (`OWNER` or `ADMIN`); `KICK` with
+`"mode":"admin"` is `OFFICER`, while a mode-less or `"vote"` kick is `MEMBER`;
+`JOIN` is refused explicitly; every other verb is `NONE`. `PRIVILEGED` is
+`{JOIN, ROLE, KICK, REKEY}` and none of those can fold from an opened parcel.
+The fourth `foldable` argument defaults to `authorityOf`, so an existing
+three-argument call site switches to the shared rule at the same instant.
+Author fingerprints and role values are trimmed and uppercased before the
+lookup; a malformed kick body degrades to an ordinary vote-kick, not to an
+officer bypass. An unknown or blank type, a blank author or a foreign circle is
+refused. With no roles, no privileged verb folds. Non-authority fields (`id`,
+`body`, `sig`, `lamport`, `createdMs`, `cert`) do not affect the decision
+(`CircleAuthority.kt:34-89`).
 
 Every fold site reaches the same answer from the same inputs:
 
@@ -792,15 +868,18 @@ trust and replay reasoning in [Security](SECURITY.md).
 | Claim tier | What is actually established |
 | --- | --- |
 | **Code reality** | Every constant, route string, header, DTO shape, canonical byte layout, pairing state machine and policy rule listed above. |
-| **Pure-test JVM** | Canonical/sign/verify for panic and Circle, forged-author rejection, replay and dedup windows, Lamport convergence, both `Content-Range` spellings, restart probe/attach, failed-chunk-then-resume, relay pairing/isolation/token, DTO and `LinkServer` parity over the in-memory duplex pipe through the real hand-HTTP + TLS stack; JOIN proof framing, bucket tolerance and refusal precedence, the `CircleAuthority.foldable` truth table, and the app receive-side fold gate. |
+| **Pure-test JVM** | Canonical/sign/verify for panic and Circle, forged-author rejection, replay and dedup windows, Lamport convergence, both `Content-Range` spellings, restart probe/attach, failed-chunk-then-resume, relay pairing/isolation/token, DTO and `LinkServer` parity over the in-memory duplex pipe through the real hand-HTTP + TLS stack; JOIN proof framing, bucket tolerance and refusal precedence, the `CircleAuthority.foldable` truth table, and the app receive-side fold gate. The 2026-11-28 wave adds prepare cert/signature binding (`TrustGateTest`, `ProtocolRefusalTest`, `PeerIdentityPinTest`), sender TLS peer pinning, panic hop-0 origin binding, digest-keyed JOIN single-use and replay saturation (`ReplayBoundaryTest`), role/kick/rekey authority, relay token backoff and caps, announce admission (`AnnounceAdmissionTest`, `UdpDiscoveryTest`), keyed landing names and gzip intake caps (`FlitCrushTest`). |
 | **Harness/sim** | `flit-cli relay` pairs a real 3 MB protocol send hash-exact with TLS inside the pipe; wrong token refused; unpaired subscription times out; dead dial surfaces `TransferUnreachable`. Two in-process TLS Circle nodes sync message, poll re-vote, file drop and kick/rekey; `bt-sim` runs the production client over the pipe carrier. The CLI host gate refuses unauthorised REKEY and same-batch hand-off keys and pins the signed answer with `--host-fp`. |
 | **On-device** | Panic QR-v2 pairing and one-phone↔box banner exchange; relay dial/subscribe with a 200 MiB camera shot and a 300 MiB mid-body relay kill resuming hash-exact from the exact prefix; Circle two-node join/message/leave and phone-as-host; the 2026-11-26 three-node baseline walk, which is DEVICE evidence for a 3-identity Circle (phone plus two CLI identities); file-drop landing hash-exact; QR v3 tap-to-join. |
-| **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. No device walk is attached to the JOIN proof, the fold-time authority gate or the CLI host pin. |
+| **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. No device walk is attached to the JOIN proof, the fold-time authority gate, the CLI host pin or any 2026-11-28 security-wave gate. A durable pin source is not implemented, replay state is process-local, and trust gates stay opt-in and off by default; none of these observations is a security proof. |
 
-The JUnit XML in the tree records 359 protocol + 323 app + 87 harness = 769
-tests with zero failures after the JOIN-proof and authority layers. The earlier
-714 figure (330 + 309 + 75) was the 2026-12-18/12-21 inventory and is
-historical. These are test counts, not a device claim for the UI or CLI layers.
+The last full green JUnit XML records 443 protocol + 167 core + 254 app + 108
+harness = 972 tests with zero failures, zero errors and zero skipped
+(`docs/TESTING.md` §1). That result covers the four test tasks only; the release
+assembly rerun behind the R8 keep-rule change was still pending, so no green
+claim is made for it. The 769 figure (359 + 323 + 87), the 714 figure
+(330 + 309 + 75) and the four-module 778 projection are historical. These are
+test counts, not a device claim for the UI or CLI layers.
 
 ## 11. Cross-links
 
@@ -2689,3 +2768,33 @@ the retained `app.flit.share` package, and the absence of those classes from the
 `:app` tree. PURE covers the JVM-only character of the moved cases: no Android
 runtime, emulator, camera or radio enters them. There is no DEVICE label for
 this layer; no phone, radio or camera walk is recorded.
+
+## 26. Security closeout wave contract (2026-11-28)
+
+This section records the wire and API shape of the security patches. No v2.2
+route, status code, QR parameter or signed canonical field order changes; every
+new header or DTO field is additive and defaulted so old peers and old callers
+keep compiling and parsing. No device walk and no security proof are claimed.
+
+| Gap | Contract as shipped | Source |
+| --- | --- | --- |
+| Prepare cert + signature binding | `X-Flit-Prepare-Cert` DER and `X-Flit-Prepare-Sig` over the exact body bytes; digest must equal declared `info.fingerprint`. Route verifies before `onPrepare` when `requirePrepareCert()` is on; defaulted three-arg delegate overload. | `Protocol.kt:60-74`, `ProtocolClient.kt:650-663`, `ServerCore.kt:52-71`, `:354-389`, `:463-493`, `TrustGate.kt:81-103` |
+| Sender TLS peer pin | `SendTarget.expectServerFp = null` by default; checked by `TcpLinkProvider`, `TlsLink` and `PeerHttpClient` before the first byte. App pin comes only from persisted Known/roster rows via `expectedPinFor`, never from peer wire data. | `ProtocolClient.kt:31-50`, `Link.kt:98`, `:150-171`, `PeerHttpClient.kt:80-92`, `TlsIdentity.kt:309-322`, `FlitEngine.kt:1674-1694` |
+| Panic origin signature / hop-0 | Additive `originSig` / `originCert`; `verifyOrigin` rebuilds `canonical(id, originFp, sentMs, text, 0, originFp)` and binds `originFp` to its own DER digest. Route checks both signatures and pins only after the verdict. | `PanicAlert.kt:17-37`, `PanicCore.kt:165-200`, `:246-273`, `ServerCore.kt:1049-1124` |
+| CircleAuthority roles / kick / rekey | `authorityOf` classifies ROLE as OWNER, REKEY and admin-mode KICK as OFFICER, vote/mode-less KICK as MEMBER; `PRIVILEGED` includes JOIN, ROLE, KICK, REKEY. `foldable`'s fourth argument defaults to it. | `CircleAuthority.kt:34-89` |
+| JOIN proof digest single-use / retention | Reservation key is `FLITJOIN1:<hex digest>`, not the event id; retained for `REPLAY_WINDOW_MS + CLOCK_SKEW_MS`; fails closed on saturation; cert pinned only after the reservation succeeds. | `CircleCore.kt:32-37`, `:649-685` |
+| Replay saturation | `Decision.Full` replaces eviction of live ids; purge only expired reservations; `fresh` returns false when saturated. | `CircleCore.kt:87-147`, `:708-743` |
+| Relay policy | Per-IP wrong-token backoff, 1024 parked-ticket cap, 300 s TTL, non-loopback strong-token requirement at bind and in every hello; app hunt/dispatch need explicit `relayFor` plus AUTO/RELAY_ONLY. | `RelayCore.kt:104-155`, `RelayServer.kt:78-95`, `FlitEngine.kt:2618-2647` |
+| Announce gate | Pure `AnnounceAdmission` before registry writes; wire listener keeps a separate stateful admission with injected clock and bounded register pool. | `core/AnnounceAdmission.kt:56-223`, `FlitEngine.kt:1724-1800`, `UdpDiscovery.kt:220-340` |
+| Keyed landing name | `DropKeyCore.safeLandingName` gate at parse and write time; `landingFileFor` / `writeLandingFile` require a single child and write with `CREATE_NEW` + `NOFOLLOW_LINKS`. | `DropKeyCore.kt:47-101`, `FlitEngine.kt:1137-1168` |
+| Intake caps | Gzip unpack ceiling 512 MiB with partial-output deletion; name, fingerprint, header, body and announce bounds. | `core/FlitCrush.kt:28-123`, `TrustGate.kt:34-47`, `ServerCore.kt:1311-1312` |
+| Dependency upgrades | Bouncy Castle 1.87, Netty 4.2.21.Final with a >= 4.2.18.Final resolution floor, slf4j 2.0.17, aligned `kotlin-reflect`. | `gradle/libs.versions.toml:1-21`, `build.gradle.kts:11-24` |
+
+Open items stated explicitly: a durable pin source is not implemented (stored
+rows carry fingerprints, not DER, and the two-tier pin cache is memory-only);
+replay reservations and JOIN single-use are process-local, with the window and
+bucket grid as stateless backstops; the courier handoff map, announce registry
+and verification marker ring are process-local; prepare and receive gates are
+opt-in and off by default, and relay routing needs the explicit per-device
+`relayFor`; all evidence is CODE, PURE or in-process SIM/HARN with no device
+walk, dependency scan report or security proof.
