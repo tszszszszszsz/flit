@@ -798,7 +798,7 @@ trust and replay reasoning in [Security](SECURITY.md).
 | **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. No device walk is attached to the JOIN proof, the fold-time authority gate or the CLI host pin. |
 
 The JUnit XML in the tree records 359 protocol + 323 app + 87 harness = 769
-tests with zero failures for the JOIN-proof and authority layers. The earlier
+tests with zero failures after the JOIN-proof and authority layers. The earlier
 714 figure (330 + 309 + 75) was the 2026-12-18/12-21 inventory and is
 historical. These are test counts, not a device claim for the UI or CLI layers.
 

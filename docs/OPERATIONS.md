@@ -183,8 +183,9 @@ sweet spots; output is `<path>: <decoded text> (scale 1/N)` or `(no code)`.
 
 **`circle`** (Harness.kt:1065-1265; `circleUsage()` at 169-188) — accountless
 group coordination over the production `/circle/join` and `/circle/sync` routes.
-CLI state lives at `<identity home>/circle.state` (7 lines: id, invite, key,
-host, members, events JSON, rekeyGen). Subcommands:
+CLI state lives at `<identity home>/circle.state` (8 lines: id, invite, key,
+host, members, events JSON, rekeyGen and the pinned host fingerprint).
+Subcommands:
 
 | Subcommand | Required flags | Effect |
 | --- | --- | --- |
@@ -753,7 +754,8 @@ flit-cli serve --dir ~/Public --relay 127.0.0.1:53318 --token T # terminal B
 
 ```bash
 flit-cli serve --dir ~/Public --circle <id> --invite <token>   # box hosts (also prints join line)
-flit-cli circle join --host 127.0.0.1:53317 --circle <id> --invite <token>
+flit-cli circle join --host 127.0.0.1:53317 --circle <id> --invite <token> \
+  --host-fp <fingerprint printed by serve>
 flit-cli circle post --text "hello from the box"
 flit-cli circle poll --text "where?" --option home,away
 flit-cli circle vote --option 0

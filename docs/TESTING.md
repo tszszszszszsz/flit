@@ -520,8 +520,8 @@ of a length-prefixed `FLITJOIN1` nonce over the normalized host fingerprint,
 circle id, invite, member fingerprint and a five-minute bucket, carried as a
 43-character unpadded Base64URL value in the closed `{proof}` body of a signed
 JOIN event. The host recomputes it from the request and answers with one of three
-exact failures: `join proof required`, `invalid join proof` or `join proof
-replay`. `CircleAuthority.foldable` is the single rule used by the app, the CLI
+exact refusals: `join proof required`, `invalid join proof` or `join proof replay`.
+`CircleAuthority.foldable` is the single rule used by the app, the CLI
 and the host: JOIN never folds out of an answer, REKEY folds only for a current
 owner or admin, ordinary verbs fold only inside their own circle, and the rule
 is total on hostile input. The app ingress replay guard verifies before
@@ -698,7 +698,8 @@ flit-cli serve --dir /tmp/opencode/bot-a-downs \
 
 # terminal B
 export FLIT_HARNESS_HOME=/tmp/opencode/bot-b
-flit-cli circle join --host 127.0.0.1:53317 --circle ID --invite TOKEN
+flit-cli circle join --host 127.0.0.1:53317 --circle ID --invite TOKEN \
+    --host-fp FP                              # fingerprint printed by the host's serve
 flit-cli circle post --text 'hello' --host 127.0.0.1:53317
 flit-cli circle poll --text 'Ship?' --option yes --option no --host 127.0.0.1:53317
 flit-cli circle vote --option 0 --host 127.0.0.1:53317

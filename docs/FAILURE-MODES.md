@@ -14,8 +14,8 @@
 | **DEVICE** | Observed on the Redmi Note 10S (API 36) and/or the `flit-cli` box on the rig. The dated walks are cited; nothing else is claimed as walked. |
 
 Current rig state: **359 protocol + 323 app + 87 harness = 769 tests, 0
-failures**, read from the JUnit XML in the tree for the JOIN-proof and authority
-layers. The 714 figure (330 + 309 + 75) was the 2026-12-18/12-21 inventory and
+failures**, recorded in the JUnit XML in the tree after the JOIN-proof and
+authority layers. The 714 figure (330 + 309 + 75) was the 2026-12-18/12-21 inventory and
 is historical; the older 302-test figure was green at `72225f8` and is
 historical too. The non-profit constraint holds
 throughout: no accounts, no cloud, no ads, no telemetry, no phone-home SDKs;
@@ -988,6 +988,37 @@ posts an ordinary signed event on `/circle/sync` and `pad show` prints the
 derived live lines; neither adds a route nor asserts that a remote device has
 folded the line. Test counts are recorded in TESTING.md, not in this table.
 
+### 3.16 JOIN proof and fold-time authority — the refusal conclusions
+
+The 2026-12-22 Protocol and 2026-12-23 Integration layers add a stateless JOIN
+proof and the shared `CircleAuthority.foldable` gate (CONTRACTS.md §7.8–§7.9).
+The route checks shape, then the certificate digest against `memberFp`, then
+the JOIN proof, then the delegate; a failed proof is answered with a host-signed
+`200` refusal before the delegate sees it. The fold sites keep JOIN out of the
+log and reserve REKEY for OWNER/ADMIN authors on the pre-batch roster, with a
+veto on same-batch leavers. No route, header, DTO field or status code is
+added. Evidence is CODE plus JVM PURE and in-process SIM/HARN only; no device
+walk is attached to these layers.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| JOIN with no JOIN event, or only a legacy `{"alias":"..."}` JOIN event | `join proof required` in a host-signed `200`; no key, roster unchanged | signed log and roster unchanged | the bare request | CODE `CircleCore.joinProofFailure`, `ServerCore.circleRoute`; PURE `JoinProofTest` |
+| Proof body with an extra key, padding, the standard `+`/`/` alphabet, a non-string value or an over-cap value | `invalid join proof`; no id reserved | existing log and pin cache unchanged | the malformed event | CODE `CircleCore.validJoinProofBody`; PURE `JoinProofTest` |
+| Proof with a changed host, circle, invite or member, a tampered body, a bad signature or a swapped certificate | `invalid join proof`; a failed certificate is not pinned | no key handed out | the forged event | CODE `CircleCore.joinProofFailure` / `verify`; PURE `JoinProofTest` |
+| Proof from a stale or future bucket, the same proof twice in one request, or an id already reserved | `join proof replay`; a captured proof cannot cross buckets | no key handed out | the captured or repeated proof | CODE `CircleCore.joinProofFailure` / `fresh`; PURE `JoinProofTest` |
+| Claimed `memberFp` differs from the signing identity's certificate fingerprint | app and CLI refuse before dialing; no proof sent | local identity unchanged | nothing | CODE `FlitCircleSync.join`, `Harness circle join`; PURE `FlitCircleSyncTest` |
+| REKEY from a MEMBER, an outsider, a log-only author or a previously departed officer | inert history: appended but installs no key and never raises `rekeyGen` | live key and roster unchanged | the unauthorised rekey | CODE `CircleAuthority.foldable`, `FlitCircleStore.applyRekey`, `FlitCircleSync.fresh`; PURE `CircleAuthorityTest`, `FlitCircleSyncTest`, `FlitCircleStoreTest` |
+| Same-batch leave and officer REKEY, in either fold order | officer's rekey refused; host mints a fresh key above the batch generation | old key material dropped on rotation | the officer's hand-off key | CODE app host, store reducer and CLI host; PURE `FlitCircleHostTest`, `FlitCircleStoreTest`; SIM/HARN `CircleHarnessTest` |
+| Departure with a staying officer's REKEY admitted in the same batch | host rotation still forced above that generation, so peers land on the fresh key | old key material dropped on rotation | the superseded key | CODE `FlitCircleHost`, `Harness.CircleHostState`; PURE `FlitCircleHostTest`; SIM/HARN `CircleHarnessTest` |
+| Answer not signed by the fingerprint pinned with `--host-fp` | refused before any merge; reported as a host-answer failure | local Circle state unchanged | the unsigned answer | CODE `CircleResponse.verify`, CLI `circleAnswerSigned`; SIM/HARN `CircleHarnessTest` |
+| A sealed JOIN or REKEY opened from a courier parcel, even from an OWNER | rejected by the empty-role authority gate; only ordinary events fold | parcel itself still held in the bag | the privileged inner events | CODE `FlitCircleSync.courierReceive`, `CourierCli`; PURE `FlitCircleSyncTest` |
+
+The signature is checked before any replay id is reserved in the app `fresh`
+pipeline, so a forgery cannot burn a valid event's id; the pipeline then runs
+`order`/`dedup`, the local-log id filter, the `EVENT_CAP` and `CircleCore.accept`.
+Every conclusion above is source- and test-evidenced only: none is a device
+observation.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -1188,6 +1219,10 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Delivery receipts (app + CLI, four conclusions) | `FlitEngine.onUploadFinish` / `postReceipt`, `FlitCircleSync.circleBodyValid`, `FlitCircleHost` SYNC filter, `CircleUi.computeFeedData`, `Harness circle receipt`, `DropKeyCore.open`, `FlitCircleStore.CircleDelivery.NO_KEY` | `FlitCircleSyncTest`, `FlitEngineTest`, `ReceiptCliTest`, `ReceiptBodyTest`, `ReceiptTallyTest`, `DropKeyCryptoTest`, `DropParityTest` | — | no device walk; one member's landing is not global delivery |
 | Circle pad (signed verb, pure fold) | `CircleEvent.PAD`, `PadCore.validPadBody` / `view` / `merge`, `CircleCore.dedup` / `evaluate` | `PadBodyTest`, `PadViewTest`, `PadMergeTest`, `PadCanonicalTest` | not added on this date | no device walk; no harness, camera or phone observation |
 | Circle pad app + CLI integration | `FlitEngine.padView` / `circlePadPut` / `circlePadDel` / `refreshCircle`, `FlitCircleSync.postPadPut` / `postPadDel` / `circleBodyValid`, `PadUi.kt` / `PadCard`, `CircleUi`, `MainActivity`, `Harness circle pad` | `PadUiTest`, `FlitEngineTest`, `PadBodyTest`, `PadViewTest`, `PadMergeTest` | — | no device walk; no phone, radio or hardware pad observation |
+| JOIN proof and route gate | `CircleCore.joinProofFailure` / `joinProofNonce` / `joinProofBody`, `ServerCore.circleRoute` | `JoinProofTest`, `CircleCoreTest` | `CircleHarnessTest` | no device walk |
+| CircleAuthority fold gate | `CircleAuthority.foldable`, `FlitCircleHost.onRequest`, `FlitCircleStore.merge` / `applyRekey`, `FlitCircleSync.fresh` / `courierReceive`, `CourierCli`, `Harness.CircleHostState` | `CircleAuthorityTest`, `FlitCircleHostTest`, `FlitCircleStoreTest`, `FlitCircleSyncTest` | `CircleHarnessTest` | no device walk |
+| CLI host pin / signed answers | `Harness` `circleAnswerSigned` / `mergeCircleAnswer`, `--host-fp`, `circle.state` eighth line | — | `CircleHarnessTest` | no device walk |
+| QR payload cap / QR round-trip escalation | `ParcelCli.parcelEncode` cap gate, `renderFrames` 768/1024/1536 px | `ParcelCliTest` (cap) | `ParcelCliHarnessTest` (encode/decode round-trip) | no device walk; no camera capture |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -1217,7 +1252,10 @@ claimed here. The 2026-12-16 circle pad app + CLI row in §3.15 is CODE and PURE
 only: its four conclusions — malformed key/text, over-cap, failed post and stale
 view — carry no DEVICE claim; no phone walk, radio exchange or hardware pad
 observation is attached to this layer, and the 2026-12-17 full-feature walk is
-not claimed here.
+not claimed here. The 2026-12-22/23 JOIN-proof and authority rows in §3.16 are
+CODE plus JVM PURE and in-process SIM/HARN; the QR payload-cap and round-trip
+escalation rows are CODE and PURE/SIM-HARN. None of these carries a DEVICE
+entry: no phone walk or camera capture is attached to them.
 
 ---
 
@@ -1320,3 +1358,10 @@ None changes a shipped contract.
     holds each key's winning `PadLine` with its `(lamport, authorFp, id)` order
     key and tombstone flag so `merge` can re-run the conflict rule; the earlier
     `PadView(lines)` shorthand did not describe that merge input.
+18. **The 2026-12-22 through 2026-12-24 JOIN-proof and authority layers add no
+    device walk here.** The §3.16 rows are CODE from the frozen protocol, app
+    and CLI seams plus JVM PURE and in-process SIM/HARN observations; the QR
+    payload-cap and round-trip escalation rows are CODE and PURE/SIM-HARN. A
+    signed JOIN proof, the fold-time authority gate, CLI host pinning and QR
+    frame escalation are not recorded from a phone or a second physical phone.
+    The 769-test inventory is a test count, not a device observation.
