@@ -3,6 +3,7 @@ package app.flit.share.harness
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.circle.DropKeyCore
 import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendReport
@@ -28,6 +29,7 @@ import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Base64
@@ -473,7 +475,10 @@ private fun circleBool(obj: JsonObject, key: String): Boolean? {
 // ==== shared "console delegate" receiving protocol callbacks ==================
 
 /** Registers collect into `seen` (dedup by fingerprint, both UDP announce + HTTP register). */
-internal class ConsoleDelegate : ServerDelegate {
+internal class ConsoleDelegate(
+    /** The serving CLI's own identity, used to unwrap a keyed drop for this device. */
+    private val cliIdentity: TlsIdentity? = null,
+) : ServerDelegate {
     val seen = ConcurrentHashMap<String, Pair<String, PeerInfo>>() // fingerprint → (ip, info)
     val circleHost = CircleHostState()
 
@@ -513,11 +518,55 @@ internal class ConsoleDelegate : ServerDelegate {
 
     override fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {
         when (result) {
-            is UploadResult.Saved -> println("${ts()} recv-ok   ${file.fileName} → ${result.path} (${result.bytes} bytes)")
+            is UploadResult.Saved -> onLandedFile(file.fileName, result.path, result.bytes)
             is UploadResult.Streamed -> println("${ts()} recv-ok   ${file.fileName} streamed (${result.bytes} bytes)")
             is UploadResult.Mismatch -> println("${ts()} recv-BAD  ${file.fileName} checksum mismatch")
             is UploadResult.Error -> println("${ts()} recv-ERR  ${file.fileName}")
         }
+    }
+
+    /**
+     * A landed file whose digest matches the `cipherSha` of a signed keyed
+     * `file` event in this CLI's own `circle.state` is a sealed drop: unwrap
+     * with the local identity, open the bytes, check the announced plaintext
+     * sha, then write the plaintext beside the landed ciphertext. A missing
+     * wrap, a GCM failure or a plaintext digest mismatch writes no plaintext;
+     * an ordinary landed file keeps the legacy `recv-ok` path.
+     */
+    private fun onLandedFile(wireName: String, path: Path, bytes: Long) {
+        val ciphertext = runCatching { Files.readAllBytes(path) }.getOrNull()
+        val cipherSha = ciphertext?.let { ProtocolClient.sha256Hex { ByteArrayInputStream(it) } }
+        val keyed = cipherSha?.let { sha ->
+            loadCircleState()?.events
+                ?.mapNotNull { DropKeyCore.parseFileKeyBody(it.body) }
+                ?.firstOrNull { it.cipherSha.equals(sha, ignoreCase = true) }
+        }
+        if (ciphertext == null || keyed == null) {
+            println("${ts()} recv-ok   $wireName → $path ($bytes bytes)")
+            return
+        }
+        val identity = cliIdentity ?: loadOrCreateIdentity()
+        val key = DropKeyCore.unwrap(keyed.wraps, identity)
+        if (key == null) {
+            // No wrap for this device: the landed ciphertext stays for cleanup,
+            // but no plaintext is written or announced.
+            println("${ts()} drop-refused ${keyed.name}: no wrap")
+            return
+        }
+        val plain = DropKeyCore.open(key, ciphertext)
+        if (plain == null) {
+            println("${ts()} drop-refused ${keyed.name}: open failed")
+            runCatching { Files.deleteIfExists(path) }
+            return
+        }
+        val plainSha = ProtocolClient.sha256Hex { ByteArrayInputStream(plain) }
+        if (!plainSha.equals(keyed.sha256, ignoreCase = true)) {
+            println("${ts()} drop-refused ${keyed.name}: open failed")
+            runCatching { Files.deleteIfExists(path) }
+            return
+        }
+        Files.write(path.resolveSibling(keyed.name), plain)
+        println("${ts()} drop-open ${keyed.name} $plainSha (${plain.size} bytes)")
     }
 
     override fun onSessionEnd(sessionId: String, cancelled: Boolean) {
@@ -540,7 +589,7 @@ private suspend fun serve(args: ParsedArgs) {
         deviceModel = System.getenv("FLIT_MODEL"),
         deviceType = "headless",
     )
-    val delegate = ConsoleDelegate()
+    val delegate = ConsoleDelegate(identity)
     val circleId = args.opt("--circle") ?: UUID.randomUUID().toString().replace("-", "").take(16)
     val circleInvite = args.opt("--invite")
         ?: (UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", ""))
@@ -910,6 +959,25 @@ internal fun circleFileAnnouncement(name: String, size: Long, sha256: String): S
         put("sha256", JsonPrimitive(sha256))
     }.toString()
 
+/**
+ * Keyed `file` announcement: the exact seven-key body whose `cipherSha`, `iv`
+ * and every wrap are bound by the sender's signature. The three-argument form
+ * above stays the legacy `{name,size,sha256}` builder for `circle post --file`,
+ * where only a reference is published. `circle file` uses this overload and
+ * also pushes the sealed bytes with `sendFiles`.
+ */
+internal fun circleFileAnnouncement(
+    name: String,
+    size: Long,
+    sha256: String,
+    keyGen: Int,
+    cipherSha: String,
+    iv: String,
+    wraps: Map<String, String>,
+): String = DropKeyCore.keyedFileBody(
+    DropKeyCore.KeyedFile(name, size, sha256, keyGen, cipherSha, iv, wraps),
+)
+
 /** Mirror of the app's local-only per-recipient status vocabulary. */
 internal object CircleDeliveryStatus {
     const val PENDING = "pending"
@@ -930,6 +998,10 @@ internal data class CircleFileDelivery(
     val size: Long,
     /** fingerprint → pending | sent | refused | failed. */
     val statuses: LinkedHashMap<String, String> = LinkedHashMap(),
+    /** Digest of the sealed bytes announced in a keyed drop; empty for legacy. */
+    val cipherSha: String = "",
+    /** Uppercase fingerprints the drop key was wrapped to. */
+    val wrappedFor: List<String> = emptyList(),
 )
 
 /** A current member plus the production route we can reach it on. */
@@ -968,11 +1040,13 @@ internal suspend fun deliverCircleFile(
     spoolPath: Path,
     recipients: Collection<CircleRecipient>,
     onStatus: ((fingerprint: String, status: String) -> Unit)? = null,
+    cipherSha: String = "",
+    wrappedFor: List<String> = emptyList(),
 ): CircleFileDelivery {
     val outgoing = PathOutgoing(spoolPath, spoolPath.fileName.toString())
     val name = outgoing.wireName
     val sha = ProtocolClient.sha256Hex { outgoing.openStream() }
-    val delivery = CircleFileDelivery(sha, name, outgoing.size)
+    val delivery = CircleFileDelivery(sha, name, outgoing.size, cipherSha = cipherSha, wrappedFor = wrappedFor)
     for (r in recipients) {
         delivery.statuses[r.fingerprint] = CircleDeliveryStatus.PENDING
         onStatus?.invoke(r.fingerprint, CircleDeliveryStatus.PENDING)
@@ -1141,27 +1215,67 @@ private suspend fun circle(args: ParsedArgs) {
             val spool = Path.of(file)
             if (!Files.isRegularFile(spool)) { println("!! no file: $file"); return }
             val name = spool.fileName.toString()
-            val size = Files.size(spool)
-            val sha = ProtocolClient.sha256Hex { java.io.FileInputStream(spool.toFile()) }
+            val plaintext = Files.readAllBytes(spool)
+            val size = plaintext.size.toLong()
+            val sha = ProtocolClient.sha256Hex { ByteArrayInputStream(plaintext) }
 
-            // 1. signed announcement — {name,size,sha256} only, no bytes/path.
-            val ev = circleEvent(st, identity, CircleEvent.FILE, circleFileAnnouncement(name, size, sha))
+            // One fresh key per drop, wrapped to CURRENT members that hold a
+            // usable certificate. The roster is never silently trimmed: above
+            // the wrap cap, or with no usable cert at all, the drop is refused
+            // before any announcement is minted or posted, and the source
+            // spool stays on disk.
+            val certs = LinkedHashMap<String, X509Certificate>()
+            for (raw in st.members) {
+                val fp = normalized(raw) ?: continue
+                val cert = TlsIdentity.pinned(fp) ?: continue
+                certs[fp] = cert
+            }
+            if (st.members.size > DropKeyCore.MAX_WRAPS) {
+                println("!! ${st.members.size} recipients exceeds key wrap cap — nothing posted")
+                return
+            }
+            if (certs.isEmpty()) {
+                println("!! no recipient key material — nothing posted")
+                return
+            }
+
+            val key = DropKeyCore.mint()
+            val wraps = DropKeyCore.wrap(key.bytes, certs)
+            if (wraps.isEmpty()) {
+                println("!! no recipient key material — nothing posted")
+                return
+            }
+            val sealed = DropKeyCore.seal(key, plaintext)
+            val cipherSha = ProtocolClient.sha256Hex { ByteArrayInputStream(sealed) }
+            val sealedSpool = spool.resolveSibling("$name.flitdrop")
+            Files.write(sealedSpool, sealed)
+            val body = circleFileAnnouncement(
+                name, size, sha, 1, cipherSha,
+                Base64.getEncoder().encodeToString(key.iv), wraps,
+            )
+
+            // 1. signed keyed announcement — no bytes, no path and no plaintext
+            //    key on the wire; the signature binds every wrap and cipherSha.
+            val ev = circleEvent(st, identity, CircleEvent.FILE, body)
             st.events.add(ev)
             pushCircleEvent(st, identity, ev)
 
-            // 2. refresh the roster, then deliver real bytes to every member.
+            // 2. refresh the roster, then deliver the sealed bytes to every member.
             if (st.host.isNotBlank()) {
                 val result = circleExchange(identity, circleTarget(st.host), st, emptyList())
                 result.getOrNull()?.takeIf { it.ok }?.let { mergeCircleAnswer(st, it) }
                 saveCircleState(st)
             }
-            val recipients = circleRecipients(identity, st, me)
-            if (recipients.isEmpty()) {
+            val routes = circleRecipients(identity, st, me)
+            if (routes.isEmpty()) {
                 println("${ts()} no other current member with a route — announcement only; nothing sent")
             }
-            val delivery = deliverCircleFile(identity, spool, recipients) { fp, status ->
-                println("${ts()}   ${fp.take(12)} ${status.padEnd(7)} $name")
-            }
+            val delivery = deliverCircleFile(
+                identity, sealedSpool, routes,
+                onStatus = { fp, status -> println("${ts()}   ${fp.take(12)} ${status.padEnd(7)} $name") },
+                cipherSha = cipherSha,
+                wrappedFor = wraps.keys.toList(),
+            )
             val tally = delivery.statuses.values.groupingBy { it }.eachCount()
             println("${ts()} file $sha: ${tally.entries.sortedBy { it.key }} (status is local-only, never gossiped)")
         }

@@ -21,6 +21,7 @@ import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.circle.DropKeyCore
 import app.flit.share.protocol.courier.CourierCarryCore
 import app.flit.share.protocol.courier.CourierEnvelope
 import app.flit.share.protocol.model.CircleRequest
@@ -383,6 +384,50 @@ val share: StateFlow<ShareIntake?> = _share
     private val _circleEvents = MutableStateFlow<List<CircleEvent>>(emptyList())
     val circleEvents: StateFlow<List<CircleEvent>> = _circleEvents
 
+    /**
+     * The announced material of one keyed drop, read from a signed `file` body.
+     * The content key is never held here — only its wrapped form and the two
+     * digests, so a restart leaves nothing but the wrapped key in the log.
+     */
+    internal data class DropKeyMaterial(
+        val name: String,
+        val sha256: String,
+        val cipherSha: String,
+        val wraps: Map<String, String>,
+    )
+
+    /** Sealed-bytes digest → keyed drop announced in the bounded folded log. */
+    private val dropKeyIndex = ConcurrentHashMap<String, DropKeyMaterial>()
+
+    /** Pure parse of a signed `file` event into its keyed-drop material. */
+    internal fun keyedDropMaterial(event: CircleEvent): DropKeyMaterial? {
+        if (!event.type.equals(CircleEvent.FILE, ignoreCase = true)) return null
+        val keyed = DropKeyCore.parseFileKeyBody(event.body) ?: return null
+        val cipher = keyed.cipherSha.trim().lowercase(Locale.ROOT)
+        if (cipher.isBlank()) return null
+        return DropKeyMaterial(
+            name = keyed.name,
+            sha256 = keyed.sha256.trim().lowercase(Locale.ROOT),
+            cipherSha = cipher,
+            wraps = keyed.wraps,
+        )
+    }
+
+    /** Rebuild the in-memory index from the bounded, already-verified event log. */
+    internal fun rebuildDropKeyIndex(events: List<CircleEvent>) {
+        val next = ConcurrentHashMap<String, DropKeyMaterial>()
+        for (event in events) {
+            val material = keyedDropMaterial(event) ?: continue
+            next.putIfAbsent(material.cipherSha, material)
+        }
+        dropKeyIndex.clear()
+        dropKeyIndex.putAll(next)
+    }
+
+    /** Read-only view for tests: the announced material indexed by cipherSha. */
+    internal fun keyedDropFor(cipherSha: String): DropKeyMaterial? =
+        dropKeyIndex[cipherSha.trim().lowercase(Locale.ROOT)]
+
     /** Local delivery state for Circle file drops, keyed by sha256. */
     private val _circleDeliveries = MutableStateFlow<Map<String, FlitCircleStore.CircleDelivery>>(emptyMap())
     val circleDeliveries: StateFlow<Map<String, FlitCircleStore.CircleDelivery>> = _circleDeliveries
@@ -475,6 +520,7 @@ val share: StateFlow<ShareIntake?> = _share
         lastCircleSignature = signature
         _circleState.value = st
         _circleEvents.value = st?.events?.let { CircleCore.order(it) } ?: emptyList()
+        rebuildDropKeyIndex(_circleEvents.value)
         _circleDeliveries.value = st?.deliveries.orEmpty()
     }
 
@@ -587,10 +633,24 @@ val share: StateFlow<ShareIntake?> = _share
         FlitCircleStore.CircleDelivery.SENT,
         FlitCircleStore.CircleDelivery.REFUSED,
         FlitCircleStore.CircleDelivery.FAILED,
+        // A member with no wrap in a keyed drop is concluded locally: no bytes
+        // are pushed and the sealed spool can be reclaimed with the others.
+        FlitCircleStore.CircleDelivery.NO_KEY,
     )
 
-    /** Create/merge a delivery record, then push real bytes to current members. */
-    private suspend fun startCircleDelivery(name: String, size: Long, sha: String, spoolPath: String) {
+    /**
+     * Create/merge a delivery record, then push real bytes to current members.
+     * [spoolPath] is the sealed spool for a keyed drop; [cipherSha] and
+     * [wrappedFor] are local-only bookkeeping from the signed announcement.
+     */
+    private suspend fun startCircleDelivery(
+        name: String,
+        size: Long,
+        sha: String,
+        spoolPath: String,
+        cipherSha: String = "",
+        wrappedFor: List<String> = emptyList(),
+    ) {
         val key = sha.trim()
         val st = FlitCircleStore.load(appCtx)
         if (st == null) {
@@ -606,9 +666,12 @@ val share: StateFlow<ShareIntake?> = _share
         if (existing != null && existing.spoolPath != spoolPath) {
             runCatching { File(existing.spoolPath).delete() }
         }
+        val wrapped = wrappedFor.map { it.trim().uppercase(Locale.ROOT) }.toSet()
+        val keyed = cipherSha.isNotBlank()
         val statuses = members.associateWith { fp ->
             existing?.statuses?.get(fp)?.takeIf { it in circleDeliveryTerminal }
-                ?: FlitCircleStore.CircleDelivery.PENDING
+                ?: if (keyed && fp !in wrapped) FlitCircleStore.CircleDelivery.NO_KEY
+                else FlitCircleStore.CircleDelivery.PENDING
         }
         if (statuses.isEmpty()) {
             runCatching { File(spoolPath).delete() }
@@ -618,10 +681,12 @@ val share: StateFlow<ShareIntake?> = _share
         val delivery = existing?.copy(
             name = name, size = size, spoolPath = spoolPath,
             statuses = statuses, createdMs = System.currentTimeMillis(),
+            cipherSha = cipherSha, wrappedFor = wrappedFor,
         ) ?: FlitCircleStore.CircleDelivery(
             id = UUID.randomUUID().toString(),
             name = name, size = size, sha256 = key, spoolPath = spoolPath,
             statuses = statuses, createdMs = System.currentTimeMillis(),
+            cipherSha = cipherSha, wrappedFor = wrappedFor,
         )
         FlitCircleStore.persistDelivery(appCtx, delivery)?.let { _circleDeliveries.value = it.deliveries }
         deliverCirclePending(delivery)
@@ -850,19 +915,140 @@ val share: StateFlow<ShareIntake?> = _share
     }
 
     /**
-     * Announce a file drop, then deliver the bytes through the existing
-     * sendFiles path. [spoolPath] is local only — never put it on the wire.
+     * Announce a keyed file drop, then deliver the sealed bytes through the
+     * existing sendFiles path. [spoolPath] is the plaintext source spool: it is
+     * local only, kept on every refusal, and never put on the wire. One fresh
+     * key per drop is wrapped to every current member with a usable cert; the
+     * sealed copy lives at `<spoolPath>.flitdrop` and is what `sendFiles` pushes.
      */
     fun circlePostFile(name: String, size: Long, sha: String, spoolPath: String) =
         scope.launch(Dispatchers.IO) {
-            val posted = runCatching { FlitCircleSync.postFile(name, size, sha) }
-            if (posted.isFailure) {
-                logLine("circle file event failed: ${posted.exceptionOrNull()?.message}")
+            val st = runCatching { FlitCircleStore.load(appCtx) }.getOrNull()
+            val idf = identity
+            if (st == null || idf == null) {
+                logLine("circle drop: circle or identity unavailable")
                 return@launch
             }
-            startCircleDelivery(name, size, sha, spoolPath)
+            val me = (st.selfFp.ifBlank { idf.fingerprint }).trim().uppercase(Locale.ROOT)
+            val recipients = st.members.map { it.fp.trim().uppercase(Locale.ROOT) }
+                .filter { it.isNotBlank() && it != me }.distinct()
+            // The cap is on the roster, not on how many certs happen to resolve:
+            // a member list above MAX_WRAPS is refused, never silently trimmed.
+            if (recipients.size > DropKeyCore.MAX_WRAPS) {
+                logLine("circle drop: ${recipients.size} recipients exceeds key wrap cap")
+                return@launch // source spool kept
+            }
+            val certs = LinkedHashMap<String, X509Certificate>()
+            for (fp in recipients) {
+                val cert = TlsIdentity.pinned(fp)
+                    ?: st.events.firstOrNull { event ->
+                        event.authorFp.equals(fp, ignoreCase = true) &&
+                            event.cert.isNotBlank() && CircleCore.verify(event)
+                    }?.cert?.let(::parseCourierCert) ?: continue
+                val certFp = runCatching { TlsIdentity.fingerprintOf(cert) }.getOrNull() ?: continue
+                if (certFp.equals(fp, ignoreCase = true)) certs[fp] = cert
+            }
+            val key = DropKeyCore.mint()
+            val wraps = DropKeyCore.wrap(key.bytes, certs)
+            if (wraps.isEmpty()) {
+                logLine("circle drop: no recipient key material — not posted")
+                return@launch // source spool kept
+            }
+            val plain = runCatching { File(spoolPath).readBytes() }.getOrNull()
+            if (plain == null) {
+                logLine("circle drop: source spool unreadable")
+                return@launch
+            }
+            val sealed = DropKeyCore.seal(key, plain)
+            val cipherSha = sha256Hex(sealed)
+            val sealedPath = "$spoolPath.flitdrop"
+            if (!runCatching { File(sealedPath).writeBytes(sealed) }.isSuccess) {
+                logLine("circle drop: could not write sealed spool")
+                return@launch // source spool kept
+            }
+            val plainSha = sha.trim().lowercase(Locale.ROOT)
+            val body = DropKeyCore.keyedFileBody(
+                DropKeyCore.KeyedFile(
+                    name = name, size = size, sha256 = plainSha, keyGen = 1,
+                    cipherSha = cipherSha,
+                    iv = Base64.getEncoder().encodeToString(key.iv),
+                    wraps = wraps,
+                ),
+            )
+            val posted = runCatching { FlitCircleSync.postFile(body) }
+            if (posted.isFailure) {
+                logLine("circle drop: announcement failed — not posted (${posted.exceptionOrNull()?.message})")
+                runCatching { File(sealedPath).delete() } // source spool kept
+                return@launch
+            }
+            // The delivery key is the announced plaintext sha (the card's
+            // digest); the record carries the sealed hash and wrap roster.
+            startCircleDelivery(name, size, plainSha, sealedPath, cipherSha, wraps.keys.toList())
             refreshCircle()
         }
+
+    /** SHA-256 hex of raw bytes, used for sealed-drop cipher digests. */
+    internal fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    /** One open attempt against the announced material of a keyed drop. */
+    internal sealed interface KeyedDropOpen {
+        data class Opened(val name: String, val sha256: String, val plaintext: ByteArray) : KeyedDropOpen
+        data class Refused(val reason: String) : KeyedDropOpen
+    }
+
+    /**
+     * Pure unwrap → open → plaintext-digest gate. No ledger write and no
+     * filesystem access: a missing wrap, a bad tag or a mismatch is a refusal.
+     */
+    internal fun openKeyedDrop(
+        sealed: ByteArray,
+        material: DropKeyMaterial,
+        identity: TlsIdentity?,
+    ): KeyedDropOpen {
+        val idf = identity ?: return KeyedDropOpen.Refused("no identity")
+        val key = DropKeyCore.unwrap(material.wraps, idf)
+            ?: return KeyedDropOpen.Refused("no wrap for this device")
+        val plain = DropKeyCore.open(key, sealed)
+            ?: return KeyedDropOpen.Refused("open failed")
+        if (!material.sha256.equals(sha256Hex(plain), ignoreCase = true)) {
+            return KeyedDropOpen.Refused("plaintext digest mismatch")
+        }
+        return KeyedDropOpen.Opened(material.name, material.sha256, plain)
+    }
+
+    /**
+     * Receive hook for a landed file. Returns true when this file was a keyed
+     * drop and was handled either way — released as plaintext or refused with
+     * its ciphertext deleted and no ledger row. False means "not keyed", so
+     * [onUploadFinish] takes the unchanged plaintext path.
+     */
+    private fun openKeyedDropIfAny(file: FileInfo, landed: File, senderFp: String): Boolean {
+        val sealed = runCatching { landed.readBytes() }.getOrNull() ?: return false
+        val landedSha = sha256Hex(sealed).lowercase(Locale.ROOT)
+        val material = dropKeyIndex[landedSha] ?: return false
+        val name = material.name.ifBlank { file.fileName }
+        val opened = openKeyedDrop(sealed, material, identity)
+        if (opened is KeyedDropOpen.Refused) {
+            logLine("circle drop: cannot open $name (${opened.reason})")
+            runCatching { landed.delete() } // no plaintext, no ledger entry
+            return true
+        }
+        val good = opened as KeyedDropOpen.Opened
+        val plainFile = File(landed.parentFile, name)
+        if (!runCatching { plainFile.writeBytes(good.plaintext) }.isSuccess) {
+            logLine("circle drop: cannot open $name (write failed)")
+            runCatching { landed.delete() }
+            return true
+        }
+        runCatching { landed.delete() } // ciphertext temp never lands as plaintext
+        publishReceived(
+            plainFile,
+            file.copy(fileName = good.name, size = good.plaintext.size.toLong(), sha256 = good.sha256),
+            senderFp,
+        )
+        return true
+    }
 
     /**
      * Seal signed [events] for an absent member and post one opaque `parcel`.
@@ -1127,6 +1313,7 @@ val share: StateFlow<ShareIntake?> = _share
             FlitCircleStore.save(appCtx, next)
             _circleState.value = next
             _circleEvents.value = CircleCore.order(next.events)
+            rebuildDropKeyIndex(_circleEvents.value)
         }
         if (host.isEvidence(answer, st) && ::appCtx.isInitialized) {
             logLine("circle host: ${req.action} ${req.memberFp.take(12)} — ${answer.events.size} event(s)")
@@ -1295,7 +1482,10 @@ val share: StateFlow<ShareIntake?> = _share
             when (result) {
                 is UploadResult.Saved -> {
                     FlitEngine.logLine("saved ${file.fileName} (" + FlitEngine.fmtBytes(result.bytes) + ")")
-                    FlitEngine.publishReceived(result.path.toFile(), file, rxSenderFp)
+                    val landed = result.path.toFile()
+                    if (!FlitEngine.openKeyedDropIfAny(file, landed, rxSenderFp)) {
+                        FlitEngine.publishReceived(landed, file, rxSenderFp)
+                    }
                 }
                 is UploadResult.Streamed -> {
                     // ledger entry + landing log already produced by the sink
@@ -3239,10 +3429,15 @@ val share: StateFlow<ShareIntake?> = _share
      * - pinned peers with a chosen folder → a document created straight in
      *   their SAF tree;
      * - everyone else (API 29+) → a pending row in MediaStore Downloads/Flit.
-     * Returns null only for old devices (API < 29) or when storage refuses,
-     * which keeps the classic two-step flow as the fallback.
+     * Returns null only for old devices (API < 29), keyed drops or when storage
+     * refuses, which keeps the classic two-step flow as the fallback.
      */
     private fun openIncomingSink(info: FileInfo, treeUri: String?): IncomingSink? {
+        // A sealed Circle drop must land on disk first: the digest gate in
+        // onUploadFinish needs the sealed bytes before plaintext is released.
+        // Other files keep the unchanged direct-to-storage path.
+        val wireSha = info.sha256?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        if (wireSha.isNotBlank() && dropKeyIndex.containsKey(wireSha)) return null
         // Crushed (gzip) wires need the assembled whole before the one-shot
         // decode, so they take the server's part-file route; publishReceived
         // unpacks them into the original name/bytes afterwards.

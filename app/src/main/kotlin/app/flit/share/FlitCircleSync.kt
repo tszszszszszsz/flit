@@ -147,14 +147,14 @@ internal fun circleBodyValid(type: String, body: String): Boolean {
     val target = text("targetFp") ?: text("target")
     return when (type.trim().lowercase(Locale.ROOT)) {
         CircleEvent.MESSAGE -> text("text") != null
-        // A file announcement is name/size/sha256 and NOTHING else. In
-        // particular the sender's local spool path (the queue token) must
-        // never be minted into a signed, fanned-out event. Bytes are pushed
-        // with `sendFiles`, not fetched by this digest; sha256 only matches a
-        // landed file to its card locally.
-        CircleEvent.FILE -> text("name") != null &&
-            (obj["size"] as? JsonPrimitive)?.content?.toLongOrNull() != null &&
-            text("sha256") != null && obj.keys == setOf("name", "size", "sha256")
+        // A file announcement carries only the legacy {name, size, sha256}
+        // set or the keyed set {name, size, sha256, keyGen, cipherSha, iv,
+        // wraps}. Both are exact, closed key sets owned by CircleCore, which
+        // also bounds every wrap value by MAX_WRAPPED_CHARS. The sender's local
+        // spool path (the queue token) is never minted into a signed, fanned-
+        // out event. Bytes are pushed with `sendFiles`, not fetched by this
+        // digest; sha256 only matches a landed file to its card locally.
+        CircleEvent.FILE -> CircleCore.validFileBody(body)
         CircleEvent.POLL -> text("pollId") != null && text("question") != null &&
             (obj["options"] as? JsonArray)?.isNotEmpty() == true
         CircleEvent.VOTE -> (text("pollId") != null && number("option") != null) ||
@@ -571,9 +571,8 @@ object FlitCircleSync {
      * kind's fields. [body] is otherwise passed through untouched.
      */
     suspend fun post(type: String, body: String) {
-        val ctx = context() ?: return
-        val state = FlitCircleStore.load(ctx) ?: return
-        val event = emit(ctx, state, type, body) ?: return
+        val state = storedState() ?: return
+        val event = emit(context(), state, type, body) ?: return
         fanout(state, listOf(event))
     }
 
@@ -595,6 +594,17 @@ object FlitCircleSync {
      */
     internal suspend fun postFile(name: String, size: Long, sha: String) {
         post(CircleEvent.FILE, circleFileBody(name, size, sha))
+    }
+
+    /**
+     * Publish a caller-built `file` body verbatim, so the engine can announce a
+     * keyed drop (DropKeyCore.keyedFileBody) through the same signed path. The
+     * body is gated by [circleBodyValid] before it is signed, so only the exact
+     * legacy or keyed key set can be posted. The `/circle/sync` route, headers
+     * and DTO are unchanged.
+     */
+    internal suspend fun postFile(body: String) {
+        post(CircleEvent.FILE, body)
     }
 
     // ==== courier handoff path ===================================================

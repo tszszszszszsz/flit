@@ -116,6 +116,10 @@ Read this first; the sections below unfold each row.
 | Drop key: roster above `MAX_WRAPS` (32), or wrap over `MAX_WRAPPED_CHARS` (512) | no | `wrap` refuses the whole map; body gate false | source bytes stay with the caller | over-cap map / over-cap body | CODE / PURE |
 | Drop key: partial, extra or mistyped keyed body | no | `validFileBody` false; `parseFileKeyBody` null | caller keeps the bytes | the malformed body | CODE / PURE |
 | Drop key: tampered `wraps` / `iv` / `cipherSha`, or flipped IV / ciphertext / tag | no | `verify` fails before unwrap, or `open` null | event log / caller's sealed bytes stay | modified event or plaintext | CODE / PURE |
+| Per-drop parity: no usable recipient cert at post time | no | refuses — no event, no sealed push | source spool kept | sealed copy if made | CODE / PURE |
+| Per-drop parity: roster over `MAX_WRAPS` (32) or wrap over `MAX_WRAPPED_CHARS` (512) | no | refuses the whole map; body gate false | source bytes kept | over-cap map / body | CODE / PURE |
+| Per-drop parity: no wrap for the reader, or wrong identity | no | `NO_KEY` / `drop-refused`; no ledger entry | landed ciphertext until cleanup | ciphertext temp; no plaintext | CODE / PURE |
+| Per-drop parity: GCM tag failure or plaintext digest mismatch | no | refused; no ledger entry | nothing released | landed ciphertext + temp | CODE / PURE |
 | Courier: no recipient cert in log or roster | yes — a later roster answer | no — `seal` refuses | events stay in the sender's own log | nothing | CODE / PURE |
 | Courier: bad body keys, oversized envelope, malformed bytes | no | `Invalid` / `decode` null | existing bag unchanged | incoming event or bad row | CODE / PURE |
 | Courier: verify fails or cert binding breaks | no | verify false; no pin written | held bytes until `ack` / `expire` | envelope on removal | CODE / PURE |
@@ -743,6 +747,51 @@ layer adds no endpoint, carrier, camera or app state. App and CLI parity,
 harness walks and any keyed-drop device observation belong to later layers and
 yield no claim here.
 
+### 3.11 Per-drop parity in app and CLI — the four refusal conclusions
+
+The 2026-12-10 Integration layer
+([per-drop-parity.md](roadmap/per-drop-parity.md)) binds the 2026-12-09 pure
+core to the app's Circle drop path and the CLI's `circle file` path. Both
+surfaces mint one fresh `DropKeyCore.Key`, wrap it to the current members'
+uppercase fingerprints, seal the cache copy at `<spool>.flitdrop` with AES-GCM,
+announce the keyed `file` body through the existing signed `/circle/sync` post,
+and push the sealed bytes with `sendFiles`. The receiver unwraps with its own
+identity, opens the sealed bytes, checks the plaintext digest announced in the
+signed body, and lands the plaintext through the normal received-file path.
+Legacy three-key `file` bodies stay plaintext and keep their existing statuses.
+The exact keyed body and the seams used below are:
+
+```
+{"name":"...","size":N,"sha256":"<plaintext sha>","keyGen":1,
+ "cipherSha":"<sha256 of sealed bytes>","iv":"<base64 12 bytes>",
+ "wraps":{"<UPPERCASE FP>":"<base64 wrapped key>"}}
+
+CircleCore.KEYED_FILE_BODY_KEYS = {name, size, sha256, keyGen, cipherSha, iv, wraps}
+FlitCircleSync.postFile(body: String)             // legacy postFile(name, size, sha) kept
+FlitCircleStore.CircleDelivery.NO_KEY = "no-key"  // additive cipherSha, wrappedFor
+Harness.circleFileAnnouncement(...)               // keyed overload; legacy builder kept
+DropKeyCore.MAX_WRAPS = 32, MAX_WRAPPED_CHARS = 512, DOMAIN = "FLITDROP1"
+```
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| No usable recipient cert at post time | Both surfaces refuse before any event or sealed push: the app logs `circle drop: no recipient key material — not posted`, the CLI prints `!! no recipient key material — nothing posted`; no `file` event is minted | Source spool kept | Sealed copy if one was made | CODE `FlitEngine.circlePostFile`, `Harness circle file` cert gate, `DropKeyCore.wrap`; PURE `DropParityTest`, `DropKeyCoreTest` |
+| Roster above `MAX_WRAPS = 32`, or a wrapped value above `MAX_WRAPPED_CHARS = 512` | `wrap` refuses the whole map rather than trimming it; the app logs `circle drop: N recipients exceeds key wrap cap`, the CLI prints the cap refusal and posts nothing; `validFileBody` is false so no body is signed | Source spool / caller's bytes kept | Over-cap map or over-cap body | CODE `DropKeyCore.wrap`, `CircleCore.validFileBody`, `FlitCircleSync.circleBodyValid`; PURE `DropParityTest`, `DropKeyBodyTest`, `DropKeyCoreTest` |
+| Fingerprint absent from `wraps`, or `unwrap` under the wrong identity | `unwrap` returns null; no plaintext and no ledger entry. The app marks that recipient `NO_KEY` (terminal) and logs `circle drop: cannot open <name> (no wrap)`; the CLI prints `drop-refused <name>: no wrap` | Landed ciphertext until cleanup; caller's source bytes stay | Ciphertext temp; no plaintext | CODE `DropKeyCore.unwrap`, `FlitCircleStore.CircleDelivery.NO_KEY`, `FlitEngine.onUploadFinish`, `ConsoleDelegate.onUploadFinish`; PURE `DropParityTest`, `FlitEngineTest`, `DropKeyCryptoTest` |
+| GCM tag failure or plaintext digest mismatch | `open` returns null, or the opened plaintext `sha256` differs from the one signed in the body: the drop is refused with no ledger entry; the app logs `circle drop: cannot open <name> (<reason>)`, the CLI prints `drop-refused <name>: open failed` | Nothing released to the received-file path | Landed ciphertext and its temp | CODE `DropKeyCore.open`, `CircleCore.canonical` (binds `cipherSha`, plaintext `sha256`, `iv` and `wraps`), receive-side plaintext digest gate; PURE `DropParityTest`, `FlitEngineTest`, `DropKeyCryptoTest` |
+
+Two digest gates apply in order: the `sendFiles` landing gate checks the sealed
+digest against the announced `cipherSha`; the receive seam then checks the
+opened plaintext against the announced `sha256`. A modified `wraps`, `iv` or
+`cipherSha` on a signed event is skipped earlier at `CircleCore.verify`
+(§3.10), before any unwrap or open. No plaintext content key is persisted:
+`FlitCircleStore` holds only `cipherSha` and `wrappedFor`, and a restart rebuilds
+the in-memory index from the bounded folded event log.
+
+The rows above are CODE and PURE only. No row claims DEVICE or SIM/HARN: no
+harness walk, camera capture or phone observation is attached to this layer,
+and the 2026-12-17 full-feature walk is not claimed here.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -937,6 +986,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | QR parcel CLI | `ParcelCli.kt` (`parcelEncode`/`parcelDecode`, cert gate, `--out` gate, exit codes) | `ParcelCodecTest`, `ParcelCodecTamperTest`, `ParcelCliTest` | `ParcelCliHarnessTest` | — |
 | QR parcel app camera / decode / caps | `ParcelUi` camera-and-paste seam, `ParcelScanState`, `Qr.decodeYPlane:187-216`, `ParcelCodec.parse/complete` | `ParcelScanStateTest`, `FlitQrTest`, `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
 | Per-drop content keys (pure core) | `DropKeyCore.wrap/unwrap/seal/open`, `keyedFileBody`, `parseFileKeyBody`; `CircleCore.validFileBody/verify`; `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
+| Per-drop parity (app + CLI) | `FlitEngine.circlePostFile`, `FlitCircleSync.circleBodyValid/postFile`, `FlitCircleStore.CircleDelivery.NO_KEY`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish`, `DropKeyCore.wrap/unwrap/open` | `DropParityTest`, `FlitCircleSyncTest`, `FlitEngineTest`, `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` | — | — |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
@@ -949,7 +999,10 @@ with no DEVICE entry; the air-gap walk is 2026-12-08. The 2026-12-07 app camera
 row in §3.9 is CODE and PURE only; no live-camera capture or air-gap walk is
 claimed for it. The 2026-12-09 per-drop content key row in §3.10 is CODE and
 PURE only: the frozen pure protocol seams and their JVM tests. No harness,
-camera, CLI or device observation is attached to this layer.
+camera, CLI or device observation is attached to this layer. The 2026-12-10
+per-drop parity row in §3.11 is CODE and PURE only: its four refusal conclusions
+carry no harness, camera or device observation, and the 2026-12-17 full-feature
+walk is not claimed here.
 
 ---
 
@@ -1014,3 +1067,9 @@ None changes a shipped contract.
     This layer adds no endpoint, carrier, camera or app state; app and CLI
     parity, harness walks and any keyed-drop device observation belong to later
     layers and yield no claim here.
+13. **The 2026-12-10 per-drop parity layer has no device walk here.** The §3.11
+    rows are CODE from the frozen app and CLI seams and PURE from the JVM-only
+    protocol and app test classes. The four conclusions — no usable cert, over
+    cap, no wrap for the reader, and tag or plaintext digest mismatch — carry no
+    DEVICE: no harness walk, camera capture or phone observation is attached to
+    this layer, and the 2026-12-17 full-feature walk is not claimed here.

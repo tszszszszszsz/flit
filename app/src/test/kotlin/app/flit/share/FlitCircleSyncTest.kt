@@ -2,6 +2,7 @@ package app.flit.share
 
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.circle.DropKeyCore
 import app.flit.share.protocol.courier.CarryState
 import app.flit.share.protocol.courier.CourierCarryCore
 import app.flit.share.protocol.courier.CourierEnvelope
@@ -15,9 +16,13 @@ import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -1243,5 +1248,210 @@ class FlitCircleSyncTest {
             FlitCircleSync.resetForTest()
         }
         Unit
+    }
+
+    // ==== per-drop keyed file announcement ======================================
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    private fun validIv() = Base64.getEncoder().encodeToString(ByteArray(DropKeyCore.IV_BYTES))
+    private fun validWrap() = Base64.getEncoder().encodeToString(ByteArray(32) { 1 })
+
+    private data class KeyedAnnouncement(
+        val body: String,
+        val plainSha: String,
+        val cipherSha: String,
+    )
+
+    /** A real mint/wrap/seal triple, so the body carries genuine key material. */
+    private fun keyedAnnouncement(recipient: TlsIdentity): KeyedAnnouncement {
+        val plaintext = "sealed drop bytes".toByteArray(Charsets.UTF_8)
+        val key = DropKeyCore.mint()
+        val sealed = DropKeyCore.seal(key, plaintext)
+        val wraps = DropKeyCore.wrap(key.bytes, mapOf(recipient.fingerprint to recipient.certificate))
+        val body = DropKeyCore.keyedFileBody(
+            DropKeyCore.KeyedFile(
+                name = "sealed.gflit",
+                size = plaintext.size.toLong(),
+                sha256 = sha256Hex(plaintext),
+                keyGen = 1,
+                cipherSha = sha256Hex(sealed),
+                iv = Base64.getEncoder().encodeToString(key.iv),
+                wraps = wraps,
+            ),
+        )
+        return KeyedAnnouncement(body, sha256Hex(plaintext), sha256Hex(sealed))
+    }
+
+    private fun keyedBodyOf(
+        name: String = "a.gflit",
+        size: Long = 12L,
+        sha: String = "plainsha",
+        keyGen: Int = 1,
+        cipherSha: String = "ciphersha",
+        iv: String = validIv(),
+        wraps: Map<String, String> = mapOf("AABB" to validWrap()),
+    ): String = DropKeyCore.keyedFileBody(
+        DropKeyCore.KeyedFile(name, size, sha, keyGen, cipherSha, iv, wraps),
+    )
+
+    /** Derive a body with one field removed or replaced by a string primitive. */
+    private fun mutatedKeyedBody(
+        body: String,
+        drop: String? = null,
+        set: Map<String, String> = emptyMap(),
+    ): String {
+        val fields = obj(body).toMutableMap()
+        drop?.let { fields.remove(it) }
+        set.forEach { (key, value) -> fields[key] = JsonPrimitive(value) }
+        return JsonObject(fields).toString()
+    }
+
+    @Test
+    fun `postFile with a caller-built keyed body signs and fans out a verified file event`() = runBlocking {
+        val id = TlsIdentity.generate()
+        val announcement = keyedAnnouncement(id)
+        val upserted = mutableListOf<CircleEvent>()
+        val sent = mutableListOf<CircleRequest>()
+        val base = state("ME", "AABB")
+        installSeam(base, dial = { fp ->
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        FlitCircleSync.identityHook = { id }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.stateHook = { base.copy(events = base.events + upserted) }
+        try {
+            FlitCircleSync.postFile(announcement.body)
+
+            val emitted = upserted.single()
+            assertEquals(CircleEvent.FILE, emitted.type)
+            assertEquals("c1", emitted.circleId)
+            assertTrue(emitted.authorFp.equals(id.fingerprint, ignoreCase = true))
+            assertTrue(CircleCore.verify(emitted), "the keyed event verifies against its own cert")
+            assertEquals(announcement.body, emitted.body, "the caller-built body is posted verbatim")
+
+            val body = obj(emitted.body)
+            assertEquals(CircleCore.KEYED_FILE_BODY_KEYS, body.keys)
+            assertTrue(circleBodyValid(CircleEvent.FILE, emitted.body))
+            assertEquals(announcement.plainSha, body.getValue("sha256").jsonPrimitive.content)
+            assertEquals(announcement.cipherSha, body.getValue("cipherSha").jsonPrimitive.content)
+            assertEquals(1, body.getValue("keyGen").jsonPrimitive.content.toInt())
+            assertTrue(body.getValue("wraps").jsonObject.keys.single().equals(id.fingerprint, ignoreCase = true))
+
+            assertEquals(1, sent.size, "one peer receives the new event")
+            assertTrue(emitted in sent.first().events, "the keyed event is offered on the sync route")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `postFile refuses a malformed keyed body without signing or fanning out`() = runBlocking {
+        val id = TlsIdentity.generate()
+        val upserted = mutableListOf<CircleEvent>()
+        val sent = mutableListOf<CircleRequest>()
+        val logs = mutableListOf<String>()
+        installSeam(state("ME", "AABB"), logs = logs, dial = { fp ->
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        FlitCircleSync.identityHook = { id }
+        FlitCircleSync.upsertHook = { upserted += it }
+        try {
+            FlitCircleSync.postFile(mutatedKeyedBody(keyedBodyOf(), drop = "cipherSha"))
+            FlitCircleSync.postFile("""{"name":"a.gflit","size":12,"sha256":"sha","token":"spool"}""")
+
+            assertTrue(upserted.isEmpty(), "an invalid body must never be signed or committed")
+            assertTrue(sent.isEmpty(), "an invalid body must never reach a peer")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `file body gate accepts exact legacy and keyed sets but refuses partial or extra keys`() {
+        val legacy = circleFileBody("a.gflit", 12L, "sha")
+        assertEquals(CircleCore.FILE_BODY_KEYS, obj(legacy).keys)
+        assertTrue(circleBodyValid(CircleEvent.FILE, legacy), "the legacy three-key body stays valid")
+
+        val keyed = keyedBodyOf()
+        assertEquals(CircleCore.KEYED_FILE_BODY_KEYS, obj(keyed).keys)
+        assertTrue(circleBodyValid(CircleEvent.FILE, keyed), "the keyed seven-key body is valid")
+        assertTrue(CircleCore.validFileBody(keyed))
+
+        // Every subset of either closed set is refused, including a legacy body
+        // with a single keyed field grafted on.
+        CircleCore.FILE_BODY_KEYS.forEach { missing ->
+            assertFalse(
+                circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(legacy, drop = missing)),
+                "legacy body missing $missing must be refused",
+            )
+        }
+        CircleCore.KEYED_FILE_BODY_KEYS.forEach { missing ->
+            assertFalse(
+                circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(keyed, drop = missing)),
+                "keyed body missing $missing must be refused",
+            )
+        }
+        listOf("token", "path", "spoolPath", "data", "bytes", "key", "wrappedFor").forEach { extra ->
+            assertFalse(
+                circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(legacy, set = mapOf(extra to "x"))),
+                "extra legacy key $extra must be refused",
+            )
+            assertFalse(
+                circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(keyed, set = mapOf(extra to "x"))),
+                "extra keyed key $extra must be refused",
+            )
+        }
+        assertFalse(
+            circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(legacy, set = mapOf("keyGen" to "1"))),
+            "a partial key set is not a keyed body",
+        )
+    }
+
+    @Test
+    fun `file body gate bounds the keyed fields and refuses wrong-typed values`() {
+        val keyed = keyedBodyOf()
+        assertTrue(circleBodyValid(CircleEvent.FILE, keyed))
+
+        // Types: size and keyGen are integers, never quoted strings.
+        assertFalse(circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(keyed, set = mapOf("size" to "12"))))
+        assertFalse(circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(keyed, set = mapOf("keyGen" to "1"))))
+        assertFalse(circleBodyValid(CircleEvent.FILE, mutatedKeyedBody(keyed, set = mapOf("wraps" to "AAEC"))))
+
+        // Field bounds: the iv is exactly 12 decoded bytes, a wrap value is
+        // bounded by MAX_WRAPPED_CHARS, and a fingerprint is a non-blank
+        // uppercase key.
+        assertFalse(
+            circleBodyValid(
+                CircleEvent.FILE,
+                keyedBodyOf(iv = Base64.getEncoder().encodeToString(ByteArray(DropKeyCore.IV_BYTES - 1))),
+            ),
+        )
+        assertFalse(
+            circleBodyValid(
+                CircleEvent.FILE,
+                keyedBodyOf(cipherSha = "x".repeat(CircleCore.MAX_FIELD_CHARS + 1)),
+            ),
+        )
+        assertFalse(
+            circleBodyValid(
+                CircleEvent.FILE,
+                keyedBodyOf(wraps = mapOf("AABB" to "x".repeat(DropKeyCore.MAX_WRAPPED_CHARS + 1))),
+            ),
+        )
+        assertFalse(circleBodyValid(CircleEvent.FILE, keyedBodyOf(wraps = mapOf("aabb" to validWrap()))))
+        assertFalse(circleBodyValid(CircleEvent.FILE, keyedBodyOf(wraps = mapOf(" " to validWrap()))))
+        assertFalse(circleBodyValid(CircleEvent.FILE, keyedBodyOf(wraps = emptyMap())))
+        assertFalse(
+            circleBodyValid(
+                CircleEvent.FILE,
+                keyedBodyOf(wraps = (1..(DropKeyCore.MAX_WRAPS + 1)).associate { "FP$it" to validWrap() }),
+            ),
+            "a roster above the wrap cap must be refused, never trimmed",
+        )
     }
 }

@@ -974,9 +974,10 @@ from the persisted desired flag (`docs/open-file-and-sharing-restore.md:247-259`
 
 The keyed form added at 2026-12-09 keeps the signed `file` verb but carries
 wrapped key material instead of content bytes; see "Per-drop content keys:
-confidentiality for file drops". The no-path rule, the hash gate on the bytes and
-the sender-local status rule above apply unchanged to both the legacy and the
-keyed form.
+confidentiality for file drops" and its app-and-CLI integration in "Keyed drops
+in app and CLI: confidentiality and receive gate (2026-12-10)". The no-path rule,
+the hash gate on the bytes and the sender-local status rule above apply unchanged
+to both the legacy and the keyed form.
 
 ## Per-drop content keys: confidentiality for file drops (2026-12-09)
 
@@ -1079,6 +1080,92 @@ protocol tests (`DropKeyCoreTest.kt`, `DropKeyBodyTest.kt`,
 `DropKeyCryptoTest.kt`). No harness walk and no device observation are made for
 this layer; the sealed drop is opaque payload to the courier and QR frame codecs,
 and the app and CLI receive path is a later integration.
+
+## Keyed drops in app and CLI: confidentiality and receive gate (2026-12-10)
+
+The 2026-12-10 integration wires `DropKeyCore` into the app's Circle drop path
+and the CLI's `circle file` path. Both surfaces mint one fresh key per file drop,
+wrap it to the current members, seal the file bytes with AES-GCM, announce the
+sealed drop in a signed `file` body — through `FlitCircleSync.postFile(body)` in
+the app and the keyed `Harness.circleFileAnnouncement` overload in the CLI — and
+push the sealed bytes with `sendFiles`. The wire shape is unchanged: the same
+`/circle/sync` route, the same `file` verb, no new route, header, DTO field, QR
+parameter or v2.2 status code. Legacy three-key bodies stay plaintext and keep
+their current path.
+
+### Only current members can read the bytes
+
+A keyed drop's confidentiality rests on the wrap map, not on the transport. The
+sender wraps the one content key to each current member's certificate, keyed by
+uppercase fingerprint, with `MAX_WRAPS = 32` and no fallback
+(`DropKeyCore.wrap`). With no usable certificate, or a roster above the cap, the
+drop is refused with a log line and no event is posted; the source spool is kept.
+The bytes pushed by `sendFiles` are the AES-GCM ciphertext and the declared
+`FileInfo.sha256` is the ciphertext digest `cipherSha`, so a carrier, relay,
+passive LAN observer or a device with no wrap holds only ciphertext, IV, wraps,
+addressee fingerprints, timing and size. A non-member, a member who left before
+the drop, and a later joiner get no wrap and no backfill; none can derive the
+content key from the sealed bytes, the group key or the public event log. The
+group key stays membership/rekey material and is never a content cipher, as
+stated in "Circle wire authority, roles and rekey". TLS keeps the body and bytes
+off the wire in cleartext, but the property that limits plaintext to members is
+the wrap, not TLS. The keyed `file` body is still plaintext JSON in the shared
+log under the at-rest rule in "Storage and permissions"; it carries no content
+plaintext, only the wrapped key, the ciphertext digest, the IV and the wrap map,
+so a member who can read the log still cannot read the file bytes without a wrap.
+
+### No escrow
+
+The content key has three forms only: the wrapped entries inside the signed
+`file` body, the sender's ephemeral `DropKeyCore.Key` until the drop finishes,
+and an in-memory unwrapped key held by the receiver for one decrypt pass through
+`DropKeyCore.unwrap`. `FlitCircleStore` and the CLI's `circle.state` persist no
+plaintext key; the sealed spool lives in app cache or the CLI temp path and is
+removed when every recipient is terminal or the drop is refused. There is no key
+server, no certificate authority and no key escrow to audit, the same rule as the
+courier envelope in "Courier: recipient-cert encryption and carrier blindness".
+A wrap is addressed with the recipient's public certificate and can be opened
+only by the identity whose private key matches that fingerprint.
+
+### No remote revocation
+
+A departure, a group `rekey`, or a bumped `keyGen` on another drop does not change
+a published body. `cipherSha`, `iv` and every wrap are bound by the sender's
+signature through `CircleCore.canonical`, so a third party cannot rewrite them;
+removing a member from the roster provides no way to unwrap or delete a copy that
+device already holds. There is no remote action that invalidates, deletes or
+recalls a landed drop, no wrap backfill for a later joiner and no second content
+key per recipient. This repeats the protocol-layer rule in "No remote revocation
+of a past drop" and the courier TTL rule: expiry or removal ends a held copy, not
+one an addressee already opened.
+
+### The receive digest gate refuses tampered plaintext
+
+Both receive surfaces apply the same gates in order before any plaintext is
+written. On the app, `FlitEngine.onUploadFinish` matches a landed
+`UploadResult.Saved` digest against the in-memory `cipherSha` index rebuilt from
+the bounded folded event log; on the CLI, `ConsoleDelegate.onUploadFinish` does
+the same against `circle.state` events. The receiver then calls
+`DropKeyCore.unwrap(wrapped, identity)` with its own `TlsIdentity`,
+`DropKeyCore.open(key, sealed)` for the AES-GCM tag check, and compares the
+opened bytes' SHA-256 with the plaintext `sha256` announced in the signed body.
+Plaintext is written under the announced name and recorded in the ledger only
+when all of those pass. A fingerprint absent from `wraps`, a wrong identity, a
+short or tampered sealed value, a GCM tag failure or a plaintext digest mismatch
+refuses the drop: the app logs `circle drop: cannot open <name> (<reason>)`, the
+CLI prints `drop-refused <name>: no wrap` or `drop-refused <name>: open failed`,
+no ledger entry is added and the landed ciphertext is dropped. The app's
+`FlitCircleSync.circleBodyValid` FILE branch accepts only the exact legacy or
+keyed key sets, each wrap value bounded by `MAX_WRAPPED_CHARS = 512`, so a
+partial, extra or oversized body is refused before any unwrap is attempted. A
+modified `wraps`, `iv`, `cipherSha` or `sha256` fails signature verification
+first, because `CircleCore.canonical` covers the whole body. A landed file with
+no `cipherSha` match takes the legacy plaintext path unchanged.
+
+Evidence: CODE for the app and CLI seams and the receive gate, PURE for the core
+crypto and body tests, and SIM-HARN for the CLI keyed-drop round-trip and refusal
+cases recorded in the integration completion. No device walk is claimed for this
+layer; a keyed drop landing on the phone belongs to the later feature walk.
 
 ## Storage and permissions
 
@@ -1193,6 +1280,7 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | Relay blindness / opt-in | `RelayCore.kt`, `RelayEndpoints.kt`, `FlitEngine.kt` | `RelayCoreTest` (11) | `RelayServerTest` over production endpoints | 200 MiB cross + 300 MiB kill/resume |
 | File no-path / local status | `CircleCore.validFileBody`, `FlitEngine` delivery loop | `CircleCoreTest`, `CircleHardeningTest`, `FlitSpoolTest` | `CircleHarnessTest` | 35 B drop landed hash-exact; Open-file walk |
 | Per-drop content keys | `DropKeyCore.kt`, `CircleCore.validFileBody`, `TlsIdentity.decryptOaepSha256` | `DropKeyCoreTest`, `DropKeyBodyTest`, `DropKeyCryptoTest` (counts at integration) | not added on this date | no device walk |
+| Keyed drops app + CLI receive gate | `FlitEngine.onUploadFinish`, `FlitCircleSync.postFile(body)` / `circleBodyValid`, `Harness.circleFileAnnouncement`, `ConsoleDelegate.onUploadFinish` | core body/crypto tests, `FlitCircleSyncTest`, `FlitEngineTest`, `DropParityTest` | CLI keyed-drop round-trip and refusals (`DropKeyCliTest`, `CircleHarnessTest`) | no device walk |
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
 | Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | SIM via CLI carrier below | no device walk |
 | App courier handoff UI | `CourierCardUi.kt`, `FlitEngine.courierHandoffs`, `FlitCircleSync.postParcel` | `CourierCardUiTest` (counts recorded at integration) | consumed CLI carrier outcomes | no device walk; peer acceptance is not end-to-end delivery |

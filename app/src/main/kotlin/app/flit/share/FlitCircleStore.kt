@@ -101,6 +101,11 @@ object FlitCircleStore {
      * [statuses] is local-only (pending / sent / refused / failed); a member
      * who joins later sees the announcement card but neither the bytes nor
      * these states. Additive fields all have defaults so older rows decode.
+     *
+     * [cipherSha] is the digest of the sealed bytes announced in a keyed drop
+     * (blank for a legacy plaintext drop); [wrappedFor] lists the uppercase
+     * fingerprints the drop's content key was wrapped to. Both are local-only
+     * bookkeeping — no plaintext key is persisted here. Additive with defaults.
      */
     @Serializable
     data class CircleDelivery(
@@ -111,12 +116,16 @@ object FlitCircleStore {
         val spoolPath: String,
         val statuses: Map<String, String> = emptyMap(),
         val createdMs: Long = 0L,
+        val cipherSha: String = "",
+        val wrappedFor: List<String> = emptyList(),
     ) {
         companion object {
             const val PENDING = "pending"
             const val SENT = "sent"
             const val REFUSED = "refused"
             const val FAILED = "failed"
+            /** Terminal local outcome: no wrap for this device in a keyed drop. */
+            const val NO_KEY = "no-key"
         }
     }
 

@@ -28,6 +28,10 @@ The 2026-12-09 Protocol layer is built ahead of its scheduled day. The per-drop
 content keys code and tests are written now, but the commit stays on 2026-12-09;
 no earlier date carries it.
 
+The 2026-12-10 Integration layer is built ahead of its scheduled day. The
+per-drop key parity code in the app and CLI and its tests are written now, but the
+commit stays on 2026-12-10; no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

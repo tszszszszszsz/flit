@@ -937,8 +937,12 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
 A file drop can carry a per-drop content key: a fresh 32-byte key and 12-byte IV
 seal the file bytes with AES-GCM, and the key is wrapped once per current member
 under that member's certificate. The signed `file` body binds the ciphertext
-digest, IV and every wrap, so a carrier cannot alter them. The limits below come
-from that design and describe layer behaviour, not a device observation.
+digest, IV and every wrap, so a carrier cannot alter them. The operator bounds
+are `MAX_WRAPS = 32` recipients and `MAX_WRAPPED_CHARS = 512` characters per
+wrapped value. The limits and refusal lines below are the implemented post-time
+and receive-time behaviour (CODE, PURE and SIM-HARN evidence): no device walk was
+made for keyed drops on 2026-12-10, and no keyed-drop landing on a phone is
+claimed here.
 
 - **A keyed drop needs a current certificate for each member it is meant to
   reach.** Wrapping uses the certificate held for a member at post time
@@ -953,8 +957,10 @@ from that design and describe layer behaviour, not a device observation.
 
 - **An over-cap roster is refused, never trimmed.** `MAX_WRAPS` is 32. A member
   list above the cap is refused at post time with no event — the app logs
-  `circle drop: N recipients exceeds key wrap cap`, the CLI prints the cap
-  reason — and the source spool is kept. Wraps are not silently dropped to fit.
+  `circle drop: N recipients exceeds key wrap cap` and the CLI prints
+  `!! no recipient key material — nothing posted`, the same refusal line it uses
+  when no member has a usable certificate — and the source spool is kept. Wraps
+  are not silently dropped to fit.
 
 - **A published drop cannot be revoked on another device.** Leaving the circle,
   a group rekey, or a fresh key generation for another drop does not change an
@@ -963,9 +969,12 @@ from that design and describe layer behaviour, not a device observation.
   no wrap backfill for a later joiner. Removing the drop locally, or deleting
   `circle.state`, affects only the local copy and the local key material — it
   does not withdraw bytes already landed elsewhere. On the receive side a
-  missing wrap, a GCM tag failure or a plaintext digest mismatch yields no
-  ledger entry and a refusal (`NO_KEY` / `drop-refused <name>: no wrap`, or
-  `drop-refused <name>: open failed`), leaving no plaintext.
+  missing wrap, a GCM tag failure or a plaintext digest mismatch yields no ledger
+  entry and leaves no plaintext: the app logs
+  `circle drop: cannot open <name> (<reason>)` with a local `NO_KEY` status, and
+  the CLI prints `drop-refused <name>: no wrap` or
+  `drop-refused <name>: open failed`. A successful keyed landing prints
+  `drop-open <name> <plainSha> (<bytes> bytes)` on the CLI.
 
 The keyed body shape is in [CONTRACTS.md](CONTRACTS.md) and the refusal
 conclusions in [FAILURE-MODES.md](FAILURE-MODES.md).

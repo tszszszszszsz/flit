@@ -1668,3 +1668,140 @@ and the value is bounded by `MAX_FIELD_CHARS` and treated as provenance only.
    round-trip behavior. This date adds no harness or device observation and
    makes no device claim for this layer. See
    [per-drop-keys.md](roadmap/per-drop-keys.md).
+
+## 20. Per-drop key parity — app and CLI keyed drop seams (2026-12-10)
+
+### 20.1 Layer and ownership
+
+This is the Integration layer over §19 (the JVM-pure per-drop key core). It wires
+`DropKeyCore` into the app's Circle file-drop path and the CLI's `circle file`
+path, and adds the receive-side digest gate on both surfaces. It lives in
+`app/src/main/kotlin/app/flit/share/` (`FlitEngine.kt`, `FlitCircleSync.kt`,
+`FlitCircleStore.kt`, `CircleUi.kt`) and
+`harness/src/main/kotlin/app/flit/share/harness/Harness.kt`. No protocol
+constant, canonical byte layout, key wrap or AES-GCM primitive is redefined:
+the two surfaces call `DropKeyCore.mint`, `wrap`, `unwrap`, `seal`, `open`,
+`keyedFileBody` and `parseFileKeyBody` from §19.2 and read their bounds from
+§19.4. No route, header, DTO field, QR parameter or v2.2 status code changes:
+the keyed body stays the body of an existing signed `file` event on
+`POST /api/flit/v1/circle/sync` (§7.3, §7.5), and the sealed bytes go through
+the existing `sendFiles` call (§2.3). A stock LocalSend v2.2 peer sees the same
+wire it saw before (§2, §4); a v0.2.0 peer sees the same `file` body and bytes
+as before for a legacy drop.
+
+Both surfaces follow one send rule: mint one fresh `DropKeyCore.Key` per file
+drop, wrap it to the current members' certificates (uppercase fingerprints, at
+most `MAX_WRAPS = 32`, no group-key fallback or escrow), seal a copy of the
+source bytes with AES-GCM, announce the sealed form in a signed keyed `file`
+body built by `DropKeyCore.keyedFileBody` (§19.3), and push the sealed bytes
+with `sendFiles`. A legacy three-key body (`FILE_BODY_KEYS = {name, size,
+sha256}`) stays plaintext and keeps its current behaviour; the CLI's
+`circle post --file` path stays legacy.
+
+### 20.2 App send seams
+
+| Seam | Contract |
+| --- | --- |
+| `FlitCircleSync.postFile(body: String)` | Additive overload that posts `CircleEvent.FILE` with the caller-built body through the same signed `emit`/`fanout` path. The legacy `postFile(name, size, sha)` and `circleFileBody(name, size, sha)` stay for plaintext drops. `circleBodyValid` gates the body before it is signed, so only the exact legacy or keyed key set can be posted. |
+| `FlitCircleSync.circleBodyValid(type, body)`, `FILE` branch | Delegates to `CircleCore.validFileBody` (§19.5) and accepts either the exact legacy set or the exact keyed set `KEYED_FILE_BODY_KEYS = {name, size, sha256, keyGen, cipherSha, iv, wraps}`, with each `wraps` value bounded by `MAX_WRAPPED_CHARS`. It stays closed to partial sets, extra fields, string `size`, blank fingerprints and oversized wrap values: a keyed event is otherwise refused by the app's own body gate before any unwrap runs. |
+| `FlitEngine.circlePostFile(name, size, sha, spoolPath)` | Gathers current members from `FlitCircleStore.load`, resolves each fingerprint's certificate from `TlsIdentity.pinned(fp)` or the member's `CircleEvent.cert` in the folded log, calls `DropKeyCore.mint` once, wraps to the members with usable certificates, seals a cache copy at `<spool>.flitdrop`, builds the keyed body with `DropKeyCore.keyedFileBody(<KeyedFile>)`, posts it through `FlitCircleSync.postFile(body)`, then starts delivery with the sealed path. No usable certificate, or a roster above `MAX_WRAPS`, logs `circle drop: no recipient key material — not posted` or `circle drop: N recipients exceeds key wrap cap`, posts no event and keeps the source spool; a sealed copy, if one was made, is dropped. |
+| `FlitCircleStore.CircleDelivery` | Gains additive fields `cipherSha: String = ""` and `wrappedFor: List<String> = emptyList()`, plus terminal status `NO_KEY = "no-key"`. `decode` keeps its current normalisation: rows with a blank sha are dropped, blank status fingerprints stripped, and old rows decode without the new keys. The delivery record holds only the sealed spool path; no plaintext content key is persisted. |
+| `circleDeliveryTerminal` | Includes `NO_KEY`. A fingerprint with no entry in `wraps` gets `NO_KEY` locally and no bytes; it never reaches `sendFiles`. |
+| `FlitEngine.startCircleDelivery` / `deliverCirclePending` | Keep the per-sha `Mutex`, the 30 s worker and the 20/40/60 s backoff unchanged. They push the sealed spool with `sendFiles(..., multi = false)`; the declared `FileInfo.sha256` is `cipherSha`, so the receiver's landing gate checks the sealed bytes (§20.4). A returned `SendReport` still concludes as `SENT`, `REFUSED` or `FAILED`; a thrown carrier or a missing route stays `PENDING`. When every current recipient is terminal, the sealed spool is deleted. |
+| `CircleUi.kt` | Extends the local-status order with `NO_KEY -> 4` and shows `file drop · no key for this device` for that status. Landed and open-file states are otherwise unchanged; status remains local and is never an event. |
+
+### 20.3 CLI send seams
+
+| Seam | Contract |
+| --- | --- |
+| `Harness.circleFileAnnouncement` | Gains a keyed overload that mints the same body shape as `DropKeyCore.keyedFileBody` (§19.3). The legacy `{name, size, sha256}` builder stays and is used by `circle post --file`. |
+| `Harness.kt` `circle file` | Wraps to the current members in `CircleCliState` using `TlsIdentity.pinned(fp)`, seals a `*.flitdrop` copy of the spool, announces the keyed event through the keyed `circleFileAnnouncement`, and calls the existing `deliverCircleFile` with the sealed path. Above `MAX_WRAPS` or with no usable certificate, the command prints `!! no recipient key material — nothing posted` and exits without an event. There is no second announcement builder for the keyed form. |
+| `CircleFileDelivery` | Gains `cipherSha` and `wrappedFor` with defaults; `circleDeliveryOutcome` is unchanged. Statuses stay local to the CLI and are never gossiped. |
+| `flit-cli parse-qr`, `Qr.kt` v1/v2/v3, parcel frame codecs | Untouched. Sealed drop bytes cross them as opaque payload; no QR key parameter or frame field is added (§8, §16, §17). |
+
+### 20.4 Receive digest gate
+
+Keyed drops are gated by two distinct SHA-256 values from the signed keyed body
+(§19.3): `cipherSha` is the digest of the sealed bytes and is declared as the
+`FileInfo.sha256` of the `sendFiles` push, so the existing landing gate (§2.2,
+§4.2) accepts only the sealed bytes; `sha256` is the plaintext digest, checked
+only after `open`. The receiver never treats a landed digest match as proof of
+plaintext.
+
+`FlitEngine` rebuilds an in-memory `cipherSha → DropKeyMaterial` index from the
+bounded folded event log at boot. In `onUploadFinish`, an `UploadResult.Saved`
+whose landed digest matches an indexed `cipherSha` passes through these steps in
+order:
+
+1. `DropKeyCore.unwrap(wraps, identity)` uses the receiving device's own
+   identity. A fingerprint absent from `wraps`, a wrong private key or a
+   malformed Base64 blob returns null (§19.6) — a refusal, not an exception.
+2. `DropKeyCore.open(key, sealed)` is called with the unwrapped key on the
+   landed bytes. A GCM tag failure or a short value returns null.
+3. The SHA-256 of the opened plaintext is compared with the announced `sha256`.
+   A mismatch refuses the drop.
+4. On success, the plaintext is written under the announced name,
+   `publishReceived` records its plaintext digest so `_circleLandedShas`
+   matches the card, and the landed ciphertext temp is deleted.
+5. On any failure the engine logs `circle drop: cannot open <name> (<reason>)`,
+   drops the landed ciphertext and adds no ledger entry. A landed file with no
+   `cipherSha` match takes the existing plaintext path unchanged.
+
+The CLI's `ConsoleDelegate.onUploadFinish` applies the same unwrap → open →
+plaintext-sha step against the CLI's own `circle.state` events, writing the
+plaintext next to the landed ciphertext. It prints
+`drop-open <name> <plainSha> (<bytes> bytes)` on success,
+`drop-refused <name>: no wrap` for a non-recipient and
+`drop-refused <name>: open failed` for a tag or digest failure; a refusal leaves
+no plaintext file. A modified `wraps`, `iv` or `cipherSha` is caught earlier:
+`CircleCore.verify` fails on the changed body before any unwrap is attempted
+(§19.7, §7.4).
+
+### 20.5 No-new-route and v2.2 boundary
+
+1. **Keyed body rides in the existing `file` event.** Its wire home is
+   `POST /api/flit/v1/circle/sync` (`Protocol.PATH_CIRCLE_SYNC`, §1, §7.5). No
+   `PATH_*` constant, Ktor route, `LinkProvider`, byte-transfer route, HTTP
+   header, `CircleRequest`/`CircleResponse` field or `CircleRequest.body`
+   repurposing is added. The key material is text inside the event body.
+2. **No status-code change.** The signed `200` decision answer and the `400` /
+   `403` / `500` refusals of §7.5 and §9 are unchanged. Delivery conclusions
+   are unchanged: a returned report concludes, a thrown carrier or no route
+   stays `PENDING`, and `NO_KEY` is terminal locally. A legacy drop lands in
+   plaintext with the same status rules.
+3. **No second crypto path.** Mint, wrap, unwrap, seal and open come from
+   `DropKeyCore` (§19.6). Signing stays with `TlsIdentity.sign` and
+   `CircleCore.verify`; the domain-tagged `FLITDROP1` AAD is the only new AAD
+   and it is owned by the protocol core. The app and CLI hold no key cache of
+   their own beyond the in-memory `DropKeyMaterial` index used for the one
+   decrypt pass.
+4. **v2.2 is untouched.** `/info`, `/register`, `/prepare-upload`, `/upload`
+   and `/cancel`, their DTO shapes and their status behaviour stay as in §2;
+   no QR key parameter is added (§8). The earlier courier, relay and parcel
+   contracts (§5, §13–§18) keep their byte shapes; a sealed drop is opaque
+   payload to them.
+
+### 20.6 State ownership and evidence boundary
+
+Content keys exist only as wrapped ciphertext in the signed event, as the
+sender's ephemeral key until the drop finishes, and as one in-memory unwrapped
+key for a single decrypt pass. `FlitCircleStore` and `circle.state` persist no
+plaintext key; removing the in-memory index or restarting the CLI still leaves
+only the wrapped key in the bounded event log. The sealed spool lives in app
+cache or the CLI temp path and is removed when all current recipients are
+terminal or the drop is refused. The received ledger keeps the plaintext
+digest, as before.
+
+CODE establishes the app and CLI seams, the body gate and the two-hash digest
+gate. PURE JVM tests pin the keyed/legacy key sets in `DropKeyCore` consumption,
+`postFile(body)` emitting a verifiable signed keyed event, the additive store
+fields surviving encode/decoding with old rows still decoding, and the receive
+seam's mapping of a `cipherSha` match to a plaintext landing with refusals for a
+missing wrap, a tag failure and a sha mismatch. SIM-HARN evidence covers two CLI
+identities with a hash-exact plaintext landing and a `drop-open` line where the
+wire bytes hash to `cipherSha`, a third identity with no wrap landing no
+plaintext, a tampered keyed event skipped at the signature gate, a legacy
+plaintext drop, and a repeat of identical bytes producing a different
+`cipherSha` and a different wrapped key. No device observation is made for this
+layer; the receive side is test-evidenced only. See
+[per-drop-parity.md](roadmap/per-drop-parity.md).

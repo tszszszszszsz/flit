@@ -6,6 +6,10 @@ Wire the protocol-layer per-drop content keys into the app and the CLI so a seal
 
 2026-12-10 — Integration. Per-drop keys in app and CLI, tests.
 
+This layer is built ahead of its scheduled day. The per-drop key parity code in
+the app and CLI and its tests are written now, but the commit stays on 2026-12-10;
+no earlier date carries it.
+
 ## Depends on
 
 2026-12-09 — Protocol: the pure per-drop key core (`per-drop-keys.md`). The integration binds to its key mint, wrap, unwrap, seal and open functions and to its keyed `file` body shape; no key material is implemented here. The three-node baseline (2026-11-26), courier carry core (2026-11-27) and air-gap parcels (2026-12-08) are already landed and keep their `Link` and frame shapes unchanged — a sealed drop is opaque payload to them.
