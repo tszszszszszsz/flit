@@ -14,8 +14,9 @@ surface: no new route, header, DTO field or Circle event verb is proposed.
 
 ## Stack decision
 
-The recommended stack is Compose Multiplatform desktop with Kotlin 2.2.0, CMP
-1.9.x and JDK 21, declared as a single `jvm("desktop")` target. The target list
+The recommended stack is Compose Multiplatform desktop with the conditional
+Gate 0 set (Kotlin 2.4.21, CMP 1.12.2, BOM 2026.09.00) and JDK 21, declared as
+a single `jvm("desktop")` target. The target list
 stays at one entry for now; no web, iOS or shared JVM target is implied by the
 word "Multiplatform" here. Material 3 in Compose supplies the existing
 expressive presentation vocabulary, and a desktop window can reuse the Compose

@@ -21,7 +21,9 @@ not turn it into evidence.
 
 The current green test inventory is 972 tests — 443 protocol, 167 core, 254
 app, 108 harness — from the four test tasks with zero failures, errors and
-skipped cases. That figure is PURE and SIM-HARN evidence for the seams and
+skipped cases. The zero-skipped value is an observation with `FLIT_HARNESS_HOME`
+unset and POSIX file attributes available; harness `assumeTrue` gates can skip
+otherwise. That figure is PURE and SIM-HARN evidence for the seams and
 in-process paths; it is not a device observation. The 778 figure from the
 three-module layout is historical, and the full rig rerun, including all four assemblies, is green after the R8
 keep-rule change; assembly results are recorded separately in `docs/TESTING.md`

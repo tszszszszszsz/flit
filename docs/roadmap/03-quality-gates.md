@@ -33,9 +33,9 @@ to the source move.
 
 A new module count is a result only with green JUnit XML. The extended-rig XML
 exists and records `:core` at 167 cases within 972 (443 + 167 + 254 + 108),
-zero failures, errors and skipped cases; the 112 figure is historical. The 778 figure (362 protocol + 324 app +
-92 harness) stays historical until a new green inventory replaces it; a move
-between modules does not by itself discard or reassign that baseline.
+zero failures, errors and skipped cases; the 112 figure is historical. The three-module 778 (362 + 324 + 92) and the projected four-module 778
+(362 + 112 + 212 + 92) are historical; the current inventory is 972. A move
+between modules does not by itself discard or reassign a baseline.
 
 ## Failure stories
 

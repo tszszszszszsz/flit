@@ -8,7 +8,9 @@ harness in the three-module layout, and the same total in the first four-module
 projection of 362 protocol + 112 core + 212 app + 92 harness. After the security
 closeout wave the last recorded four-module test XML is **972 tests**, split as
 443 protocol + 167 core + 254 app + 108 harness, with zero failures, zero errors
-and zero skipped cases. That XML is the current inventory and the projected split
+and zero skipped cases. The zero-skipped value is an observation with `FLIT_HARNESS_HOME`
+unset and POSIX file attributes available; harness `assumeTrue` gates can skip
+otherwise. That XML is the current inventory and the projected split
 for this layout; the release assembly is green after the R8 keep-rule fix, and
 no finished-release claim follows from it. Earlier counts (76,
 115, 302, 396, 588, 714, 769, 778) are historical snapshots of the same suite at

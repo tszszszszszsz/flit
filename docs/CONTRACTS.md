@@ -154,8 +154,9 @@ Wire JSON config is shared by client, server and discovery:
 still written on the wire** (so `port` and `protocol` appear in register/info
 answers as well as in announcements), while nulls are omitted. This is the
 safe side for the rust `RegisterDtoV2`, which requires `port` and `protocol`
-with no serde defaults. The longer comment on `PeerInfo` (`Model.kt:6-12`) says
-the opposite — it is stale; see §12.
+with no serde defaults. The longer comment on `PeerInfo` (`Model.kt:6-12`) agrees with
+the shared config: `port` and `protocol` are always written in register/info
+answers.
 
 - `PeerInfo(alias, version, deviceModel?, deviceType?, fingerprint,
   port = 53317, protocol = "https", download = false, announce? = null)`.
@@ -329,7 +330,8 @@ with the code that enforces each:
 2. **New request headers are sender-side only.** `X-Flit-Client: 1` is sent on
    every prepare so a Flit receiver can mark its refusal; `X-Flit-Multi: 1` is
    sent only for turbo; `X-Flit-Resume` and `X-Flit-Base` are sent only on a
-   resume/chunk attempt. A v2.2 receiver ignores all four (`ProtocolClient.kt:699-702`).
+   resume/chunk attempt; `X-Flit-Prepare-Cert` and `X-Flit-Prepare-Sig` are sent
+   on every prepare. A v2.2 receiver ignores all six (`ProtocolClient.kt:658-663`).
 3. **New response fields are nullable and omitted when absent.**
    `PrepareUploadResponse.multipart` is populated only when the sender signalled
    multi and the receiver is a Flit peer; `explicitNulls = false` removes the
@@ -875,7 +877,9 @@ trust and replay reasoning in [Security](SECURITY.md).
 
 The last full green JUnit XML records 443 protocol + 167 core + 254 app + 108
 harness = 972 tests with zero failures, zero errors and zero skipped
-(`docs/TESTING.md` §1). That result covers the four test tasks only; the full rig rerun, including `:app:assembleDebug`, `:app:assembleRelease`,
+(`docs/TESTING.md` §1). The zero-skipped value is an observation with `FLIT_HARNESS_HOME`
+unset and POSIX file attributes available; harness `assumeTrue` gates can skip
+otherwise. That result covers the four test tasks only; the full rig rerun, including `:app:assembleDebug`, `:app:assembleRelease`,
 `:harness:installDist` and `:harness:distZip`, is green after the R8 keep-rule
 change; assembly results are outside the JUnit XML. The 769 figure (359 + 323 + 87), the 714 figure
 (330 + 309 + 75) and the four-module 778 projection are historical. These are
@@ -897,9 +901,6 @@ test counts, not a device claim for the UI or CLI layers.
 
 - `docs/circle.md` says every SYNC posts the full bounded log; code uses
   per-peer deltas on fan-out and the full log only on the repair tick (§7.6).
-- `Model.kt:6-12` claims default-valued `port`/`protocol` are omitted from
-  register/info answers; the shared `WireJson` config sets
-  `encodeDefaults = true`, so they are present (§2.1).
 - A few code comments (`CircleEvent.kt:28-29`, `CircleCore.kt:310-312`) call
   `sendFiles` the "bulk transfer path/queue"; the corrected doc vocabulary is
   a direct per-member `sendFiles` delivery, explicitly **not** the app's

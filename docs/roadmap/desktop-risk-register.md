@@ -4,10 +4,10 @@
 
 This document is a plan. No desktop build exists in this repository, no desktop
 test has run, and no desktop binary has been packaged or signed. The recommended
-target is Compose Multiplatform desktop with Kotlin 2.2.0, CMP 1.9.x and JDK 21,
-declared as one `jvm("desktop")` target, as set out in
-`docs/roadmap/desktop-app.md`. The planned modules `:core` (JVM) and `ui-common`
-(KMP) are design targets, not built modules. Every mitigation and verification
+target is Compose Multiplatform desktop with the conditional Gate 0 set
+(Kotlin 2.4.21, CMP 1.12.2, BOM 2026.09.00) and JDK 21, declared as one
+`jvm("desktop")` target, as set out in `docs/roadmap/desktop-app.md`. `:core`
+exists on disk with JVM tests; `ui-common` and `:desktop` remain design targets. Every mitigation and verification
 step below is a planned action; none is recorded as complete.
 
 Severity is plan-level judgment: High means the risk can break identity, trust
@@ -24,7 +24,8 @@ target.
   to more than one version set; a Compose BOM drifts from the CMP release that
   expects it. The failure surfaces as rendering or linkage breakage across the
   shared UI rather than as one isolated test case.
-- **Mitigation:** Pin Kotlin 2.2.0 against CMP 1.9.x and one matching
+- **Mitigation:** Pin the conditional Gate 0 set (Kotlin 2.4.21, CMP 1.12.2,
+  BOM 2026.09.00) and one matching
   Compose/Material 3 set. Confirm a single resolved version set before any
   desktop screen is written, and keep the Android app on the same set so
   `ui-common` compiles against one API surface for both targets.
@@ -177,7 +178,7 @@ target.
 
 ## Cross-cutting note
 
-All nine items are open. None has been mitigated or verified, because no
-desktop source set, module, build, test or bundle exists. The historical rig
+All nine desktop items remain open. The local `:core` extraction is not a
+desktop module and does not mitigate them. The historical rig
 state and the partially walked phone remain as recorded elsewhere in the
 repository; nothing in this register adds a desktop claim.

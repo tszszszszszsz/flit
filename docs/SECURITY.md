@@ -20,7 +20,9 @@
 
 Rig status: 443 protocol + 167 core + 254 app + 108 harness = 972 tests, 0
 failures, 0 errors, 0 skipped in the last full green test XML (2026-11-28,
-`docs/TESTING.md` §1). That result covers the four test tasks; the release assembly is also green
+`docs/TESTING.md` §1). The zero-skipped value is an observation with `FLIT_HARNESS_HOME`
+unset and POSIX file attributes available; harness `assumeTrue` gates can skip
+otherwise. That result covers the four test tasks; the release assembly is also green
 after the R8 keep-rule change. The 714 figure (330 + 309 + 75), the
 769 figure (359 + 323 + 87) and the four-module 778 projection are historical.
 Properties asserted only by a code comment or an unrun path are marked "not
@@ -195,9 +197,10 @@ author can be verified without poisoning the pin store: a forged event whose
 canonical bytes cannot be signed twice by accident (`CircleCore.kt:152-163`).
 
 The panic route uses the same rule with the certificate in a header rather than
-in the body: `ServerCore.panicRoute` decodes `X-Flit-Panic-Cert`, pins it under its
-own digest, requires that digest to equal `alert.senderFp`, and verifies the
-signature (`protocol/.../server/ServerCore.kt:902-945`). Circle routes require
+in the body: `ServerCore.panicRoute` decodes `X-Flit-Panic-Cert`, requires its
+digest to equal `alert.senderFp`, verifies the current-hop and hop-zero
+signatures in hand, reserves the id, calls the delegate, and pins only after
+that verdict (`protocol/.../server/ServerCore.kt:1058-1124`). Circle routes require
 `X-Flit-Circle-Cert` and compare its digest to `memberFp`
 (`ServerCore.kt:971-997`). That header check remains only a name claim: the
 certificate DER is public in every signed Circle event. Proof of the private

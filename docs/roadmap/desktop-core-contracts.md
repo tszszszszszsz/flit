@@ -2,14 +2,13 @@
 
 ## Status
 
-No `core` module, no `ui-common` module, no desktop source set and no desktop
-binary exist in this repository. The shipped JVM modules remain `:protocol`,
-`:app` and `:harness`, with the Android application in `app/src/main`. This
+`:core` is present on disk with its leaf pure seams and local JUnit XML;
+`ui-common`, a desktop source set and a desktop binary do not exist. This
 document proposes a public surface for a later extraction; it adds no source
 file, build task, repository operation or release step. The 778-test figure
 (362 protocol + 324 app + 92 harness) quoted in `desktop-app.md:141` is a
-historical baseline. No test run, device walk or new test count is claimed
-here.
+historical baseline. No desktop test run or device walk is claimed; local `:core` JUnit XML
+exists.
 
 The proposal follows the extraction order in `desktop-app.md:49-95`: a JVM-pure
 `:core` is shared by `app`, `harness` and the later desktop target, with

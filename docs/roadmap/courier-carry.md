@@ -268,8 +268,9 @@ Device walk at the 2026-12-02 layer (`DEVICE`, evidence note only):
 A new `docs/completions/2026-11-27-courier-core.md` records the fresh pure-test
 run (`source env.sh && ./gradlew --no-daemon --rerun-tasks :protocol:test`) with
 the exact number of added `CourierCarryDecisionTest` cases and the protocol count
-moving from 82 to 136, against the current rig of
-714 = 330 protocol + 309 app + 75 harness after a green `--rerun-tasks` run.
+moving from 82 to 136, against the rig at that layer,
+714 = 330 protocol + 309 app + 75 harness (historical; current inventory is
+972 = 443 protocol + 167 core + 254 app + 108 harness).
 The 302 baseline (82 protocol + 210 app + 10 harness) and the 396 inventory are
 historical. No
 `SIM-HARN` or `DEVICE` evidence is claimed at this layer; those rows stay

@@ -180,8 +180,8 @@ and an optional webcam QR path.
 
 ## Version gate
 
-Before any UI file moves or any desktop screen is built, pin Kotlin 2.2.0
-against CMP 1.9.x and JDK 21, keep the target list at the single
+Before any UI file moves or any desktop screen is built, pin the conditional
+Gate 0 set (Kotlin 2.4.21, CMP 1.12.2, BOM 2026.09.00) with JDK 21; keep the target list at the single
 `jvm("desktop")` entry, and confirm one resolved Compose and Material 3
 version set. A mismatch there breaks rendering across the shared cards rather
 than one isolated test. The gate also covers the Compose insets and modal sheet

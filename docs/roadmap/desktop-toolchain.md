@@ -11,7 +11,8 @@ dependency output when the modules are added, not a record of a green build.
 
 The stack target is recorded in
 [docs/roadmap/desktop-app.md](desktop-app.md): Compose Multiplatform desktop with
-a single `jvm("desktop")` target, Kotlin 2.2.0, CMP 1.9.x and JDK 21. Phase 0 is
+a single `jvm("desktop")` target, the conditional Gate 0 set (Kotlin 2.4.21,
+CMP 1.12.2, BOM 2026.09.00) and JDK 21. Phase 0 is
 extraction, Phase 1 is a Linux MVP, Phase 2 is packaging and parity. `flit-cli`
 in `harness/` remains the interop rig and the peer client; the desktop target
 does not turn the CLI into an API.
@@ -199,7 +200,7 @@ The re-baseline updates `docs/TESTING.md` §2, §3 and the verification record,
 the count comment at `.github/workflows/rig.yml:1-3`, and the scale paragraph in
 `docs/QUALITY-CONFIDENCE.md`, alongside the completion note for that layer.
 Earlier totals — 302, 588, 714, 769 and 773 — stay labelled historical, and
-778 becomes historical once a new green figure replaces it. Until a desktop
+778 is historical; the current figure is 972 = 443 + 167 + 254 + 108 from green XML. Until a desktop
 module exists and its tests run, this document claims no desktop binary,
 desktop test result or device observation.
 
