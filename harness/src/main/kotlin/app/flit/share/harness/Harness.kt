@@ -74,7 +74,7 @@ internal class ParsedArgs(argv: Array<String>) {
             "--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin",
             "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
             "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host", "--role",
-            "--bag", "--to", "--cert", "--ttl",
+            "--bag", "--to", "--cert", "--ttl", "--out",
         )
     }
 }
@@ -128,6 +128,10 @@ fun main(argv: Array<String>) {
                 val code = CourierCli.run(args)
                 if (code != 0) exitProcess(code)
             }
+            "parcel" -> {
+                val code = ParcelCli.run(args)
+                if (code != 0) exitProcess(code)
+            }
             else -> usage()
         }
     } catch (e: Exception) {
@@ -157,6 +161,7 @@ circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--i
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
 courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
+parcel <encode|decode> -- render a file as numbered QR PNGs or fold the PNGs back into bytes, offline
 """
     )
 }
@@ -195,6 +200,11 @@ internal fun courierUsage() {
   Parcels move by copying courier-bag/ between machines; the carrier adds no route.
 """
     )
+}
+
+/** Detailed parcel help. The usage string itself is owned by ParcelCli. */
+internal fun parcelUsage() {
+    println(ParcelCli.usage())
 }
 
 /** Dev bench: what does the deployed app actually show on screen? */

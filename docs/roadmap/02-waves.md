@@ -15,6 +15,9 @@ The 2026-12-03 Protocol wave is built ahead. QR parcel frame codec
 implementation runs now, but the commit stays on 2026-12-03; no earlier wave
 carries it.
 
+The 2026-12-04 CLI wave is built ahead. Parcel encode and decode implementation
+runs now, but the commit stays on 2026-12-04; no earlier wave carries it.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator

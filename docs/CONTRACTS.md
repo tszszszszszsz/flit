@@ -1191,3 +1191,126 @@ releases bytes.
    caps and digest/recipient gates (§13.4, §16.2).
 4. A parcel frame is a distinct string from a `flit://add` / `flit://pair` code;
    no pairing key or address field crosses this seam (§8).
+
+## 17. QR parcel CLI contract — encode and decode at the harness seam (2026-12-04)
+
+### 17.1 Layer and ownership
+
+This is the CLI layer over §16 (frame codec) and §13 (courier envelope). It lives
+in `harness/src/main/kotlin/app/flit/share/harness/ParcelCli.kt`, object
+`ParcelCli` in package `app.flit.share.harness`. Both commands are one-shot and
+offline: no socket, route, `Link`, worker or background process. The adapter
+imports `ParcelCodec` from the JVM-pure protocol module and owns only argument
+reading, the zxing image step, file I/O, the printed summary and the process
+code. Frame layout, CRC, sequence, caps, digest and crypto are not redefined
+here; they stay in `ParcelCodec` and the `CourierEnvelope` calls it makes.
+
+`Harness.kt` gains one `"parcel"` dispatch beside `courier`, one line in the
+top-level `usage()` and `parcelUsage()`, which prints `ParcelCli.usage()`.
+`--out` is added to `ParsedArgs.VALUE_FLAGS`; `--dir`, `--to` and `--cert`
+already exist. No other command's arguments, dispatch or output change.
+
+### 17.2 Command surface and flags
+
+```
+parcel encode <file> --dir DIR --to FP --cert PATH
+parcel decode --dir DIR --out PATH
+```
+
+| Input | Command | Contract |
+| --- | --- | --- |
+| `<file>` | encode | One source file; its bytes are the payload. No file name travels in a frame. |
+| `--dir DIR` | encode | Output directory for the numbered PNGs. It must be empty of existing frames; encode refuses to overwrite. |
+| `--dir DIR` | decode | Input directory; only the numbered frame PNGs are read. Decode never writes into it. |
+| `--to FP` | encode | Recipient fingerprint, normalised before comparison with the certificate's own fingerprint. |
+| `--cert PATH` | encode | Path to a file holding Base64 DER of the recipient X.509 certificate. Parsed for this invocation, checked against `--to`, then the certificate object itself is passed to `encodeParcel`. |
+| `--out PATH` | decode | Path for the verified payload bytes. The operator names the landed file; no name is derived from a frame or from the payload. |
+
+All flags are read through `ParsedArgs`. Encode does no recipient pin lookup and
+has no self-addressed fallback: the only certificate used is `--cert`, held in
+memory for that call and never copied into `--dir` or into a frame.
+
+### 17.3 Frozen API (`ParcelCli.kt`)
+
+```
+object ParcelCli {
+  data class EncodeResult(val dir: Path, val frames: Int,
+                          val sealedChars: Int, val sha256: String)
+  data class DecodeResult(val out: Path, val bytes: Int, val sha256: String,
+                          val signerFp: String, val recipientFp: String)
+  internal fun parcelEncode(args: ParsedArgs): EncodeResult
+  internal fun parcelDecode(args: ParsedArgs): DecodeResult
+  fun usage(): String
+  fun run(args: ParsedArgs): Int
+}
+```
+
+| Result field | Meaning |
+| --- | --- |
+| `EncodeResult.dir` | Frame directory the PNGs were written to. |
+| `EncodeResult.frames` | Number of ordered frame strings rendered from `encodeParcel`. |
+| `EncodeResult.sealedChars` | Character count of the sealed envelope carried by those frames. |
+| `EncodeResult.sha256` | SHA-256 of the source file bytes. |
+| `DecodeResult.out` | Path the verified bytes were written to (`--out`). |
+| `DecodeResult.bytes` | Byte count of `ParcelPayload.bytes`. |
+| `DecodeResult.sha256` | `ParcelPayload.sha256`, the digest of the opened bytes. |
+| `DecodeResult.signerFp` | `ParcelPayload.signerFp`, printed by decode. |
+| `DecodeResult.recipientFp` | `ParcelPayload.recipientFp`, printed by decode and checked against the local identity. |
+
+`parcelEncode` and `parcelDecode` are `internal` so harness tests drive the same
+functions the command uses without spawning a process. `usage()` is the single
+source of the detailed `parcel` help text; `run(args)` returns the process code.
+
+### 17.4 Encode path
+
+Encode reads one file, calls `loadOrCreateIdentity()` and sets
+`signerFp = identity.fingerprint`. It generates a fresh `parcelId` per encode,
+parses `--cert` as an X.509 certificate, and requires
+`TlsIdentity.fingerprintOf(cert) == --to` after normalisation. A mismatch or an
+unparseable certificate is refused before any frame is rendered. The checked
+certificate object is then passed directly as
+`ParcelCodec.encodeParcel(payload, parcelId, recipientFp, cert, signerFp,
+identity)`; the codec's own cert-fingerprint binding in `CourierEnvelope.seal`
+applies unchanged.
+
+Each returned frame string is rendered with zxing `QRCodeWriter` as a
+768 × 768 PNG at error correction `M`, margin `2` and UTF-8, into
+`frame-0001.png`, `frame-0002.png`, … in codec order (1-based, four digits, so
+file-name order is frame order). Encode writes no other file into `--dir`.
+
+### 17.5 Decode path
+
+Decode reads the `frame-*.png` files, decodes each with zxing
+`MultiFormatReader`, and keeps the returned frame strings opaque. It calls
+`ParcelCodec.complete(frames, identity.fingerprint, identity)` with the local
+identity from `loadOrCreateIdentity()`, and writes `ParcelPayload.bytes` to
+`--out` only on a verified result for that identity. Verification — frame
+layout, CRC, sequence, count, whole-parcel digest, envelope signature and
+recipient — stays in `ParcelCodec`; the CLI adds no second crypto or digest
+path. Decode prints the signer fingerprint, the recipient fingerprint, the
+SHA-256 and the byte count. No file name travels in a frame, so `--out` is the
+only source of the output name.
+
+### 17.6 Process codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success: frames written, or bytes written to `--out`. |
+| `2` | Bad arguments, or a missing certificate, frame directory or output path; also a mismatch between `--cert` and `--to`. |
+| `3` | Verification failure: an incomplete, unverified or wrongly addressed parcel, including a failed `complete`. |
+
+`run(args)` returns the code; `Harness.main` calls `exitProcess(code)` when it
+is non-zero. These three codes are the frozen surface for this layer; earlier
+draft wording in the roadmap used `1` for usage/I/O and `2` for verification
+refusal.
+
+### 17.7 Wire and state boundary
+
+No v2.2 route, DTO, header, request field or status code changes. No QR key
+parameter, `LinkProvider`, socket or network carrier is added. The grammar,
+`FRAME_MAGIC`, per-frame CRC32 and the caps in §16.3 are read from
+`ParcelCodec`, not restated or raised by the CLI. The only durable state is the
+identity file under `harnessHome()` and the frame PNGs in `--dir`; certificate
+and assembled bytes live in memory for one invocation. A failed gate leaves no
+output file. This layer is CODE plus harness round-trip evidence on the box;
+no device walk is claimed here.

@@ -23,9 +23,9 @@ flit-cli parcel decode --dir DIR --out PATH
 
 `decode` takes an explicit `--out`: neither the frame strings nor `ParcelPayload` carries a file name, so the operator names the landed bytes.
 
-`encode` reads one file, parses the recipient certificate supplied by `--cert`, checks its fingerprint against `--to`, passes the certificate itself to `ParcelCodec.encodeParcel` for the ordered frame strings, and writes them as `frame-0001.png`, `frame-0002.png`, … into an empty `--dir`. It prints the signer fingerprint, the payload name, size and SHA-256, and the frame count. The SHA-256 printed here is computed by the adapter over the file bytes; `encodeParcel` returns only the frame strings.
+`encode` reads one file, Base64-decodes the DER in `--cert` into an X.509 certificate, checks `TlsIdentity.fingerprintOf(cert)` against `--to` with both values normalised, and passes the certificate itself to `ParcelCodec.encodeParcel` for the ordered frame strings. It renders those strings as `frame-0001.png`, `frame-0002.png`, … into an empty `--dir`. It prints the frame count, the sealed frame-text size and a SHA-256 computed by the adapter over the source bytes; the signer is this CLI's own identity. The certificate is read for this one invocation only, and no pin lookup or self-addressed fallback exists.
 
-`decode` reads every `frame-*.png` in `--dir`, turns each image into an opaque frame string, reads descriptors through `ParcelCodec.parse` for progress, and passes the strings to `ParcelCodec.complete` with this CLI's own fingerprint and `TlsIdentity`. It writes the opened bytes to `--out` only when `complete` returns a `ParcelPayload` whose `recipientFp` is this CLI's fingerprint; otherwise `output` is `null` and the exit code is `2`. It prints seen, duplicate and rejected counts, missing indices, the signer fingerprint and `ParcelPayload.sha256`.
+`decode` reads every `frame-*.png` in `--dir` with `MultiFormatReader`, keeps each opaque frame string unchanged and passes them to `ParcelCodec.complete` with this CLI's own fingerprint and `TlsIdentity`. On success it writes `ParcelPayload.bytes` to `--out` and prints the signer and recipient fingerprints, the SHA-256 and the byte count. A missing or unverified parcel writes no output file and is reported by the exit code.
 
 Both commands are one-shot and offline. They open no socket, register no route and use no `Link`.
 
@@ -33,40 +33,34 @@ Both commands are one-shot and offline. They open no socket, register no route a
 
 ### One adapter at the harness seam
 
-All codec and image work is confined to `harness/src/main/kotlin/app/flit/share/harness/ParcelCli.kt`, called from `Harness.main` by `"parcel" -> parcel(args)` beside the existing `circle` and `parse-qr` branches (`Harness.kt:112-135`). `VALUE_FLAGS` gains `--out`; `--dir`, `--to` and `--cert` already exist (`Harness.kt:73-77`). The usage text gains the two command lines above.
+All codec and image work is confined to `harness/src/main/kotlin/app/flit/share/harness/ParcelCli.kt`, an `object ParcelCli` reached from `Harness.main` by a `"parcel"` dispatch that passes `ParsedArgs` through and exits on a non-zero code, beside the existing command branches (`Harness.kt:113-143`). `VALUE_FLAGS` gains `--out`; `--dir`, `--to` and `--cert` already exist (`Harness.kt:73-78`). `usage()` gains the two command lines above, `parcelUsage()` delegates to `ParcelCli.usage()` (`Harness.kt:205-208`), and no other command changes.
 
-The adapter exposes two functions that the harness tests call directly, without spawning a process:
+The adapter exposes one result pair and four entry points that the harness tests call directly, without spawning a process:
 
 ```
-data class ParcelEncodeResult(
-    val name: String, val size: Long, val sha256: String,
-    val frameCount: Int, val framesDir: Path, val signerFp: String,
-)
+data class EncodeResult(val dir: Path, val frames: Int, val sealedChars: Int, val sha256: String)
+data class DecodeResult(val out: Path, val bytes: Int, val sha256: String,
+                        val signerFp: String, val recipientFp: String)
 
-data class ParcelDecodeResult(
-    val total: Int, val seen: Int, val duplicate: Int, val rejected: Int,
-    val missing: List<Int>, val signerFp: String, val sha256: String,
-    val name: String, val size: Long, val output: Path?,
-)
-
-fun parcelEncode(file: Path, dir: Path, to: String, cert: Path,
-                 identity: TlsIdentity): ParcelEncodeResult
-fun parcelDecode(dir: Path, identity: TlsIdentity, out: Path): ParcelDecodeResult
+internal fun parcelEncode(args: ParsedArgs): EncodeResult
+internal fun parcelDecode(args: ParsedArgs): DecodeResult
+fun usage(): String
+fun run(args: ParsedArgs): Int
 ```
 
-`name` in `ParcelDecodeResult` is the file name supplied by `--out`; `signerFp` and `sha256` come from `ParcelPayload`, and `size` is the byte count of `ParcelPayload.bytes`. `output` is `null` for every incomplete, unverified or wrongly addressed parcel; it is the only signal a caller needs before writing bytes.
+`parcelEncode` and `parcelDecode` take their flags from `ParsedArgs`; `run` dispatches on the subcommand and returns the process exit code. `EncodeResult.dir` is the frame directory, `frames` is the number of PNGs written, `sealedChars` is the character count of the sealed frame text rendered into those PNGs, and `sha256` is over the source bytes. `DecodeResult` is the printed set of facts: `out`, `bytes`, `sha256`, `signerFp` and `recipientFp` from `ParcelPayload`. No file name is part of either result.
 
 ### Codec boundary
 
 The adapter imports `app.flit.share.protocol.parcel.ParcelCodec` from the 2026-12-03 protocol layer; the frame grammar is not redefined here. The boundary is exact in shape:
 
-- encode calls `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, recipientCert, signerFp, identity)` and receives an ordered `List<String>` of opaque frame strings. `identity` comes from `loadOrCreateIdentity()` (`Harness.kt:93-99`), `signerFp` is `identity.fingerprint`, `recipientCert` is the X.509 certificate parsed from `--cert` whose fingerprint has been checked against `--to`, and `parcelId` is generated by the adapter for this encode. The certificate is handed to the codec directly rather than reduced to a fingerprint for the encode call. `encodeParcel` returns no hash: the adapter computes the SHA-256 it prints over the file bytes. Inside the codec `encodeParcel` uses `CourierEnvelope.seal`, so there is one crypto path.
-- decode passes each frame string to `ParcelCodec.parse(frame)` for a `FrameDescriptor` (`parcelId`, `seq`, `count`, `totalBytes`, `crc`) and uses those descriptors for seen, duplicate and missing indices. It then calls `ParcelCodec.complete(frames, identity.fingerprint, identity)`; the fingerprint is the recipient gate and the same `TlsIdentity` supplies the private key the codec needs for `CourierEnvelope.open`. That call verifies the frames, CRC, sequence, count, digest and recipient before decrypting, and returns a `ParcelPayload` (`parcelId`, `recipientFp`, `signerFp`, `sha256`, `bytes`) only on success. The CLI adds no second crypto or digest computation; its only gate on top is comparing `ParcelPayload.recipientFp` with `identity.fingerprint` before writing.
-- The CLI never rewrites a frame string and never interprets the frame grammar. Every frame string it renders comes from `encodeParcel`; every frame string it hands to `parse` and `complete` comes from a QR decode.
+- encode calls `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, cert, signerFp, identity)` and receives an ordered `List<String>` of opaque frame strings. `identity` comes from `loadOrCreateIdentity()` (`Harness.kt:94-100`), `signerFp` is `identity.fingerprint`, `recipientFp` is the normalised `--to`, `cert` is the X.509 certificate decoded from `--cert` and bound to that fingerprint, and `parcelId` is generated by the adapter for this encode. The certificate is handed to the codec directly; no pin lookup and no self-addressed fallback exist. `encodeParcel` returns no hash: the adapter computes the SHA-256 it prints over the source bytes. Inside the codec `encodeParcel` uses `CourierEnvelope.seal`, so there is one crypto path.
+- decode hands the opaque strings unchanged to `ParcelCodec.complete(frames, identity.fingerprint, identity)`. The fingerprint is the recipient gate and the same `TlsIdentity` supplies the private key the codec needs for `CourierEnvelope.open`. That call verifies the frames, CRC, sequence, count, digest and recipient before decrypting, and returns a `ParcelPayload` (`parcelId`, `recipientFp`, `signerFp`, `sha256`, `bytes`) only on success. The CLI adds no second crypto or digest computation.
+- The CLI never rewrites a frame string and never interprets the frame grammar. Every frame string it renders comes from `encodeParcel`; every frame string it hands to `complete` comes from a QR decode.
 
 CLI decode is a batch fold over numbered PNGs for the round-trip test and box-side capture. Camera frame intake, display cadence and reassembly progress stay in the app layer on 2026-12-07 and are not implemented here.
 
-`--cert` is parsed as an X.509 certificate with `CertificateFactory` and bound to `--to` by `TlsIdentity.fingerprintOf` (`TlsIdentity.kt:192`); the certificate object itself is passed as `recipientCert` to `encodeParcel`, so no encode-side pin lookup is needed. Decode passes both `identity.fingerprint` and `identity` to `complete` and checks the returned `ParcelPayload.recipientFp` before any output is written. Signature verification, cert-in-hand checks and the digest gate stay inside `ParcelCodec` and `CourierEnvelope`; the CLI has no second crypto path.
+`--cert` holds Base64 DER: the adapter Base64-decodes the file, parses it with `CertificateFactory` as an X.509 certificate, and compares `TlsIdentity.fingerprintOf(cert)` with `--to` after normalising both (`TlsIdentity.kt:192,303-307`). The certificate object itself is passed to `encodeParcel`; no encode-side pin lookup or self-addressed fallback is used. Decode passes both `identity.fingerprint` and `identity` to `complete`, which already gates the recipient. Signature verification, cert-in-hand checks and the digest gate stay inside `ParcelCodec` and `CourierEnvelope`; the CLI has no second crypto path.
 
 ### Image seam and constants
 
@@ -79,48 +73,48 @@ CLI decode is a batch fold over numbered PNGs for the round-trip test and box-si
 | Character set | `UTF-8` | `ParcelCli.kt`; same as `Qr.encode` |
 | Quiet zone | `2` modules | `ParcelCli.kt`; same as `Qr.encode` |
 | Frame file name | `frame-%04d.png`, 1-based | `ParcelCli.kt` |
-| Exit codes | `0` verified, `2` incomplete or unverified, `1` usage or I/O | `ParcelCli.kt` and `Harness.kt:128-133` |
+| Exit codes | `0` success, `2` bad arguments or missing `--cert` / `--dir` / `--out`, `3` verification failure | `ParcelCli.kt` and the `Harness.kt` `parcel` dispatch |
 
 The render size, error correction and frame names above are CLI-side values; no app display or intake constant is declared or imported here. The frame count follows `ParcelCodec.MAX_FRAMES = 64`, the same cap the app uses for display, with no additional CLI-side frame limit.
 
-The per-frame payload cap and the defensive parcel cap come from the codec: `ParcelCodec.MAX_CHUNK_BYTES = 512` bounds the raw bytes in one frame and `ParcelCodec.MAX_AIR_GAP_PARCEL_BYTES = 131072` is the frame-layer ceiling, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS = 12 * 1024`. The adapter imports those constants and refuses a parcel that exceeds them rather than restating a second limit; with 64 frames of at most 512 bytes the reachable maximum is 32768 bytes. The frame domain tag `FRAME_MAGIC = "FLITPARCEL1"` and the per-frame CRC32 stay inside the codec; the CLI neither writes nor checks them. Every frame string is rendered in memory and decoded back to a string before the first PNG is written. On decode, images are read as RGB int arrays through `RGBLuminanceSource` and `HybridBinarizer`, the same shape `parseQr` uses; zxing failure counts as one rejected image and does not abort the batch.
+The per-frame payload cap and the defensive parcel cap come from the codec: `ParcelCodec.MAX_CHUNK_BYTES = 512` bounds the raw bytes in one frame and `ParcelCodec.MAX_AIR_GAP_PARCEL_BYTES = 131072` is the frame-layer ceiling, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS = 12 * 1024`. The adapter declares no frame, chunk or parcel cap of its own; `encodeParcel` returns an empty list for an oversized parcel and the adapter reports that as a refusal. The frame domain tag `FRAME_MAGIC = "FLITPARCEL1"` and the per-frame CRC32 stay inside the codec; the CLI neither writes nor checks them. Every frame string is rendered in memory and decoded back to a string before the first PNG is written. On decode, PNGs are read with zxing `MultiFormatReader` over `RGBLuminanceSource` and `HybridBinarizer`, the same image shape `parseQr` uses; an unreadable image is skipped and does not abort the batch.
 
 ### State ownership
 
-- Sender identity lives in `identity.p12` under `harnessHome()` and survives rebuilds (`Harness.kt:81-99`). The signer fingerprint is printed so an operator can pair it on the receiving side.
-- The recipient certificate is read from `--cert` for one invocation and held in memory for that invocation only. No certificate file is copied into `--dir`.
+- Sender identity lives in `identity.p12` under `harnessHome()` and survives rebuilds (`Harness.kt:88-100`). The signer fingerprint is printed so an operator can pair it on the receiving side.
+- The recipient certificate is read from `--cert` as Base64 DER for one invocation and held in memory for that invocation only. No certificate file is copied into `--dir`.
 - The frame directory is the whole checkpoint: numbered PNGs, no manifest and no sidecar. Encode refuses a directory that already holds a `frame-*.png`; decode never writes into it.
-- `parse` / `complete` state, pins and opened bytes are in memory for the one decode invocation. A killed process leaves no output file, no partial bytes and no progress record.
+- `complete` state, pins and opened bytes are in memory for the one decode invocation. A killed process leaves no output file, no partial bytes and no progress record.
 - No delivery status, receipt or gossip state exists at this layer.
 
 ## Invariants
 
-1. The CLI contains no frame grammar, CRC, signature, encryption, digest or sequencing code; those operations are reached only through `ParcelCodec` (`encodeParcel`, `parse`, `complete`) and the `CourierEnvelope` calls it makes.
+1. The CLI contains no frame grammar, CRC, signature, encryption, digest or sequencing code; those operations are reached only through `ParcelCodec` (`encodeParcel`, `complete`) and the `CourierEnvelope` calls it makes.
 2. Every PNG is written only after its own QR round-trip returns the identical frame string at `768 × 768`, EC `M`, margin `2` and UTF-8.
 3. Frame names are 1-based and zero-padded to four digits; lexicographic order of `frame-*.png` equals codec frame order, and encode creates no other file in `--dir`.
-4. Decode considers `frame-*.png` only. An image with no readable QR increments `rejected`; a frame `parse` refuses is counted and never aborts the remaining images.
-5. Decode writes an output file only when `complete(frames, identity.fingerprint, identity)` returns a `ParcelPayload` whose `recipientFp` equals `identity.fingerprint`; otherwise `output` is `null` and the exit code is `2`. The codec has already passed the CRC, sequence, count, digest and recipient checks at that point.
-6. A recipient certificate whose own SHA-256 DER fingerprint differs from `--to` is refused before any frame is rendered.
-7. Two decode runs over an unchanged frame directory produce the same counts, hash and output bytes.
+4. Decode considers `frame-*.png` only and hands each decoded string unchanged to `complete`. An image with no readable QR is skipped rather than aborting the batch, so a missing frame makes `complete` return null and the exit code `3`.
+5. Decode writes `ParcelPayload.bytes` to `--out` only when `complete(frames, identity.fingerprint, identity)` returns a `ParcelPayload`; a null result is a verification failure, exits `3` and leaves no output file. The codec has already passed the CRC, sequence, count, digest and recipient checks at that point.
+6. A recipient certificate whose `TlsIdentity.fingerprintOf` value differs from normalised `--to` is refused before any frame is rendered, with exit code `2`.
+7. Two decode runs over an unchanged frame directory produce the same `DecodeResult` and output bytes.
 8. No socket, route, `Link`, app module, v2.2 DTO or status code is added or changed by this layer.
-9. Missing `--dir`, missing `--out`, a missing input file or an existing output path ends with a `!!` reason and a non-zero exit, not a zero-frame success or a stack trace.
-10. No CLI-side frame, chunk or parcel cap is declared: `MAX_FRAMES`, `MAX_CHUNK_BYTES` and `MAX_AIR_GAP_PARCEL_BYTES` are read from `ParcelCodec`, so the box cannot emit a sequence the app refuses to display.
+9. Bad arguments, missing `--cert`, missing `--dir`, missing `--out`, a missing input file or an existing output path end with a `!!` reason and exit `2`, not a zero-frame success or a stack trace.
+10. No CLI-side frame, chunk or parcel cap is declared: `MAX_FRAMES`, `MAX_CHUNK_BYTES` and `MAX_AIR_GAP_PARCEL_BYTES` are enforced inside `ParcelCodec`, so the box cannot emit a sequence the app refuses to display.
 
 ## Failure modes
 
 | Condition | Conclusion | Keeps bytes | Drops | Evidence |
 | --- | --- | --- | --- | --- |
-| `--cert` fingerprint differs from `--to` | Refuse before rendering; exit `1` | Source file; any pre-existing frames | Nothing written | CODE; SIM-HARN `ParcelCliTest` |
-| Frame string exceeds QR capacity at EC `M`, or parcel exceeds a codec cap | Refuse encode; exit `1` | Source file; no PNGs | Nothing written | CODE; SIM-HARN |
-| `--dir` already holds `frame-*.png` | Refuse encode; exit `1` | Source file and old frames | Nothing written | CODE; SIM-HARN |
-| One PNG has no readable QR | Count `rejected`, continue; result unverified if a frame is missing | All frames on disk | That frame's contribution | CODE; SIM-HARN |
-| A frame index is missing | `missing` lists indices from `parse`; `output == null`, exit `2` | All frames; no output file | Assembled bytes in memory | PURE (codec); SIM-HARN |
-| A frame is repeated | `parse` descriptors count it as `duplicate`; `complete` still verifies the sequence; verified result writes | All frames and output | Repeated frame | PURE (codec); SIM-HARN |
-| Codec digest check fails | `complete` returns `null`; `output == null`, exit `2` | Frames; no output file | Unverified bytes | PURE (codec); SIM-HARN |
-| Parcel addressed to another fingerprint | `complete` refuses or `ParcelPayload.recipientFp` differs; `output == null`, exit `2`; print both fingerprints | Frames; no output file | Opened bytes | CODE; SIM-HARN |
-| Output path already exists | Refuse before writing; exit `1` | Existing file and frames | Nothing | CODE; SIM-HARN |
+| `--cert` fingerprint differs from normalised `--to` | Refuse before rendering; exit `2` | Source file; any pre-existing frames | Nothing written | CODE; SIM-HARN `ParcelCliTest` |
+| Frame string exceeds QR capacity at EC `M`, or parcel exceeds a codec cap | Refuse encode; exit `2` | Source file; no PNGs | Nothing written | CODE; SIM-HARN |
+| `--dir` already holds `frame-*.png` | Refuse encode; exit `2` | Source file and old frames | Nothing written | CODE; SIM-HARN |
+| One PNG has no readable QR | Skip that image; `complete` returns null and exit `3` if a frame is missing | All frames on disk; no output file | That frame's contribution | CODE; SIM-HARN |
+| A frame index is missing | `complete` returns null; no output file, exit `3` | All frames; no output file | Assembled bytes in memory | PURE (codec); SIM-HARN |
+| A frame is repeated | `complete` still verifies the sequence; success writes output and exits `0` | All frames and output | Repeated frame | PURE (codec); SIM-HARN |
+| Codec digest check fails | `complete` returns `null`; no output file, exit `3` | Frames; no output file | Unverified bytes | PURE (codec); SIM-HARN |
+| Parcel addressed to another fingerprint | `complete` refuses; no output file, exit `3`; print both fingerprints | Frames; no output file | Opened bytes | CODE; SIM-HARN |
+| Output path already exists | Refuse before writing; exit `2` | Existing file and frames | Nothing | CODE; SIM-HARN |
 | Process dies during encode | Partial numbered PNGs may remain | Source file; written PNGs | Frames not yet written | CODE |
-| Process dies during decode | No output file; frames unchanged | Frames | `parse`/`complete` state and pins | CODE |
+| Process dies during decode | No output file; frames unchanged | Frames | `complete` state and pins | CODE |
 
 ## Tests
 
@@ -128,13 +122,13 @@ Pure tests come first and are owned by the 2026-12-03 codec layer: `encodeParcel
 
 `harness/src/test/kotlin/app/flit/share/harness/ParcelCliTest.kt` is added to the existing 32 harness tests. Tests use seeded random bytes, a generated `TlsIdentity` for sender and recipient, and a fresh temp directory per case:
 
-1. Encode a seeded multi-frame payload; assert frame count, exact `frame-%04d.png` names, that every PNG re-decodes to its original frame string, and that decode returns `output` with byte-for-byte equal content, `sha256` equal to `ParcelPayload.sha256`, `missing` empty and `rejected == 0`.
-2. Delete one frame; assert `output == null`, `missing` names that index, and no file at the output path.
-3. Add a second copy of a frame under another `frame-*.png` name; assert `duplicate == 1` and the verified result still writes.
-4. Add a solid-color PNG; assert `rejected == 1` and the verified result still writes.
-5. Decode with an identity other than the recipient; assert `output == null` and that the printed reason names both fingerprints.
-6. Encode with a certificate that does not match `--to`; assert the refusal happens before any PNG exists.
-7. Encode into a directory that already holds a frame; assert the refusal leaves the old frames untouched.
+1. Encode a seeded multi-frame payload; assert `EncodeResult.frames`, exact `frame-%04d.png` names, that every PNG re-decodes to its original frame string, and that `DecodeResult.out` holds byte-for-byte equal content with `DecodeResult.sha256` equal to `EncodeResult.sha256` and `DecodeResult.bytes` equal to the source size.
+2. Delete one frame; assert `complete` returns null, exit `3`, and no file at the output path.
+3. Add a second copy of a frame under another `frame-*.png` name; assert `complete` still verifies and the result exits `0` with output written.
+4. Add a solid-color PNG; assert the unreadable image is skipped and the verified result exits `0` with output written.
+5. Decode with an identity other than the recipient; assert exit `3`, no output file, and that the printed reason names both fingerprints.
+6. Encode with a certificate that does not match `--to`; assert exit `2` before any PNG exists.
+7. Encode into a directory that already holds a frame; assert exit `2` and that the old frames are untouched.
 
 The green run uses `source env.sh && ./gradlew --no-daemon --rerun-tasks :protocol:test :app:testDebugUnitTest :harness:test`, followed by the full rig command in `docs/TESTING.md` §3. The harness totals in `docs/TESTING.md` §2, §4 and §5 move to the recorded total plus the number of `@Test` functions added; counts are taken from `--rerun-tasks` XML, not from a target figure.
 
@@ -142,7 +136,7 @@ Device walk: scheduled for 2026-12-08, not claimed here. The recipe is to render
 
 ## Evidence for this day
 
-`docs/completions/2026-12-04-parcel-cli.md` records CODE for the adapter functions, flags, image constants and exit codes; PURE for the inherited codec tests; and SIM-HARN for `ParcelCliTest` results with the exact harness count, one byte-for-byte round-trip with its hash and frame count, and the missing-frame, cert-mismatch and wrong-recipient refusals. DEVICE is not recorded on this date; the air-gap walk is scheduled for 2026-12-08.
+`docs/completions/2026-12-04-qr-parcel-cli.md` records CODE for the adapter functions, flags, image constants and exit codes; PURE for the inherited codec tests; and SIM-HARN for `ParcelCliTest` results with the harness count taken from `--rerun-tasks` XML, one byte-for-byte round-trip with its hash and frame count, and the missing-frame, cert-mismatch and wrong-recipient refusals. DEVICE is not recorded on this date; the air-gap walk is scheduled for 2026-12-08.
 
 ## Out of scope
 

@@ -23,9 +23,13 @@ into `docs/completions/`.
   (`docs/roadmap/qr-parcel-codec.md`): frame shape, sequencing, CRC, size caps
   and reassembly.
 - 2026-12-04 CLI — parcel encode and decode, tests
-  (`docs/roadmap/qr-parcel-cli.md`): the commands that write and read frame
-  images. The existing `parse-qr` image path in `Harness.kt:180-216` is the seam
-  that layer extends.
+  (`docs/roadmap/qr-parcel-cli.md`): `flit-cli parcel encode <file> --dir DIR
+  --to FP --cert PATH` writes the frame images and `flit-cli parcel decode
+  --dir DIR --out PATH` reads them back. The seam is a `"parcel"` dispatch in
+  `Harness.kt` with a `parcelUsage()` line and `--out` added to
+  `ParsedArgs.VALUE_FLAGS` beside `--dir`, `--to` and `--cert`; no other command
+  changes. Its result fields are `EncodeResult(dir, frames, sealedChars,
+  sha256)` and `DecodeResult(out, bytes, sha256, signerFp, recipientFp)`.
 - 2026-12-07 App — parcel display and camera decode, tests
   (`docs/roadmap/qr-parcel-app.md`): the screens built on `QrCanvas` and
   `CameraQrView` (`QrUi.kt:59-82,264-314`).
@@ -90,20 +94,25 @@ read from the 2026-12-03 specification and from the CLI encode output, not
 restated here; the size caps that bound the fixtures are named in the next
 section.
 
-Decode on the box uses the CLI surface from `docs/roadmap/qr-parcel-cli.md`.
-The encode step prints or writes the frame count and the payload SHA-256;
-those two values are the expected values for the direction. Decode takes only
-frame images and writes one reconstructed file. Camera decode on the phone
-uses the surface from `docs/roadmap/qr-parcel-app.md`, which reads the Y-plane
-through `Qr.decodeYPlane` (`Qr.kt:187-216`) rather than adding a second camera
-path.
+Decode on the box uses `flit-cli parcel decode --dir DIR --out PATH` from
+`docs/roadmap/qr-parcel-cli.md`. Its `DecodeResult` fields are `out`, `bytes`,
+`sha256`, `signerFp` and `recipientFp`: the command writes the opened bytes to
+`out` and prints the byte count, hash and both fingerprints; no file name
+travels in a frame, so `--out` names the landed file. The encode side reports
+`EncodeResult(dir, frames, sealedChars, sha256)`; `frames` and `sha256` are the
+expected count and hash for each direction, and `sealedChars` is the sealed
+envelope's character count rather than a byte size. Decode takes only frame
+images and writes one reconstructed file. Camera decode on the phone uses the
+surface from `docs/roadmap/qr-parcel-app.md`, which reads the Y-plane through
+`Qr.decodeYPlane` (`Qr.kt:187-216`) rather than adding a second camera path.
 
 ### Recipient certificate and decoder identity
 
-The corrected codec seam takes two inputs that are not frame strings.
-`encodeParcel(..., recipientCert, ..., identity)` seals to the recipient's
-X.509 certificate, so the sender must hold that certificate before encoding;
-`complete(frames, identity)` decrypts with the decoding device's own
+The codec seam takes two inputs that are not frame strings.
+`ParcelCodec.encodeParcel(payload, parcelId, recipientFp, cert, signerFp,
+identity)` seals to the recipient's X.509 certificate, so the sender must hold
+that certificate before encoding; `ParcelCodec.complete(frames,
+identity.fingerprint, identity)` decrypts with the decoding device's own
 `TlsIdentity`, so the receiver must hold that identity's private key. Neither
 is carried in a QR frame, and a fingerprint string alone cannot seal or open a
 parcel.
@@ -111,19 +120,23 @@ parcel.
 Because the walk is air-gapped, the recipient certificate moves out of band as
 fixture setup, before the direction starts. It is public certificate material —
 not payload bytes and not a private key — so the ADB control channel may place
-it next to the fixture file (`adb push` into the rig directory). The CLI encode
-step is given that certificate and pins it in memory for the one invocation;
-no certificate is rendered into a frame. In the phone → box direction the
-recipient is the box, so the box's certificate is staged for the phone's
-encode; in the box → phone direction the recipient is the phone, so the
-phone's certificate is staged for the box's encode. The certificate's own
-SHA-256 DER fingerprint is the recipient fingerprint recorded in the evidence
-note.
+it next to the fixture file (`adb push` into the rig directory). For the box's
+encode step the file named by `--cert PATH` holds the recipient's Base64 DER;
+the CLI parses it, checks `TlsIdentity.fingerprintOf(cert)` against the
+normalised `--to` and holds the certificate object for that one invocation.
+There is no pin lookup and no self-addressed fallback, and no certificate is
+rendered into a frame. In the phone → box direction the recipient is the box,
+so the box's certificate is staged for the phone's encode; in the box → phone
+direction the recipient is the phone, so the phone's certificate is staged for
+the box's encode. The certificate's own SHA-256 DER fingerprint is the
+recipient fingerprint recorded in the evidence note.
 
-The decoding device supplies its own identity to `complete`: the box's
-`TlsIdentity` under `FLIT_HARNESS_HOME` in direction A, and the phone's own
-identity in direction B. A device that cannot present the matching private key
-cannot open a parcel addressed to it, even with every frame captured.
+The decoding device supplies its own identity to `complete(frames,
+identity.fingerprint, identity)`: the box's `TlsIdentity` under
+`FLIT_HARNESS_HOME` in direction A, loaded by `loadOrCreateIdentity()`, and the
+phone's own identity in direction B. A device that cannot present the matching
+private key cannot open a parcel addressed to it, even with every frame
+captured.
 
 ### Walk fixtures and constants
 
@@ -144,9 +157,9 @@ The 2026-12-03 codec fixes the caps that size these fixtures:
 `CourierEnvelope` string is separately bound by `MAX_ENVELOPE_CHARS = 12288`,
 about 24 frames at 512 bytes per chunk. All three fixtures sit below both caps,
 so none is reduced and the `gap-8k.bin` ceiling case is walked unchanged. The
-CLI encode step reports the exact frame count and sealed byte size for each
-fixture; those reported values, not an assumed fixed count, are recorded in the
-evidence note. A fixture that did exceed a cap would be refused at encode,
+CLI encode step reports `frames` (the exact frame count) and `sealedChars`
+(the sealed envelope's character count) for each fixture; those reported
+values, not an assumed fixed count, are recorded in the evidence note. A fixture that did exceed a cap would be refused at encode,
 reduced to fit and rerun (see Failure modes).
 
 Three loops are run because an air gap has no back channel: the sender cannot
@@ -174,8 +187,9 @@ actual display timing is measured and recorded.
 
 1. Place `gap-1k.bin` and the box's recipient certificate on the phone once as
    fixture setup: `adb push gap-1k.bin /sdcard/Download/flit-gap/gap-1k.bin`
-   and `adb push box-cert.pem /sdcard/Download/flit-gap/box-cert.pem`. The
-   certificate is out-of-band public material, not part of the payload.
+   and `adb push box-cert.b64 /sdcard/Download/flit-gap/box-cert.b64`. The file
+   holds the box certificate's Base64 DER for the `--cert PATH` argument and is
+   out-of-band public material, not part of the payload.
 2. Read the expected hash without moving bytes:
    `adb shell sha256sum /sdcard/Download/flit-gap/gap-1k.bin`.
 3. Open the parcel display surface for that file on the phone, with the box's
@@ -184,10 +198,12 @@ actual display timing is measured and recorded.
 4. Capture three loops into a fresh directory:
    `for i in $(seq 1 $((3*N))); do adb exec-out screencap -p > frames/gap-1k-$i.png; sleep 0.5; done`
    where `N` is the frame count recorded in step 3.
-5. Decode with the 2026-12-04 CLI surface, passing the captured PNGs as the
-   frame input and the box's own `TlsIdentity` under `FLIT_HARNESS_HOME` to
-   `complete`. Record the reported frame count, sender fingerprint and payload
-   SHA-256.
+5. Decode with `flit-cli parcel decode --dir <captured-frames-dir> --out
+   <output>`, passing only the captured PNGs as `--dir` and using the box's own
+   `TlsIdentity` under `FLIT_HARNESS_HOME` for `complete(frames,
+   identity.fingerprint, identity)`. Record the `DecodeResult` fields `out`,
+   `bytes`, `sha256`, `signerFp` and `recipientFp`; `recipientFp` must equal the
+   box's fingerprint.
 6. Compare the decoded hash with step 2, then `cmp` the decoded file against
    the fixture still on the box. The fixture and the certificate are never
    frame inputs to the decoder.
@@ -195,14 +211,16 @@ actual display timing is measured and recorded.
 
 ### Direction B — box to phone
 
-1. Stage the phone's recipient certificate on the box out of band as fixture
-   setup, then encode `gap-8k.bin` with the 2026-12-04 CLI surface into a fresh
-   frame directory, passing that certificate to `encodeParcel`. Record the
-   frame count and payload SHA-256 printed or written by the encode step.
+1. Stage the phone's recipient certificate as a Base64 DER file on the box out
+   of band as fixture setup, then run `flit-cli parcel encode gap-8k.bin --dir
+   <frames-dir> --to <phone-FP> --cert <phone-cert-path>` into a fresh,
+   empty frame directory. Record `EncodeResult.dir`, `EncodeResult.frames`,
+   `EncodeResult.sealedChars` and `EncodeResult.sha256` from the encode step.
 2. Show the PNGs full-screen on the rig monitor in manifest order for three
    loops, recording the exact viewer command and the measured loop time.
 3. Point the phone camera at the monitor and open the parcel scan surface; the
-   phone supplies its own identity and private key to `complete`. Let the three
+   phone supplies its own identity and private key to
+   `complete(frames, identity.fingerprint, identity)`. Let the three
    loops pass; record the `logcat` lines for frames taken, deduplication,
    finalization and the landed path.
 4. Read the landed hash with `adb shell sha256sum <landed path>` and compare
@@ -221,14 +239,17 @@ unavailable.
 1. No carrier is present in either direction: Wi-Fi and Bluetooth read `0` on
    the phone and no `serve`/`relay` process is alive on the box at the start
    and end of each direction. ADB is a control channel only.
-2. The reconstructed payload's SHA-256 equals the SHA-256 declared by the
-   sender for all three fixtures in both directions.
+2. The reconstructed payload's SHA-256 — `DecodeResult.sha256` on the box —
+   equals the hash declared by the sender (`EncodeResult.sha256` when the box
+   encodes, the hash read from the phone when it encodes) for all three fixtures
+   in both directions.
 3. Frame indices are consumed in sequence; a missing index leaves the payload
    undecoded and produces an incomplete-sequence line naming the index.
 4. Three loops produce exactly one landed file. Repeated frames are
    deduplicated by index and do not finalize a second time.
 5. A frame with a bad CRC, a bad signature or a sender fingerprint other than
-   the expected one is refused with a reason line and no landed file.
+   the expected one is refused with a reason line; no `DecodeResult.out` is
+   written and exit code `3` is returned.
 6. Parcel decode creates no queue row, no resume sidecar and no `/partial`
    exchange; state after finalization is the landed file and its ledger row.
 7. Every claim in the completion note carries one label from `CODE`, `PURE`,
@@ -236,9 +257,10 @@ unavailable.
    claim. No test result is written as a device observation.
 8. The recipient certificate is moved out of band as fixture setup: it is
    public material, never a frame field and never a private key. Each direction
-   decodes with the receiving device's own `TlsIdentity` passed to `complete`;
-   without the matching private key a parcel addressed to that device is not
-   opened, even when every frame is present.
+   decodes with the receiving device's own `TlsIdentity` passed to
+   `complete(frames, identity.fingerprint, identity)`; without the matching
+   private key a parcel addressed to that device is not opened, even when every
+   frame is present.
 
 ## Failure modes
 
@@ -248,7 +270,7 @@ unavailable.
 | Same frame taken twice across loops | Dedup by index; finalize once | One reconstructed payload | Duplicate PNGs after decode | Exactly one landed file; duplicate-frame line in the log |
 | Frame image tampered with | CRC or signature refusal | Nothing from that sequence | Whole sequence buffer | Reason line with the failing index; no landed file |
 | Frames from a different CLI identity | Bad sender fingerprint | Nothing from that sequence | Whole sequence buffer | Refusal naming expected and presented fingerprints |
-| Recipient certificate not staged or decoder lacks the matching private key | Encode or decode cannot complete | Fixture and captured frames on the rig | No landed file | CLI or `logcat` error naming the missing certificate or key; direction marked `not verified` for that run |
+| Recipient certificate not staged (or `--cert PATH` is not Base64 DER, or its `TlsIdentity.fingerprintOf` differs from `--to`), or decoder lacks the matching private key | Encode refuses before any PNG with exit `2`; `complete(frames, identity.fingerprint, identity)` fails with exit `3` | Fixture and captured frames on the rig | No landed file and no `DecodeResult.out` | CLI or `logcat` error naming the missing certificate or key; direction marked `not verified` for that run |
 | Camera permission not granted on the phone | Direction B cannot start | Frame PNGs on the box | Nothing | Permission state in the log; direction B marked `not verified` for that run |
 | Wi-Fi, Bluetooth or a CLI carrier found live | Walk run invalid | Captured frames | The air-gap claim for that run | `settings get` and `pgrep` lines; rerun after fixing state |
 | Fixture above a codec cap (64 frames, 512-byte chunks, 32768 framed bytes, or the 12288-char envelope) | Encode refuses with the cap reason | Fixture file | No frames emitted | CLI error line; fixture reduced to fit and the run repeated |
@@ -263,10 +285,11 @@ tests from 2026-12-03, the CLI encode/decode tests from 2026-12-04 and the app
 display/camera tests from 2026-12-07 are the acceptance gate for the surfaces
 this walk consumes. No test is added on 2026-12-08.
 
-Harness sanity check before the walk: run the CLI encode step and decode its
-own frame images in one process on the box, with no socket and no phone. This
-is `SIM-HARN` evidence for the command path and is kept separate from the
-device observation.
+Harness sanity check before the walk: run `flit-cli parcel encode <fixture>
+--dir <frames-dir> --to <box-FP> --cert <box-cert-path>` and then
+`flit-cli parcel decode --dir <frames-dir> --out <output>` back-to-back on the
+box, with no socket and no phone. This is `SIM-HARN` evidence for the command
+path and is kept separate from the device observation.
 
 Device walk: direction A for all three fixtures, then direction B for
 `gap-8k.bin`, with the radio and process checks before and after each
@@ -277,11 +300,15 @@ count, loop count, decode time and the resulting log excerpt with timestamps.
 
 `docs/completions/2026-12-08-air-gap-parcel-walk.md` records the date, the
 commit under which the rig ran, the phone model and API level, the exact
-commands for encode, out-of-band certificate placement, capture, decode and
-hash reads, the recipient fingerprint used in each direction, the identity
-passed to `complete` on each decoding device, the frame and loop counts
-per fixture, the two hashes compared in each direction, and the `logcat` and
-CLI excerpts with timestamps. Each claim is labelled: `DEVICE` for walked
+commands for encode (`flit-cli parcel encode <file> --dir DIR --to FP --cert
+PATH`) and decode (`flit-cli parcel decode --dir DIR --out PATH`), out-of-band
+certificate placement, capture and hash reads, the `EncodeResult` fields
+(`dir`, `frames`, `sealedChars`, `sha256`) and `DecodeResult` fields (`out`,
+`bytes`, `sha256`, `signerFp`, `recipientFp`) where the CLI ran, the recipient
+fingerprint used in each direction, the identity passed to `complete(frames,
+identity.fingerprint, identity)` on each decoding device, the frame and loop
+counts per fixture, the two hashes compared in each direction, and the `logcat`
+and CLI excerpts with timestamps. Each claim is labelled: `DEVICE` for walked
 observations, `SIM-HARN` for the CLI loopback, `PURE` for the test gate and
 `CODE` for source facts. Limitations are listed in the same file: no second
 phone, no phone-to-phone air gap, no QR throughput measurement, no radio

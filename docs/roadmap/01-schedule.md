@@ -16,6 +16,10 @@ The 2026-12-03 Protocol layer is built ahead of its scheduled day. The QR
 parcel frame codec code and tests are written now, but the commit stays on
 2026-12-03; no earlier date carries it.
 
+The 2026-12-04 CLI layer is built ahead of its scheduled day. The parcel encode
+and decode code and tests are written now, but the commit stays on 2026-12-04;
+no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

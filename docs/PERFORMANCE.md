@@ -249,6 +249,18 @@ At `MAX_CHUNK_BYTES = 512` and `MAX_FRAMES = 64`, the largest frameable byte str
 
 Each frame repeats the parcel id, its `seq`, `count` and `totalBytes`, and carries a CRC32 over canonical bytes, so a captured frame can be checked on its own before the set is complete. `complete` verifies sequence, count, digest and recipient before decrypting through `CourierEnvelope.open`; it adds no second crypto path. None of this has a captured wall-clock, throughput or device byte measurement: frame rendering, camera decode and per-frame cost are unverified at this layer, and real-camera decode belongs to a later air-gap walk.
 
+### 8.6 QR parcel CLI: PNG render and read cost
+
+The 2026-12-04 CLI layer ([qr-parcel-cli.md](roadmap/qr-parcel-cli.md)) supplies the image step that §8.5 leaves unmeasured. `parcel encode` renders each opaque frame string to a **768 × 768 PNG** with zxing's `QRCodeWriter` at error correction level **M**, margin 2 and UTF-8; `parcel decode` reads each `frame-%04d.png` back with `MultiFormatReader` through `RGBLuminanceSource` and `HybridBinarizer`, the same image shape `parse-qr` uses. Both commands are one-shot and offline: neither opens a socket, registers a route nor starts a worker, so an idle invocation does no repeated work.
+
+The cost is qualitative and bounded by frame count, not by any captured figure:
+
+- Encode pays one QR matrix render and one PNG write per frame, plus an in-memory render → decode → compare round-trip of that frame string before its PNG is written. No PNG is emitted until its own round-trip returns the identical string. With `MAX_FRAMES = 64`, one invocation is at most 64 such renders, writes and round-trips, each aimed at the fixed 768 × 768 raster; the frame count comes from the codec, with no extra CLI-side frame limit.
+- Decode pays one PNG read and one QR decode per numbered image, then one `ParcelCodec.parse` per decoded string for the seen/duplicate/missing counts and a single `ParcelCodec.complete` over the collected strings. An image with no readable QR counts as one rejected image and does not abort the batch. A killed process leaves no output file, no partial bytes and no progress record.
+- Verification inside `complete` (CRC32, sequence, count, digest and recipient gate) and the underlying `CourierEnvelope.open` (AES-GCM decrypt, RSA key unwrap, signature verification) run once per successful decode, not once per frame. The CLI adds no second crypto or digest computation.
+
+The 768 × 768 size and EC `M` are CLI-side constants shared with `Qr.encode`, not a measured minimum or a captured frame budget; EC `M` trades redundancy for module density at that fixed raster. No wall-clock timing, throughput figure, CPU or heap sample, frame-time capture or device byte count has been recorded for rendering or reading a frame, and no camera capture belongs to this layer. The §8.5 caps remain structural bounds, not measured working sets.
+
 ---
 
 ## 9. Tradeoffs, stated
@@ -282,7 +294,7 @@ Each frame repeats the parcel id, its `seq`, `count` and `totalBytes`, and carri
 - **Sweep beyond one subnet**: the hardware walk was a `/24`; the 1024-host cap is a pure admission rule, not a measured worst case.
 - **Wire-byte totals** for Circle repair beyond the structural caps (1024 events/request, 8 MiB request body, 16 KiB event body); no traffic capture was published.
 - **Courier CLI one-shot and bag copy**: no wall-clock timing, invocation count or byte count was captured. The one-shot read / whole-file-write shape and the directory-copy handoff in §8.4 are structural descriptions, not measured costs.
-- **QR air-gap frames**: the `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512` and `MAX_AIR_GAP_PARCEL_BYTES = 131072` limits in §8.5 are structural caps, not measured sizes or costs. The 32 KiB reachable maximum is arithmetic from the first two caps. No frame-render, camera-scan, CRC or reassembly timing, throughput or device byte count has been captured, and real-camera decode is not verified by this layer.
+- **QR air-gap frames**: the `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512` and `MAX_AIR_GAP_PARCEL_BYTES = 131072` limits in §8.5 are structural caps, not measured sizes or costs. The 32 KiB reachable maximum is arithmetic from the first two caps. No frame-render, PNG read, camera-scan, CRC or reassembly timing, throughput or device byte count has been captured; the 768 × 768 / EC `M` PNG render and read cost in §8.6 is described qualitatively only, and real-camera decode is not verified by this layer.
 
 ---
 

@@ -594,6 +594,50 @@ The rows above are CODE and PURE only. No row claims DEVICE, SIM-HARN or a
 camera walk: rendering, capture and the end-to-end air-gap walk are later layers
 and are recorded as not verified here.
 
+### 3.8 QR parcel CLI — the one-shot conclusion table
+
+The 2026-12-04 CLI layer adds `parcel encode` and `parcel decode` at the harness
+seam. Both commands are one-shot and offline: no socket, route, `Link`, pin
+lookup or self-addressed fallback. `--cert PATH` holds the recipient's Base64
+DER certificate for one encode invocation; the object is parsed with
+`CertificateFactory`, bound to `--to` by `TlsIdentity.fingerprintOf`
+(normalised), and handed to `ParcelCodec` directly. Decode keeps the frame
+strings opaque and calls `ParcelCodec.complete` with the local fingerprint and
+identity, then writes `ParcelPayload.bytes` to `--out` only on success. No file
+name travels in a frame; the operator names the output
+and the CLI reports signer, recipient, SHA-256 and byte count. Exit codes are
+`2` for bad arguments or a missing cert/dir/out, `3` for a verification
+failure, and `0` for success.
+
+The exact CLI API is:
+
+```
+object ParcelCli {
+  data class EncodeResult(val dir: Path, val frames: Int, val sealedChars: Int,
+                          val sha256: String)
+  data class DecodeResult(val out: Path, val bytes: Int, val sha256: String,
+                          val signerFp: String, val recipientFp: String)
+  internal fun parcelEncode(args: ParsedArgs): EncodeResult
+  internal fun parcelDecode(args: ParsedArgs): DecodeResult
+  fun usage(): String
+  fun run(args: ParsedArgs): Int
+}
+```
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| `--cert` missing or unreadable, not Base64 DER, or its `TlsIdentity.fingerprintOf` differs from `--to` | exit `2`; refuse before any PNG is rendered — no pin lookup and no self-addressed fallback | source file; any pre-existing frames in `--dir` | nothing; the certificate is held in memory for this invocation | CODE `ParcelCli.parcelEncode` cert gate; PURE `ParcelCliTest` (cert gate) |
+| A `frame-*.png` is absent, or its QR does not decode | `complete` requires every `seq` in `1..count`; verification failure, exit `3`, no output file | all remaining frames on disk | assembled bytes in memory | CODE `ParcelCli.parcelDecode` + `ParcelCodec.complete` sequence gate; PURE missing-`seq` codec case; SIM-HARN `ParcelCliHarnessTest` (one frame removed) |
+| Decode with an identity other than the addressed recipient: `complete(frames, identity.fingerprint, identity)` returns null, or the returned `ParcelPayload.recipientFp` is not the local fingerprint | exit `3`; no output file; signer and recipient fingerprints printed | frames unchanged | opened bytes | CODE `ParcelCli.parcelDecode` recipient gate + `ParcelCodec.complete`; PURE wrong-identity codec case; SIM-HARN `ParcelCliHarnessTest` (two temp homes, wrong recipient) |
+| `--out` missing, already present, or its parent cannot be written | exit `2`; refuse before writing; frames untouched | existing output file and every frame in `--dir` | nothing | CODE `ParcelCli.run` / `parcelDecode` argument gate; PURE `ParcelCliTest` (flag cases) |
+
+The rows above are CODE from the frozen CLI API and the adapter at the harness
+seam, PURE from the inherited codec tests and the flag/cert-gate tests, and
+SIM-HARN from the two harness test classes named in the roadmap. No row claims
+DEVICE: rendering, capture and the air-gap walk are a later layer dated
+2026-12-08. This wave records no Gradle run, so no new test total is claimed
+here; the inventory above stays as recorded until TESTING.md is updated.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -785,13 +829,16 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Courier CLI carrier | `CourierCli.kt` | `CourierCliTest` | `CourierCarrierHarnessTest` | — |
 | Courier app worker / card projection | `FlitEngine.circleCourierDrop/courierHandoffs`, `FlitCircleSync.postParcel/fresh/fanout/sync`, `FlitCircleStore.update/decode`, `CourierCardUi.kt`, `CircleUi.computeFeedData`, `MainActivity` | `FlitCircleSyncTest`, `FlitCircleStoreTest`, `CourierCardUiTest` | — | — |
 | QR parcel frame codec | `ParcelCodec.kt` (`parse`/`encodeParcel`/`complete`, CRC and caps) | `ParcelCodecTest`, `ParcelCodecTamperTest` | — | — |
+| QR parcel CLI | `ParcelCli.kt` (`parcelEncode`/`parcelDecode`, cert gate, `--out` gate, exit codes) | `ParcelCodecTest`, `ParcelCodecTamperTest`, `ParcelCliTest` | `ParcelCliHarnessTest` | — |
 
 The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
 entry: the bag moved between directories on one box. The 2026-12-01 app courier
 worker and card projection rows are CODE and PURE only. The three-node courier
 walk is dated 2026-12-02 and is not claimed here. The 2026-12-03 QR parcel frame
 codec row is CODE and PURE only; camera capture and the air-gap walk are later
-layers and are not claimed here.
+layers and are not claimed here. The 2026-12-04 QR parcel CLI row adds CODE,
+PURE and SIM-HARN from the one-shot adapter and its two-temp-home harness pair,
+with no DEVICE entry; the air-gap walk is 2026-12-08.
 
 ---
 

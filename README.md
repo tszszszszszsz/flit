@@ -163,6 +163,7 @@ flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>   # accou
 ```
 
 - `courier` moves signed Circle events between machines as sealed parcels in a portable bag directory: `drop` seals an event for a recipient fingerprint, `carry` verifies the bag and marks parcels carried, `receive` opens parcels addressed to the local identity and folds them into local Circle state, and `status`/`sweep` report rows and expire or refuse undeliverable parcels. The bag is moved by directory copy (USB or any file copy); the CLI adds no transport of its own and no route to the v2.2 wire.
+- `parcel` folds one file into numbered QR frames and back, entirely offline: `encode <file> --dir DIR --to FP --cert PATH` seals the bytes for a recipient certificate supplied out of band (its fingerprint checked against `--to`) and writes `frame-0001.png`, `frame-0002.png`, … into `--dir` through the parcel codec; `decode --dir DIR --out PATH` reads those PNGs, verifies them through the same codec and writes the opened bytes to the explicitly named `--out`. No file name travels in a frame, and neither command opens a socket or uses a radio carrier.
 
 Needs java 21 at run time — the installed launcher says so in one line if the
 ambient `java` is older (`JAVA_HOME` or PATH wins). Identity lives at

@@ -642,6 +642,67 @@ seam, and PURE for round-trip, CRC, cap and refusal tests. No real-camera
 decode, carrier walk or device claim is made here: camera rendering, scanning
 and the air-gap walk are later layers.
 
+## Air-gap CLI: certificate in hand, identity on decode (2026-12-04)
+
+The 2026-12-04 CLI layer adds two one-shot, offline commands over the
+2026-12-03 parcel codec: `flit-cli parcel encode <file> --dir DIR --to FP
+--cert PATH` and `flit-cli parcel decode --dir DIR --out PATH`. It moves no
+trust anchor into the frame directory and adds no second crypto path.
+
+### Recipient certificate travels out of band
+
+`--cert PATH` is an operator-supplied file holding Base64 DER of the
+recipient's X.509 certificate. The CLI reads it for one encode invocation,
+parses it with `CertificateFactory`, and holds the certificate object in memory
+only for that call. No certificate is copied into `--dir`, written into a frame
+or fetched from a peer. Frames carry encrypted material only — no private key,
+recipient certificate, content key, plaintext or shared secret ("No key on a
+frame" above). Whoever copies the PNG directory therefore gets ciphertext and
+frame metadata, not the certificate needed to address or redirect a parcel.
+
+### Fingerprint checked against `--to`
+
+Encode normalizes `--to` and requires `TlsIdentity.fingerprintOf(cert)` — the
+uppercase-hex SHA-256 of the certificate's DER encoding, the same root of trust
+described in "Trust anchor: fingerprint and certificate pinning" — to equal the
+normalized `--to`. A certificate whose own digest differs from `--to` is refused
+before any PNG is rendered; no frame is emitted for a mismatched pair. The
+checked certificate object is then passed directly to `ParcelCodec.encodeParcel`
+as `recipientCert`, so `CourierEnvelope.seal` wraps the content key to its public
+key and the codec's own cert-bind and signature rules apply.
+
+### No pin registry or self-addressed fallback
+
+Encode does no recipient pin lookup. The CLI does not consult a stored
+fingerprint-to-certificate map, a roster or a key server to find the addressee,
+and it has no self-addressed fallback that silently redirects the parcel to the
+sender's own identity. The one certificate used is the one supplied by `--cert`
+and checked against `--to` for that invocation. The bounded in-memory pin cache
+described in "The pin cache" is a verification aid for signed network events;
+the parcel CLI's encode gate does not depend on it, and nothing is persisted
+between invocations.
+
+### Decode needs the local identity
+
+`parcel decode` calls `loadOrCreateIdentity()` and passes both
+`identity.fingerprint` and the `TlsIdentity` object to `ParcelCodec.complete`
+as `complete(frames, identity.fingerprint, identity)`. Verifying frames, CRC,
+sequence, count, digest and recipient is only the first half: `complete` opens
+the envelope through `CourierEnvelope.open` with that identity's private key,
+and the RSA-OAEP-wrapped content key can be unwrapped only by the identity whose
+fingerprint is `recipientFp`. A fingerprint string plus frames cannot produce
+bytes. No in-memory identity registry is consulted, and decode is not tied to
+the encode process: any box holding the identity named by `recipientFp` can
+decode, including a different machine from the one that encoded; a box holding
+a different identity gets no output. An output file is written only when
+`complete` returns a `ParcelPayload` whose `recipientFp` equals the local
+`identity.fingerprint`. No file name travels in a frame — `--out` supplies it.
+
+Evidence for this layer is CODE for the CLI adapter, flags and the cert gate,
+and SIM-HARN for the round-trip and refusal cases in `ParcelCliTest`; the codec
+crypto and digest checks stay PURE tests owned by the 2026-12-03 layer. The CLI
+adds no camera capture, radio carrier or device walk on this date.
+
 ## Panic: authorization, hops, and informational-only delivery
 
 Panic is a signed, hop-counted Flit-only route (`/api/flit/v1/panic`); it adds no
@@ -870,7 +931,8 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
 | Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | not run (2026-11-30 CLI layer) | not walked (2026-12-02 layer) |
 | App courier handoff UI | `CourierCardUi.kt`, `FlitEngine.courierHandoffs`, `FlitCircleSync.postParcel` | `CourierCardUiTest` (counts recorded at integration) | consumed CLI carrier outcomes | not walked (2026-12-02 layer) |
-| Air-gap QR parcel frames | `ParcelCodec.kt` (parcel package) | parcel pure tests (counts recorded at integration) | not run (CLI capture is 2026-12-04) | not walked (camera 2026-12-07, air gap 2026-12-08) |
+| Air-gap QR parcel frames | `ParcelCodec.kt` (parcel package) | parcel pure tests (counts recorded at integration) | SIM via CLI row below | not walked (camera 2026-12-07, air gap 2026-12-08) |
+| Air-gap QR parcel CLI (encode/decode) | `ParcelCli.kt` (harness), `--cert` gate | `ParcelCliTest` (counts recorded at integration) | SIM-HARN round-trip + cert/recipient refusals | not walked (air gap 2026-12-08) |
 
 The 2026-11-26 three-node baseline walk is DEVICE evidence for a 3-identity
 Circle: the phone plus two CLI identities joined one Circle, and event sync, a

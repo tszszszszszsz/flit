@@ -924,27 +924,45 @@ grammar, per-frame CRC and size caps belong to the protocol codec and are not
 restated or edited here (see [CONTRACTS.md](CONTRACTS.md) for the grammar and
 [FAILURE-MODES.md](FAILURE-MODES.md) for refusals).
 
+The CLI surface is exactly two commands:
+
+```
+parcel encode <file> --dir DIR --to FP --cert PATH
+parcel decode --dir DIR --out PATH
+```
+
+`--out` is a value-taking flag on `ParsedArgs`; `--dir`, `--to` and `--cert`
+already are. Both commands are one-shot and offline.
+
 ### 11.1 Before you start
 
 - Use the built `flit-cli` described in §3 and a phone with the parcel surface
   installed as described in §4. The two `parcel` commands come from the CLI
   layer (`docs/roadmap/qr-parcel-cli.md`) and the app surfaces from the app
   layer (`docs/roadmap/qr-parcel-app.md`); this procedure adds no build step.
-- Have the recipient's X.509 certificate as a file and the recipient's
-  fingerprint. The fingerprint is the value the receiver prints (`serve`
-  prints `fingerprint <fp>`; the app shows its own identity), and `--cert` must
-  match `--to`: the CLI checks the certificate's own SHA‑256 DER fingerprint
-  before it renders any frame. The certificate is pinned in memory for that one
-  encode call and is not copied into the frame directory.
+- Have the recipient's certificate as a **Base64 DER file** for `--cert` and
+  the recipient's fingerprint for `--to`. The fingerprint is the value the
+  receiver prints (`serve` prints `fingerprint <fp>`; the app shows its own
+  identity). The CLI parses the certificate, checks
+  `TlsIdentity.fingerprintOf(cert) == --to` (normalised) before it renders any
+  frame, and passes the certificate object itself to
+  `ParcelCodec.encodeParcel`. There is no pin lookup and no self-addressed
+  fallback: the file in `--cert` is the only source of the recipient key. The
+  certificate is held in memory for that one encode call and is not copied into
+  the frame directory.
 - Pick a fresh, empty frame directory. `parcel encode` refuses a directory that
   already holds a `frame-*.png`.
 - For a true air gap, turn Wi‑Fi and Bluetooth off on the phone and stop any
   `flit-cli serve` or `flit-cli relay` process on the box. ADB over USB is a
   control channel for fixture placement, screen capture and log reads; it never
   carries the payload bytes. Record the radio and process state before starting.
-- Record the source hash with `sha256sum <file>`. The file name is bound into
-  the frames as the display name, and this SHA‑256 is the payload hash to
-  compare at the far end.
+- Record the source hash with `sha256sum <file>`. No file name travels in a
+  frame: the operator supplies the output name at decode with `--out`. The
+  encoding adapter computes its own SHA‑256 over the file bytes and reports it
+  as `sha256`; that is the value to compare at the far end.
+- Exit codes for both commands: **0** success, **2** bad arguments or a missing
+  `--cert`, `--dir` or `--out`, **3** verification failure on decode. These are
+  the only `parcel` exit codes.
 
 ### 11.2 Box → phone (display and scan)
 
@@ -954,10 +972,19 @@ restated or edited here (see [CONTRACTS.md](CONTRACTS.md) for the grammar and
    flit-cli parcel encode <file> --dir <frames-dir> --to <FP> --cert <cert-path>
    ```
 
-   The command prints the signer fingerprint, name, size, payload SHA‑256 and
-   frame count, then writes `frame-0001.png`, `frame-0002.png`, … in frame
-   order. Each frame is one opaque UTF‑8 string rendered at error correction M
-   with a 2‑module margin; the CLI round-trips every frame before writing it.
+   Flags: `<file>` is the payload; `--dir` is the fresh frame directory; `--to`
+   is the recipient fingerprint; `--cert` is the Base64 DER certificate file.
+   The command returns `EncodeResult(dir, frames, sealedChars, sha256)` — the
+   frame directory, the frame count, the sealed-character count and the
+   adapter's SHA‑256 over the file bytes — and writes `frame-0001.png`,
+   `frame-0002.png`, … in frame order. The signer is
+   `loadOrCreateIdentity().fingerprint`; a fresh `parcelId` is generated for
+   this encode and the certificate object itself is passed to
+   `ParcelCodec.encodeParcel(payload, parcelId, recipientFp, cert, signerFp,
+   identity)`. Each frame is one opaque UTF‑8 string rendered as a 768 × 768
+   PNG with zxing `QRCodeWriter` at error correction M and a 2‑module margin;
+   the adapter round-trips every frame string through zxing before writing it.
+   Exit 0 on success; exit 2 for bad arguments or a missing `--cert` or `--dir`.
 2. Move the PNG directory to the display by physical copy, or show it on the
    rig monitor. No network path is involved.
 3. Show the frames in file-name order and open the parcel scan surface on the
@@ -992,9 +1019,17 @@ restated or edited here (see [CONTRACTS.md](CONTRACTS.md) for the grammar and
    flit-cli parcel decode --dir <dir> --out <output>
    ```
 
-   It prints seen, duplicate and rejected counts, missing indices, signer
-   fingerprint and payload hash. Exit 0 means verified, 2 incomplete or
-   unverified, 1 usage or I/O.
+   Flags: `--dir` holds the captured PNGs; `--out` is the path for the opened
+   bytes. No file name is carried in a frame, so `--out` is the only source of
+   the output name. The command reads the PNGs with zxing `MultiFormatReader`,
+   keeps the opaque frame strings, calls
+   `ParcelCodec.complete(frames, identity.fingerprint, identity)` with the local
+   identity, writes `ParcelPayload.bytes` to `--out`, and returns
+   `DecodeResult(out, bytes, sha256, signerFp, recipientFp)` — the output path,
+   the byte count, the payload hash and the two fingerprints. It prints the
+   signer fingerprint, recipient fingerprint, SHA‑256 and byte count. Exit 0
+   means verified and written; exit 2 means bad arguments or a missing `--dir`
+   or `--out`; exit 3 means verification failed and no output was written.
 4. Compare the printed hash with the phone hash, then `cmp` the output against
    the fixture still on the box. The fixture is never an input to the decoder.
    If no monitor or print surface can be placed in front of a camera, this
@@ -1016,13 +1051,15 @@ restated or edited here (see [CONTRACTS.md](CONTRACTS.md) for the grammar and
   sender loops blindly and only the receiver knows which indices it has seen.
   A carry is verified by hash equality, not by a returned status, and no
   delivery count moves because of it.
-- No partial state is durable. A killed encode or decode leaves no output and
-  no progress record; a missed frame means starting the scan again. There is
-  no `.part`, queue row, resume sidecar or `/partial` exchange in this path.
+- No partial state is durable. A killed decode writes no `--out` file; a killed
+  encode may leave partial numbered PNGs in `--dir` and no progress record; a
+  missed frame means starting the scan again. There is no `.part`, queue row,
+  resume sidecar or `/partial` exchange in this path.
 - Gate failures are refusals, not repairs. A CRC mismatch, missing index,
   digest mismatch, bad envelope signature or a recipient fingerprint other
-  than the receiver's yields no output and no landed file; held frames stay in
-  memory until the caller drops them. See [FAILURE-MODES.md](FAILURE-MODES.md).
+  than the receiver's yields no output and no landed file; decode exits 3 and
+  held frames stay in memory until the caller drops them. See
+  [FAILURE-MODES.md](FAILURE-MODES.md).
 - The parcel is sealed to one recipient fingerprint. A node that is not that
   recipient cannot open it and the carrier cannot read the contents; the
   certificate must arrive out of band and is not part of the frame directory.
