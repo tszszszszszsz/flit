@@ -37,13 +37,10 @@ android {
     }
 }
 
-// Netty ships host-native transports (epoll/kqueue) that are dead weight (and
-// unrunnable .so blobs) on Android; the server runs on the JDK NIO transport.
-configurations.all {
-    exclude(group = "io.netty", module = "netty-transport-native-epoll")
-    exclude(group = "io.netty", module = "netty-transport-native-kqueue")
-    exclude(group = "io.netty", module = "netty-transport-native-unix-common")
-}
+// Note: keep netty's native transport artifacts on the app classpath — ktor/netty
+// probes them at engine start and a missing class hard-fails the probe. The
+// probe itself is neutralized in FlitApp (io.netty.transport.noNative=true),
+// because the bundled .so blobs are Linux/macOS ELFs, not Android.
 
 kotlin {
     compilerOptions {
