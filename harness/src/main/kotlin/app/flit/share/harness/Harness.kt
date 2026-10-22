@@ -16,6 +16,7 @@ import app.flit.share.protocol.server.ServerDelegate
 import app.flit.share.protocol.server.UploadResult
 import app.flit.share.protocol.tls.TlsIdentity
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.LocalTime
@@ -51,7 +52,7 @@ private class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--udp-port", "--wait", "--pin", "--parallel")
+        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to")
     }
 }
 
@@ -60,9 +61,17 @@ private fun loadOrCreateIdentity(): TlsIdentity {
     val dir = Path.of("flit-harness")
     Files.createDirectories(dir)
     val file = dir.resolve("identity.p12")
-    return if (Files.exists(file)) TlsIdentity.load(file)
-    else TlsIdentity.generate().also { it.save(file) }
+    return if (Files.exists(file)) TlsIdentity.load(file.toFile())
+    else TlsIdentity.generate().also { it.save(file.toFile()) }
 }
+
+/** --announce-to a:port,b:port — unicast announce copies for hosts where multicast is stripped. */
+private fun announceTargets(arg: String?): List<InetSocketAddress> =
+    arg?.split(',')?.mapNotNull { token ->
+        val parts = token.trim().split(':')
+        if (parts.size != 2) return@mapNotNull null
+        runCatching { InetSocketAddress(parts[0], parts[1].toInt()) }.getOrNull()
+    }.orEmpty()
 
 private val fmt = DateTimeFormatter.ofPattern("HH:mm:ss")
 private fun ts(): String = LocalTime.now().format(fmt)
@@ -80,6 +89,7 @@ fun main(argv: Array<String>) {
         }
     } catch (e: Exception) {
         System.err.println("!! ${e.message ?: e.javaClass.simpleName}")
+        if (System.getenv("FLIT_TRACE") != null) e.printStackTrace()
         exitProcess(1)
     }
 }
@@ -88,8 +98,8 @@ private fun usage() {
     println(
         """flit harness — LocalSend v2.2 interop checker
 
-serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http]
-discover [--wait S] [--udp-port N] [--http]
+serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--announce-to ip:port,...]
+discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N]
 info <ip[:port]> [--http]
 """
@@ -165,6 +175,7 @@ private suspend fun serve(args: ParsedArgs) {
         registerPoster = { ip, port, protocol, self ->
             client.register(SendTarget(ip, port, protocol == "https"), self)
         },
+        fallbackPeers = announceTargets(args.opt("--announce-to")),
     )
     discovery.start()
 
@@ -201,6 +212,7 @@ private suspend fun discover(args: ParsedArgs) {
         registerPoster = { ip, port, protocol, self ->
             client.register(SendTarget(ip, port, protocol == "https"), self)
         },
+        fallbackPeers = announceTargets(args.opt("--announce-to")),
     )
     discovery.start(announceIntervalMillis = 600)
 

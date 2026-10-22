@@ -9,17 +9,17 @@ import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.tls.TlsIdentity
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
+import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
-import io.ktor.server.application.ApplicationEngine
 import io.ktor.server.application.install
-import io.ktor.server.cio.CIO
-import io.ktor.server.engine.applicationEngineEnvironment
-import io.ktor.server.engine.connector
+import io.ktor.server.netty.Netty
+import io.ktor.server.engine.EngineConnectorBuilder
+import io.ktor.server.engine.applicationEnvironment
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.sslConnector
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.server.request.origin
+import io.ktor.server.plugins.origin
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
@@ -27,11 +27,11 @@ import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
-import io.ktor.serialization.kotlinx.json.json
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.BufferedOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -92,7 +92,7 @@ internal class ActiveSession(
 
 /**
  * LocalSend v2.2 HTTP server: /info, /register, /prepare-upload, /upload, /cancel.
- * TLS (self-signed) is the default; the peer's claim is only secured by transport.
+ * TLS (self-signed) is the default, mirroring upstream behavior.
  */
 class ProtocolServer(
     private val identity: TlsIdentity,
@@ -102,13 +102,11 @@ class ProtocolServer(
 
     private val mutex = Mutex()
     private var session: ActiveSession? = null
-    private var engine: ApplicationEngine? = null
+    private var server: io.ktor.server.engine.EmbeddedServer<*, *>? = null
     private val actualPort = AtomicInteger(-1)
 
     val port: Int get() = actualPort.get().takeIf { it > 0 } ?: config.port
     val scheme: String get() = if (config.tls) "https" else "http"
-
-    private fun selfPort(): Int = port
 
     fun selfInfo(): PeerInfo = PeerInfo(
         alias = config.alias,
@@ -116,16 +114,16 @@ class ProtocolServer(
         deviceModel = config.deviceModel,
         deviceType = config.deviceType,
         fingerprint = identity.fingerprint,
-        port = selfPort(),
+        port = port,
         protocol = scheme,
         download = config.downloadApiEnabled,
     )
 
     fun start() {
-        check(engine == null) { "server already started" }
+        check(server == null) { "server already started" }
         Files.createDirectories(config.destDir)
 
-        val application: Application.() -> Unit = {
+        val module: suspend Application.() -> Unit = {
             install(ContentNegotiation) { json(WireJson.json) }
             routing {
                 get(Protocol.PATH_INFO) { infoRoute(call) }
@@ -137,35 +135,32 @@ class ProtocolServer(
             }
         }
 
-        val env = applicationEngineEnvironment {
-            module { application() }
+        val configBlock: io.ktor.server.engine.ApplicationEngine.Configuration.() -> Unit = {
             if (config.tls) {
-                sslConnector(
-                    identity.keyStore,
-                    identity.alias,
-                    { identity.password },
-                    { identity.password },
-                    config.port,
-                    config.host,
-                ) {}
-            } else {
-                connector {
-                    this.host = config.host
+                sslConnector(identity.keyStore, identity.alias, { identity.secretChars() }, { identity.secretChars() }) {
+                    host = config.host
                     this.port = config.port
                 }
+            } else {
+                connectors = mutableListOf<io.ktor.server.engine.EngineConnectorConfig>(
+                    EngineConnectorBuilder().apply {
+                        host = config.host
+                        this.port = config.port
+                    },
+                )
             }
         }
 
-        val e = embeddedServer(CIO, env).start(wait = false)
-        engine = e
+        val e = embeddedServer(Netty, applicationEnvironment { }, configBlock, module).let { it.start(wait = false) }
+        server = e
         runBlocking {
-            actualPort.set(e.resolvedConnectors().first().port)
+            actualPort.set(e.engine.resolvedConnectors().first().port)
         }
     }
 
     override fun close() {
-        engine?.stop(gracePeriodMillis = 300, timeoutMillis = 2000)
-        engine = null
+        server?.stop(gracePeriodMillis = 300, timeoutMillis = 2000)
+        server = null
         runBlocking { mutex.withLock { session = null } }
     }
 
@@ -214,34 +209,27 @@ class ProtocolServer(
         val sessionId = UUID.randomUUID().toString()
         val candidate = ActiveSession(sessionId, peerIp)
 
+        var badNames = false
         mutex.withLock {
-            if (session != null) return respondConflict(call)
+            if (session != null) {
+                call.respondText("Blocked by another session", ContentType.Text.Plain, HttpStatusCode.Conflict)
+                return
+            }
             for ((id, f) in accepted) {
                 val rel = sanitizeRelative(f.fileName)
-                if (rel.isEmpty()) continue // invalid name → skip, mirrors excluded files
+                if (rel.isEmpty()) { badNames = true; continue }
                 val parent = Path.of(rel).parent
                 val dir = if (parent != null) config.destDir.resolve(parent) else config.destDir
                 Files.createDirectories(dir)
                 val target = uniqueTarget(dir, Path.of(rel).fileName.toString())
                 candidate.files[id] = PendingFile(f, UUID.randomUUID().toString(), target)
             }
-            if (candidate.files.isEmpty()) {
-                return respondBadRequest(call)
-            }
-            session = candidate
+            if (candidate.files.isEmpty()) badNames = true else session = candidate
         }
+        if (badNames) call.respond(HttpStatusCode.NoContent)
 
         val tokens = candidate.files.entries.associate { it.key to it.value.token }
         call.respondText(WireJson.encode(PrepareUploadResponse(sessionId, tokens)), ContentType.Application.Json)
-    }
-
-    private suspend fun respondConflict(call: ApplicationCall) {
-        call.respondText("Blocked by another session", ContentType.Text.Plain, HttpStatusCode.Conflict)
-    }
-
-    private suspend fun respondBadRequest(call: ApplicationCall) {
-        // pretend there was nothing to transfer — valid but degenerate offers
-        call.respond(HttpStatusCode.NoContent)
     }
 
     private suspend fun uploadRoute(call: ApplicationCall) {
@@ -254,25 +242,28 @@ class ProtocolServer(
             return
         }
 
-        val pf: PendingFile? = mutex.withLock {
+        val claim = mutex.withLock {
             val s = session
             val f = s?.files?.get(fileId)
             if (s != null && s.id == sessionId && s.senderIp == peerIp && f != null &&
                 f.token == token && !f.settled && f.attempts < MAX_ATTEMPTS
             ) {
                 f.attempts++
-                f // claim: flash window; concurrent duplicate upload of same file would race past here
+                f
             } else {
                 null
             }
-        } ?: run {
+        }
+        if (claim == null) {
             call.respondText("Invalid token or IP address", ContentType.Text.Plain, HttpStatusCode.Forbidden)
             return
         }
 
+        val pf = claim
         delegate.onUploadStart(sessionId, fileId, pf.file)
         val md = MessageDigest.getInstance("SHA-256")
         var bytes: Long = 0
+        var ok = false
         try {
             Files.newOutputStream(pf.temp).use { rawOut ->
                 val out = BufferedOutputStream(rawOut, 64 * 1024)
@@ -290,7 +281,7 @@ class ProtocolServer(
 
             val digestHex = md.digest().joinToString("") { "%02x".format(it) }
             val declared = pf.file.sha256?.trim()
-            val ok = declared.isNullOrEmpty() || digestHex.equals(declared, ignoreCase = true)
+            ok = declared.isNullOrEmpty() || digestHex.equals(declared, ignoreCase = true)
 
             if (ok) {
                 Files.createDirectories(pf.target.parent)
@@ -298,58 +289,47 @@ class ProtocolServer(
             } else {
                 Files.deleteIfExists(pf.temp)
             }
-
-            mutex.withLock {
-                pf.settled = ok || pf.attempts >= MAX_ATTEMPTS // don't loop forever on a bad source
-                if (session?.id == sessionId) {
-                    val allDone = session?.files?.all { it.value.settled || it.value.attempts >= MAX_ATTEMPTS } ?: true
-                    if (allDone) {
-                        val ended = session
-                        session = null
-                        ended
-                    } else null
-                } else null
-            }?.let { ended -> delegate.onSessionEnd(ended.id, cancelled = ok.not()) }
-
-            if (ok) {
-                dFinished(sessionId, pf, UploadResult.Saved(pf.target, bytes), call)
-            } else {
-                dFinished(sessionId, pf, UploadResult.Mismatch, call)
-            }
+            call.respond(if (ok) HttpStatusCode.OK else HttpStatusCode.UnprocessableEntity)
         } catch (e: CancellationException) {
             runCatching { Files.deleteIfExists(pf.temp) }
-            markFailed(sessionId, pf)
+            pf.settled = true
+            markSessionEnded(sessionId, cancelled = false)
             throw e
         } catch (e: Throwable) {
             runCatching { Files.deleteIfExists(pf.temp) }
-            markFailed(sessionId, pf)
-            dFinished(sessionId, pf, UploadResult.Error, call, status = HttpStatusCode.InternalServerError)
+            pf.settled = true
+            markSessionEnded(sessionId, cancelled = false)
+            call.respondText("Unknown error", ContentType.Text.Plain, HttpStatusCode.InternalServerError)
+        }
+
+        if (ok) {
+            pf.settled = true
+            delegate.onUploadFinish(
+                sessionId,
+                fileId,
+                pf.file,
+                UploadResult.Saved(pf.target, bytes),
+            )
+            markSessionEnded(sessionId, cancelled = false)
+        } else {
+            delegate.onUploadFinish(sessionId, fileId, pf.file, UploadResult.Mismatch)
+            if (pf.attempts >= MAX_ATTEMPTS) {
+                pf.settled = true
+                markSessionEnded(sessionId, cancelled = false)
+            }
         }
     }
 
-    private suspend fun dFinished(
-        sessionId: String,
-        pf: PendingFile,
-        result: UploadResult,
-        call: ApplicationCall,
-        status: HttpStatusCode = HttpStatusCode.OK,
-    ) {
-        delegate.onUploadFinish(sessionId, pf.file.id ?: "", pf.file, result)
-        call.respondText("", ContentType.Text.Plain, status)
-    }
-
-    private suspend fun markFailed(sessionId: String, pf: PendingFile) {
-        mutex.withLock {
-            pf.settled = true
-            if (session?.id == sessionId) {
-                val allDone = session?.files?.all { it.value.settled || it.value.attempts >= MAX_ATTEMPTS } ?: true
-                if (allDone) {
-                    val ended = session
-                    session = null
-                    ended
-                } else null
+    /** Ends + notifies once every file is terminal. */
+    private suspend fun markSessionEnded(sessionId: String, cancelled: Boolean) {
+        val ended = mutex.withLock {
+            val s = session
+            if (s != null && s.id == sessionId && s.files.values.all { it.settled || it.attempts >= MAX_ATTEMPTS }) {
+                session = null
+                s
             } else null
-        }?.let { ended -> delegate.onSessionEnd(ended.id, cancelled = false) }
+        }
+        if (ended != null) delegate.onSessionEnd(ended.id, cancelled)
     }
 
     private suspend fun cancelRoute(call: ApplicationCall) {
@@ -366,22 +346,9 @@ class ProtocolServer(
         call.respond(HttpStatusCode.OK)
     }
 
-    private suspend fun finishAndRespondInternal(
-        sessionId: String,
-        pf: PendingFile,
-        result: UploadResult,
-        ok: Boolean,
-    ) {
-        delegate.onUploadFinish(sessionId, pf.file.id ?: "", pf.file, result)
-    }
-
     companion object {
         const val MAX_ATTEMPTS = 3
     }
-}
-
-private suspend fun applyUpload(call: ApplicationCall, pf: PendingFile, ok: Boolean, status: HttpStatusCode) {
-    call.respondText("", ContentType.Text.Plain, status)
 }
 
 internal fun ApplicationCall.peerIp(): String = request.origin.remoteHost ?: ""

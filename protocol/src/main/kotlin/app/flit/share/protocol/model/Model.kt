@@ -23,6 +23,21 @@ data class PeerInfo(
     val announce: Boolean? = null,
 ) {
     fun sansAnnounce(): PeerInfo = copy(announce = null)
+
+    /**
+     * The UDP announcement payload. Requires concrete port/protocol (a device
+     * announcing without serving is a protocol violation).
+     */
+    fun announcePayload(): AnnounceMessage = AnnounceMessage(
+        alias = alias,
+        version = version,
+        deviceModel = deviceModel,
+        deviceType = deviceType,
+        fingerprint = fingerprint,
+        port = port,
+        protocol = protocol,
+        download = download,
+    )
 }
 
 /** Optional timestamp metadata, ISO-8601 "2021-01-01T12:34:56Z". */
@@ -54,4 +69,20 @@ data class PrepareUploadResponse(
     val sessionId: String,
     /** file id → per-file transfer token; only accepted files. */
     val files: Map<String, String>,
+)
+
+/**
+ * Multicast announcement wire shape: port + protocol are always present here
+ * (never default-omitted), unlike register/info responses.
+ */
+@Serializable
+data class AnnounceMessage(
+    val alias: String,
+    val version: String,
+    val deviceModel: String? = null,
+    val deviceType: String? = null,
+    val fingerprint: String,
+    val port: Int,
+    val protocol: String,
+    val download: Boolean = false,
 )

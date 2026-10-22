@@ -1,6 +1,7 @@
 package app.flit.share.protocol.discovery
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.model.AnnounceMessage
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.WireJson
 import kotlinx.coroutines.CoroutineScope
@@ -28,6 +29,8 @@ class UdpDiscovery(
     private val own: () -> PeerInfo,
     private val onPeerDiscovered: (ip: InetAddress, info: PeerInfo) -> Unit,
     private val registerPoster: suspend (ip: String, port: Int, protocol: String, own: PeerInfo) -> Unit,
+    /** Explicit unicast announce targets (networks that strip multicast, e.g. containers). */
+    private val fallbackPeers: List<java.net.InetSocketAddress> = emptyList(),
 ) {
     private val group: InetAddress = InetAddress.getByName(Protocol.MULTICAST_GROUP)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -71,13 +74,31 @@ class UdpDiscovery(
 
     fun announceOnce() {
         val s = socket ?: return
-        val payload = WireJson.encode(own().sansAnnounce()).toByteArray(Charsets.UTF_8)
+        val o = own()
+        val payload = WireJson.encode(
+            AnnounceMessage(
+                alias = o.alias, version = o.version, deviceModel = o.deviceModel,
+                deviceType = o.deviceType, fingerprint = o.fingerprint,
+                port = o.port, protocol = o.protocol, download = o.download,
+            ),
+        ).toByteArray(Charsets.UTF_8)
         if (joined.isEmpty()) {
             runCatching { s.send(DatagramPacket(payload, payload.size, group, udpPort)) }
             return
         }
-        for (ni in joined) {
-            runCatching { s.send(DatagramPacket(payload, payload.size, group, udpPort), 1, ni) }
+        // JDK has no per-call interface send; anchor the outgoing interface per iteration.
+        val packet = DatagramPacket(payload, payload.size, group, udpPort)
+        synchronized(this) {
+            for (ni in joined) {
+                runCatching {
+                    s.networkInterface = ni
+                    s.send(packet)
+                }
+            }
+            // Unicast fallback: same announce payload, delivered point-to-point.
+            for (peer in fallbackPeers) {
+                runCatching { s.send(DatagramPacket(payload, payload.size, peer)) }
+            }
         }
     }
 

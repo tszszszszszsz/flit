@@ -1,5 +1,6 @@
 package app.flit.share.protocol
 
+import app.flit.share.protocol.model.AnnounceMessage
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
@@ -20,7 +21,7 @@ class DtoParityTest {
 
     @Test
     fun `announce serializes like upstream rust test fixture`() {
-        val msg = PeerInfo(
+        val msg = AnnounceMessage(
             alias = "Nice Orange",
             version = "2.2",
             deviceModel = "Samsung",
@@ -69,7 +70,10 @@ class DtoParityTest {
     }
 
     @Test
-    fun `register responses omit port and protocol like upstream DTO`() {
+    fun `register info always carries port and protocol like upstream DTO`() {
+        // Upstream RegisterDtoV2 (rust, serde) declares `port` and `protocol` with
+        // NO defaults, so omitting their values fails strict readers (the real CLI
+        // answered "Invalid JSON body"). Extra fields are ignored by serde readers.
         val self = PeerInfo(
             alias = "Flit",
             version = "2.2",
@@ -78,8 +82,9 @@ class DtoParityTest {
             protocol = "https",
         )
         val json = WireJson.encode(self.sansAnnounce())
-        assertFalse(json.contains("\"port\""), json)
-        assertFalse(json.contains("\"protocol\""), json)
+        assertTrue(json.contains("\"port\":53317"), json)
+        assertTrue(json.contains("\"protocol\":\"https\""), json)
+        assertFalse(json.contains("\"announce\""), json)
     }
 
     @Test

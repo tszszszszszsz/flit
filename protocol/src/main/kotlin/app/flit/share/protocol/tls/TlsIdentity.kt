@@ -11,23 +11,26 @@ import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
 import java.math.BigInteger
-import java.security.KeyManager
-import java.security.KeyManagerFactory
+import java.net.Socket
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.Principal
+import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.Date
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.KeyManager
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
+import javax.net.ssl.X509ExtendedKeyManager
 import javax.net.ssl.X509TrustManager
 
 /**
@@ -40,7 +43,9 @@ import javax.net.ssl.X509TrustManager
 class TlsIdentity private constructor(
     val alias: String,
     val keyStore: KeyStore,
-    val password: CharArray,
+    // Held as an immutable String: Ktor/netty zero-fill password arrays after use,
+    // so every consumer must get its own fresh copy (see [secretChars]).
+    private val secret: String,
 ) {
     val certificate: X509Certificate get() = keyStore.getCertificate(alias) as X509Certificate
 
@@ -51,10 +56,68 @@ class TlsIdentity private constructor(
             .joinToString("") { "%02X".format(it) }
     }
 
+    /** Fresh mutable copy per call — consumers may zero it after use. */
+    fun secretChars(): CharArray = secret.toCharArray()
+
+    /**
+     * Key managers whose client-cert selection ignores the peer's `certificate_authorities` list.
+     *
+     * LocalSend peers are self-signed with no CA hierarchy; v2 servers (rustls-based) list their
+     * own subject DN as the only acceptable issuer. Honoring that list makes stock SunX509 select
+     * NO certificate and send an empty client flight — then the peer kills the handshake with
+     * `certificate_required` (rustls alert 116). Selection must match by key algorithm only.
+     */
     fun keyManagers(): Array<KeyManager> {
         val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-        kmf.init(keyStore, password)
-        return kmf.keyManagers ?: emptyArray()
+        kmf.init(keyStore, secretChars())
+        val inner = kmf.keyManagers?.filterIsInstance<X509ExtendedKeyManager>()?.firstOrNull()
+            ?: return kmf.keyManagers ?: emptyArray()
+        val delegatePrivate = inner.getPrivateKey(alias)
+
+        return arrayOf(object : X509ExtendedKeyManager() {
+            override fun chooseClientAlias(
+                keyType: Array<out String>,
+                issuers: Array<Principal>?,
+                socket: Socket?,
+            ): String = inner.chooseClientAlias(keyType, null, socket) ?: aliasIfUsable(keyType) ?: alias
+
+            override fun chooseEngineClientAlias(
+                keyType: Array<out String>?,
+                issuers: Array<Principal>?,
+                engine: SSLEngine?,
+            ): String = inner.chooseEngineClientAlias(keyType, null, engine) ?: aliasIfUsable(keyType.orEmpty()) ?: alias
+
+            override fun chooseServerAlias(
+                keyType: String,
+                issuers: Array<Principal>?,
+                socket: Socket?,
+            ): String = inner.chooseServerAlias(keyType, null, socket) ?: aliasIfUsable(arrayOf(keyType)) ?: alias
+
+            override fun chooseEngineServerAlias(
+                keyType: String,
+                issuers: Array<Principal>?,
+                engine: SSLEngine?,
+            ): String = inner.chooseEngineServerAlias(keyType, null, engine) ?: aliasIfUsable(arrayOf(keyType)) ?: alias
+
+            override fun getClientAliases(keyType: String, issuers: Array<Principal>?): Array<String> =
+                inner.getClientAliases(keyType, null) ?: emptyArray()
+
+            override fun getServerAliases(keyType: String, issuers: Array<Principal>?): Array<String> =
+                inner.getServerAliases(keyType, null) ?: emptyArray()
+
+            override fun getCertificateChain(alias: String?): Array<X509Certificate> =
+                inner.getCertificateChain(alias) ?: emptyArray()
+
+            override fun getPrivateKey(alias: String?): PrivateKey =
+                if (alias == this@TlsIdentity.alias) delegatePrivate ?: inner.getPrivateKey(alias)
+                else inner.getPrivateKey(alias)
+
+            /** The stock KM may still fail its own issuer-free selection for exotic key types; ours is universal. */
+            private fun aliasIfUsable(keyTypes: Array<out String>): String? {
+                val alg = delegatePrivate?.algorithm ?: return null
+                return if (keyTypes.any { it.equals(alg, ignoreCase = true) }) alias else null
+            }
+        })
     }
 
     /** One TLS context fits both roles: presents our key, trusts any peer cert. */
@@ -65,7 +128,7 @@ class TlsIdentity private constructor(
     fun save(file: File) {
         val fos: OutputStream = file.outputStream()
         try {
-            keyStore.store(fos, password)
+            keyStore.store(fos, secretChars())
         } finally {
             fos.close()
         }
@@ -83,8 +146,8 @@ class TlsIdentity private constructor(
             val builder = JcaX509v3CertificateBuilder(
                 name,
                 BigInteger.valueOf(now), // uniqueness within a second; good enough for a device cert
-                now - TimeUnit.DAYS.toMillis(1),
-                now + TimeUnit.DAYS.toMillis(365 * 30),
+                Date(now - TimeUnit.DAYS.toMillis(1)),
+                Date(now + TimeUnit.DAYS.toMillis(365L * 30)),
                 name,
                 keyPair.public,
             )
@@ -113,20 +176,19 @@ class TlsIdentity private constructor(
             val ks = KeyStore.getInstance("PKCS12")
             ks.load(null)
             ks.setKeyEntry(alias, keyPair.private, password, arrayOf(cert))
-            return TlsIdentity(alias, ks, password)
+            return TlsIdentity(alias, ks, DEFAULT_PASSWORD)
         }
 
         fun load(file: File, alias: String = DEFAULT_ALIAS): TlsIdentity {
-            val password = DEFAULT_PASSWORD.toCharArray()
             val ks = KeyStore.getInstance("PKCS12")
-            file.inputStream().use { ks.load(it, password) }
+            file.inputStream().use { ks.load(it, DEFAULT_PASSWORD.toCharArray()) }
             try {
                 val c = ks.getCertificate(alias) as X509Certificate
                 c.checkValidity()
             } catch (e: CertificateException) {
                 throw IllegalStateException("stored identity certificate is not valid: ${e.message}", e)
             }
-            return TlsIdentity(alias, ks, password)
+            return TlsIdentity(alias, ks, DEFAULT_PASSWORD)
         }
     }
 }

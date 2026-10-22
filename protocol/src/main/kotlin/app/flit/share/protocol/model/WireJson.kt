@@ -9,7 +9,9 @@ import kotlinx.serialization.encodeToString
 object WireJson {
     val json: Json = Json {
         ignoreUnknownKeys = true
-        encodeDefaults = false
+        // v2 RegisterDtoV2 (rust) requires `port` and `protocol` with no serde
+        // defaults; keeping default-valued fields on the wire is the safe side.
+        encodeDefaults = true
         explicitNulls = false
     }
 

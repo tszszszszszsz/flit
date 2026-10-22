@@ -7,28 +7,12 @@ import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.model.PrepareUploadResponse
 import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.tls.TlsIdentity
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.cio.CIO
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.request.get
-import io.ktor.client.request.post
-import io.ktor.client.request.setBody
-import io.ktor.client.statement.HttpResponse
-import io.ktor.client.statement.bodyAsText
-import io.ktor.http.ContentType
-import io.ktor.http.HttpStatusCode
-import io.ktor.http.content.OutgoingContent
-import io.ktor.serialization.kotlinx.json.json
-import io.ktor.client.call.body
-import io.ktor.client.plugins.api.createClientPlugin
-import io.ktor.utils.io.ByteWriteChannel
-import io.ktor.utils.io.writeFully
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileInputStream
 import java.net.URLEncoder
 import java.nio.file.Files
@@ -46,42 +30,56 @@ data class SendError(val fileName: String, val reason: String)
 
 data class SendReport(val sent: List<String>, val failed: List<SendError>, val sessionId: String?)
 
-class TransferException(val status: HttpStatusCode, val detail: String) :
-    Exception("prepare-upload failed: ${status.value} $detail")
+class TransferException(val status: Int, val detail: String) :
+    Exception("prepare-upload failed: $status $detail")
 
 /** LocalSend v2.2 client: register, info, and file sending over the upload API. */
 class ProtocolClient(
     private val identity: TlsIdentity,
-    httpClient: HttpClient? = null,
 ) : AutoCloseable {
 
-    private val client: HttpClient =
-        httpClient ?: HttpClient(CIO) {
-            engine { sslContext = identity.sslContext() }
-            install(ContentNegotiation) { json(WireJson.json) }
-        }
-
-    private fun url(target: SendTarget, path: String): String = target.baseUrl() + path
+    private val http = PeerHttpClient(identity)
 
     private fun enc(v: String): String = URLEncoder.encode(v, "UTF-8")
 
     suspend fun info(target: SendTarget, timeoutMs: Long = 2500): PeerInfo? =
         withTimeoutOrNull(timeoutMs) {
             runCatching {
-                client.get(url(target, Protocol.PATH_INFO)).body<PeerInfo>()
+                json<PeerInfo>(
+                    http.exchange(
+                        method = "GET", host = target.ip, port = target.port, tls = target.tls,
+                        pathAndQuery = Protocol.PATH_INFO, timeoutMs = timeoutMs,
+                    ),
+                )
             }.getOrNull()
         }
 
-    /** Registers us with a target — used by discovery to answer announcements. */
+    /** Registers us with a target — how discovery announces are answered. */
     suspend fun register(target: SendTarget, self: PeerInfo, timeoutMs: Long = 2500): PeerInfo? =
         withTimeoutOrNull(timeoutMs) {
             runCatching {
-                client.post(url(target, Protocol.PATH_REGISTER)) {
-                    contentType(ContentType.Application.Json)
-                    setBody(self.sansAnnounce())
-                }.body<PeerInfo>()
+                json<PeerInfo>(
+                    postJson(
+                        target,
+                        Protocol.PATH_REGISTER,
+                        WireJson.encode(self.sansAnnounce()),
+                        timeoutMs = timeoutMs,
+                    ),
+                )
             }.getOrNull()
         }
+
+    suspend fun cancelTransfer(target: SendTarget, sessionId: String) {
+        withTimeoutOrNull(2000) {
+            runCatching {
+                http.exchange(
+                    method = "POST", host = target.ip, port = target.port, tls = target.tls,
+                    pathAndQuery = "${Protocol.PATH_CANCEL}?sessionId=${enc(sessionId)}",
+                    timeoutMs = 2000,
+                )
+            }
+        }
+    }
 
     suspend fun sendFiles(
         target: SendTarget,
@@ -94,67 +92,55 @@ class ProtocolClient(
 
         val infos: Map<String, FileInfo> = specs.associate { s ->
             val id = "f${UUID.randomUUID().toString().substring(0, 8)}"
-            val mime = guessMime(s.path)
             id to FileInfo(
                 id = id,
                 fileName = s.wireName,
                 size = Files.size(s.path),
-                fileType = mime,
+                fileType = guessMime(s.path),
                 sha256 = sha256Hex(s.path),
             )
         }
-        val pathsById = specs.associate { it to infos.entries.first { (_, info) -> info.fileName == it.wireName } }
-        val pathById: Map<String, Path> = specs.associate { s ->
-            val info = infos.entries.first { (_, info) -> info.fileName == s.wireName }
-            info.key to s.path
+        val pathsById: Map<String, Path> = infos.entries.associate { (id, info) ->
+            id to specs.first { it.wireName == info.fileName }.path
         }
 
-        val preparePath = Protocol.PATH_PREPARE_UPLOAD +
-            (pin?.let { "?pin=" + enc(it) } ?: "")
-        val prepareUrl = url(target, preparePath)
-
-        val resp: HttpResponse = client.post(prepareUrl) {
-            contentType(ContentType.Application.Json)
-            setBody(PrepareUploadRequest(self.sansAnnounce(), infos))
+        val preparePath = Protocol.PATH_PREPARE_UPLOAD + (pin?.let { "?pin=" + enc(it) } ?: "")
+        val prepare = postJson(
+            target,
+            preparePath,
+            WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), infos)),
+            timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
+        )
+        if (prepare.status == 204) {
+            return SendReport(emptyList(), emptyList(), null)
         }
-        when {
-            resp.status == HttpStatusCode.NoContent ->
-                return SendReport(emptyList(), emptyList(), null)
-
-            resp.status != HttpStatusCode.OK -> {
-                val detail = runCatching { resp.bodyAsText() }.getOrDefault("")
-                throw TransferException(resp.status, detail)
-            }
+        if (prepare.status != 200) {
+            throw TransferException(prepare.status, prepare.text())
         }
-        val prepared = resp.body<PrepareUploadResponse>();
+        val prepared = json<PrepareUploadResponse>(prepare)
 
         val sem = Semaphore(parallelism)
-        val results: List<Pair<String, String?>> = prepared.files.map { (fileId, token) ->
-            async {
-                sem.withPermit {
-                    val path = pathById[fileId] ?: return@withPermit fileId to "missing local path"
-                    val info = infos.getValue(fileId)
-                    try {
-                        uploadAttempts(target, prepared.sessionId, fileId, token, path, info)
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e
-                    } catch (e: Throwable) {
-                        info.fileName to (e.message ?: "error")
+        val results: List<Pair<String, String?>> = coroutineScope {
+            prepared.files.map { (fileId, token) ->
+                async {
+                    sem.withPermit {
+                        val path = pathsById[fileId] ?: return@withPermit fileId to "missing local path"
+                        try {
+                            uploadAttempts(target, prepared.sessionId, fileId, token, path)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            fileId to (e.message ?: "error")
+                        }
                     }
                 }
-            }
-        }.awaitAll()
+            }.awaitAll()
+        }
 
         val anyFailed = results.any { it.second != null }
-        if (anyFailed) {
-            // best-effort cancel so the receiver doesn't lock its single slot
-            withTimeoutOrNull(2000) {
-                runCatching {
-                    client.post(url(target, "${Protocol.PATH_CANCEL}?sessionId=" + enc(prepared.sessionId)))
-                }
-            }
-        }
-        val sent = results.filter { it.second == null }.mapNotNull { r -> infos[r.first]?.fileName }
+        if (anyFailed) cancelTransfer(target, prepared.sessionId)
+
+        val sent = results.filter { it.second == null }.map { r -> infos.getValue(r.first).fileName }
         val failed = results.filter { it.second != null }.map { (fileId, reason) ->
             SendError(infos[fileId]?.fileName ?: fileId, reason ?: "error")
         }
@@ -167,26 +153,42 @@ class ProtocolClient(
         fileId: String,
         token: String,
         path: Path,
-        info: FileInfo,
     ): Pair<String, String?> {
-        val uploadUrl = url(
-            target,
-            "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}",
-        )
+        val uploadPath = "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}"
         var attempt = 0
         while (attempt < 3) { // mirrors upstream MAX_UPLOAD_ATTEMPTS
             attempt++
-            val resp = client.post(uploadUrl) {
-                contentType(ContentType.Application.OctetStream)
-                setBody(FileContent(path, Files.size(path)))
-            }
+            val resp = http.exchange(
+                method = "POST", host = target.ip, port = target.port, tls = target.tls,
+                pathAndQuery = uploadPath,
+                headers = mapOf("Content-Type" to "application/octet-stream"),
+                bodyProvider = { FileInputStream(path.toFile()).buffered() },
+                contentLength = Files.size(path),
+                timeoutMs = UPLOAD_TIMEOUT_MS,
+            )
             when (resp.status) {
-                HttpStatusCode.OK -> return info.fileName to null
-                HttpStatusCode.UnprocessableEntity -> {} // retry: same token per upstream semantics
-                else -> return info.fileName to "receiver answered ${resp.status.value}"
+                200 -> return fileId to null
+                422 -> {} // retry with the SAME token (upstream semantics)
+                else -> return fileId to "receiver answered ${resp.status}"
             }
         }
-        return info.fileName to "checksum never matched (${attempt} tries)"
+        return fileId to "checksum never matched (3 tries)"
+    }
+
+    private suspend fun postJson(target: SendTarget, pathAndQuery: String, jsonBody: String, timeoutMs: Long) =
+        http.exchange(
+            method = "POST", host = target.ip, port = target.port, tls = target.tls,
+            pathAndQuery = pathAndQuery,
+            headers = mapOf("Content-Type" to "application/json"),
+            bodyProvider = { jsonBody.byteInputStream(Charsets.UTF_8) },
+            contentLength = jsonBody.toByteArray(Charsets.UTF_8).size.toLong(),
+            timeoutMs = timeoutMs,
+        )
+
+    private inline fun <reified T> json(resp: PeerHttpClient.Response): T {
+        val text = resp.text().trim()
+        if (text.isEmpty()) throw IllegalStateException("peer answered ${resp.status} with empty body")
+        return WireJson.decode(text)
     }
 
     private fun guessMime(path: Path): String =
@@ -207,23 +209,12 @@ class ProtocolClient(
     }
 
     override fun close() {
-        client.close()
+        http.close()
     }
-}
 
-private class FileContent(
-    private val path: Path,
-    override val contentLength: Long,
-) : OutgoingContent.WriteChannelContent() {
-    override suspend fun writeTo(channel: ByteWriteChannel) {
-        FileInputStream(path.toFile()).use { input ->
-            val buf = ByteArray(64 * 1024)
-            while (true) {
-                val n = input.read(buf)
-                if (n <= 0) break
-                channel.writeFully(buf, 0, n)
-                channel.flush()
-            }
-        }
+    companion object {
+        /** Receivers may hold prepare until a human accepts the offer. */
+        private const val ACCEPT_TIMEOUT_MS = 30_000L
+        private const val UPLOAD_TIMEOUT_MS = 120_000L
     }
 }
