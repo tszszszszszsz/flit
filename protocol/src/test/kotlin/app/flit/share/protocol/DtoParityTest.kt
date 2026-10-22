@@ -1,0 +1,123 @@
+package app.flit.share.protocol
+
+import app.flit.share.protocol.model.PeerInfo
+import app.flit.share.protocol.model.FileInfo
+import app.flit.share.protocol.model.PrepareUploadRequest
+import app.flit.share.protocol.model.WireJson
+import app.flit.share.protocol.tls.TlsIdentity
+import java.io.File
+import kotlin.io.path.createTempDirectory
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+
+/**
+ * Wire-format parity with the official (Rust/Dart) implementation, asserted
+ * against the test JSON from localsend/localsend's `packages/core/src/model/discovery.rs`.
+ */
+class DtoParityTest {
+
+    @Test
+    fun `announce serializes like upstream rust test fixture`() {
+        val msg = PeerInfo(
+            alias = "Nice Orange",
+            version = "2.2",
+            deviceModel = "Samsung",
+            deviceType = "mobile",
+            fingerprint = "random string",
+            port = 53317,
+            protocol = "https",
+            download = true,
+        )
+        val json = WireJson.encode(msg)
+        assertTrue(json.contains("\"alias\":\"Nice Orange\""), json)
+        assertTrue(json.contains("\"version\":\"2.2\""), json)
+        assertTrue(json.contains("\"fingerprint\":\"random string\""), json)
+        assertTrue(json.contains("\"port\":53317"), json)
+        assertTrue(json.contains("\"protocol\":\"https\""), json)
+        assertTrue(json.contains("\"deviceType\":\"mobile\""), json)
+        assertTrue(json.contains("\"download\":true"), json)
+        assertFalse(json.contains("announce"), "modern v2.2 announcements never carry the legacy announce flag: $json")
+    }
+
+    @Test
+    fun `announce parses upstream fixture and tolerates missing optionals`() {
+        val json = """
+            {"alias":"Secret Banana","version":"2.2","deviceModel":"Windows","deviceType":"desktop",
+             "fingerprint":"random string","port":53317,"protocol":"https","download":true}
+        """.trimIndent()
+        val msg = WireJson.decode<PeerInfo>(json)
+        assertEquals("Secret Banana", msg.alias)
+        assertEquals("2.2", msg.version)
+        assertEquals("Windows", msg.deviceModel)
+        assertEquals("desktop", msg.deviceType)
+        assertEquals(53317, msg.port)
+        assertEquals("https", msg.protocol)
+        assertTrue(msg.download)
+    }
+
+    @Test
+    fun `legacy v2_0 announce with announce field still parses`() {
+        val json = """
+            {"alias":"Old Phone","version":"2.0","fingerprint":"abc","port":53317,
+             "protocol":"http","download":false,"announce":true}
+        """.trimIndent()
+        val msg = WireJson.decode<PeerInfo>(json)
+        assertEquals("Old Phone", msg.alias)
+        assertTrue(msg.announce == true)
+    }
+
+    @Test
+    fun `register responses omit port and protocol like upstream DTO`() {
+        val self = PeerInfo(
+            alias = "Flit",
+            version = "2.2",
+            fingerprint = "FP",
+            port = Protocol.DEFAULT_PORT,
+            protocol = "https",
+        )
+        val json = WireJson.encode(self.sansAnnounce())
+        assertFalse(json.contains("\"port\""), json)
+        assertFalse(json.contains("\"protocol\""), json)
+    }
+
+    @Test
+    fun `prepare upload roundtrip matches spec sample`() {
+        val specJson = """
+            {"info":{"alias":"Nice Orange","version":"2.0","deviceModel":"Samsung","deviceType":"mobile",
+             "fingerprint":"random string","port":53317,"protocol":"https","download":true},
+             "files":{"some file id":{
+               "id":"some file id","fileName":"my image.png","size":324242,"fileType":"image/jpeg",
+               "sha256":"deadbeef",
+               "metadata":{"modified":"2021-01-01T12:34:56Z"}
+             }}}
+        """.trimIndent()
+        val req = WireJson.decode<PrepareUploadRequest>(specJson)
+        assertEquals("my image.png", req.files["some file id"]?.fileName)
+        assertEquals(324242L, req.files["some file id"]?.size)
+        assertEquals("2021-01-01T12:34:56Z", req.files["some file id"]?.metadata?.modified)
+        val again = WireJson.encode(req)
+        assertTrue(again.contains("\"fileName\":\"my image.png\""), again)
+    }
+}
+
+class TlsIdentityTest {
+
+    @Test
+    fun `fingerprint is uppercase hex sha256 of certificate`() {
+        val identity = TlsIdentity.generate()
+        assertEquals(64, identity.fingerprint.length)
+        assertTrue(identity.fingerprint.all { it in "0123456789ABCDEF" })
+    }
+
+    @Test
+    fun `keystore survival roundtrip keeps fingerprint`() {
+        val dir = createTempDirectory("flit-ids")
+        val file = File(dir.toFile(), "identity.p12")
+        val identity = TlsIdentity.generate()
+        identity.save(file)
+        val reloaded = TlsIdentity.load(file)
+        assertEquals(identity.fingerprint, reloaded.fingerprint)
+    }
+}
