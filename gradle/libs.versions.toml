@@ -5,6 +5,9 @@ coroutines = "1.10.2"
 ktor = "3.2.2"
 bouncycastle = "1.81.1"
 slf4j = "2.0.17"
+agp = "8.13.2"
+composeBom = "2026.06.00"
+activityCompose = "1.13.0"
 
 [libraries]
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
@@ -13,9 +16,10 @@ ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }
 ktor-server-netty = { module = "io.ktor:ktor-server-netty", version.ref = "ktor" }
 ktor-server-content-negotiation = { module = "io.ktor:ktor-server-content-negotiation", version.ref = "ktor" }
 ktor-serialization-kotlinx-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }
-ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
-ktor-client-cio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
-ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
+androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
+androidx-compose-ui = { module = "androidx.compose.ui:ui" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
 bouncycastle-provider = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
 bouncycastle-pkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle" }
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
@@ -23,3 +27,6 @@ slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+android-application = { id = "com.android.application", version.ref = "agp" }
