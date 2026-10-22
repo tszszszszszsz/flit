@@ -13,18 +13,14 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.FileInputStream
+import java.io.InputStream
 import java.net.URLEncoder
-import java.nio.file.Files
-import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.UUID
 
 data class SendTarget(val ip: String, val port: Int, val tls: Boolean) {
     fun baseUrl(): String = "${if (tls) "https" else "http"}://$ip:$port"
 }
-
-data class SendSpec(val path: Path, val wireName: String)
 
 data class SendError(val fileName: String, val reason: String)
 
@@ -84,31 +80,34 @@ class ProtocolClient(
     suspend fun sendFiles(
         target: SendTarget,
         self: PeerInfo,
-        specs: List<SendSpec>,
+        files: Collection<OutgoingFile>,
         pin: String? = null,
         parallelism: Int = 2,
     ): SendReport {
-        check(specs.isNotEmpty()) { "no files given" }
+        check(files.isNotEmpty()) { "no files given" }
 
-        val infos: Map<String, FileInfo> = specs.associate { s ->
+        val infos: HashMap<String, FileInfo> = HashMap()
+        val outgoingById: HashMap<String, OutgoingFile> = HashMap()
+        val prepareHashMap: LinkedHashMap<String, FileInfo> = LinkedHashMap()
+        for (f in files) {
             val id = "f${UUID.randomUUID().toString().substring(0, 8)}"
-            id to FileInfo(
+            val info = FileInfo(
                 id = id,
-                fileName = s.wireName,
-                size = Files.size(s.path),
-                fileType = guessMime(s.path),
-                sha256 = sha256Hex(s.path),
+                fileName = f.wireName,
+                size = f.size,
+                fileType = f.mime,
+                sha256 = sha256Hex { f.openStream() },
             )
-        }
-        val pathsById: Map<String, Path> = infos.entries.associate { (id, info) ->
-            id to specs.first { it.wireName == info.fileName }.path
+            infos[id] = info
+            outgoingById[id] = f
+            prepareHashMap[id] = info
         }
 
         val preparePath = Protocol.PATH_PREPARE_UPLOAD + (pin?.let { "?pin=" + enc(it) } ?: "")
         val prepare = postJson(
             target,
             preparePath,
-            WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), infos)),
+            WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap)),
             timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
         )
         if (prepare.status == 204) {
@@ -124,9 +123,10 @@ class ProtocolClient(
             prepared.files.map { (fileId, token) ->
                 async {
                     sem.withPermit {
-                        val path = pathsById[fileId] ?: return@withPermit fileId to "missing local path"
+                        val info = infos[fileId] ?: return@withPermit fileId to "unmatched file id"
+                        val source = outgoingById[fileId] ?: return@withPermit fileId to "unmatched file id"
                         try {
-                            uploadAttempts(target, prepared.sessionId, fileId, token, path)
+                            uploadAttempts(target, prepared.sessionId, fileId, token, info, source)
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
                         } catch (e: Throwable) {
@@ -152,8 +152,10 @@ class ProtocolClient(
         sessionId: String,
         fileId: String,
         token: String,
-        path: Path,
+        info: FileInfo,
+        source: OutgoingFile,
     ): Pair<String, String?> {
+        check(info.id == fileId)
         val uploadPath = "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}"
         var attempt = 0
         while (attempt < 3) { // mirrors upstream MAX_UPLOAD_ATTEMPTS
@@ -162,8 +164,8 @@ class ProtocolClient(
                 method = "POST", host = target.ip, port = target.port, tls = target.tls,
                 pathAndQuery = uploadPath,
                 headers = mapOf("Content-Type" to "application/octet-stream"),
-                bodyProvider = { FileInputStream(path.toFile()).buffered() },
-                contentLength = Files.size(path),
+                bodyProvider = { source.openStream() },
+                contentLength = source.size,
                 timeoutMs = UPLOAD_TIMEOUT_MS,
             )
             when (resp.status) {
@@ -191,23 +193,6 @@ class ProtocolClient(
         return WireJson.decode(text)
     }
 
-    private fun guessMime(path: Path): String =
-        runCatching { Files.probeContentType(path) }.getOrNull()?.takeIf { it.isNotBlank() }
-            ?: "application/octet-stream"
-
-    private fun sha256Hex(path: Path): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        FileInputStream(path.toFile()).use { input ->
-            val buf = ByteArray(64 * 1024)
-            while (true) {
-                val n = input.read(buf)
-                if (n <= 0) break
-                md.update(buf, 0, n)
-            }
-        }
-        return md.digest().joinToString("") { "%02x".format(it) }
-    }
-
     override fun close() {
         http.close()
     }
@@ -216,5 +201,19 @@ class ProtocolClient(
         /** Receivers may hold prepare until a human accepts the offer. */
         private const val ACCEPT_TIMEOUT_MS = 30_000L
         private const val UPLOAD_TIMEOUT_MS = 120_000L
+
+        /** Hex SHA-256 of a freshly opened stream; used as the upload checksum. */
+        fun sha256Hex(open: () -> InputStream): String {
+            val md = MessageDigest.getInstance("SHA-256")
+            open().use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    md.update(buf, 0, n)
+                }
+            }
+            return md.digest().joinToString("") { "%02x".format(it) }
+        }
     }
 }

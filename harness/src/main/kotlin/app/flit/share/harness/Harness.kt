@@ -1,8 +1,8 @@
 package app.flit.share.harness
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
-import app.flit.share.protocol.client.SendSpec
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.discovery.UdpDiscovery
 import app.flit.share.protocol.model.FileInfo
@@ -260,7 +260,7 @@ private suspend fun send(args: ParsedArgs) {
         val report = it.sendFiles(
             target = target,
             self = self,
-            specs = specs,
+            files = specs,
             pin = args.opt("--pin"),
             parallelism = args.optInt("--parallel", 2),
         )
@@ -313,17 +313,17 @@ private fun splitHostPort(s: String): Pair<String, Int> {
     return s.substring(0, idx) to port
 }
 
-private fun expandSpecs(paths: List<String>): List<SendSpec> {
-    val out = mutableListOf<SendSpec>()
+private fun expandSpecs(paths: List<String>): List<PathOutgoing> {
+    val out = mutableListOf<PathOutgoing>()
     for (raw in paths) {
         val root = Path.of(raw)
         if (Files.isRegularFile(root)) {
-            out.add(SendSpec(root, root.fileName.toString()))
+            out.add(PathOutgoing(root, root.fileName.toString()))
         } else if (Files.isDirectory(root)) {
             Files.walk(root).use { stream ->
                 stream.filter { it.isRegularFile() }.forEach { child ->
                     val relName = root.relativize(child).toString().replace('\\', '/')
-                    out.add(SendSpec(child, relName))
+                    out.add(PathOutgoing(child, relName))
                 }
             }
         }
