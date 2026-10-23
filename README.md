@@ -11,9 +11,19 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 | 1 | Chunked **resumable** transfers (their issue #2127, open 20+ months) | planned |
 | 2 | **Rescue mode**: hotspot fallback when networks block multicast | planned |
 | 3 | **Crush & send**: on-device media compression before transfer (Pro) | planned |
-| 4 | Native speed: instant cold start, share-sheet-first UX | planned |
+| 4 | Native speed: instant cold start, share-sheet-first UX | **shipped** (share intake spool, send-later queue, trusted peers + per-peer folder, progress notifications, QS tile) |
 
 Working name. Rename is a 15-minute chore before Play listing (no trademark reuse of "LocalSend").
+
+## Current capabilities (verified on device)
+
+- Share-sheet send: streams are spooled into app cache the moment the intent lands, so grants can
+  never expire and every shared file can queue for later (`Send later` row; auto-dispatches when
+  the peer reappears).
+- Receive: progress notification with live speed; completed transfers land in
+  `Downloads/Flit/`, or in a per-peer folder you pick once for trusted peers.
+- Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
+  when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 
 ## Repo layout
 

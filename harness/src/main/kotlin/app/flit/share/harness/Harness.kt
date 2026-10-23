@@ -52,7 +52,7 @@ private class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to")
+        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to")
     }
 }
 
@@ -154,7 +154,8 @@ internal class ConsoleDelegate : ServerDelegate {
 private suspend fun serve(args: ParsedArgs) {
     val identity = loadOrCreateIdentity()
     val alias = args.opt("--alias") ?: "Flit (${System.getenv("USER") ?: "dev"})"
-    val destDir = Path.of(args.opt("--dir") ?: "flit-downloads")
+            // accept --dir and --dest (same meaning; --dest used in scripts)
+        val destDir = Path.of(args.opt("--dir") ?: args.opt("--dest") ?: "flit-downloads")
     val config = ServerConfig(
         alias = alias,
         port = args.optInt("--port", Protocol.DEFAULT_PORT),

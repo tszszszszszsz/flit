@@ -40,9 +40,10 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
         headers: Map<String, String> = emptyMap(),
         bodyProvider: (() -> InputStream)? = null,
         contentLength: Long = 0,
+        bodyProgress: ((Long) -> Unit)? = null,
         timeoutMs: Long = 10_000,
     ): Response = withContext(Dispatchers.IO) {
-        raw(method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength, timeoutMs)
+        raw(method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength, bodyProgress, timeoutMs)
     }
 
     private fun raw(
@@ -54,6 +55,7 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
         headers: Map<String, String>,
         bodyProvider: (() -> InputStream)?,
         contentLength: Long,
+        bodyProgress: ((Long) -> Unit)?,
         timeoutMs: Long,
     ): Response {
         val socket: Socket = if (tls) sslFactory.createSocket() else Socket()
@@ -85,6 +87,7 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
                     if (n <= 0) throw EOFException("body source ended after $sent of $contentLength bytes")
                     out.write(buf, 0, n)
                     sent += n
+                    if (bodyProgress != null) bodyProgress(sent)
                 }
                 out.flush()
             }

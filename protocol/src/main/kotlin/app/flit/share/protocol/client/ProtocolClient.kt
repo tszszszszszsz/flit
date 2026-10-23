@@ -81,6 +81,7 @@ class ProtocolClient(
         files: Collection<OutgoingFile>,
         pin: String? = null,
         parallelism: Int = 2,
+        progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)? = null,
     ): SendReport {
         check(files.isNotEmpty()) { "no files given" }
 
@@ -124,7 +125,7 @@ class ProtocolClient(
                         val info = infos[fileId] ?: return@withPermit fileId to "unmatched file id"
                         val source = outgoingById[fileId] ?: return@withPermit fileId to "unmatched file id"
                         try {
-                            uploadAttempts(target, prepared.sessionId, fileId, token, info, source)
+                            uploadAttempts(target, prepared.sessionId, fileId, token, info, source, progress)
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
                         } catch (e: Throwable) {
@@ -152,10 +153,12 @@ class ProtocolClient(
         token: String,
         info: FileInfo,
         source: OutgoingFile,
+        progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)?,
     ): Pair<String, String?> {
         check(info.id == fileId)
         val uploadPath = "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}"
         var attempt = 0
+        var carried = 0L // bytes shipped in earlier (failed) attempts, keeps progress monotonic
         while (attempt < 3) { // mirrors upstream MAX_UPLOAD_ATTEMPTS
             attempt++
             val resp = http.exchange(
@@ -164,11 +167,15 @@ class ProtocolClient(
                 headers = mapOf("Content-Type" to "application/octet-stream"),
                 bodyProvider = { source.openStream() },
                 contentLength = source.size,
+                bodyProgress = progress?.let { cb -> { sent: Long -> cb(info.fileName, carried + sent, info.size) } },
                 timeoutMs = UPLOAD_TIMEOUT_MS,
             )
             when (resp.status) {
                 200 -> return fileId to null
-                422 -> {} // retry with the SAME token (upstream semantics)
+                422 -> {
+                    carried = info.size // body was fully shipped; receiver rejected the digest
+                    progress?.invoke(info.fileName, carried, info.size)
+                } // retry with the SAME token (upstream semantics)
                 else -> return fileId to "receiver answered ${resp.status}"
             }
         }

@@ -1,6 +1,7 @@
 package app.flit.share
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
@@ -19,6 +20,23 @@ import kotlinx.coroutines.launch
 class FlitService : Service() {
 
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    companion object {
+        const val NOTIFICATION_ID = 4711
+
+        /**
+         * Starts the FGS when the system allows it (Android 15 rations dataSync
+         * background hours); returns false when it must run engine-only.
+         */
+        fun launch(context: Context): Boolean = try {
+            androidx.core.content.ContextCompat.startForegroundService(
+                context, Intent(context, FlitService::class.java),
+            )
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -70,8 +88,4 @@ class FlitService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    companion object {
-        const val NOTIFICATION_ID = 4711
-    }
 }

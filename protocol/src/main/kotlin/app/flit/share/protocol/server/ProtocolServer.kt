@@ -62,6 +62,9 @@ interface ServerDelegate {
     fun onRegister(info: PeerInfo, ip: String) {}
     fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision
     fun onUploadStart(sessionId: String, fileId: String, file: FileInfo) {}
+
+    /** Byte-stream progress for one file. Emitted at most ~10\u00d7/s per file. */
+    fun onUploadProgress(sessionId: String, fileId: String, file: FileInfo, bytes: Long, totalBytes: Long) {}
     fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {}
     fun onSessionEnd(sessionId: String, cancelled: Boolean) {}
 }
@@ -296,12 +299,18 @@ class ProtocolServer(
                 val out = BufferedOutputStream(rawOut, 64 * 1024)
                 val channel = call.receiveChannel()
                 val buf = ByteArray(64 * 1024)
+                var lastEmit = 0L
                 while (true) {
                     val n = channel.readAvailable(buf, 0, buf.size)
                     if (n <= 0) break
                     md.update(buf, 0, n)
                     out.write(buf, 0, n)
                     bytes += n
+                    val now = System.nanoTime()
+                    if (now - lastEmit > 100_000_000L) { // ~= 10 Hz cap
+                        lastEmit = now
+                        delegate.onUploadProgress(sessionId, fileId, pf.file, bytes, pf.file.size)
+                    }
                 }
                 out.flush()
             }

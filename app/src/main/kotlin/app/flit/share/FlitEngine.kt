@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.ContentValues
+import android.content.Intent
 import android.content.Context
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -31,6 +32,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -44,9 +46,8 @@ import kotlinx.coroutines.launch
 /** Peers vanish from the list after this long without an announce/register. */
 const val PEER_TTL_MS = 30_000L
 
-private const val CHANNEL_SERVICE = "service"
-private const val CHANNEL_TRANSFERS = "transfers"
-
+internal const val CHANNEL_SERVICE = "service"
+internal const val CHANNEL_TRANSFERS = "transfers"
 /**
  * App-side engine: one identity, one server, one discovery socket, one registry.
  * Lives in the process; started by [FlitService] and observed by the UI.
@@ -78,6 +79,27 @@ object FlitEngine {
 
     data class ReceivedFile(val name: String, val bytes: Long, val whenMs: Long, val path: File)
 
+/** Intake from the system share sheet: files and/or a text note. */
+/** A shared stream already copied into our cache — grant-proof and queueable. */
+data class SpooledFile(val f: File, val name: String, val mime: String) {
+    val size: Long get() = f.length()
+}
+
+/**
+ * Intake from the system share sheet: streams are SPOOLED into app cache the
+ * moment the intent lands (before the user picks a peer), so later reads never
+ * depend on the sender's non-persistable URI grants.
+ */
+data class ShareIntake(
+    val ready: Boolean,
+    val files: List<SpooledFile>,
+    val text: String?,
+    val sourceApp: String?,
+)
+
+private val _share = MutableStateFlow<ShareIntake?>(null)
+val share: StateFlow<ShareIntake?> = _share
+
     private val _state = MutableStateFlow(EngineState())
     val state: StateFlow<EngineState> = _state
 
@@ -90,10 +112,16 @@ object FlitEngine {
     private val _received = MutableStateFlow<List<ReceivedFile>>(emptyList())
     val received: StateFlow<List<ReceivedFile>> = _received
 
+    private val _queue = MutableStateFlow<List<QueuedSend>>(emptyList())
+    val queue: StateFlow<List<QueuedSend>> = _queue
     // ==== internal fields =======================================================
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
+        private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO +
+            CoroutineExceptionHandler { _, e ->
+                logLine("internal error: ${e.message ?: e.javaClass.simpleName}")
+            }
+    )
     private lateinit var appCtx: Context
     private var identity: TlsIdentity? = null
     private var server: ProtocolServer? = null
@@ -106,38 +134,84 @@ object FlitEngine {
 
     private class FlitDelegate : ServerDelegate {
 
+        // one receive session at a time; ledger set at prepare, nulled at session end
+        private var rxProgress: FlitProgress? = null
+        private var rxBegun = false
+        private var rxFiles: Map<String, Long> = emptyMap()
+        private var rxSenderFp: String = ""
+
         override fun onRegister(info: PeerInfo, ip: String) {
             FlitEngine.touchPeer(ip, info)
         }
 
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
             FlitEngine.logLine("offer from ${request.info.alias} ($peerIp): ${request.files.size} file(s)")
+            rxFiles = request.files.values.associate { it.fileName to it.size }
+            rxSenderFp = request.info.fingerprint
+            rxBegun = false
+            rxProgress = null
             return PrepareDecision.Accept(request.files.keys)
         }
 
         override fun onUploadStart(sessionId: String, fileId: String, file: FileInfo) {
             FlitEngine.logLine("receiving ${file.fileName}")
+            if (!rxBegun) {
+                rxBegun = true
+                (rxProgress ?: FlitProgress(FlitEngine.ctx(), FlitEngine.RECV_PROGRESS_ID)
+                    .also { rxProgress = it })
+                    .begin(FlitProgress.Kind.RECEIVE, rxFiles)
+            }
+        }
+
+        override fun onUploadProgress(sessionId: String, fileId: String, file: FileInfo, bytes: Long, totalBytes: Long) {
+            rxProgress?.tick(file.fileName, bytes)
         }
 
         override fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {
             when (result) {
                 is UploadResult.Saved -> {
                     FlitEngine.logLine("saved ${file.fileName} (" + FlitEngine.fmtBytes(result.bytes) + ")")
-                    FlitEngine.publishReceived(result.path.toFile(), file)
+                    FlitEngine.publishReceived(result.path.toFile(), file, rxSenderFp)
                 }
                 UploadResult.Mismatch -> FlitEngine.logLine("BAD ${file.fileName}: checksum mismatch")
                 UploadResult.Error -> FlitEngine.logLine("error writing ${file.fileName}")
             }
+            rxProgress?.fileDone(file.fileName)
         }
 
         override fun onSessionEnd(sessionId: String, cancelled: Boolean) {
-            if (cancelled) FlitEngine.logLine("transfer cancelled")
+            if (cancelled) {
+                FlitEngine.logLine("transfer cancelled")
+                rxProgress?.finish("receiving cancelled", ok = false, iconDone = false)
+            } else {
+                val got = rxFiles.size
+                val tag = if (got == 1) "received 1 file" else "received $got files"
+                rxProgress?.finish("$tag from Flit", ok = true, iconDone = true)
+            }
+            rxProgress = null
+            rxBegun = false
         }
     }
 
     // ==== lifecycle =============================================================
 
     fun prefs(): android.content.SharedPreferences = appCtx.getSharedPreferences("flit", Context.MODE_PRIVATE)
+
+    /** For nested/delegate access to the app context. */
+    internal fun ctx(): Context = appCtx
+
+    internal fun toast(msg: String) {
+        runCatching { android.widget.Toast.makeText(appCtx, msg, android.widget.Toast.LENGTH_SHORT).show() }
+    }
+
+    /** Stable id for the single-session receive progress notification. */
+    const val RECV_PROGRESS_ID = 51
+
+    fun openAppIntent() = android.app.PendingIntent.getActivity(
+        appCtx, 0,
+        android.content.Intent(appCtx, MainActivity::class.java),
+        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+    )
 
     fun currentAlias(): String = prefs().getString("alias", null) ?: defaultAlias()
 
@@ -151,6 +225,8 @@ object FlitEngine {
     fun start(ctx: Context) {
         if (_state.value.running || _state.value.starting) return
         appCtx = ctx.applicationContext
+        FlitRoster.init(appCtx)
+        _queue.value = FlitRoster.queued() // pick up send-later entries from a previous run
         _state.value = _state.value.copy(starting = true, error = null)
         val seq = ++startSeq
         scope.launch(Dispatchers.IO) { run(seq) }
@@ -291,7 +367,34 @@ object FlitEngine {
                 ?: PeerEntry(ip, info, now)
             m + (info.fingerprint to entry)
         }
+        // A pinned-from-queue peer just came back: dispatch any send-later batch
+        // for it (guarded so an announce storm cannot double-send).
+        if (FlitRoster.queued().any { it.fingerprint == info.fingerprint } &&
+            dispatching.add(info.fingerprint)
+        ) {
+            val peer = PeerEntry(ip, info, now)
+            val batch = FlitRoster.queued().first { it.fingerprint == info.fingerprint }
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val spools = batch.uris.mapNotNull { spoolFileFor(it, "queue") }
+                    if (spools.isEmpty()) {
+                        logLine("queue: nothing left for ${info.alias} — dropping")
+                        FlitRoster.dequeue(peer.info.fingerprint)
+                    } else {
+                        logLine("queue: ${spools.size} queued for ${info.alias} — sending now")
+                        dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
+                        FlitRoster.dequeue(peer.info.fingerprint)
+                    }
+                } finally {
+                    dispatching.remove(info.fingerprint)
+                    _queue.value = FlitRoster.queued()
+                }
+            }
+        }
     }
+
+    /** Fingerprints currently being dispatched from the send-later queue. */
+    private val dispatching = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     // ==== sending ===============================================================
 
@@ -335,47 +438,287 @@ object FlitEngine {
         }
     }
 
-    fun send(peer: PeerEntry, uris: List<Uri>) {
-        val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }
+    /** Files picked in-app (SAF). Persistable grants → these can also queue. */
+    fun send(peer: PeerEntry, uris: List<Uri>, fromQueue: Boolean = false) {
+        dispatchTo(peer, SourceList(emptyList(), uris), null, fromQueue)
+    }
+
+    /** Share-sheet dispatch: spooled files + optional text note; clears intake. */
+    fun sendShare(peer: PeerEntry) {
+        val intake = _share.value ?: return
+        if (!intake.ready) {
+            logLine("still preparing the share…")
+            return
+        }
+        dispatchTo(peer, SourceList(intake.files, emptyList()), intake.text, fromQueue = false)
+    }
+
+    /** One of the two lists is non-empty; spools are already local files. */
+    private class SourceList(val spools: List<SpooledFile>, val uris: List<Uri>)
+
+    /** Wire-format outgoings backed by a spooled (local, grant-proof) file. */
+    private class FileOutgoing(private val s: SpooledFile) : OutgoingFile {
+        override val wireName: String = s.name
+        override val size: Long get() = s.size
+        override val mime: String = s.mime
+        override fun openStream() = s.f.inputStream()
+    }
+
+    private fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean) {
+        val cli = client ?: run { logLine("not sharing — start sharing first"); return }
         val self = server?.selfInfo() ?: return
         scope.launch(Dispatchers.IO) {
+            var outgoing: List<OutgoingFile> = emptyList()
+            var prog = FlitProgress(appCtx, peer.info.fingerprint.hashCode() and 0x7fffffff)
             try {
-                val outgoing = uris.mapNotNull { uri -> outgoingFrom(appCtx, uri) }
+                outgoing = buildList {
+                    if (text != null && text.isNotBlank()) add(TextNoteOutgoing(text))
+                    addAll(src.spools.map { FileOutgoing(it) })
+                    addAll(src.uris.mapNotNull { uri -> outgoingFrom(appCtx, uri) })
+                }
                 if (outgoing.isEmpty()) {
                     logLine("nothing openable selected")
+                    _share.value = null
                     return@launch
                 }
                 val target = SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
-                val report = cli.sendFiles(target, self, outgoing)
-                if (report.sent.isNotEmpty()) {
-                    logLine("sent ${report.sent.size}/${outgoing.size} to ${peer.displayName}: ${report.sent.joinToString(", ")}")
+                prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
+                val report = cli.sendFiles(target, self, outgoing, progress = { name, soFar, _ ->
+                    prog.tick(name, soFar)
+                })
+                val sent = report.sent.size
+                val fail = report.failed.size
+                val summary = when {
+                    fail == 0 -> "sent $sent/${outgoing.size} to ${peer.displayName}"
+                    sent == 0 -> "all $fail failed"
+                    else -> "sent $sent, $fail failed → ${peer.displayName}"
                 }
+                prog.finish(summary, ok = sent > 0, iconDone = false)
+                if (sent > 0) logLine("$summary: ${report.sent.joinToString(", ")}")
                 for (f in report.failed) logLine("FAIL ${f.fileName}: ${f.reason}")
-                if (report.sent.isEmpty() && report.failed.isEmpty()) logLine("declined by ${peer.displayName}")
+                if (sent == 0 && fail == 0) logLine("declined by ${peer.displayName}")
+                _share.value = null
             } catch (e: Exception) {
-                logLine("send failed: ${e.message ?: e.javaClass.simpleName}")
+                val reason = e.message ?: e.javaClass.simpleName
+                var queuedLog = false
+                if (!fromQueue) {
+                    val tokens = queueTokensFor(src)
+                    if (!tokens.isNullOrEmpty()) {
+                        val ok = FlitRoster.enqueue(
+                            QueuedSend(
+                                fingerprint = peer.info.fingerprint,
+                                alias = peer.displayName,
+                                uris = tokens,
+                                names = outgoing.map { it.wireName },
+                                createdMs = System.currentTimeMillis(),
+                            )
+                        )
+                        if (ok) {
+                            _queue.value = FlitRoster.queued()
+                            logLine("${peer.displayName} unreachable ($reason) — kept, sends when it reappears")
+                            prog.finish("queued for later", ok = false, iconDone = false)
+                            queuedLog = true
+                        }
+                    }
+                }
+                if (!queuedLog) {
+                    logLine("send failed: $reason")
+                    prog.finish("send failed — $reason", ok = false, iconDone = false)
+                }
+                _share.value = null
             }
         }
     }
+
+    /**
+     * Tokens for the send-later queue, or null if this source cannot outlive
+     * the session. Spooled files are always queueable; SAF URIs only when every
+     * grant is persistable (taken and KEPT at queue time, released on dequeue).
+     */
+    private fun queueTokensFor(src: SourceList): List<String>? = when {
+        src.spools.isNotEmpty() && src.uris.isEmpty() -> src.spools.map { it.f.absolutePath }
+        src.spools.isEmpty() && src.uris.isNotEmpty() -> {
+            val keepers = src.uris.filter { uri ->
+                runCatching {
+                    appCtx.contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                    true
+                }.getOrDefault(false)
+            }
+            if (keepers.size == src.uris.size) keepers.map { it.toString() } else null
+        }
+        else -> null
+    }
+
+    fun cancelQueued(fingerprint: String) {
+        FlitRoster.dequeue(fingerprint)
+        _queue.value = FlitRoster.queued()
+        logLine("queued send cancelled")
+    }
+
+    /** Turn a queue token (spool path or durable SAF uri) into a local file. */
+    private fun spoolFileFor(token: String, tag: String): SpooledFile? {
+        val f = File(token)
+        if (f.isFile) return SpooledFile(f, f.name, guessMime(f.name))
+        val uri = runCatching { Uri.parse(token) }.getOrNull() ?: return null
+        if (uri.scheme == "content" || uri.scheme == "file") {
+            return runCatching { spoolUri(uri, tag) }.getOrNull()
+        }
+        return null
+    }
+
+
+    // ==== share intake ==========================================================
+
+    /** Called by MainActivity for ACTION_SEND / ACTION_SEND_MULTIPLE intents. */
+    fun handleShareIntent(intent: Intent?, referrerHost: String?) {
+        if (intent == null) return
+        val uris: List<Uri> = when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val u = intent.extras?.get(Intent.EXTRA_STREAM) as? Uri
+                if (u != null) listOf(u) else emptyList()
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                @Suppress("UNCHECKED_CAST")
+                intent.extras?.get(Intent.EXTRA_STREAM) as? List<Uri> ?: emptyList()
+            }
+            else -> emptyList()
+        }
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        if (uris.isEmpty() && text.isNullOrBlank()) return
+        _share.value = ShareIntake(ready = false, files = emptyList(), text = text, sourceApp = referrerHost)
+        spoolIntake(uris, text)
+    }
+
+    /**
+     * Copies the shared streams into app cache so the intake becomes usable.
+     * A share may arrive BEFORE the engine has a context (cold start from the
+     * share sheet), so wait for the engine to finish starting first.
+     */
+    private fun spoolIntake(uris: List<Uri>, text: String?) {
+        scope.launch(Dispatchers.IO) {
+            var waitedMs = 0
+            while (!::appCtx.isInitialized && waitedMs < 20_000) {
+                delay(250)
+                waitedMs += 250
+            }
+            if (!::appCtx.isInitialized) {
+                _share.value = null
+                logLine("could not prepare the share — start Flit and share again")
+                return@launch
+            }
+            val spooled = mutableListOf<SpooledFile>()
+            var dropped = 0
+            for (uri in uris) {
+                try {
+                    spooled += spoolUri(uri, "share")
+                } catch (e: Exception) {
+                    dropped++
+                    logLine("cannot read shared file (${e.message ?: e.javaClass.simpleName})")
+                }
+            }
+            if ((dropped == uris.size || uris.isEmpty()) && spooled.isEmpty() && text.isNullOrBlank()) {
+                _share.value = null
+                return@launch
+            }
+            _share.update { it?.copy(ready = true, files = spooled) }
+        }
+    }
+
+    /** Copy one shared stream into app cache; returns the local, grant-proof file. */
+    private fun spoolUri(uri: Uri, tag: String): SpooledFile {
+        val resolver = appCtx.contentResolver
+        val mime = runCatching { resolver.getType(uri) }.getOrNull() ?: "application/octet-stream"
+        val displayName = runCatching {
+            resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        }.getOrNull()
+        val stamp = System.currentTimeMillis()
+        val safe = (displayName ?: "shared").replace(Regex("[\\/:*?\"<>|]"), "_").takeLast(80)
+        val f = File(appCtx.cacheDir, "$tag-$stamp-${spoolSeq.incrementAndGet()}-$safe")
+        resolver.openInputStream(uri)?.use { input ->
+            f.outputStream().use { input.copyTo(it) }
+        } ?: throw IllegalStateException("no stream for $uri")
+        return SpooledFile(f, safe, mime)
+    }
+    private val spoolSeq = java.util.concurrent.atomic.AtomicInteger(0)
 
     // ==== receive publishing ====================================================
 
-    private fun publishReceived(file: File, info: FileInfo) {
+    private fun publishReceived(file: File, info: FileInfo, senderFp: String) {
         _received.update { list -> (list + ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file)).takeLast(20) }
-        notifyReceived(file)
-        // Republish into the user-visible Downloads/Flit bucket (API 29+).
-        if (Build.VERSION.SDK_INT >= 29) {
+        // Pinned peers may have their own folder; otherwise the Downloads/Flit bucket.
+        val tree = FlitRoster.destTree(senderFp)
+        if (tree != null) {
             scope.launch(Dispatchers.IO) {
-                runCatching { copyToDownloads(file) }
+                runCatching { copyToTree(file, tree) }
                     .onSuccess {
                         runCatching { file.delete() }
-                        logLine("\u2192 Downloads/Flit/${it.lastPathSegment}")
+                        logLine("\u2192 ${it ?: file.name}")
+                    }
+                    .onFailure {
+                        runCatching { copyToDownloadsBucket(file) }
+                        logLine("\u2192 Downloads/Flit/${file.name} (folder unreachable)")
+                    }
+            }
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            scope.launch(Dispatchers.IO) {
+                runCatching { copyToDownloadsBucket(file) }
+                    .onSuccess {
+                        runCatching { file.delete() }
+                        logLine("→ Downloads/Flit/${file.name}")
                     }
             }
         }
+        // API < 29: the file stays in the app dir; the Received list points there.
     }
 
-    private fun copyToDownloads(file: File): Uri {
+
+    private fun copyToTree(file: File, treeUri: String): String? {
+        val tree = Uri.parse(treeUri)
+        val resolver = appCtx.contentResolver
+        val rootDocId = android.provider.DocumentsContract.getTreeDocumentId(tree)
+        val rootUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, rootDocId)
+        val name = uniqueNameIn(rootUri, file.name)
+        val docUri = android.provider.DocumentsContract.createDocument(
+            resolver, rootUri, guessMime(file.name), name,
+        ) ?: throw IllegalStateException("SAF rejected createDocument")
+        resolver.openOutputStream(docUri)?.use { out ->
+            file.inputStream().use { it.copyTo(out) }
+        } ?: throw IllegalStateException("cannot write to tree")
+        return name
+    }
+
+    /** SAF providers do not dedupe consistently; do it ourselves. */
+    private fun uniqueNameIn(dir: Uri, wanted: String): String {
+        val resolver = appCtx.contentResolver
+        try {
+            val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(
+                dir, android.provider.DocumentsContract.getDocumentId(dir),
+            )
+            resolver.query(childrenUri, arrayOf(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
+                val taken = HashSet<String>(c.count)
+                while (c.moveToNext()) c.getString(0)?.let { taken.add(it) }
+                if (wanted !in taken) return wanted
+                val stem = wanted.substringBeforeLast('.', "")
+                val ext = wanted.substringAfterLast('.', "").takeIf { wanted.contains('.') }
+                var n = 1
+                while (true) {
+                    val candidate = if (ext != null) "$stem ($n).$ext" else "$stem ($n)"
+                    if (candidate !in taken) return candidate
+                    n++
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return wanted
+    }
+
+    private fun copyToDownloadsBucket(file: File): Uri {
         val resolver = appCtx.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
@@ -398,20 +741,6 @@ object FlitEngine {
         }
 
     // ==== notifications =========================================================
-
-    private fun notifyReceived(file: File) {
-        val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(
-            (file.absolutePath).hashCode(),
-            NotificationCompat.Builder(appCtx, CHANNEL_TRANSFERS)
-                .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentTitle("File received")
-                .setContentText("${file.name} (" + fmtBytes(file.length()) + ")")
-                .setContentIntent(servicePendingIntent())
-                .setAutoCancel(true)
-                .build(),
-        )
-    }
 
     private fun servicePendingIntent() = runCatching {
         android.app.PendingIntent.getActivity(
@@ -444,6 +773,7 @@ object FlitEngine {
 
     private fun logLine(text: String) {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        android.util.Log.i("FlitSend", text)
         _log.update { list -> (list + LogLine(ts, text)).takeLast(60) }
     }
 
@@ -481,8 +811,18 @@ object FlitEngine {
             name = n
             size = s
         }
-        if (size < 0) return null
-        return UriOutgoing(resolver, uri, name, size, mime)
+        var effSize = size
+        if (effSize < 0) {
+            // Share-sheet providers often omit SIZE; stat the PFD instead.
+            effSize = runCatching {
+                resolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+            }.onFailure {
+                android.util.Log.v("FlitShare", "pfd stat failed for $uri: ${it.javaClass.simpleName}: ${it.message}")
+            }.getOrDefault(-1L)
+        }
+        android.util.Log.v("FlitShare", "outgoingFrom uri=$uri name=$name qsize=$size eff=$effSize mime=$mime")
+        if (effSize < 0) return null
+        return UriOutgoing(resolver, uri, name, effSize, mime)
     }
 
     fun fmtBytes(v: Long): String = when {
@@ -503,5 +843,16 @@ object FlitEngine {
     ) : OutgoingFile {
         override fun openStream() = resolver.openInputStream(uri)
             ?: throw IOException("cannot open $wireName")
+    }
+
+    /** A chat-style text note sent through the same file pipeline (v2.2 pure). */
+    private class TextNoteOutgoing(
+        val text: String,
+    ) : OutgoingFile {
+        override val wireName: String =
+            "Flit note " + SimpleDateFormat("HHmmss", Locale.getDefault()).format(Date()) + ".txt"
+        override val size: Long = text.toByteArray(Charsets.UTF_8).size.toLong()
+        override val mime: String = "text/plain"
+        override fun openStream() = java.io.ByteArrayInputStream(text.toByteArray(Charsets.UTF_8))
     }
 }
