@@ -176,6 +176,23 @@ object FlitEngine {
             val id = identity ?: loadOrCreateIdentity(appCtx).also { identity = it }
             val alias = currentAlias()
 
+            // Android can route egress via mobile data when the Wi-Fi network is
+            // marked unvalidated (captive/absent internet), even though LAN peers
+            // live on the Wi-Fi link. Pin the process to the Wi-Fi network so every
+            // socket (announce send, register, transfers) uses the right interface.
+            val cm = appCtx.getSystemService(android.net.ConnectivityManager::class.java)
+            val wifiNet = cm?.allNetworks?.firstOrNull { n ->
+                val caps = cm.getNetworkCapabilities(n)
+                caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                    caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) != true
+            }
+            if (wifiNet != null) {
+                val bound = runCatching { cm.bindProcessToNetwork(wifiNet) }.getOrDefault(false)
+                logLine(if (bound) "egress pinned to Wi\u2011Fi network" else "could not pin egress; using default network")
+            } else {
+                logLine("no Wi\u2011Fi network; using default network")
+            }
+
             val dest = (appCtx.getExternalFilesDir(null) ?: appCtx.filesDir)
                 .resolve("received").also { it.mkdirs() }
 
@@ -204,7 +221,12 @@ object FlitEngine {
                 own = srv::selfInfo,
                 onPeerDiscovered = ::touchPeer,
                 registerPoster = { ip, port, protocol, self ->
-                    cli.register(SendTarget(ip, port, protocol == "https"), self)
+                    val t = SendTarget(ip, port, protocol == "https")
+                    try {
+                        cli.register(t, self) ?: logLine("register to $ip:$port failed")
+                    } catch (e: Exception) {
+                        logLine("register to $ip:$port: ${e.message ?: e.javaClass.simpleName}")
+                    }
                 },
             )
             disc.start()
@@ -263,6 +285,46 @@ object FlitEngine {
     }
 
     // ==== sending ===============================================================
+
+    /**
+     * Manual peer entry for networks that strip multicast (captive APs, phones
+     * whose Wi-Fi loses default-egress to mobile data): the user types
+     * `host:port`; we insert a stub row immediately and try a real register. On
+     * success the stub is replaced by the peer's actual info (and the peer
+     * learns about us in the same exchange).
+     */
+    fun addManualPeer(address: String) {
+        val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }
+        val raw = address.trim().removePrefix("https://").removePrefix("http://").trimEnd('/')
+        val host = raw.substringBeforeLast(':').takeIf { it.isNotBlank() } ?: run {
+            logLine("cannot parse address \"$raw\"")
+            return
+        }
+        val port = raw.substringAfterLast(':').toIntOrNull()?.takeIf { it in 1..65535 }
+            ?: Protocol.DEFAULT_PORT
+        val stubFp = "manual@$host:$port"
+        _peers.update { m ->
+            m + (stubFp to PeerEntry(
+                ip = host,
+                info = PeerInfo(
+                    alias = "$host:$port", version = Protocol.VERSION, deviceModel = null,
+                    deviceType = "device", fingerprint = stubFp, port = port, protocol = "https",
+                ),
+                lastSeenMs = System.currentTimeMillis(),
+            ))
+        }
+        logLine("probe $host:$port\u2026")
+        val self = server?.selfInfo() ?: return
+        scope.launch(Dispatchers.IO) {
+            val real = try {
+                cli.register(SendTarget(host, port, true), self, timeoutMs = 4_000)
+            } catch (e: Exception) {
+                logLine("probe $host:$port unreachable (${e.message ?: e.javaClass.simpleName})")
+                null
+            }
+            if (real != null) touchPeer(host, real)
+        }
+    }
 
     fun send(peer: PeerEntry, uris: List<Uri>) {
         val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }

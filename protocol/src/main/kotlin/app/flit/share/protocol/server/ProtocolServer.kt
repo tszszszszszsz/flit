@@ -149,6 +149,14 @@ class ProtocolServer(
                     },
                 )
             }
+            if (this is io.ktor.server.netty.NettyApplicationEngine.Configuration) {
+                // HTTP/2 drags ALPN negotiation into every TLS connection. Peers that
+                // don't offer ALPN (JDK/Conscrypt stacks, some Dart/jvm clients) then
+                // get their connection reset — on Android Conscrypt this even throws
+                // an AssertionError inside netty's JdkAlpnSslEngine and RSTs mid
+                // handshake. LocalSend v2.2 is HTTP/1.1 anyway.
+                enableHttp2 = false
+            }
         }
 
         val e = embeddedServer(Netty, applicationEnvironment { }, configBlock, module).let { it.start(wait = false) }

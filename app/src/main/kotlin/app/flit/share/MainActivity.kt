@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -88,6 +89,7 @@ class MainActivity : ComponentActivity() {
         val peers by FlitEngine.peers.collectAsState()
         val received by FlitEngine.received.collectAsState()
         val log by FlitEngine.log.collectAsState()
+        var showAddDialog by remember { mutableStateOf(false) }
 
         Surface(modifier = Modifier.fillMaxSize()) {
             Column(
@@ -134,8 +136,45 @@ class MainActivity : ComponentActivity() {
                         pickFiles.launch(arrayOf("*/*"))
                     }
                 }
+                if (state.running) {
+                    OutlinedButton(onClick = { showAddDialog = true }) { Text("+ Add device by address\u2026") }
+                }
 
-                HorizontalDivider()
+        if (showAddDialog) {
+            var addr by remember { mutableStateOf("") }
+            AlertDialog(
+                onDismissRequest = { showAddDialog = false },
+                title = { Text("Add device by address") },
+                text = {
+                    Column {
+                        Text(
+                            "A peer that is never discovered automatically? Enter an IP or address (port defaults to 53317).",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        OutlinedTextField(
+                            value = addr,
+                            onValueChange = { addr = it },
+                            singleLine = true,
+                            placeholder = { Text("192.168.1.42:53317") },
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showAddDialog = false
+                            if (addr.isNotBlank()) FlitEngine.addManualPeer(addr)
+                        },
+                    ) { Text("Add") }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { showAddDialog = false }) { Text("Cancel") }
+                },
+            )
+        }
+
+        HorizontalDivider()
 
                 Text("Received", style = MaterialTheme.typography.titleMedium)
                 if (received.isEmpty()) {

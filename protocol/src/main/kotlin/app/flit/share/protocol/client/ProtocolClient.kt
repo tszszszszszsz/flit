@@ -50,19 +50,17 @@ class ProtocolClient(
             }.getOrNull()
         }
 
-    /** Registers us with a target — how discovery announces are answered. */
+    /** Registers us with a target — how discovery announces are answered. Throws on failure. */
     suspend fun register(target: SendTarget, self: PeerInfo, timeoutMs: Long = 2500): PeerInfo? =
         withTimeoutOrNull(timeoutMs) {
-            runCatching {
-                json<PeerInfo>(
-                    postJson(
-                        target,
-                        Protocol.PATH_REGISTER,
-                        WireJson.encode(self.sansAnnounce()),
-                        timeoutMs = timeoutMs,
-                    ),
-                )
-            }.getOrNull()
+            json<PeerInfo>(
+                postJson(
+                    target,
+                    Protocol.PATH_REGISTER,
+                    WireJson.encode(self.sansAnnounce()),
+                    timeoutMs = timeoutMs,
+                ),
+            )
         }
 
     suspend fun cancelTransfer(target: SendTarget, sessionId: String) {
