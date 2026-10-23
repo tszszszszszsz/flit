@@ -1,0 +1,20 @@
+Flit moves files between the devices around you, directly over your Wi-Fi network.
+
+Open the app, press Share, and everything on the same network appears: phones,
+tablets, laptops, and headless boxes. Tap a device, pick a file, done. No
+accounts, no sign-up, no pairing ceremony, and nothing ever leaves your LAN.
+
+* Instant: the transfer engine is running the moment the app opens.
+* Local-first: files hop device-to-device, not through any server.
+* Secure: every transfer, including discovery and metadata, rides mutual TLS
+  with per-device identities and fingerprint pinning.
+* Native: a small Kotlin app built on Android's own networking stack — no
+  webviews, no embedded browsers.
+* Cross-platform: speaks a fully open, documented protocol (version 2.2), so it
+  interoperates with any other compatible client on your network.
+
+Received files land in Downloads/Flit. Sending works from the built-in picker,
+so you can share anything any app can produce.
+
+The core — discovery, transfers, everything you need to move files — is free
+and complete. No ads, no trackers, no analytics.

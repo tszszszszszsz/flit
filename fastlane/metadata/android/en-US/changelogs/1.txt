@@ -1,0 +1,7 @@
+First release.
+
+* Device discovery over Wi-Fi (multicast + direct by address)
+* File transfers both ways, byte-identical, over mutual TLS
+* Peer fingerprints shown and pinned
+* Foreground service keeps transfers alive with the screen off
+* Adaptive app icon with themed (monochrome) support

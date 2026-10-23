@@ -262,6 +262,8 @@ object FlitEngine {
         } catch (t: Throwable) {
             _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
             logLine("start failed: ${t.message ?: t.javaClass.simpleName}")
+            // Full stack goes to logcat (obfuscated in release; use mapping.txt to deobfuscate).
+            android.util.Log.e("FlitEngine", "engine start failed", t)
         }
     }
 

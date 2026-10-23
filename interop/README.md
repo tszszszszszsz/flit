@@ -132,3 +132,52 @@ phone↔box multicast delivers both directions once announce TX is wired properl
 - Android main route table is empty; routes live in per-netid tables (e.g. Wi-Fi =
   `table 1000000033`, holding `224.0.0.0/24 dev wlan0`).
 - Session-restart ritual stays: restart `harness serve` after every `installDist`.
+
+## Day 3 (2026-10-23) — release build (R8) shipped to real Wi-Fi, all green
+
+Built `:app:assembleRelease` with R8 minify + resource shrink + local release
+keystore, installed on the phone, and re-ran the wireless matrix. Results vs
+the debug build: identical (all PASS).
+
+| Check (release R8 APK) | Result |
+| --- | --- |
+| W0 egress pin to Wi-Fi | PASS (`egress pinned to Wi-Fi network` at 15:03:40) |
+| W1 box → phone multicast discovery | PASS (FlitAlpha row discovered on phone) |
+| W2 phone → box register | PASS (`seen Flit · M2101K7BNY … port=53317 v=2.2`) |
+| W3/W4 phone → box transfer | PASS (`recv-ok day2-final.txt 27 bytes` 15:04:50, byte-identical) |
+| W5 box → phone transfer | PASS (`sent 1/1` 15:05:18 → `saved rel-day2-w5.txt (272 B)` → Downloads/Flit/, byte-identical) |
+
+### Release config
+
+- `app/build.gradle.kts`: `release { isMinifyEnabled = true; isShrinkResources = true }`,
+  signing from root `keystore.properties` (`rootProject.file()` resolve — module-relative
+  path broke signing validation), falling back to the debug key when the properties
+  file is absent so source builds stay reproducible everywhere.
+- Local release key: `keystore/` + `keystore.properties` (gitignored).
+- APK: 5.35 MB.
+
+### R8 findings (the debugging story, worth keeping)
+
+1) **`start failed: Class a does not have a public non-arg constructor`** —
+   netty's `ReflectiveChannelFactory` does `getConstructor().newInstance()` on
+   `NioServerSocketChannel` (mapping: `NioServerSocketChannel → c6.a`,
+   `ReflectiveChannelFactory → y5.x0`); R8's rewrite had killed the no-arg ctor
+   lookup. Fixed by keeping netty (below) — a targeted ctor keep alone was NOT
+   enough because the failure then moved one level deeper:
+2) **`VerifyError: AdaptiveByteBufAllocator sub-types erroneous
+   AbstractByteBufAllocator`** — ART rejects R8's rewritten netty buffer code at
+   verify time. Persisted even with `android.enableR8.fullMode=false`; the
+   `AbstractByteBufAllocator` dex entry looked structurally sane with all
+   referenced types resolvable, i.e. plain R8 bytecode rewriting trips this
+   device's verifier, not (only) full-mode class merging.
+   **Final rule set: keep `io.netty.**` / `io.ktor.**` verbatim, shrink only app
+   code** (+ kotlinx-serialization serializer keeps per runtime docs). APK 5.35 MB —
+   acceptable; correctness verified on-device was the winning criterion.
+   `fullMode=false` stays as a defensive default (closest to the tested debug config).
+3) Keeping netty bodies surfaced its optional compression backends (brotli4j,
+   zstd-jni, lz4, jzlib, ning-lzf, oracle-svm, pkitesting) as missing classes —
+   all `-dontwarn` (guarded at runtime; we use JDK gzip/deflate).
+- Diag tooling: `Log.e("FlitEngine", "engine start failed", e)` in the engine's
+  catch → `adb logcat -d | grep -a FlitEngine` (obfuscated stack) +
+  `mapping.txt` deobfuscation of `c6.a`/`y5.x0` to identify the reflective ctor
+  consumer; dexdump of the R8-built APK for the buffer-class audit.

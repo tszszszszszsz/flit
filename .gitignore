@@ -17,3 +17,6 @@ node_modules/
 local.properties
 flit-downloads/
 flit-incoming/
+# local release signing
+keystore/
+keystore.properties

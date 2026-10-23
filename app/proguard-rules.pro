@@ -1,0 +1,75 @@
+# Flit release R8 rules.
+# Focus: kotlinx-serialization + netty/ktor reflection surfaces + BouncyCastle.
+
+# kotlinx-serialization (per runtime docs)
+-keepattributes *Annotation*, InnerClasses
+-dontnote kotlinx.serialization.**
+-keep,includedescriptorclasses class app.flit.share.**$$serializer { *; }
+-keepclassmembers class app.flit.share.** {
+    *** Companion;
+}
+-keepclasseswithmembers class app.flit.share.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+
+# ktor / netty: reflection accessors and optional native probes are all guarded
+# by try/catch at runtime; missing optional classes (slf4j bindings, native
+# transports disabled at app start) must not fail the build.
+-dontwarn org.slf4j.**
+-dontwarn io.netty.util.internal.NativeImageLoader
+
+# Netty: R8's optimized rewrites (class merging etc.) emit bytecode the device's
+# ART rejects during buffer init ("VerifyError: AdaptiveByteBufAllocator sub-types
+# erroneous AbstractByteBufAllocator"), even with full mode off. Debug builds run
+# the same jars unminified with zero issues, so keep netty bytecode verbatim and
+# let only app code shrink. (~1.5 MB — acceptable.)
+-keep class io.netty.** { *; }
+-keep class org.reactivestreams.** { *; }
+-keep class io.ktor.** { *; }
+
+# BouncyCastle: provider/algorithm classes are reached via JCA servants and
+# OID tables; strip only its optional-API warnings.
+-dontwarn org.bouncycastle.**
+
+# Optional paths R8 correctly flags as absent on Android — all guarded at runtime:
+# netty's native OpenSSL (tcnative; we run JDK TLS), netty/ktor optional log
+# bindings (slf4j-simple is used), ktor's JVM debugger detector, blockhound,
+# and conscrypt's optional provider hooks.
+-dontwarn io.netty.internal.tcnative.**
+-dontwarn java.lang.management.**
+-dontwarn org.apache.log4j.**
+-dontwarn org.apache.logging.log4j.**
+-dontwarn org.conscrypt.**
+-dontwarn reactor.blockhound.integration.BlockHoundIntegration
+# netty codec-compression optional backends (JDK gzip/deflate is what we use)
+-dontwarn com.aayushatharva.brotli4j.**
+-dontwarn com.github.luben.zstd.**
+-dontwarn net.jpountz.lz4.**
+-dontwarn org.lz4.**
+-dontwarn lzma.sdk.**
+
+# R8-generated dontwarn list (optional codec/transport backends, all guarded at runtime):
+-dontwarn com.jcraft.jzlib.Deflater
+-dontwarn com.jcraft.jzlib.Inflater
+-dontwarn com.jcraft.jzlib.JZlib
+-dontwarn com.jcraft.jzlib.JZlib$WrapperType
+-dontwarn com.ning.compress.BufferRecycler
+-dontwarn com.ning.compress.lzf.ChunkDecoder
+-dontwarn com.ning.compress.lzf.ChunkEncoder
+-dontwarn com.ning.compress.lzf.LZFChunk
+-dontwarn com.ning.compress.lzf.LZFEncoder
+-dontwarn com.ning.compress.lzf.util.ChunkDecoderFactory
+-dontwarn com.ning.compress.lzf.util.ChunkEncoderFactory
+-dontwarn com.oracle.svm.core.annotate.Alias
+-dontwarn com.oracle.svm.core.annotate.InjectAccessors
+-dontwarn com.oracle.svm.core.annotate.RecomputeFieldValue
+-dontwarn com.oracle.svm.core.annotate.RecomputeFieldValue$Kind
+-dontwarn com.oracle.svm.core.annotate.TargetClass
+-dontwarn com.sun.nio.file.SensitivityWatchEventModifier
+-dontwarn io.netty.pkitesting.CertificateBuilder
+-dontwarn io.netty.pkitesting.CertificateBuilder$Algorithm
+-dontwarn io.netty.pkitesting.X509Bundle
+-dontwarn net.jpountz.xxhash.XXHash32
+-dontwarn net.jpountz.xxhash.XXHashFactory
+-dontwarn org.osgi.annotation.bundle.Export
+-dontwarn reactor.blockhound.BlockHound$Builder
