@@ -8,10 +8,11 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 
 | # | Differentiator | Status |
 |---|---|---|
-| 1 | Chunked **resumable** transfers (their issue #2127, open 20+ months) | planned |
+| 1 | Chunked **resumable** transfers (their issue #2127, open 20+ months) | **shipped** (Flit↔Flit extension: interrupted uploads keep their prefix on disk and resume after a reconnect, verified hash-exact in both directions) |
 | 2 | **Rescue mode**: hotspot fallback when networks block multicast | planned |
 | 3 | **Crush & send**: on-device media compression before transfer (Pro) | planned |
 | 4 | Native speed: instant cold start, share-sheet-first UX | **shipped** (share intake spool, send-later queue, trusted peers + per-peer folder, progress notifications, QS tile) |
+| 5 | **Direct-to-MediaStore receive**: incoming files stream straight into a pending `Downloads/Flit/` row — no temp file, no second copy — with parallel uploads (4 streams) | **shipped** |
 
 Working name. Rename is a 15-minute chore before Play listing (no trademark reuse of "LocalSend").
 
@@ -20,6 +21,10 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
 - Share-sheet send: streams are spooled into app cache the moment the intent lands, so grants can
   never expire and every shared file can queue for later (`Send later` row; auto-dispatches when
   the peer reappears).
+- Multi-file sends stream concurrently (4 parallel), and a dropped connection mid-file is
+  recovered automatically: the receiver keeps the received prefix, the sender probes
+  `GET /api/flit/v1/partial`, and the transfer resumes from there (Flit↔Flit only; plain v2.2
+  peers get a clean full resend — the final sha256 gate verifies every landing either way).
 - Receive: progress notification with live speed; completed transfers land in
   `Downloads/Flit/`, or in a per-peer folder you pick once for trusted peers.
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
