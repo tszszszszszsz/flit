@@ -71,6 +71,10 @@ data class PrepareUploadResponse(
     val files: Map<String, String>,
 )
 
+/** What the receiver still holds of a previously interrupted file. */
+@Serializable
+data class PartialInfo(val size: Long)
+
 /**
  * Multicast announcement wire shape: port + protocol are always present here
  * (never default-omitted), unlike register/info responses.

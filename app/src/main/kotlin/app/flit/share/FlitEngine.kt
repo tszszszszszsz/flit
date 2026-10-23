@@ -155,6 +155,10 @@ val share: StateFlow<ShareIntake?> = _share
             return PrepareDecision.Accept(request.files.keys)
         }
 
+        override fun onResumeStart(sessionId: String, fileId: String, file: FileInfo, prefixBytes: Long) {
+            logLine("resuming ${file.fileName} at ${fmtBytes(prefixBytes)}")
+        }
+
         override fun onUploadStart(sessionId: String, fileId: String, file: FileInfo) {
             FlitEngine.logLine("receiving ${file.fileName}")
             if (!rxBegun) {
@@ -243,6 +247,9 @@ val share: StateFlow<ShareIntake?> = _share
         appCtx = ctx.applicationContext
         FlitRoster.init(appCtx)
         _queue.value = FlitRoster.queued() // pick up send-later entries from a previous run
+        // Test-only dead-link emulation (see PeerHttpClient.testAbortBytes).
+        debugProp("debug.flit.abortbytes")?.trim()?.toLongOrNull()?.takeIf { it > 0 }
+            ?.let { app.flit.share.protocol.client.PeerHttpClient.testAbortBytes = it }
         _state.value = _state.value.copy(starting = true, error = null)
         val seq = ++startSeq
         scope.launch(Dispatchers.IO) { run(seq) }

@@ -1,5 +1,8 @@
 package app.flit.share.protocol
 
+import app.flit.share.protocol.model.FileInfo
+import java.security.MessageDigest
+
 /**
  * LocalSend wire protocol v2.2 defaults.
  *
@@ -26,4 +29,26 @@ object Protocol {
     const val PATH_PREPARE_UPLOAD: String = "$API_ROOT/prepare-upload"
     const val PATH_UPLOAD: String = "$API_ROOT/upload"
     const val PATH_CANCEL: String = "$API_ROOT/cancel"
+
+    // Flit extension (Flit↔Flit only; v2.2 wire stays untouched, other
+    // LocalSend-compatible apps simply never call these).
+    const val FLIT_ROOT: String = "/api/flit/v1"
+    const val PATH_PARTIAL: String = "$FLIT_ROOT/partial"
+
+    /**
+     * Identity of a resumable file across sessions: name + size + content
+     * hash. Nobody ever uploads against a token they didn't first offer to
+     * us in prepare (the part registry is verified against the live
+     * session's FileInfo), so this value only scans; it doesn't grant.
+     */
+    fun resumeToken(info: FileInfo): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(info.fileName.toByteArray(Charsets.UTF_8))
+        md.update(byteArrayOf(0))
+        md.update(info.size.toString().toByteArray(Charsets.US_ASCII))
+        md.update(byteArrayOf(0))
+        md.update((info.sha256 ?: "").toByteArray(Charsets.US_ASCII))
+        val hex = md.digest().joinToString("") { "%02x".format(it) }
+        return hex.take(32)
+    }
 }

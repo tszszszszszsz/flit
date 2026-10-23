@@ -25,6 +25,19 @@ import javax.net.ssl.SSLSocketFactory
  */
 class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
 
+    /** Test hooks (never set in shipping code paths). */
+    companion object {
+        /** Abort the first upload body after N bytes (dead-sender emulation). */
+        @Volatile
+        var testAbortBytes: Long = 0L
+    }
+
+    /** FLIT_TEST_ABORT_BYTES fires on the first upload body only. */
+    private val abortOnceFired = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    @Synchronized
+    private fun attemptUnused(): Boolean = abortOnceFired.compareAndSet(false, true)
+
     class Response(val status: Int, val headers: Map<String, String>, val body: ByteArray) {
         fun text(): String = String(body, Charsets.UTF_8)
     }
@@ -78,6 +91,12 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
             out.write(head.toString().toByteArray(Charsets.US_ASCII))
             out.flush()
 
+            // Test knob: abort the FIRST upload body after N bytes — dead-link
+            // emulation without MIUI tricks. Sources: FLIT_TEST_ABORT_BYTES
+            // env (harness) or companion set from the app's debug props.
+            val abortAfter = testAbortBytes.takeIf { it > 0 }
+                ?: System.getenv("FLIT_TEST_ABORT_BYTES")?.trim()?.toLongOrNull()?.takeIf { it > 0 }
+                ?: Long.MAX_VALUE
             bodyProvider?.invoke()?.use { input ->
                 val buf = ByteArray(64 * 1024)
                 var sent = 0L
@@ -86,8 +105,13 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
                     val n = input.read(buf, 0, want)
                     if (n <= 0) throw EOFException("body source ended after $sent of $contentLength bytes")
                     out.write(buf, 0, n)
+                    out.flush()
                     sent += n
                     if (bodyProgress != null) bodyProgress(sent)
+                    if (sent >= abortAfter && attemptUnused()) { // dead-sender simulation, once
+                        runCatching { socket.close() }
+                        throw java.io.IOException("FLIT_TEST_ABORT after $sent bytes")
+                    }
                 }
                 out.flush()
             }

@@ -2,6 +2,7 @@ package app.flit.share.protocol.server
 
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.model.FileInfo
+import app.flit.share.protocol.model.PartialInfo
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.model.PrepareUploadResponse
@@ -40,6 +41,7 @@ import java.io.BufferedOutputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.nio.file.Files
+import java.nio.file.StandardOpenOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
@@ -69,6 +71,9 @@ interface ServerDelegate {
     fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision
     fun onUploadStart(sessionId: String, fileId: String, file: FileInfo) {}
 
+    /** Resumed an interrupted file: [prefixBytes] already sat on the receiver. */
+    fun onResumeStart(sessionId: String, fileId: String, file: FileInfo, prefixBytes: Long) {}
+
     /** Byte-stream progress for one file. Emitted at most ~10\u00d7/s per file. */
     fun onUploadProgress(sessionId: String, fileId: String, file: FileInfo, bytes: Long, totalBytes: Long) {}
     fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {}
@@ -86,6 +91,13 @@ data class ServerConfig(
     val downloadApiEnabled: Boolean = false,
 
     /**
+     * Keep incomplete uploads on disk and let a Flit sender resume them
+     * after a connection loss (Flit↔Flit extension; v2.2 senders are
+     * unaffected — they just never send the resume header).
+     */
+    val resume: Boolean = true,
+
+    /**
      * When provided, upload bodies are piped straight into these streams
      * instead of temp files (the product streams into MediaStore/SAF without
      * the double copy). Return null per file to keep the classic file path.
@@ -99,6 +111,56 @@ class IncomingSink(
     val open: OutputStream,
     val done: (ok: Boolean) -> Unit,
 )
+
+/**
+ * Interrupted uploads kept on disk, keyed by content identity token
+ * (Protocol.resumeToken). Part files are only ever resumed by senders
+ * holding the matching sha256 — assembly is checked before accept.
+ */
+internal class PartRegistry {
+    class Entry(val path: Path, val senderIp: String, val added: Long)
+
+    private val map = LinkedHashMap<String, Entry>()
+    private val lock = Any()
+
+    fun peek(token: String): Entry? = synchronized(lock) { prune(); map[token] }
+
+    fun put(token: String, path: Path, senderIp: String): Entry? = synchronized(lock) {
+        prune()
+        val entry = Entry(path, senderIp, System.currentTimeMillis())
+        map[token] = entry
+        if (map.size > CAP) {
+            // evict oldest — and its bytes, registry entries own their file
+            map.entries.removeIf { (k, e) ->
+                if (map.size <= CAP / 2) false else {
+                    runCatching { Files.deleteIfExists(e.path) }
+                    map.remove(k)
+                    true
+                }
+            }
+        }
+        entry
+    }
+
+    fun remove(token: String) = synchronized(lock) { map.remove(token) }
+
+    private fun prune() {
+        val now = System.currentTimeMillis()
+        val it = map.entries.iterator()
+        while (it.hasNext()) {
+            val (_, e) = it.next()
+            if (now - e.added > TTL_MS || !Files.exists(e.path)) {
+                if (now - e.added > TTL_MS) runCatching { Files.deleteIfExists(e.path) }
+                it.remove()
+            }
+        }
+    }
+
+    companion object {
+        const val CAP = 8
+        const val TTL_MS = 6 * 60 * 60 * 1000L
+    }
+}
 
 internal class PendingFile(
     val file: FileInfo,
@@ -114,7 +176,15 @@ internal class ActiveSession(
     val id: String,
     val senderIp: String,
     val files: MutableMap<String, PendingFile> = LinkedHashMap(),
-)
+) {
+    var lastTouch: Long = System.currentTimeMillis()
+
+    /** Dead senders must not block a reconnecting one's new prepare. */
+    fun stale(): Boolean = System.currentTimeMillis() - lastTouch > STALE_SESSION_MS
+}
+
+/** A session whose last byte arrived this long ago is replaceable. */
+internal const val STALE_SESSION_MS = 10_000L
 
 /** Raw socket address of the peer, captured before ktor wraps the call. */
 internal val peerAddrAttr = AttributeKey<InetSocketAddress>("flit-peer-addr")
@@ -131,6 +201,7 @@ class ProtocolServer(
 
     private val mutex = Mutex()
     private var session: ActiveSession? = null
+    private val parts = PartRegistry()
     private var server: io.ktor.server.engine.EmbeddedServer<*, *>? = null
     private val actualPort = AtomicInteger(-1)
 
@@ -174,6 +245,7 @@ class ProtocolServer(
                 post(Protocol.PATH_PREPARE_UPLOAD) { prepareRoute(call) }
                 post(Protocol.PATH_UPLOAD) { uploadRoute(call) }
                 post(Protocol.PATH_CANCEL) { cancelRoute(call) }
+                get(Protocol.PATH_PARTIAL) { partialRoute(call) }
             }
         }
 
@@ -210,6 +282,7 @@ class ProtocolServer(
             }
         }
 
+        sweepOldParts(config.destDir)
         val e = embeddedServer(Netty, applicationEnvironment { }, configBlock, module).let { it.start(wait = false) }
         server = e
         runBlocking {
@@ -268,11 +341,18 @@ class ProtocolServer(
         val sessionId = UUID.randomUUID().toString()
         val candidate = ActiveSession(sessionId, peerIp)
 
+        val sessionId0 = session?.id // for the stale check below
         var badNames = false
         mutex.withLock {
             if (session != null) {
-                call.respondText("Blocked by another session", ContentType.Text.Plain, HttpStatusCode.Conflict)
-                return
+                // A reconnecting sender gets a new session; the old one was
+                // likely killed mid-transfer (resume) or abandoned.
+                val evict = session?.stale() ?: true
+                if (!evict) {
+                    call.respondText("Blocked by another session", ContentType.Text.Plain, HttpStatusCode.Conflict)
+                    return
+                }
+                session = null
             }
             for ((id, f) in accepted) {
                 val rel = sanitizeRelative(f.fileName)
@@ -308,6 +388,7 @@ class ProtocolServer(
                 f.token == token && !f.settled && f.attempts < MAX_ATTEMPTS
             ) {
                 f.attempts++
+                s.lastTouch = System.currentTimeMillis()
                 f
             } else {
                 null
@@ -323,13 +404,56 @@ class ProtocolServer(
         val md = MessageDigest.getInstance("SHA-256")
         var bytes: Long = 0
         var ok = false
-        val sink: IncomingSink? = try {
+
+        // Flit↔Flit resume: append the new body onto an interrupted prefix
+        // (or a caller-provided stream straight through — those can't append,
+        // so resume always takes the file path).
+        val resumeToken = call.request.headers["X-Flit-Resume"]?.takeIf { config.resume && it.isNotBlank() }
+        var resumed = false
+        if (resumeToken != null) {
+            val e = parts.peek(resumeToken)
+            if (e != null && e.senderIp == peerIp) {
+                if (e.path != pf.temp && Files.exists(e.path)) {
+                    Files.createDirectories(pf.temp.parent)
+                    Files.copy(e.path, pf.temp, StandardCopyOption.REPLACE_EXISTING)
+                }
+                resumed = runCatching {
+                    val have = Files.size(pf.temp)
+                    have > 0 && have < pf.file.size
+                }.getOrDefault(false)
+            }
+        }
+        if (resumed) {
+            // The prefix is already on disk; fold it into the digest so the
+            // final hash covers the assembled whole.
+            runCatching {
+                Files.newInputStream(pf.temp).use { ins ->
+                    val b = ByteArray(256 * 1024)
+                    while (true) {
+                        val n = ins.read(b)
+                        if (n <= 0) break
+                        md.update(b, 0, n)
+                        bytes += n
+                    }
+                }
+            }.getOrDefault(Unit)
+            delegate.onResumeStart(sessionId, fileId, pf.file, bytes)
+        }
+
+        val sink: IncomingSink? = if (resumed) null else try {
             config.incomingSink?.invoke(fileId, pf.file)
         } catch (_: Throwable) {
             null
         }
         try {
-            val rawOut = sink?.open ?: Files.newOutputStream(pf.temp)
+            val rawOut = when {
+                resumed -> Files.newOutputStream(
+                    pf.temp,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.APPEND,
+                )
+                else -> sink?.open ?: Files.newOutputStream(pf.temp)
+            }
             rawOut.use { out ->
                 val buf = ByteArray(256 * 1024)
                 var lastEmit = 0L
@@ -358,20 +482,36 @@ class ProtocolServer(
                     Files.createDirectories(pf.target.parent)
                     Files.move(pf.temp, pf.target, StandardCopyOption.REPLACE_EXISTING)
                 }
-            } else {
-                if (sink == null) Files.deleteIfExists(pf.temp)
+                if (resumed) resumeToken?.let { parts.remove(it) }
+            } else if (sink == null) {
+                if (resumed) {
+                    // keep the prefix — the sender (or a retry) can extend it
+                    parts.put(resumeToken!!, pf.temp, peerIp)
+                } else {
+                    // A truncated body (sender died) looks exactly like a
+                    // digest mismatch: as bytes they are an honest prefix of
+                    // what was shipped. Keep it; resume + final sha still
+                    // gate acceptance.
+                    parts.put(Protocol.resumeToken(pf.file), pf.temp, peerIp)
+                }
             }
             sink?.done(ok)
             call.respond(if (ok) HttpStatusCode.OK else HttpStatusCode.UnprocessableEntity)
         } catch (e: CancellationException) {
             runCatching { sink?.done(false) }
-            runCatching { Files.deleteIfExists(pf.temp) }
+            if (sink == null) {
+                val t = resumeToken ?: Protocol.resumeToken(pf.file)
+                keepPartAfterAbort(pf.temp, t, resumed || (config.resume && bytes > 0), peerIp)
+            }
             pf.settled = true
             markSessionEnded(sessionId, cancelled = false)
             throw e
         } catch (e: Throwable) {
             runCatching { sink?.done(false) }
-            runCatching { Files.deleteIfExists(pf.temp) }
+            if (sink == null) {
+                val t = resumeToken ?: Protocol.resumeToken(pf.file)
+                keepPartAfterAbort(pf.temp, t, resumed || (config.resume && bytes > 0), peerIp)
+            }
             pf.settled = true
             markSessionEnded(sessionId, cancelled = false)
             call.respondText("Unknown error", ContentType.Text.Plain, HttpStatusCode.InternalServerError)
@@ -393,6 +533,43 @@ class ProtocolServer(
                 markSessionEnded(sessionId, cancelled = false)
             }
         }
+    }
+
+    /** Interrupted without claim of completion: keep any usable prefix. */
+    private fun keepPartAfterAbort(
+        temp: Path,
+        token: String,
+        keepable: Boolean,
+        peerIp: String,
+    ) {
+        val keep = keepable && runCatching { Files.size(temp) }.getOrDefault(0L) > 0
+        if (keep) {
+            parts.put(token, temp, peerIp)
+        } else {
+            runCatching { Files.deleteIfExists(temp) }
+        }
+    }
+
+    /**
+     * Flit extension: how many bytes of an interrupted file the receiver
+     * still holds. Old peers never call this; a 404 just means "start over".
+     */
+    private suspend fun partialRoute(call: ApplicationCall) {
+        val token = call.request.queryParameters["token"]
+        val ip = call.peerIp()
+        val e = if (token.isNullOrBlank()) null else parts.peek(token)
+        if (e != null && (e.senderIp == ip || e.senderIp.isEmpty())) {
+            val size = runCatching { Files.size(e.path) }.getOrDefault(0L)
+            if (size > 0) {
+                call.respondText(
+                    WireJson.encode(PartialInfo(size)),
+                    ContentType.Application.Json,
+                    HttpStatusCode.OK,
+                )
+                return
+            }
+        }
+        call.respondText("{}", ContentType.Application.Json, HttpStatusCode.NotFound)
     }
 
     /** Ends + notifies once every file is terminal. */
@@ -455,6 +632,21 @@ internal fun sanitizeRelative(fileName: String): String {
     if (normalized.startsWith("..") || normalized.toString().contains("..")) return ""
     return normalized.toString().split("/").joinToString("/") { seg ->
         seg.replace(Regex("[\\\\:*?\"<>|\\r\\n]"), "_").ifEmpty { "_" }
+    }
+}
+
+/** Interrupted uploads left by earlier runs: parts older than a day go. */
+private fun sweepOldParts(dest: Path) {
+    runCatching {
+        Files.walk(dest).use { walk ->
+            walk.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".part") }
+                .forEach { p ->
+                    runCatching {
+                        val age = System.currentTimeMillis() - Files.getLastModifiedTime(p).toMillis()
+                        if (age > 24 * 3_600_000L) Files.deleteIfExists(p)
+                    }
+                }
+        }
     }
 }
 

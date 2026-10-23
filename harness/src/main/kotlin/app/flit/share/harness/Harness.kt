@@ -136,6 +136,10 @@ internal class ConsoleDelegate : ServerDelegate {
         println("${ts()} recv-start ${file.fileName} id=$fileId")
     }
 
+    override fun onResumeStart(sessionId: String, fileId: String, file: FileInfo, prefixBytes: Long) {
+        println("${ts()} recv-resume ${file.fileName} from ${prefixBytes} bytes")
+    }
+
     override fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {
         when (result) {
             is UploadResult.Saved -> println("${ts()} recv-ok   ${file.fileName} → ${result.path} (${result.bytes} bytes)")
