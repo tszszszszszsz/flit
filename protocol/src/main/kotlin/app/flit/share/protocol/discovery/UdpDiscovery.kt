@@ -32,6 +32,13 @@ class UdpDiscovery(
     private val registerPoster: suspend (ip: String, port: Int, protocol: String, own: PeerInfo) -> Unit,
     /** Explicit unicast announce targets (networks that strip multicast, e.g. containers). */
     private val fallbackPeers: List<java.net.InetSocketAddress> = emptyList(),
+    /**
+     * Hidden mode: never announce, never register back. We still listen, so
+     * announcing peers appear in OUR list — but their rosters never learn
+     * about this device, which stays reachable only by address or by
+     * initiating a send.
+     */
+    private val announce: Boolean = true,
 ) {
     private val group: InetAddress = InetAddress.getByName(Protocol.MULTICAST_GROUP)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -76,14 +83,16 @@ class UdpDiscovery(
         check(socket != null) { "create() must run before start()" }
 
         listenJob = scope.launch(Dispatchers.IO) { receiveLoop(socket!!) }
-        // double burst on start for slow joiners
-        announceOnce()
-        delay(START_BURST_DELAY)
-        announceOnce()
-        announceJob = scope.launch {
-            while (isActive) {
-                delay(announceIntervalMillis)
-                announceOnce()
+        if (announce) {
+            // double burst on start for slow joiners
+            announceOnce()
+            delay(START_BURST_DELAY)
+            announceOnce()
+            announceJob = scope.launch {
+                while (isActive) {
+                    delay(announceIntervalMillis)
+                    announceOnce()
+                }
             }
         }
     }
@@ -133,7 +142,10 @@ class UdpDiscovery(
             if (info.fingerprint == own().fingerprint) continue
             val ip = packet.address ?: continue
             onPeerDiscovered(ip, info)
-            if (ip.hostAddress != null && info.port in 1..65535) {
+            // Hidden mode: the announce itself carries the peer's info, but
+            // answering with a register would publish our identity. Listen
+            // only — sends to them still reveal us when the user chooses.
+            if (announce && ip.hostAddress != null && info.port in 1..65535) {
                 scope.launch {
                     runCatching { postRegister(ip.hostAddress!!, info.port, info.protocol) }
                 }

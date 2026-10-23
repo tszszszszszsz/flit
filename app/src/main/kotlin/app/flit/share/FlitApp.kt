@@ -11,6 +11,7 @@ import android.app.Application
 class FlitApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        FlitEngine.initAppCtx(this)
         System.setProperty("io.netty.transport.noNative", "true")
     }
 }

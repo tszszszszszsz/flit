@@ -13,6 +13,8 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 | 3 | **Crush & send**: on-device media compression before transfer (Pro) | planned |
 | 4 | Native speed: instant cold start, share-sheet-first UX | **shipped** (share intake spool, send-later queue, trusted peers + per-peer folder, progress notifications, QS tile) |
 | 5 | **Direct-to-MediaStore receive**: incoming files stream straight into a pending `Downloads/Flit/` row — no temp file, no second copy — with parallel uploads (4 streams) | **shipped** |
+| 6 | **Real on-device options**: Material You theme (dynamic color, light/dark/auto), rename from the app, trusted-senders-only gate, hidden mode (listen-only discovery), battery-rationing opt-out helper | **shipped** |
+| 7 | **Receive ledger you can act on**: tap a received file to open it, one-tap re-share, clear anything | **shipped** |
 
 Working name. Rename is a 15-minute chore before Play listing (no trademark reuse of "LocalSend").
 
@@ -26,7 +28,9 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   `GET /api/flit/v1/partial`, and the transfer resumes from there (Flit↔Flit only; plain v2.2
   peers get a clean full resend — the final sha256 gate verifies every landing either way).
 - Receive: progress notification with live speed; completed transfers land in
-  `Downloads/Flit/`, or in a per-peer folder you pick once for trusted peers.
+  `Downloads/Flit/`, or stream straight into a per-peer folder you pick once for
+  trusted peers (no double write). Received files open with one tap and re-share
+  from the ledger.
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 

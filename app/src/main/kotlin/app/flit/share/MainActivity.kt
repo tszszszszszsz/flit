@@ -1,6 +1,7 @@
 package app.flit.share
 
 import android.Manifest
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -12,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,8 +30,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -39,11 +46,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -85,6 +94,9 @@ class MainActivity : ComponentActivity() {
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         startSharing()
     }
+
+    /** App-wide settings — same store the engine/roster read ("flit"). */
+    private fun prefs() = getSharedPreferences("flit", Context.MODE_PRIVATE)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -134,6 +146,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Applies the new device identity immediately: sharing restarts behind the
+     * scenes (a short gap keeps the service stop/start from racing). A Flit
+     * peer mid-transfer will reconnect and resume from its saved prefix.
+     */
+    private fun applyAlias(name: String) {
+        FlitEngine.setAlias(name)
+        if (FlitEngine.state.value.running || FlitEngine.state.value.starting) {
+            stopSharing()
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                startSharing()
+                FlitEngine.toast("renamed — sharing restarted")
+            }, 700)
+        } else {
+            FlitEngine.toast("renamed — applies when sharing starts")
+        }
+    }
+
     @Composable
     private fun FlitUi() {
         val state by FlitEngine.state.collectAsState()
@@ -144,124 +174,234 @@ class MainActivity : ComponentActivity() {
         val queue by FlitEngine.queue.collectAsState()
         var showAddDialog by remember { mutableStateOf(false) }
         var peerMenuFor by remember { mutableStateOf<FlitEngine.PeerEntry?>(null) }
+        var showRenameDialog by remember { mutableStateOf(false) }
+        var showThemeDialog by remember { mutableStateOf(false) }
+        var showBatteryDialog by remember { mutableStateOf(false) }
+        var theme by remember { mutableStateOf(prefs().getString("theme", "auto") ?: "auto") }
 
         // Share-sheet mode: close ourselves once the dispatch clears the intake.
         if (shareMode) {
             LaunchedEffect(share) { if (share == null && FlitEngine.state.value.running) finish() }
         }
 
-        Surface(modifier = Modifier.fillMaxSize()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Text("Flit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
-                Text(
-                    when {
-                        state.error != null -> "start failed: ${state.error}"
-                        state.running -> "visible on Wi\u2011Fi as \u201c${state.alias}\u201d \u00b7 port ${state.port}"
-                        state.starting -> "starting\u2026"
-                        else -> "not sharing"
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+        val ctx = LocalContext.current
+        val dark = when (theme) {
+            "dark" -> true
+            "light" -> false
+            else -> isSystemInDarkTheme()
+        }
+        val colors = if (Build.VERSION.SDK_INT >= 31) {
+            if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
+        } else {
+            if (dark) darkColorScheme() else lightColorScheme()
+        }
+        MaterialTheme(colorScheme = colors) {
+            Surface(modifier = Modifier.fillMaxSize()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("Flit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                    Text(
+                        when {
+                            state.error != null -> "start failed: ${state.error}"
+                            state.running -> "visible on Wi\u2011Fi as \u201c${state.alias}\u201d \u00b7 port ${state.port}"
+                            state.starting -> "starting\u2026"
+                            else -> "not sharing"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
 
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (state.running || state.starting) {
-                        // Disabled while starting: a tap here used to cancel a
-                        // start that hadn't announced itself yet, leaving the
-                        // engine silently dead while logs said "egress pinned".
-                        OutlinedButton(
-                            onClick = { stopSharing() },
-                            enabled = !state.starting,
-                        ) { Text(if (state.starting) "starting\u2026" else "Stop sharing") }
-                    } else {
-                        Button(onClick = { askThenStart() }) { Text("Share on Wi\u2011Fi") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (state.running || state.starting) {
+                            // Disabled while starting: a tap here used to cancel a
+                            // start that hadn't announced itself yet, leaving the
+                            // engine silently dead while logs said "egress pinned".
+                            OutlinedButton(
+                                onClick = { stopSharing() },
+                                enabled = !state.starting,
+                            ) { Text(if (state.starting) "starting\u2026" else "Stop sharing") }
+                        } else {
+                            Button(onClick = { askThenStart() }) { Text("Share on Wi\u2011Fi") }
+                        }
+                        if (state.running) {
+                            Text("fp ${state.fingerprintShort}\u2026", fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+
+                    if (share != null) {
+                        Card {
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                val s = share!!
+                                val parts = if (s.ready) {
+                                    buildList {
+                                        if (s.files.isNotEmpty()) add("${s.files.size} file${if (s.files.size > 1) "s" else ""}")
+                                        if (!s.text.isNullOrBlank()) add("a text note")
+                                    }
+                                } else listOf("files (preparing…)")
+                                Text(
+                                    "Ready to send ${parts.joinToString(" + ")}",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                if (!s.text.isNullOrBlank() && s.files.isEmpty()) {
+                                    Text(
+                                        s.text.take(160),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontSize = 12.sp,
+                                    )
+                                }
+                                Text(
+                                    if (s.ready) {
+                                        "tap a device below to send" + (s.sourceApp?.let { " (from $it)" } ?: "")
+                                    } else "copying shared files to a safe place…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider()
+
+                    Text("Nearby devices", style = MaterialTheme.typography.titleMedium)
+                    if (peers.isEmpty()) {
+                        Text(
+                            if (state.running) "scanning\u2026 another Flit or LocalSend device on the same Wi\u2011Fi will appear here"
+                            else "start sharing, or add a device by address",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    for (p in peers.values.sortedBy { it.displayName }) {
+                        PeerRow(
+                            p,
+                            onSend = {
+                                if (share != null) FlitEngine.sendShare(p) else {
+                                    pendingPeer = p
+                                    pickFiles.launch(arrayOf("*/*"))
+                                }
+                            },
+                            onMenu = { peerMenuFor = p },
+                        )
                     }
                     if (state.running) {
-                        Text("fp ${state.fingerprintShort}\u2026", fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        OutlinedButton(onClick = { showAddDialog = true }) { Text("+ Add device by address\u2026") }
                     }
-                }
 
-                if (share != null) {
-                    Card {
-                        Column(modifier = Modifier.padding(14.dp)) {
-                            val s = share!!
-                            val parts = if (s.ready) {
-                                buildList {
-                                    if (s.files.isNotEmpty()) add("${s.files.size} file${if (s.files.size > 1) "s" else ""}")
-                                    if (!s.text.isNullOrBlank()) add("a text note")
+                    if (queue.isNotEmpty()) {
+                        HorizontalDivider()
+                        Text("Send later", style = MaterialTheme.typography.titleMedium)
+                        for (q in queue) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(q.alias, style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        "${q.uris.size} file(s) waiting for it to reappear",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
                                 }
-                            } else listOf("files (preparing…)")
-                            Text(
-                                "Ready to send ${parts.joinToString(" + ")}",
-                                style = MaterialTheme.typography.titleSmall,
-                            )
-                            if (!s.text.isNullOrBlank() && s.files.isEmpty()) {
-                                Text(
-                                    s.text.take(160),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontSize = 12.sp,
-                                )
+                                TextButton(onClick = { FlitEngine.cancelQueued(q.fingerprint) }) { Text("✕") }
                             }
-                            Text(
-                                if (s.ready) {
-                                    "tap a device below to send" + (s.sourceApp?.let { " (from $it)" } ?: "")
-                                } else "copying shared files to a safe place…",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
                         }
                     }
-                }
 
-                HorizontalDivider()
-
-                Text("Nearby devices", style = MaterialTheme.typography.titleMedium)
-                if (peers.isEmpty()) {
-                    Text(
-                        if (state.running) "scanning\u2026 another Flit or LocalSend device on the same Wi\u2011Fi will appear here"
-                        else "start sharing, or add a device by address",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                for (p in peers.values.sortedBy { it.displayName }) {
-                    PeerRow(
-                        p,
-                        onSend = {
-                            if (share != null) FlitEngine.sendShare(p) else {
-                                pendingPeer = p
-                                pickFiles.launch(arrayOf("*/*"))
-                            }
-                        },
-                        onMenu = { peerMenuFor = p },
-                    )
-                }
-                if (state.running) {
-                    OutlinedButton(onClick = { showAddDialog = true }) { Text("+ Add device by address\u2026") }
-                }
-
-                if (queue.isNotEmpty()) {
                     HorizontalDivider()
-                    Text("Send later", style = MaterialTheme.typography.titleMedium)
-                    for (q in queue) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(q.alias, style = MaterialTheme.typography.bodyMedium)
-                                Text(
-                                    "${q.uris.size} file(s) waiting for it to reappear",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            }
-                            TextButton(onClick = { FlitEngine.cancelQueued(q.fingerprint) }) { Text("✕") }
+
+                    SectionHeader("Options")
+                    OptionRow(
+                        title = "Device name",
+                        subtitle = "\u201c${FlitEngine.currentAlias()}\u201d — how other devices see you",
+                        onClick = { showRenameDialog = true },
+                    )
+                    OptionRow(
+                        title = "Theme",
+                        subtitle = when (theme) {
+                            "dark" -> "dark"
+                            "light" -> "light"
+                            else -> "follow the system"
+                        },
+                        onClick = { showThemeDialog = true },
+                    )
+                    SwitchOption(
+                        title = "Only trusted devices can send me files",
+                        subtitle = "offers from devices you haven't starred (\u2605) are declined automatically",
+                        initial = prefs().getBoolean("onlyTrusted", false),
+                    ) { on ->
+                        prefs().edit().putBoolean("onlyTrusted", on).apply()
+                        if (on && state.running) FlitEngine.toast("takes effect for new offers now")
+                    }
+                    SwitchOption(
+                        title = "Hidden on the network",
+                        subtitle = "stop announcing — nobody lists you until you send first, or they add you by address",
+                        initial = prefs().getBoolean("hiddenMode", false),
+                    ) { on ->
+                        prefs().edit().putBoolean("hiddenMode", on).apply()
+                        if (on && state.running) {
+                            stopSharing()
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                startSharing()
+                                FlitEngine.toast("hidden from now on")
+                            }, 700)
+                        } else if (state.running) {
+                            stopSharing()
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                startSharing()
+                                FlitEngine.toast("visible again")
+                            }, 700)
                         }
                     }
+                    OptionRow(
+                        title = "Background battery\u2026",
+                        subtitle = "let background sharing run without the system rationing it",
+                        onClick = { showBatteryDialog = true },
+                    )
+
+                    HorizontalDivider()
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Received", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                        if (received.isNotEmpty()) {
+                            TextButton(onClick = { FlitEngine.clearReceived() }) { Text("Clear") }
+                        }
+                    }
+                    if (received.isEmpty()) {
+                        Text("nothing yet", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Column {
+                            for (r in received.asReversed()) {
+                                ReceivedRow(
+                                    r,
+                                    onOpen = { openReceived(r) },
+                                    onShare = { shareReceived(r) },
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider()
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Activity", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { FlitEngine.clearLog() }) { Text("Clear") }
+                    }
+                    Text(
+                        log.joinToString("\n") { "${it.ts}  ${it.text}" }.ifEmpty { "—" },
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
                 }
+            }
+        }
 
         if (showAddDialog) {
             var addr by remember { mutableStateOf("") }
@@ -297,41 +437,200 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-                peerMenuFor?.let { peer ->
-                    PeerMenuDialog(
-                        peer = peer,
-                        onDismiss = { peerMenuFor = null },
-                        onChooseDest = { fp ->
-                            peerMenuFor = null
-                            pendingDestPeer = fp
-                            pickDest.launch(null)
-                        },
+        if (showRenameDialog) {
+            var name by remember { mutableStateOf(FlitEngine.currentAlias()) }
+            AlertDialog(
+                onDismissRequest = { showRenameDialog = false },
+                title = { Text("Device name") },
+                text = {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it.take(40) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     )
-                }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        showRenameDialog = false
+                        if (name.isNotBlank()) applyAlias(name)
+                    }) { Text("Save") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRenameDialog = false }) { Text("Cancel") }
+                },
+            )
+        }
 
-        HorizontalDivider()
+        if (showThemeDialog) {
+            AlertDialog(
+                onDismissRequest = { showThemeDialog = false },
+                title = { Text("Theme") },
+                text = {
+                    Column {
+                        listOf(
+                            "auto" to "Follow the system",
+                            "light" to "Light",
+                            "dark" to "Dark",
+                        ).forEach { (key, label) ->
+                            TextButton(onClick = {
+                                prefs().edit().putString("theme", key).apply()
+                                theme = key
+                                showThemeDialog = false
+                            }) { Text(if (theme == key) "● $label" else "○ $label") }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    TextButton(onClick = { showThemeDialog = false }) { Text("Cancel") }
+                },
+            )
+        }
 
-                Text("Received", style = MaterialTheme.typography.titleMedium)
-                if (received.isEmpty()) {
-                    Text("nothing yet", style = MaterialTheme.typography.bodySmall)
-                } else {
+        if (showBatteryDialog) {
+            AlertDialog(
+                onDismissRequest = { showBatteryDialog = false },
+                title = { Text("Background battery") },
+                text = {
                     Text(
-                        received.joinToString("\n") {
-                            "${ts(it.whenMs)}  ${it.name}  ${FlitEngine.fmtBytes(it.bytes)}"
-                        },
-                        fontSize = 13.sp,
+                        "The system rations background work, which can pause sharing while Flit is closed. " +
+                            "Excluding Flit from battery optimization keeps it available on your Wi\u2011Fi. " +
+                            "This opens the system settings — the choice stays yours.",
+                        style = MaterialTheme.typography.bodySmall,
                     )
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        showBatteryDialog = false
+                        runCatching {
+                            startActivity(
+                                Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }.onFailure { FlitEngine.toast("no battery settings on this device") }
+                    }) { Text("Open settings") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showBatteryDialog = false }) { Text("Not now") }
+                },
+            )
+        }
+
+        peerMenuFor?.let { peer ->
+            PeerMenuDialog(
+                peer = peer,
+                onDismiss = { peerMenuFor = null },
+                onChooseDest = { fp ->
+                    peerMenuFor = null
+                    pendingDestPeer = fp
+                    pickDest.launch(null)
+                },
+            )
+        }
+    }
+
+    private fun openReceived(r: FlitEngine.ReceivedFile) {
+        val uri = when {
+            r.uri != null -> Uri.parse(r.uri)
+            r.path != null -> FileProvider.getUriForFile(this, "$packageName.fileprovider", r.path)
+            else -> null
+        } ?: run { FlitEngine.toast("no location stored for ${r.name}"); return }
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, FlitEngine.guessMime(r.name))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = Intent.createChooser(view, r.name).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newRawUri(r.name, uri)
+        }
+        runCatching { startActivity(chooser) }
+            .onFailure { FlitEngine.toast("nothing can open ${r.name}") }
+    }
+
+    private fun shareReceived(r: FlitEngine.ReceivedFile) {
+        val uri = when {
+            r.uri != null -> Uri.parse(r.uri)
+            r.path != null -> FileProvider.getUriForFile(this, "$packageName.fileprovider", r.path)
+            else -> null
+        } ?: run { FlitEngine.toast("no location stored for ${r.name}"); return }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = FlitEngine.guessMime(r.name)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = Intent.createChooser(send, "Share ${r.name}").apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newRawUri(r.name, uri)
+        }
+        runCatching { startActivity(chooser) }
+            .onFailure { FlitEngine.toast("share failed") }
+    }
+
+    @Composable
+    private fun SectionHeader(text: String) {
+        Text(text, style = MaterialTheme.typography.titleMedium)
+    }
+
+    @Composable
+    private fun OptionRow(title: String, subtitle: String, onClick: () -> Unit) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+
+    @Composable
+    private fun SwitchOption(title: String, subtitle: String, initial: Boolean, onChange: (Boolean) -> Unit) {
+        var on by remember { mutableStateOf(initial) }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    val v = !on
+                    on = v
+                    onChange(v)
                 }
+                .padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = on, onCheckedChange = { v -> on = v; onChange(v) })
+        }
+    }
 
-                HorizontalDivider()
-
-                Text("Activity", style = MaterialTheme.typography.titleMedium)
+    @Composable
+    private fun ReceivedRow(
+        r: FlitEngine.ReceivedFile,
+        onOpen: () -> Unit,
+        onShare: () -> Unit,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(r.name, style = MaterialTheme.typography.bodyMedium)
                 Text(
-                    log.joinToString("\n") { "${it.ts}  ${it.text}" }.ifEmpty { "—" },
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
+                    "${ts(r.whenMs)} \u00b7 ${FlitEngine.fmtBytes(r.bytes)} \u00b7 tap to open",
+                    style = MaterialTheme.typography.bodySmall,
                 )
             }
+            TextButton(onClick = onShare) { Text("\u21A6") }
         }
     }
 
@@ -371,7 +670,7 @@ class MainActivity : ComponentActivity() {
             text = {
                 Column {
                     Text(
-                        "Trusted devices are kept in the roster; received files land in the folder you pick for them (otherwise Downloads/Flit).",
+                        "Trusted devices are kept in the roster; received files stream straight into the folder you pick for them (otherwise Downloads/Flit).",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     TextButton(onClick = {

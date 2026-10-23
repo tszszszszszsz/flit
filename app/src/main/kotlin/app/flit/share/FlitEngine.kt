@@ -78,7 +78,14 @@ object FlitEngine {
 
     data class LogLine(val ts: String, val text: String)
 
-    data class ReceivedFile(val name: String, val bytes: Long, val whenMs: Long, val path: File?)
+    data class ReceivedFile(
+        val name: String,
+        val bytes: Long,
+        val whenMs: Long,
+        val path: File?,
+        /** MediaStore/SAF uri for direct-to-storage receives (tap-to-open, share). */
+        val uri: String? = null,
+    )
 
 /** Intake from the system share sheet: files and/or a text note. */
 /** A shared stream already copied into our cache — grant-proof and queueable. */
@@ -147,6 +154,15 @@ val share: StateFlow<ShareIntake?> = _share
         }
 
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
+            // Trust gate (Options): an untrusted offer is declined outright —
+            // the sender's UI shows it the way people expect a refusal to
+            // show. Only the sender's fingerprint decides, never its IP.
+            if (prefs().getBoolean("onlyTrusted", false) &&
+                !FlitRoster.pinned(request.info.fingerprint)
+            ) {
+                logLine("declined offer from ${request.info.alias} ($peerIp) — device not trusted")
+                return PrepareDecision.Decline
+            }
             FlitEngine.logLine("offer from ${request.info.alias} ($peerIp): ${request.files.size} file(s)")
             rxFiles = request.files.values.associate { it.fileName to it.size }
             rxSenderFp = request.info.fingerprint
@@ -215,7 +231,18 @@ val share: StateFlow<ShareIntake?> = _share
 
     // ==== lifecycle =============================================================
 
-    fun prefs(): android.content.SharedPreferences = appCtx.getSharedPreferences("flit", Context.MODE_PRIVATE)
+    /** App-boot context (set by FlitApp), so prefs work before any engine start. */
+    @Volatile
+    private var bootCtx: Context? = null
+
+    fun initAppCtx(ctx: Context) {
+        if (bootCtx == null) bootCtx = ctx.applicationContext
+    }
+
+    fun prefs(): android.content.SharedPreferences =
+        (if (::appCtx.isInitialized) appCtx else bootCtx)
+            ?.getSharedPreferences("flit", Context.MODE_PRIVATE)
+            ?: throw IllegalStateException("no context yet for prefs")
 
     /** For nested/delegate access to the app context. */
     internal fun ctx(): Context = appCtx
@@ -320,6 +347,8 @@ val share: StateFlow<ShareIntake?> = _share
                         logLine("register to $ip:$port: ${e.message ?: e.javaClass.simpleName}")
                     }
                 },
+                // Hidden mode: stay off other devices' rosters entirely.
+                announce = !prefs().getBoolean("hiddenMode", false),
             )
             disc.create()
 
@@ -360,6 +389,9 @@ val share: StateFlow<ShareIntake?> = _share
                 fingerprintShort = id.fingerprint.take(12),
             )
             logLine("serving ${srv.scheme}://0.0.0.0:${srv.port} as \u201c$alias\u201d")
+            if (prefs().getBoolean("hiddenMode", false)) {
+                logLine("hidden mode: not announcing — others find this device by address, or when you send first")
+            }
 
             startPruner(seq)
         } catch (t: Throwable) {
@@ -675,15 +707,21 @@ val share: StateFlow<ShareIntake?> = _share
     // ==== receive publishing ====================================================
 
     /**
-     * Direct receive path: the POST body streams straight into a pending
-     * MediaStore row (Downloads/Flit) — no temp file, no second copy. Returns
-     * null for pinned peers with their own folder / old devices, which keeps
-     * the classic two-step flow.
+     * Direct receive paths — the POST body streams into its final home without
+     * a temp file, no second copy:
+     * - pinned peers with a chosen folder → a document created straight in
+     *   their SAF tree;
+     * - everyone else (API 29+) → a pending row in MediaStore Downloads/Flit.
+     * Returns null only for old devices (API < 29) or when storage refuses,
+     * which keeps the classic two-step flow as the fallback.
      */
     private fun openIncomingSink(info: FileInfo, treeUri: String?): IncomingSink? {
-        if (Build.VERSION.SDK_INT < 29 || !treeUri.isNullOrBlank()) return null
+        if (Build.VERSION.SDK_INT < 29) return null
         if (debugProp("debug.flit.nosink") == "1") return null // A/B: classic double-copy path
         val resolver = appCtx.contentResolver
+        // Pinned peer's own folder: create the target document up front and
+        // stream into it directly.
+        if (!treeUri.isNullOrBlank()) return runCatching { sinkIntoTree(info, treeUri) }.getOrNull()
         return runCatching {
             val values = android.content.ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, info.fileName)
@@ -702,7 +740,7 @@ val share: StateFlow<ShareIntake?> = _share
                             val (name, size) = runCatching { finalizeRow(url) }
                                 .getOrDefault(info.fileName to info.size)
                             _received.update { list ->
-                                (list + ReceivedFile(name, size, System.currentTimeMillis(), null)).takeLast(20)
+                                (list + ReceivedFile(name, size, System.currentTimeMillis(), null, url.toString())).takeLast(20)
                             }
                             logLine("→ Downloads/Flit/$name")
                         } else {
@@ -712,6 +750,40 @@ val share: StateFlow<ShareIntake?> = _share
                 },
             )
         }.getOrNull()
+    }
+
+    /** Stream a receive straight into a chosen SAF folder (pinned peers). */
+    private fun sinkIntoTree(info: FileInfo, treeUri: String): IncomingSink {
+        val tree = Uri.parse(treeUri)
+        val resolver = appCtx.contentResolver
+        val rootDocId = android.provider.DocumentsContract.getTreeDocumentId(tree)
+        val rootUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, rootDocId)
+        val name = uniqueNameIn(rootUri, info.fileName)
+        val docUri = android.provider.DocumentsContract.createDocument(
+            resolver, rootUri, info.fileType ?: guessMime(info.fileName), name,
+        ) ?: throw IllegalStateException("SAF rejected createDocument")
+        val out = resolver.openOutputStream(docUri)
+            ?: throw IllegalStateException("cannot write to tree")
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        return IncomingSink(
+            open = java.io.BufferedOutputStream(out, 256 * 1024),
+            done = { ok ->
+                if (finished.compareAndSet(false, true)) {
+                    if (ok) {
+                        _received.update { list ->
+                            (list + ReceivedFile(name, info.size, System.currentTimeMillis(), null, docUri.toString())).takeLast(20)
+                        }
+                        logLine("→ $name (chosen folder)")
+                    } else {
+                        // Aborted/partial transfer: remove the half-written
+                        // document so the folder stays clean.
+                        runCatching {
+                            android.provider.DocumentsContract.deleteDocument(resolver, docUri)
+                        }
+                    }
+                }
+            },
+        )
     }
 
     /** Un-pend a successful pending row and read back its final name/size. */
@@ -825,7 +897,7 @@ val share: StateFlow<ShareIntake?> = _share
         return uri
     }
 
-    private fun guessMime(name: String): String =
+    internal fun guessMime(name: String): String =
         when (name.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
             "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"
             "pdf" -> "application/pdf"; "txt", "md" -> "text/plain"; "zip" -> "application/zip"
@@ -867,6 +939,14 @@ val share: StateFlow<ShareIntake?> = _share
         val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         android.util.Log.i("FlitSend", text)
         _log.update { list -> (list + LogLine(ts, text)).takeLast(60) }
+    }
+
+    fun clearLog() {
+        _log.value = emptyList()
+    }
+
+    fun clearReceived() {
+        _received.value = emptyList()
     }
 
     /** Debug escape hatch: `adb shell setprop debug.flit.nopin 1` before starting the engine. */
