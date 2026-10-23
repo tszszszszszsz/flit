@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
@@ -37,6 +38,8 @@ class UdpDiscovery(
     private val stopped = AtomicBoolean(false)
 
     private var socket: MulticastSocket? = null
+    /** Plain UDP socket used for all sends (see announceOnce). */
+    private var announceSocket: DatagramSocket? = null
     private var announceJob: Job? = null
     private var listenJob: Job? = null
     private var joined: List<NetworkInterface> = emptyList()
@@ -45,21 +48,34 @@ class UdpDiscovery(
         registerPoster(ip, port, protocol, own())
     }
 
-    suspend fun start(announceIntervalMillis: Long = ANNOUNCE_INTERVAL) {
+    /**
+     * Creates the UDP sockets. Runs BEFORE egress pinning (see FlitEngine): a
+     * precaution — netd-marked sockets showed suspicious multicast behavior on
+     * this device, and unmarked discovery sockets cost nothing.
+     */
+    fun create() {
         val s = MulticastSocket(null as InetSocketAddress?)
         s.reuseAddress = true
         s.bind(InetSocketAddress(udpPort))
         // Java quirk: `loopbackMode = false` ENABLES loopback delivery (same-host peers).
         s.loopbackMode = false
-
         val ifs = eligibleNetworkInterfaces()
         joined = ifs
         for (ni in ifs) {
             runCatching { s.joinGroup(InetSocketAddress(group, udpPort), ni) }
         }
         socket = s
+        announceSocket = DatagramSocket().apply {
+            // connect() forces the route resolution up front — mirrors what a
+            // raw `nc -u` does, whose datagrams demonstrably leave this device.
+            runCatching { connect(group, udpPort) }
+        }
+    }
 
-        listenJob = scope.launch(Dispatchers.IO) { receiveLoop(s) }
+    suspend fun start(announceIntervalMillis: Long = ANNOUNCE_INTERVAL) {
+        check(socket != null) { "create() must run before start()" }
+
+        listenJob = scope.launch(Dispatchers.IO) { receiveLoop(socket!!) }
         // double burst on start for slow joiners
         announceOnce()
         delay(START_BURST_DELAY)
@@ -73,7 +89,7 @@ class UdpDiscovery(
     }
 
     fun announceOnce() {
-        val s = socket ?: return
+        val s = announceSocket ?: return
         val o = own()
         val payload = WireJson.encode(
             AnnounceMessage(
@@ -82,18 +98,13 @@ class UdpDiscovery(
                 port = o.port, protocol = o.protocol, download = o.download,
             ),
         ).toByteArray(Charsets.UTF_8)
-        if (joined.isEmpty()) {
-            runCatching { s.send(DatagramPacket(payload, payload.size, group, udpPort)) }
-            return
-        }
-        // JDK has no per-call interface send; anchor the outgoing interface per iteration.
         val packet = DatagramPacket(payload, payload.size, group, udpPort)
         synchronized(this) {
-            for (ni in joined) {
-                runCatching {
-                    s.networkInterface = ni
-                    s.send(packet)
-                }
+            // Plain UDP socket for sends: identical to a raw `nc -u` on the
+            // wire (ephemeral source port, no multicast-socket state). The
+            // listener socket stays a MulticastSocket for group membership.
+            runCatching { s.send(packet) }.onFailure {
+                println("Flit-announce send failed: $it")
             }
             // Unicast fallback: same announce payload, delivered point-to-point.
             for (peer in fallbackPeers) {
@@ -107,6 +118,8 @@ class UdpDiscovery(
         scope.coroutineContext[Job]?.cancelChildren()
         socket?.close()
         socket = null
+        announceSocket?.close()
+        announceSocket = null
     }
 
     private suspend fun receiveLoop(s: MulticastSocket) {

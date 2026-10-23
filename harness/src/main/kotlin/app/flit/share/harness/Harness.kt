@@ -177,6 +177,7 @@ private suspend fun serve(args: ParsedArgs) {
         },
         fallbackPeers = announceTargets(args.opt("--announce-to")),
     )
+    discovery.create()
     discovery.start()
 
     println("${ts()} serving ${server.scheme}://0.0.0.0:${server.port} dir=${config.destDir.toAbsolutePath()}")
@@ -214,6 +215,7 @@ private suspend fun discover(args: ParsedArgs) {
         },
         fallbackPeers = announceTargets(args.opt("--announce-to")),
     )
+    discovery.create()
     discovery.start(announceIntervalMillis = 600)
 
     println("${ts()} discovering (udp ${args.optInt("--udp-port", Protocol.MULTICAST_PORT)})…")
@@ -293,6 +295,7 @@ private suspend fun resolveTarget(targetArg: String, args: ParsedArgs, identity:
             client.register(SendTarget(ip, port, protocol == "https"), self)
         },
     )
+    discovery.create()
     discovery.start(announceIntervalMillis = 500)
     kotlinx.coroutines.delay(args.optInt("--wait", 5) * 1000L)
     discovery.stop()

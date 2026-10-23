@@ -12,14 +12,15 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.install
 import io.ktor.server.netty.Netty
 import io.ktor.server.engine.EngineConnectorBuilder
 import io.ktor.server.engine.applicationEnvironment
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.sslConnector
+import io.ktor.server.netty.NettyApplicationCall
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.server.plugins.origin
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
@@ -27,12 +28,14 @@ import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.util.AttributeKey
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.BufferedOutputStream
+import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -90,6 +93,9 @@ internal class ActiveSession(
     val files: MutableMap<String, PendingFile> = LinkedHashMap(),
 )
 
+/** Raw socket address of the peer, captured before ktor wraps the call. */
+internal val peerAddrAttr = AttributeKey<InetSocketAddress>("flit-peer-addr")
+
 /**
  * LocalSend v2.2 HTTP server: /info, /register, /prepare-upload, /upload, /cancel.
  * TLS (self-signed) is the default, mirroring upstream behavior.
@@ -124,6 +130,19 @@ class ProtocolServer(
         Files.createDirectories(config.destDir)
 
         val module: suspend Application.() -> Unit = {
+            // Capture the peer's raw socket address at the earliest pipeline
+            // phase, while `call` is still the engine's NettyApplicationCall
+            // (routing wraps it later, hiding the channel). Later readers must
+            // use this attribute — see peerIp() for why `request.origin` is
+            // unusable (it reverse-resolves, blocking route handlers ~5s on
+            // LAN IPs).
+            intercept(ApplicationCallPipeline.Setup) {
+                (context as? NettyApplicationCall)?.let { nc ->
+                    (nc.context.channel().remoteAddress() as? InetSocketAddress)?.let {
+                        context.attributes.put(peerAddrAttr, it)
+                    }
+                }
+            }
             install(ContentNegotiation) { json(WireJson.json) }
             routing {
                 get(Protocol.PATH_INFO) { infoRoute(call) }
@@ -359,7 +378,24 @@ class ProtocolServer(
     }
 }
 
-internal fun ApplicationCall.peerIp(): String = request.origin.remoteHost ?: ""
+/**
+ * Peer IP read straight from the socket address. MUST NOT go through
+ * `request.origin`: ktor's netty connection point calls
+ * `InetSocketAddress.getHostName()`, which blocks ~5s per call on a literal
+ * LAN IP doing a reverse-DNS lookup that never resolves — stalling the route
+ * handler past any client timeout (and poisoning the event loop that serves
+ * other connections). `address.hostAddress` is a pure string conversion.
+ */
+/**
+ * Peer IP from the Setup-phase attribute (raw `InetSocketAddress` of the
+ * channel). MUST NOT go through `request.origin`: ktor's netty connection
+ * point calls `InetSocketAddress.getHostName()`, which blocks ~5s per call on
+ * a literal LAN IP doing reverse-DNS that never resolves — stalling the route
+ * handler past any client timeout. `address.hostAddress` is a pure string
+ * conversion.
+ */
+internal fun ApplicationCall.peerIp(): String =
+    attributes.getOrNull(peerAddrAttr)?.address?.hostAddress ?: ""
 
 /** Keeps only relative, traversal-safe path segments; returns "" when invalid. */
 internal fun sanitizeRelative(fileName: String): String {

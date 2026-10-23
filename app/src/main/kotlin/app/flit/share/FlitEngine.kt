@@ -176,23 +176,12 @@ object FlitEngine {
             val id = identity ?: loadOrCreateIdentity(appCtx).also { identity = it }
             val alias = currentAlias()
 
-            // Android can route egress via mobile data when the Wi-Fi network is
-            // marked unvalidated (captive/absent internet), even though LAN peers
-            // live on the Wi-Fi link. Pin the process to the Wi-Fi network so every
-            // socket (announce send, register, transfers) uses the right interface.
-            val cm = appCtx.getSystemService(android.net.ConnectivityManager::class.java)
-            val wifiNet = cm?.allNetworks?.firstOrNull { n ->
-                val caps = cm.getNetworkCapabilities(n)
-                caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                    caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) != true
-            }
-            if (wifiNet != null) {
-                val bound = runCatching { cm.bindProcessToNetwork(wifiNet) }.getOrDefault(false)
-                logLine(if (bound) "egress pinned to Wi\u2011Fi network" else "could not pin egress; using default network")
-            } else {
-                logLine("no Wi\u2011Fi network; using default network")
-            }
-
+            // UDP discovery sockets are created BEFORE egress pinning as a
+            // precaution: netd-marked sockets showed suspicious multicast
+            // behavior on this device, and unmarked discovery sockets cost
+            // nothing. The pin runs right after disc.create() and before any
+            // TLS client exchange, so registers and transfers still egress
+            // via Wi-Fi even when MIUI defaults them to mobile data.
             val dest = (appCtx.getExternalFilesDir(null) ?: appCtx.filesDir)
                 .resolve("received").also { it.mkdirs() }
 
@@ -229,6 +218,24 @@ object FlitEngine {
                     }
                 },
             )
+            disc.create()
+
+            val cm = appCtx.getSystemService(android.net.ConnectivityManager::class.java)
+            val wifiNet = cm?.allNetworks?.firstOrNull { n ->
+                val caps = cm.getNetworkCapabilities(n)
+                caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                    caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) != true
+            }
+            when {
+                debugProp("debug.flit.nopin") == "1" ->
+                    logLine("egress pin skipped (debug.flit.nopin)")
+                wifiNet != null -> {
+                    val bound = runCatching { cm.bindProcessToNetwork(wifiNet) }.getOrDefault(false)
+                    logLine(if (bound) "egress pinned to Wi\u2011Fi network" else "could not pin egress; using default network")
+                }
+                else -> logLine("no Wi\u2011Fi network; using default network")
+            }
+
             disc.start()
 
             if (seq != startSeq) { // stopped/restarted meanwhile
@@ -437,6 +444,12 @@ object FlitEngine {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         _log.update { list -> (list + LogLine(ts, text)).takeLast(60) }
     }
+
+    /** Debug escape hatch: `adb shell setprop debug.flit.nopin 1` before starting the engine. */
+    private fun debugProp(key: String): String? = runCatching {
+        val c = Class.forName("android.os.SystemProperties")
+        c.getMethod("get", String::class.java).invoke(null, key) as? String
+    }.getOrNull()
 
     private fun loadOrCreateIdentity(ctx: Context): TlsIdentity {
         val f = File(ctx.filesDir, "flit-identity.p12")

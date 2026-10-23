@@ -52,3 +52,83 @@ Our stack: `:protocol` module (Kotlin), Netty server, own `PeerHttpClient` (JDK 
 - Node B send: `harness send --to 127.0.0.1:53318 <files>` (T0), `--to 127.0.0.1:53216` (T1 reverse).
 - CLI receive driving: `mkfifo cli-stdin`, `exec 3<> cli-stdin`, launch `script -qec "$HOME/.local/opt/localsend-cli" /dev/null <&3 > cli-tui.log 2>&1 &`,
   then `printf 'Y' >&3` when the offer dialog shows (same shell invocation; fd3 dies with the shell).
+
+## Day 2 (2026-10-23) — wireless mesh: phone (M2101K7BNY, MIUI) ↔ Linux box
+
+Environment: real Wi-Fi LAN "Bojan i Stefan 5g"; phone 192.168.100.80 (Flit app),
+box 192.168.100.12 (harness `serve --port 53318`). The final verification pass ran with
+**no USB tunnels** (`adb forward`/`reverse` removed). The box's firewalld REJECTs by
+default; runtime-opened with
+`sudo firewall-cmd --add-port=53317-53320/tcp --add-port=53317/udp` (nothing persisted).
+
+| # | Scenario | Result |
+|---|----------|--------|
+| W0 | Engine boot: UDP discovery sockets unmarked → egress pinned to Wi-Fi → serving `https://0.0.0.0:53317` | PASS |
+| W1 | Box→phone multicast announce → nearby-device row auto-appears with the real address (192.168.100.12:53318) | PASS |
+| W2 | Phone→box register-back over Wi-Fi | PASS — A logs `seen Flit · M2101K7BNY (192.168.100.80:53317)` ≤ 12 s after engine start |
+| W3 | Phone→box transfer (row tap → SAF pick) | PASS — round-trip `day2-rev.txt` (29 B), `offer` + `recv-ok`, sha held |
+| W4 | Box→phone transfer (`harness send 192.168.100.80:53317 day2-final.txt`) | PASS — `sent 1/1`, 27 B byte-identical on phone (`Downloads/Flit/`) |
+| W5 | Phone→box multicast announce from the **app process** | **PASS after this day's wiring** — 3/3 deliveries to a fresh listener (14:41:51 / :57 / 14:42:03) |
+
+Also re-verified the harness after the discovery refactor: `harness discover` lists the
+phone and the box peer with correct fps/addresses; the phone's row survives engine
+restarts by re-discovery alone (no manual injection anywhere).
+
+Corrects day-1 T0-m: the box's kernel multicast path is **not** broken —
+phone↔box multicast delivers both directions once announce TX is wired properly.
+
+### Fixes / findings this day
+
+1. **Ktor netty peer reverse-DNS stall (the day-1 "TLS wedge")** — ktor 3.2.2 netty
+   `NettyConnectionPoint` (http1) builds `request.origin` via
+   `InetSocketAddress.getHostName()`: a **blocking reverse-DNS** on literal LAN IPs
+   (`getent hosts 192.168.100.80` on the box: 4.98 s, fails; ~10 s negative cache, so the
+   wedge recurs in cycles). Every handler touching `request.origin`
+   (register/prepare/upload/cancel) stalled past any client timeout; loopback peers
+   resolve instantly from /etc/hosts, which is why tunnel flows worked and direct ones
+   hung; `/info` never calls it, which is why health curls stayed 200 throughout.
+   **Fix**: an `ApplicationCallPipeline.Setup` intercept (runs before routing wraps the
+   call in `RoutingCall`, which hides the channel) captures the raw channel
+   `InetSocketAddress` into a call attribute; `peerIp()` returns
+   `attributes.getOrNull(peerAddrAttr)?.address?.hostAddress` — pure string, no DNS.
+   **Rule: on the server never read `request.origin`.**
+
+2. **Announcement TX wiring on Android**:
+   - a `runCatching` wrapping **both** `s.networkInterface = ni` and `s.send()` silently
+     skipped the send whenever `setNetworkInterface` threw — which it does for
+     netd-marked sockets on this device. **This is the proven killer**: with the
+     day-1 pin active the announce socket was marked, every announce threw-and-skipped,
+     silently (W2 worked because it is TCP, not UDP).   - supporting observation (not cleanly isolated): a raw `nc -u` datagram sent as the
+     app's own UID (`run-as app.flit.share nc -u -p 53317 224.0.0.167 53317`) always
+     delivered; identical in-app sends of that era appeared dead — but every in-app
+     check then ran on a listener whose seen-map already held the phone's fingerprint
+     (dedupe mask), so marked-vs-unmarked multicast could not be separated. The final
+     wiring defensively keeps UDP sockets **created before the pin** regardless.
+   **Fix**: UdpDiscovery split into `create()` (bind + per-iface `joinGroup` RX + aux TX
+   socket) and `start()` (loops); engine order
+   `srv.start()` → `cli` → multicast lock → `disc.create()` → `bindProcessToNetwork`
+   pin → `disc.start()`; per-interface `setNetworkInterface` TX removed entirely
+   (only RX membership anchoring kept); sends use the plain aux `DatagramSocket`
+   pre-`connect()`-ed to the group. After that, W5 delivers.
+   Also dismissed as causes: UID (run-as passes), fixed source port (`-p 53317`
+   passes), multicast lock, loopback mode, main-table route emptiness (per-netid
+   tables hold the multicast route), socket type (plain vs MulticastSocket both fine
+   once the send actually runs).
+
+3. **firewalld**: phone→box TCP was icmp-admin-prohibited (`connect: No route to host`
+   → `EHOSTUNREACH` in the phone's register log), UDP silently dropped. Runtime-open
+   only.
+
+### Tooling / observation notes
+- Harness `ConsoleDelegate` dedupes **every** `seen` print (UDP announce *and* HTTP
+  register) by fingerprint. After a peer's first register, its announces are logged
+  nowhere; **use a fresh listener (`harness discover --wait 3`) for clean announce
+  observations**. Multiple "phone multicasts never arrive" debug readings were this
+  mask — the register-based `seen` line made every later check a false negative.
+- UDP probes over adb: `cmd | nc -u …` never exits and wedges the session — always
+  `nohup … >/dev/null 2>&1 &`.
+- `adb shell setprop debug.flit.nopin 1` (read via SystemProperties reflection) skips
+  egress pinning for that start — escape hatch for pin-related experiments.
+- Android main route table is empty; routes live in per-netid tables (e.g. Wi-Fi =
+  `table 1000000033`, holding `224.0.0.0/24 dev wlan0`).
+- Session-restart ritual stays: restart `harness serve` after every `installDist`.
