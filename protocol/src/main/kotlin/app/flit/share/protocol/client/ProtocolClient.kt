@@ -80,7 +80,7 @@ class ProtocolClient(
         self: PeerInfo,
         files: Collection<OutgoingFile>,
         pin: String? = null,
-        parallelism: Int = 2,
+        parallelism: Int = 4,
         progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)? = null,
     ): SendReport {
         check(files.isNotEmpty()) { "no files given" }

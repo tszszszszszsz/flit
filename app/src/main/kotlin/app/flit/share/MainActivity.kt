@@ -171,7 +171,13 @@ class MainActivity : ComponentActivity() {
 
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (state.running || state.starting) {
-                        OutlinedButton(onClick = { stopSharing() }) { Text("Stop sharing") }
+                        // Disabled while starting: a tap here used to cancel a
+                        // start that hadn't announced itself yet, leaving the
+                        // engine silently dead while logs said "egress pinned".
+                        OutlinedButton(
+                            onClick = { stopSharing() },
+                            enabled = !state.starting,
+                        ) { Text(if (state.starting) "starting\u2026" else "Stop sharing") }
                     } else {
                         Button(onClick = { askThenStart() }) { Text("Share on Wi\u2011Fi") }
                     }

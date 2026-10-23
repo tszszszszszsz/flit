@@ -139,6 +139,7 @@ internal class ConsoleDelegate : ServerDelegate {
     override fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {
         when (result) {
             is UploadResult.Saved -> println("${ts()} recv-ok   ${file.fileName} → ${result.path} (${result.bytes} bytes)")
+            is UploadResult.Streamed -> println("${ts()} recv-ok   ${file.fileName} streamed (${result.bytes} bytes)")
             is UploadResult.Mismatch -> println("${ts()} recv-BAD  ${file.fileName} checksum mismatch")
             is UploadResult.Error -> println("${ts()} recv-ERR  ${file.fileName}")
         }
@@ -265,7 +266,7 @@ private suspend fun send(args: ParsedArgs) {
             self = self,
             files = specs,
             pin = args.opt("--pin"),
-            parallelism = args.optInt("--parallel", 2),
+            parallelism = args.optInt("--parallel", 4),
         )
         println("${ts()} sent ${report.sent.size}/${specs.size} to ${target.ip}:${target.port}")
         for (s in report.sent) println("${ts()}   ok $s")

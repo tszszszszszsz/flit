@@ -15,6 +15,8 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.install
 import io.ktor.server.netty.Netty
+import io.netty.channel.ChannelOption
+import io.netty.channel.FixedRecvByteBufAllocator
 import io.ktor.server.engine.EngineConnectorBuilder
 import io.ktor.server.engine.applicationEnvironment
 import io.ktor.server.engine.embeddedServer
@@ -35,6 +37,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.BufferedOutputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
@@ -53,6 +56,9 @@ sealed interface PrepareDecision {
 
 sealed interface UploadResult {
     data class Saved(val path: Path, val bytes: Long) : UploadResult
+
+    /** The bytes went straight into a caller-provided stream (no temp file). */
+    data class Streamed(val bytes: Long) : UploadResult
     data object Mismatch : UploadResult
     data object Error : UploadResult
 }
@@ -78,6 +84,20 @@ data class ServerConfig(
     val deviceModel: String? = "Flit",
     val deviceType: String? = "headless",
     val downloadApiEnabled: Boolean = false,
+
+    /**
+     * When provided, upload bodies are piped straight into these streams
+     * instead of temp files (the product streams into MediaStore/SAF without
+     * the double copy). Return null per file to keep the classic file path.
+     * [IncomingSink.done] must be safe to call exactly once.
+     */
+    val incomingSink: ((fileId: String, info: FileInfo) -> IncomingSink?)? = null,
+)
+
+/** Caller-owned destination stream for one incoming file. */
+class IncomingSink(
+    val open: OutputStream,
+    val done: (ok: Boolean) -> Unit,
 )
 
 internal class PendingFile(
@@ -178,6 +198,15 @@ class ProtocolServer(
                 // an AssertionError inside netty's JdkAlpnSslEngine and RSTs mid
                 // handshake. LocalSend v2.2 is HTTP/1.1 anyway.
                 enableHttp2 = false
+                // Bulk-upload throughput: netty's adaptive allocator grows slowly
+                // and the default SO_RCVBUF trims the TCP window on phones, so
+                // large-file transfers stream in small costly slices. Pin big
+                // allocations up front.
+                configureBootstrap = {
+                    childOption(ChannelOption.SO_RCVBUF, 4 * 1024 * 1024)
+                    childOption(ChannelOption.RCVBUF_ALLOCATOR, FixedRecvByteBufAllocator(256 * 1024))
+                    childOption(ChannelOption.TCP_NODELAY, true)
+                }
             }
         }
 
@@ -294,12 +323,17 @@ class ProtocolServer(
         val md = MessageDigest.getInstance("SHA-256")
         var bytes: Long = 0
         var ok = false
+        val sink: IncomingSink? = try {
+            config.incomingSink?.invoke(fileId, pf.file)
+        } catch (_: Throwable) {
+            null
+        }
         try {
-            Files.newOutputStream(pf.temp).use { rawOut ->
-                val out = BufferedOutputStream(rawOut, 64 * 1024)
-                val channel = call.receiveChannel()
-                val buf = ByteArray(64 * 1024)
+            val rawOut = sink?.open ?: Files.newOutputStream(pf.temp)
+            rawOut.use { out ->
+                val buf = ByteArray(256 * 1024)
                 var lastEmit = 0L
+                val channel = call.receiveChannel()
                 while (true) {
                     val n = channel.readAvailable(buf, 0, buf.size)
                     if (n <= 0) break
@@ -320,18 +354,23 @@ class ProtocolServer(
             ok = declared.isNullOrEmpty() || digestHex.equals(declared, ignoreCase = true)
 
             if (ok) {
-                Files.createDirectories(pf.target.parent)
-                Files.move(pf.temp, pf.target, StandardCopyOption.REPLACE_EXISTING)
+                if (sink == null) {
+                    Files.createDirectories(pf.target.parent)
+                    Files.move(pf.temp, pf.target, StandardCopyOption.REPLACE_EXISTING)
+                }
             } else {
-                Files.deleteIfExists(pf.temp)
+                if (sink == null) Files.deleteIfExists(pf.temp)
             }
+            sink?.done(ok)
             call.respond(if (ok) HttpStatusCode.OK else HttpStatusCode.UnprocessableEntity)
         } catch (e: CancellationException) {
+            runCatching { sink?.done(false) }
             runCatching { Files.deleteIfExists(pf.temp) }
             pf.settled = true
             markSessionEnded(sessionId, cancelled = false)
             throw e
         } catch (e: Throwable) {
+            runCatching { sink?.done(false) }
             runCatching { Files.deleteIfExists(pf.temp) }
             pf.settled = true
             markSessionEnded(sessionId, cancelled = false)
@@ -344,7 +383,7 @@ class ProtocolServer(
                 sessionId,
                 fileId,
                 pf.file,
-                UploadResult.Saved(pf.target, bytes),
+                if (sink == null) UploadResult.Saved(pf.target, bytes) else UploadResult.Streamed(bytes),
             )
             markSessionEnded(sessionId, cancelled = false)
         } else {

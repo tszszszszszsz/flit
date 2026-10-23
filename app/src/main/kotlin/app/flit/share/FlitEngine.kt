@@ -16,6 +16,7 @@ import app.flit.share.protocol.client.OutgoingFile
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.discovery.UdpDiscovery
+import app.flit.share.protocol.server.IncomingSink
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
@@ -77,7 +78,7 @@ object FlitEngine {
 
     data class LogLine(val ts: String, val text: String)
 
-    data class ReceivedFile(val name: String, val bytes: Long, val whenMs: Long, val path: File)
+    data class ReceivedFile(val name: String, val bytes: Long, val whenMs: Long, val path: File?)
 
 /** Intake from the system share sheet: files and/or a text note. */
 /** A shared stream already copied into our cache — grant-proof and queueable. */
@@ -138,7 +139,8 @@ val share: StateFlow<ShareIntake?> = _share
         private var rxProgress: FlitProgress? = null
         private var rxBegun = false
         private var rxFiles: Map<String, Long> = emptyMap()
-        private var rxSenderFp: String = ""
+        var rxSenderFp: String = ""
+        private val rxMarks = HashMap<String, LongArray>()
 
         override fun onRegister(info: PeerInfo, ip: String) {
             FlitEngine.touchPeer(ip, info)
@@ -165,6 +167,17 @@ val share: StateFlow<ShareIntake?> = _share
 
         override fun onUploadProgress(sessionId: String, fileId: String, file: FileInfo, bytes: Long, totalBytes: Long) {
             rxProgress?.tick(file.fileName, bytes)
+            // Paced throughput marks every 16 MiB (and at EOF) so slow
+            // receive paths are visible in the log instead of guessed at.
+            val m = rxMarks.getOrPut(fileId) { longArrayOf(0, System.nanoTime()) }
+            if (bytes - m[0] >= (16L shl 20)) {
+                val now = System.nanoTime()
+                val dt = ((now - m[1]) / 1e9).coerceAtLeast(0.001)
+                val seg = (bytes - m[0]) / dt / (1024.0 * 1024.0)
+                logLine("rx ${fmtBytes(bytes)}/${fmtBytes(totalBytes)} pace %.1f MiB/s".format(seg))
+                m[0] = bytes
+                m[1] = now
+            }
         }
 
         override fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {
@@ -172,6 +185,9 @@ val share: StateFlow<ShareIntake?> = _share
                 is UploadResult.Saved -> {
                     FlitEngine.logLine("saved ${file.fileName} (" + FlitEngine.fmtBytes(result.bytes) + ")")
                     FlitEngine.publishReceived(result.path.toFile(), file, rxSenderFp)
+                }
+                is UploadResult.Streamed -> {
+                    // ledger entry + landing log already produced by the sink
                 }
                 UploadResult.Mismatch -> FlitEngine.logLine("BAD ${file.fileName}: checksum mismatch")
                 UploadResult.Error -> FlitEngine.logLine("error writing ${file.fileName}")
@@ -268,6 +284,10 @@ val share: StateFlow<ShareIntake?> = _share
                     destDir = dest.toPath(),
                     deviceModel = Build.MODEL.take(40),
                     deviceType = "mobile",
+                    // Receive straight into MediaStore (no temp+copy roundtrip);
+                    // files for pinned peers' custom folders still take the
+                    // file path so publishReceived can copyToTree them.
+                    incomingSink = { _, info -> openIncomingSink(info, FlitRoster.destTree(delegate.rxSenderFp)) },
                 ),
             )
             srv.start()
@@ -646,6 +666,71 @@ val share: StateFlow<ShareIntake?> = _share
     private val spoolSeq = java.util.concurrent.atomic.AtomicInteger(0)
 
     // ==== receive publishing ====================================================
+
+    /**
+     * Direct receive path: the POST body streams straight into a pending
+     * MediaStore row (Downloads/Flit) — no temp file, no second copy. Returns
+     * null for pinned peers with their own folder / old devices, which keeps
+     * the classic two-step flow.
+     */
+    private fun openIncomingSink(info: FileInfo, treeUri: String?): IncomingSink? {
+        if (Build.VERSION.SDK_INT < 29 || !treeUri.isNullOrBlank()) return null
+        if (debugProp("debug.flit.nosink") == "1") return null // A/B: classic double-copy path
+        val resolver = appCtx.contentResolver
+        return runCatching {
+            val values = android.content.ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, info.fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, info.fileType ?: "application/octet-stream")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Flit")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val url = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+            val out = resolver.openOutputStream(url) ?: return null
+            val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+            IncomingSink(
+                open = java.io.BufferedOutputStream(out, 256 * 1024),
+                done = { ok ->
+                    if (finished.compareAndSet(false, true)) {
+                        if (ok) {
+                            val (name, size) = runCatching { finalizeRow(url) }
+                                .getOrDefault(info.fileName to info.size)
+                            _received.update { list ->
+                                (list + ReceivedFile(name, size, System.currentTimeMillis(), null)).takeLast(20)
+                            }
+                            logLine("→ Downloads/Flit/$name")
+                        } else {
+                            runCatching { resolver.delete(url, null, null) }
+                        }
+                    }
+                },
+            )
+        }.getOrNull()
+    }
+
+    /** Un-pend a successful pending row and read back its final name/size. */
+    private fun finalizeRow(url: Uri): Pair<String, Long> {
+        val resolver = appCtx.contentResolver
+        resolver.update(
+            url,
+            android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+            null, null,
+        )
+        var name = url.lastPathSegment ?: "received"
+        var size = -1L
+        runCatching {
+            resolver.query(
+                url,
+                arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE),
+                null, null, null,
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    name = c.getString(0) ?: name
+                    size = c.getLong(1)
+                }
+            }
+        }
+        return name to size
+    }
 
     private fun publishReceived(file: File, info: FileInfo, senderFp: String) {
         _received.update { list -> (list + ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file)).takeLast(20) }
