@@ -1,5 +1,7 @@
 First release.
 
+* Dock-first redesigned UI: floating bottom dock, animated screens, live
+  transfer telemetry with speed readout and progress ring around Send
 * Device discovery over Wi-Fi (multicast + direct by address)
 * File transfers both ways, byte-identical, over mutual TLS
 * Interrupted transfers resume instead of restarting from zero

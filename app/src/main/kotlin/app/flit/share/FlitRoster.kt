@@ -3,6 +3,7 @@ package app.flit.share
 import android.content.Context
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
 /** A trusted ("pinned") peer. Pinning drives roster UI + per-peer destinations. */
@@ -92,4 +93,26 @@ object FlitRoster {
     }
 
     fun dequeue(fingerprint: String) = saveQueue(queueList().filterNot { it.fingerprint == fingerprint })
+
+    // ==== manually added addresses =============================================
+
+    private const val KEY_MANUAL = "manualPeers"
+
+    /** "host:port" strings the user added by hand — they survive restarts. */
+    fun manual(): List<String> = prefs().getString(KEY_MANUAL, null)?.let {
+        runCatching { json.decodeFromString(ListSerializer(String.serializer()), it) }
+            .getOrDefault(emptyList())
+    } ?: emptyList()
+
+    fun addManual(address: String): Boolean {
+        val cur = manual()
+        if (cur.contains(address)) return false
+        prefs().edit().putString(KEY_MANUAL, json.encodeToString(ListSerializer(String.serializer()), cur + address)).apply()
+        return true
+    }
+
+    /** Dropping a stale manual row (only from the engine after add proved futile). */
+    fun removeManual(address: String) = prefs().edit()
+        .putString(KEY_MANUAL, json.encodeToString(ListSerializer(String.serializer()), manual() - address))
+        .apply()
 }

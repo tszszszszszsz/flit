@@ -32,6 +32,11 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   `Downloads/Flit/`, in your default folder (Options), or straight into a
   per-peer folder for trusted peers — no double write either way. Received files
   open with one tap and re-share from the ledger.
+- Dock-first redesigned UI (Material You expressive cards, floating bottom dock, animated
+  screen transitions): live transfer telemetry — a "↑ Sending 48.0 MiB/s" hero strip and a
+  progress ring around the dock's Send button while bytes are in flight. Tabs double as Home
+  buttons, manual by-address peers persist across restarts, and files picked straight from
+  the dock's Send stay ready under the "Ready to send" banner.
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 

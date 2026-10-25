@@ -103,6 +103,8 @@ data class ShareIntake(
     val files: List<SpooledFile>,
     val text: String?,
     val sourceApp: String?,
+    /** Files picked in-app (dock "Send") — document URIs, valid while staged. */
+    val uris: List<String> = emptyList(),
 )
 
 private val _share = MutableStateFlow<ShareIntake?>(null)
@@ -131,6 +133,18 @@ val share: StateFlow<ShareIntake?> = _share
     private val _transferActive = MutableStateFlow(false)
     val transferActive: StateFlow<Boolean> = _transferActive
     fun setTransferActive(v: Boolean) { _transferActive.value = v }
+
+    /** Live transfer readout for the dock badge and home hero (null = idle). */
+    data class TransferTelemetry(
+        val isSend: Boolean,
+        val doneBytes: Long,
+        val totalBytes: Long,
+        val speedBytesPerSec: Long,
+    )
+
+    private val _transfer = MutableStateFlow<TransferTelemetry?>(null)
+    val transfer: StateFlow<TransferTelemetry?> = _transfer
+    internal fun pushTelemetry(t: TransferTelemetry?) { _transfer.value = t }
 
     /** The last successfully-served peer (fingerprint, alias) for "send again". */
     fun lastPeer(): Pair<String, String>? {
@@ -310,6 +324,7 @@ val share: StateFlow<ShareIntake?> = _share
         appCtx = ctx.applicationContext
         FlitRoster.init(appCtx)
         _queue.value = FlitRoster.queued() // pick up send-later entries from a previous run
+        addManualStubs() // previously added by-address devices stay listed
         // Test-only dead-link emulation (see PeerHttpClient.testAbortBytes).
         debugProp("debug.flit.abortbytes")?.trim()?.toLongOrNull()?.takeIf { it > 0 }
             ?.let { app.flit.share.protocol.client.PeerHttpClient.testAbortBytes = it }
@@ -446,7 +461,9 @@ val share: StateFlow<ShareIntake?> = _share
                 delay(5_000)
                 if (seq != startSeq) return@launch
                 val cutoff = System.currentTimeMillis() - PEER_TTL_MS
-                _peers.update { m -> m.filterValues { it.lastSeenMs >= cutoff } }
+                _peers.update { m ->
+                    m.filterValues { it.lastSeenMs >= cutoff || it.info.fingerprint.startsWith("manual@") }
+                }
             }
         }
     }
@@ -528,6 +545,23 @@ val share: StateFlow<ShareIntake?> = _share
         }
         val port = raw.substringAfterLast(':').toIntOrNull()?.takeIf { it in 1..65535 }
             ?: Protocol.DEFAULT_PORT
+        // Manual rows persist across restarts (roster) and never age out.
+        FlitRoster.addManual("$host:$port")
+        insertManualStub(host, port)
+        logLine("probe $host:$port\u2026")
+        val self = server?.selfInfo() ?: return
+        scope.launch(Dispatchers.IO) {
+            val real = try {
+                cli.register(SendTarget(host, port, true), self, timeoutMs = 4_000)
+            } catch (e: Exception) {
+                logLine("probe $host:$port unreachable (${e.message ?: e.javaClass.simpleName})")
+                null
+            }
+            if (real != null) touchPeer(host, real)
+        }
+    }
+
+    private fun insertManualStub(host: String, port: Int) {
         val stubFp = "manual@$host:$port"
         _peers.update { m ->
             m + (stubFp to PeerEntry(
@@ -539,16 +573,16 @@ val share: StateFlow<ShareIntake?> = _share
                 lastSeenMs = System.currentTimeMillis(),
             ))
         }
-        logLine("probe $host:$port\u2026")
-        val self = server?.selfInfo() ?: return
-        scope.launch(Dispatchers.IO) {
-            val real = try {
-                cli.register(SendTarget(host, port, true), self, timeoutMs = 4_000)
-            } catch (e: Exception) {
-                logLine("probe $host:$port unreachable (${e.message ?: e.javaClass.simpleName})")
-                null
+    }
+
+    /** Engine start: silently re-add the addresses the user added by hand. */
+    private fun addManualStubs() {
+        for (addr in FlitRoster.manual()) {
+            val host = addr.substringBeforeLast(':')
+            val port = addr.substringAfterLast(':').toIntOrNull() ?: Protocol.DEFAULT_PORT
+            if (host.isNotBlank() && _peers.value.keys.none { it == "manual@$host:$port" }) {
+                insertManualStub(host, port)
             }
-            if (real != null) touchPeer(host, real)
         }
     }
 
@@ -564,13 +598,30 @@ val share: StateFlow<ShareIntake?> = _share
             logLine("still preparing the share…")
             return
         }
-        dispatchTo(peer, SourceList(intake.files, emptyList()), intake.text, fromQueue = false)
+        val picked = intake.uris.mapNotNull { runCatching { Uri.parse(it) }.getOrNull() }
+        dispatchTo(peer, SourceList(intake.files, picked), intake.text, fromQueue = false)
     }
 
     /** In-app note composer: stages a text note exactly like the share sheet does. */
     fun stageNote(text: String) {
         if (text.isBlank()) return
         _share.value = ShareIntake(ready = true, files = emptyList(), text = text, sourceApp = null)
+    }
+
+    /**
+     * Dock "Send": files picked in-app first, a device is tapped afterwards.
+     * Document URIs stage without copying (they outlive the picker call); a
+     * note staged earlier rides along.
+     */
+    fun stagePicked(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        _share.value = ShareIntake(
+            ready = true,
+            files = emptyList(),
+            text = _share.value?.text,
+            sourceApp = null,
+            uris = uris.map { it.toString() },
+        )
     }
 
     /** One of the two lists is non-empty; spools are already local files. */

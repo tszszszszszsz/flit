@@ -91,6 +91,9 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.activity.compose)
+    // Recent material3 no longer pulls icons transitively; the core set covers
+    // the dock (Send/Email/Add/List/Settings), share and refresh glyphs.
+    implementation(libs.androidx.compose.icons)
 
     implementation(project(":protocol"))
 }

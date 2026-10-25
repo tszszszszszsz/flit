@@ -22,7 +22,16 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
     private var speedBytesPerSec = 0.0
     private var title = ""
 
+    /** Counts FlitProgress instances across ALL sessions; zero ⇒ telemetry idle. */
+    private companion object {
+        val activeSessions = java.util.concurrent.atomic.AtomicInteger(0)
+    }
+
+    private var kind: Kind? = null
+
     fun begin(kind: Kind, files: Map<String, Long>) {
+        this.kind = kind
+        activeSessions.incrementAndGet()
         ledger.clear()
         files.forEach { (n, _) -> ledger[n] = 0L }
         sessionTotal = max(0L, files.values.sum())
@@ -67,11 +76,24 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
     private fun paint(timeBudgetMs: Long = 0) {
         val now = System.currentTimeMillis()
         val sp = speed()
+        val doneNow = doneBytes()
+        // In-app readout (hero card / dock ring) refreshes every call, faster
+        // than the notification budget — it's just a StateFlow assignment.
+        kind?.let { k ->
+            FlitEngine.pushTelemetry(
+                FlitEngine.TransferTelemetry(
+                    isSend = k == Kind.SEND,
+                    doneBytes = doneNow,
+                    totalBytes = sessionTotal,
+                    speedBytesPerSec = sp,
+                ),
+            )
+        }
         if (timeBudgetMs > 0 && now - lastPaintMs < timeBudgetMs) return
         lastPaintMs = now
-        lastPaintBytes = doneBytes()
+        lastPaintBytes = doneNow
 
-        val done = doneBytes()
+        val done = doneNow
         // 10,000-step scale: immune to setProgress Int overflow, plenty smooth.
         val scaled = if (sessionTotal > 0) (done.coerceAtMost(sessionTotal) * 10_000 / sessionTotal).toInt() else 0
         val progressText = if (sessionTotal > 0) {
@@ -97,6 +119,8 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
 
     /** Final, sticky-until-swiped summary notification replacing the progress bar. */
     fun finish(summary: String, ok: Boolean, iconDone: Boolean) {
+        kind = null
+        if (activeSessions.decrementAndGet() <= 0) FlitEngine.pushTelemetry(null)
         FlitEngine.setTransferActive(false)
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(
