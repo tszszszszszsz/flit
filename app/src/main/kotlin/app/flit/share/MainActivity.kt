@@ -475,6 +475,13 @@ class MainActivity : ComponentActivity() {
                         keepOn = on
                         prefs().edit().putBoolean("keepScreenOn", on).apply()
                     }
+                    SwitchOption(
+                        title = "Crush files when sending",
+                        subtitle = "text, notes, logs, JSON and code are gzip'd on the way — Flit receivers unpack them automatically",
+                        initial = prefs().getBoolean("crushSend", false),
+                    ) { on ->
+                        prefs().edit().putBoolean("crushSend", on).apply()
+                    }
                     OptionRow(
                         title = "Background battery\u2026",
                         subtitle = "let background sharing run without the system rationing it",

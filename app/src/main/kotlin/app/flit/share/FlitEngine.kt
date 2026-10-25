@@ -590,11 +590,16 @@ val share: StateFlow<ShareIntake?> = _share
         scope.launch(Dispatchers.IO) {
             var outgoing: List<OutgoingFile> = emptyList()
             var prog = FlitProgress(appCtx, peer.info.fingerprint.hashCode() and 0x7fffffff)
+            val crushedTmp = ArrayList<File>()
             try {
                 outgoing = buildList {
                     if (text != null && text.isNotBlank()) add(TextNoteOutgoing(text))
                     addAll(src.spools.map { FileOutgoing(it) })
                     addAll(src.uris.mapNotNull { uri -> outgoingFrom(appCtx, uri) })
+                }
+                // Crush & send: optional gzip on the wire for compressible files.
+                if (prefs().getBoolean("crushSend", false)) {
+                    outgoing = crushOutgoing(appCtx, outgoing, crushedTmp)
                 }
                 if (outgoing.isEmpty()) {
                     logLine("nothing openable selected")
@@ -655,6 +660,8 @@ val share: StateFlow<ShareIntake?> = _share
                     prog.finish("send failed — $reason", ok = false, iconDone = false)
                 }
                 _share.value = null
+            } finally {
+                crushedTmp.forEach { runCatching { it.delete() } }
             }
         }
     }
@@ -790,6 +797,10 @@ val share: StateFlow<ShareIntake?> = _share
      * which keeps the classic two-step flow as the fallback.
      */
     private fun openIncomingSink(info: FileInfo, treeUri: String?): IncomingSink? {
+        // Crushed (gzip) wires need the assembled whole before the one-shot
+        // decode, so they take the server's part-file route; publishReceived
+        // unpacks them into the original name/bytes afterwards.
+        if (FlitCrush.isCrushed(info.fileName)) return null
         if (Build.VERSION.SDK_INT < 29) return null
         if (debugProp("debug.flit.nosink") == "1") return null // A/B: classic double-copy path
         val resolver = appCtx.contentResolver
@@ -885,7 +896,20 @@ val share: StateFlow<ShareIntake?> = _share
         return name to size
     }
 
-    private fun publishReceived(file: File, info: FileInfo, senderFp: String) {
+    private fun publishReceived(file0: File, info: FileInfo, senderFp: String) {
+        var file = file0
+        if (FlitCrush.isCrushed(file.name)) {
+            val plain = File(file.parent, FlitCrush.plainName(file.name))
+            runCatching { FlitCrush.unpack(file, plain) }
+                .onSuccess {
+                    runCatching { file.delete() }
+                    file = plain
+                    logLine("unpacked \u2192 ${plain.name}")
+                }
+                .onFailure {
+                    logLine("could not unpack ${file.name} — keeping the gzip (${it.message ?: it.javaClass.simpleName})")
+                }
+        }
         _received.update { list -> (list + ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file)).takeLast(20) }
         // A per-peer folder, else the global default, else the Downloads/Flit bucket.
         val tree = receiveTreeFor(senderFp)
@@ -1070,6 +1094,41 @@ val share: StateFlow<ShareIntake?> = _share
         android.util.Log.v("FlitShare", "outgoingFrom uri=$uri name=$name qsize=$size eff=$effSize mime=$mime")
         if (effSize < 0) return null
         return UriOutgoing(resolver, uri, name, effSize, mime)
+    }
+
+    /**
+     * Crush & send pass: compressible entries are spooled as gzip
+     * "name.txt.gflit"; the wire's sha/size/progress all derive from the
+     * spooled file, so protocol-level checks and resume are unaffected.
+     * Non-crushable entries pass through unchanged; text notes are tiny.
+     */
+    private fun crushOutgoing(
+        appCtx: Context,
+        files: List<OutgoingFile>,
+        sink: MutableList<File>,
+    ): List<OutgoingFile> = files.map { of ->
+        when {
+            of is TextNoteOutgoing -> of
+            !FlitCrush.crushable(of.wireName, of.mime, of.size) -> of
+            else -> runCatching {
+                val dir = File(appCtx.cacheDir, "crush").apply { mkdirs() }
+                val tmp = File.createTempFile("crush-", FlitCrush.SUFFIX, dir)
+                of.openStream().use { ins -> FlitCrush.crushTo(ins, tmp) }
+                sink.add(tmp)
+                CrushedOutgoing(tmp, of.wireName, of.mime)
+            }.getOrDefault(of)
+        }
+    }
+
+    private class CrushedOutgoing(
+        private val spool: File,
+        private val plain: String,
+        private val originalMime: String,
+    ) : OutgoingFile {
+        override val wireName = plain + FlitCrush.SUFFIX
+        override val size = spool.length()
+        override val mime = originalMime
+        override fun openStream() = spool.inputStream()
     }
 
     fun fmtBytes(v: Long): String = when {

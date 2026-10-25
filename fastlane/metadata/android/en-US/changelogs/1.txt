@@ -3,6 +3,8 @@ First release.
 * Device discovery over Wi-Fi (multicast + direct by address)
 * File transfers both ways, byte-identical, over mutual TLS
 * Interrupted transfers resume instead of restarting from zero
+* Crush & send (optional): text-like files are gzip'd on the wire, unpacked
+  automatically by Flit receivers — other clients still get a valid gzip
 * Received files stream straight into Downloads/Flit, your default folder, or
   a per-device folder for trusted devices — no double copies
 * Text notes share the same secure wire as files (share sheet or in-app)
