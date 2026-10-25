@@ -5,6 +5,7 @@ import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.model.WireJson
+import app.flit.share.protocol.server.ProtocolServer
 import app.flit.share.protocol.tls.TlsIdentity
 import java.io.File
 import kotlin.io.path.createTempDirectory
@@ -104,6 +105,36 @@ class DtoParityTest {
         assertEquals("2021-01-01T12:34:56Z", req.files["some file id"]?.metadata?.modified)
         val again = WireJson.encode(req)
         assertTrue(again.contains("\"fileName\":\"my image.png\""), again)
+    }
+
+    @Test
+    fun `prepare upload response stays v2_2-shaped without multi socket`() {
+        val json = app.flit.share.protocol.model.PrepareUploadResponse(sessionId = "s", files = mapOf("f1" to "t"))
+        val encoded = WireJson.encode(json)
+        assertFalse(encoded.contains("multipart"), "v2.2 answers must never grow extra fields: $encoded")
+        assertTrue(encoded.contains("\"sessionId\":\"s\""), encoded)
+        assertTrue(encoded.contains("\"files\":{\"f1\":\"t\"}"), encoded)
+    }
+
+    @Test
+    fun `multi socket response carries the chunk hint and decodes back`() {
+        val json = app.flit.share.protocol.model.PrepareUploadResponse(
+            sessionId = "s", files = mapOf("f1" to "t"), multipart = ProtocolServer.TURBO_CHUNK_BYTES,
+        )
+        val encoded = WireJson.encode(json)
+        assertTrue(encoded.contains("\"multipart\":${ProtocolServer.TURBO_CHUNK_BYTES}"), encoded)
+        val back = WireJson.decode<app.flit.share.protocol.model.PrepareUploadResponse>(encoded)
+        assertEquals(ProtocolServer.TURBO_CHUNK_BYTES, back.multipart)
+    }
+
+    @Test
+    fun `v2_2 receivers tolerate a response that carries the hint`() {
+        // Flit receive + plain v2.2 senders: they parse OUR response DTOs leniently,
+        // and we must equally survive a peer that answers with the hint.
+        val json = """{"sessionId":"x","files":{"a":"b"},"multipart":8388608}"""
+        val back = WireJson.decode<app.flit.share.protocol.model.PrepareUploadResponse>(json)
+        assertEquals(8388608L, back.multipart)
+        assertEquals("x", back.sessionId)
     }
 }
 

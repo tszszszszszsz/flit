@@ -83,6 +83,7 @@ class ProtocolClient(
         files: Collection<OutgoingFile>,
         pin: String? = null,
         parallelism: Int = 4,
+        multi: Boolean = false,
         progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)? = null,
     ): SendReport {
         check(files.isNotEmpty()) { "no files given" }
@@ -110,6 +111,7 @@ class ProtocolClient(
             preparePath,
             WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap)),
             timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
+            extraHeaders = if (multi) mapOf(MULTI_HEADER to "1") else emptyMap(),
         )
         if (prepare.status == 204) {
             return SendReport(emptyList(), emptyList(), null)
@@ -118,6 +120,10 @@ class ProtocolClient(
             throw TransferException(prepare.status, prepare.text())
         }
         val prepared = json<PrepareUploadResponse>(prepare)
+        // The receiver arms multi-socket sending when (and only when) we sent
+        // the header; the `multipart` hint is its go signal. Absence (a v2.2
+        // peer never has the field) falls back to classic single-stream.
+        val chunkBytes = prepared.multipart ?: 0L
 
         // Single-file snapshot for mid-transfer re-prepare (resume path).
         val prepareMap1 = LinkedHashMap<String, FileInfo>(prepareHashMap)
@@ -129,7 +135,24 @@ class ProtocolClient(
                         val info = infos[fileId] ?: return@withPermit fileId to "unmatched file id"
                         val source = outgoingById[fileId] ?: return@withPermit fileId to "unmatched file id"
                         try {
-                            uploadAttempts(target, prepared.sessionId, fileId, token, info, source, progress) {
+                            // Turbo lane: split large files across concurrent
+                            // sockets when the receiver signed up for it.
+                            var carried = 0L
+                            if (multi && chunkBytes > 0 && info.size >= TURBO_MIN_BYTES) {
+                                val turboErr = turboUpload(
+                                    target, prepared.sessionId, fileId, token, info, source, progress,
+                                )
+                                if (turboErr == null) return@withPermit fileId to null
+                                // Turbo was cut short: whatever covered bytes
+                                // from zero are salvageable — the receiver's
+                                // /partial answers with that base, and the
+                                // single-stream resume extends it.
+                                carried = runCatching {
+                                    queryPartial(target, Protocol.resumeToken(info))
+                                }.getOrNull() ?: 0L
+                                if (carried !in 1 until source.size) carried = 0
+                            }
+                            uploadAttempts(target, prepared.sessionId, fileId, token, info, source, initialCarried = carried, progress = progress) {
                                 // A fresh session for just this file, so a
                                 // resumed part can be re-claimed after the
                                 // receiver reaped the dead one.
@@ -172,6 +195,7 @@ class ProtocolClient(
         info: FileInfo,
         source: OutgoingFile,
         progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)?,
+        initialCarried: Long = 0,
         reprepare: (suspend () -> Pair<String, String>?)? = null,
     ): Pair<String, String?> {
         check(info.id == fileId)
@@ -180,7 +204,7 @@ class ProtocolClient(
         var sessionId = sessionId0
         var token = token0
         var attempt = 0
-        var carried = 0L // bytes receiver-confirmed to exist; keeps progress monotonic
+        var carried = initialCarried.coerceIn(0, total) // receiver-confirmed bytes; keeps progress monotonic
         while (attempt < 3) { // mirrors upstream MAX_UPLOAD_ATTEMPTS
             attempt++
             // A Flit receiver may still hold an interrupted prefix of this
@@ -273,6 +297,114 @@ class ProtocolClient(
         }
     }
 
+    /**
+     * Multi-socket (Flit↔Flit) upload: split the file into contiguous ranges
+     * and push each on its own connection to the normal upload route with
+     * `Content-Range`. Ranges are disjoint, so the receiver pieces them into
+     * its temp with no coordination on our side. One failed stream cancels
+     * the others and surfaces the failure; the caller falls back to a plain
+     * single-stream resume of the receiver's salvage base.
+     *
+     * @return null when every stream confirmed its range; an error message
+     *   otherwise (sender then continues on the single-stream path).
+     */
+    private suspend fun turboUpload(
+        target: SendTarget,
+        sessionId: String,
+        fileId: String,
+        token: String,
+        info: FileInfo,
+        source: OutgoingFile,
+        progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)?,
+    ): String? {
+        val total = source.size
+        val streamCount = minOf(
+            TURBO_MAX_STREAMS,
+            maxOf(1, ((total + SPLIT_TARGET_BYTES - 1) / SPLIT_TARGET_BYTES).toInt()),
+        )
+        if (streamCount < 2) return "multi-stream: file not worth splitting"
+        val uploadPath =
+            "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}"
+        return try {
+            coroutineScope {
+                (0 until streamCount).map { i ->
+                    val start = total * i / streamCount
+                    val endExcl = total * (i + 1) / streamCount
+                    val len = endExcl - start
+                    val last = endExcl - 1
+                    async {
+                        var attempt = 0
+                        while (attempt < 2) { // transport hiccup: one clean range retry
+                            attempt++
+                            val resp = try {
+                                http.exchange(
+                                    method = "POST", host = target.ip, port = target.port, tls = target.tls,
+                                    pathAndQuery = uploadPath,
+                                    headers = buildMap {
+                                        put("Content-Type", "application/octet-stream")
+                                        // The receiver's coverage ledger reads exactly this.
+                                        put("Content-Range", "bytes $start-$last/$total")
+                                    },
+                                    bodyProvider = {
+                                        val st = source.openStream()
+                                        st.skipFlit(start) // cheap: buffered reads, no memory copy
+                                        RangeStream(st, len)
+                                    },
+                                    contentLength = len,
+                                    bodyProgress = progress?.let { cb ->
+                                        var lastReport = 0L
+                                        { sent: Long ->
+                                            if (sent - lastReport >= PROGRESS_STEP) {
+                                                lastReport = sent
+                                                cb(info.fileName, start + sent, total)
+                                            }
+                                        }
+                                    },
+                                    timeoutMs = UPLOAD_TIMEOUT_MS,
+                                )
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                if (attempt >= 2) throw e
+                                continue // reopen + re-skip, resend the whole range
+                            }
+                            if (resp.status == 200) return@async
+                            throw IllegalStateException("range $start-$last answered ${resp.status}")
+                        }
+                        throw EOFException("range $start-$last never settled")
+                    }
+                }.awaitAll()
+            }
+            progress?.invoke(info.fileName, total, total) // all ranges confirmed
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            "multi-stream: ${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    /**
+     * A fresh range view over one already-positioned source stream: serves
+     * exactly [remaining] bytes. One per exchange — sources are never shared
+     * between concurrent streams.
+     */
+    private class RangeStream(private val src: InputStream, private var remaining: Long) : InputStream() {
+        override fun read(): Int {
+            val b = ByteArray(1)
+            return if (read(b, 0, 1) < 0) -1 else b[0].toInt() and 0xff
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (remaining <= 0) return -1
+            val n = src.read(b, off, minOf(len.toLong(), remaining).toInt())
+            if (n > 0) remaining -= n
+            return n
+        }
+
+        override fun close() = src.close()
+    }
+
     private suspend fun queryPartial(target: SendTarget, contentToken: String): Long? {
         return runCatching {
             val resp = http.exchange(
@@ -284,15 +416,23 @@ class ProtocolClient(
         }.getOrNull()
     }
 
-    private suspend fun postJson(target: SendTarget, pathAndQuery: String, jsonBody: String, timeoutMs: Long) =
-        http.exchange(
-            method = "POST", host = target.ip, port = target.port, tls = target.tls,
-            pathAndQuery = pathAndQuery,
-            headers = mapOf("Content-Type" to "application/json"),
-            bodyProvider = { jsonBody.byteInputStream(Charsets.UTF_8) },
-            contentLength = jsonBody.toByteArray(Charsets.UTF_8).size.toLong(),
-            timeoutMs = timeoutMs,
-        )
+    private suspend fun postJson(
+        target: SendTarget,
+        pathAndQuery: String,
+        jsonBody: String,
+        timeoutMs: Long,
+        extraHeaders: Map<String, String> = emptyMap(),
+    ) = http.exchange(
+        method = "POST", host = target.ip, port = target.port, tls = target.tls,
+        pathAndQuery = pathAndQuery,
+        headers = buildMap {
+            put("Content-Type", "application/json")
+            putAll(extraHeaders)
+        },
+        bodyProvider = { jsonBody.byteInputStream(Charsets.UTF_8) },
+        contentLength = jsonBody.toByteArray(Charsets.UTF_8).size.toLong(),
+        timeoutMs = timeoutMs,
+    )
 
     private inline fun <reified T> json(resp: PeerHttpClient.Response): T {
         val text = resp.text().trim()
@@ -308,6 +448,19 @@ class ProtocolClient(
         /** Receivers may hold prepare until a human accepts the offer. */
         private const val ACCEPT_TIMEOUT_MS = 30_000L
         private const val UPLOAD_TIMEOUT_MS = 120_000L
+
+        /** Files at least this big get the concurrent-socket treatment. */
+        private val TURBO_MIN_BYTES = 16L shl 20 // 16 MiB
+        private val TURBO_MAX_STREAMS = 4
+
+        /** Rough split target per stream when deciding on a stream count. */
+        private val SPLIT_TARGET_BYTES = 16L shl 20
+
+        /** Coarse per-stream progress callbacks so 4 streams don't spam 40 Hz. */
+        private const val PROGRESS_STEP = 512L * 1024L
+
+        /** Marks a prepare-upload as multi-socket capable (Flit↔Flit only). */
+        internal const val MULTI_HEADER = "X-Flit-Multi"
 
         /** Hex SHA-256 of a freshly opened stream; used as the upload checksum. */
         fun sha256Hex(open: () -> InputStream): String {

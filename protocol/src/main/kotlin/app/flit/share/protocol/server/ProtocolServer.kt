@@ -170,6 +170,16 @@ internal class PendingFile(
     val temp: Path = target.resolveSibling("." + target.fileName.toString() + ".part")
     var attempts: Int = 0
     var settled: Boolean = false
+
+    /** Piece ledger for multi-socket uploads; null until the first chunk claim. */
+    @Volatile
+    var tracker: ChunkTracker? = null
+
+    /** Guards finalization (assembled hash + move) against racing chunk streams. */
+    val finalizeLock = Mutex()
+
+    /** Back-reference for keep-alive touching while long chunk bodies flow. */
+    var sessionRef: ActiveSession? = null
 }
 
 internal class ActiveSession(
@@ -177,6 +187,13 @@ internal class ActiveSession(
     val senderIp: String,
     val files: MutableMap<String, PendingFile> = LinkedHashMap(),
 ) {
+    /**
+     * The sender asked for multi-socket sending (X-Flit-Multi), so this
+     * session accepts Content-Range chunk claims. v2.2 sessions never set
+     * it; their wiring is untouched.
+     */
+    var turbo: Boolean = false
+
     var lastTouch: Long = System.currentTimeMillis()
 
     /** Dead senders must not block a reconnecting one's new prepare. */
@@ -283,6 +300,7 @@ class ProtocolServer(
         }
 
         sweepOldParts(config.destDir)
+        sweepPieceSidecars(config.destDir)
         val e = embeddedServer(Netty, applicationEnvironment { }, configBlock, module).let { it.start(wait = false) }
         server = e
         runBlocking {
@@ -340,6 +358,7 @@ class ProtocolServer(
 
         val sessionId = UUID.randomUUID().toString()
         val candidate = ActiveSession(sessionId, peerIp)
+        candidate.turbo = call.request.headers["X-Flit-Multi"]?.isNotBlank() == true
 
         val sessionId0 = session?.id // for the stale check below
         var badNames = false
@@ -363,12 +382,22 @@ class ProtocolServer(
                 val target = uniqueTarget(dir, Path.of(rel).fileName.toString())
                 candidate.files[id] = PendingFile(f, UUID.randomUUID().toString(), target)
             }
-            if (candidate.files.isEmpty()) badNames = true else session = candidate
+            if (candidate.files.isEmpty()) badNames = true else {
+                candidate.files.values.forEach { it.sessionRef = candidate }
+                session = candidate
+            }
         }
         if (badNames) call.respond(HttpStatusCode.NoContent)
 
         val tokens = candidate.files.entries.associate { it.key to it.value.token }
-        call.respondText(WireJson.encode(PrepareUploadResponse(sessionId, tokens)), ContentType.Application.Json)
+        // The chunk hint travels only when this session is a Flit↔Flit
+        // multi-socket one; plain v2.2 responses are byte-for-byte unchanged.
+        val resp = PrepareUploadResponse(
+            sessionId,
+            tokens,
+            multipart = if (candidate.turbo) TURBO_CHUNK_BYTES else null,
+        )
+        call.respondText(WireJson.encode(resp), ContentType.Application.Json)
     }
 
     private suspend fun uploadRoute(call: ApplicationCall) {
@@ -380,26 +409,57 @@ class ProtocolServer(
             call.respondText("Missing parameters", ContentType.Text.Plain, HttpStatusCode.BadRequest)
             return
         }
+        val range = call.request.headers["Content-Range"]?.trim()?.takeIf { it.isNotBlank() }
 
+        // Second element: first claim after a new piece ledger → the delegate
+        // learns about the upload exactly once, no matter how many streams run.
         val claim = mutex.withLock {
             val s = session
-            val f = s?.files?.get(fileId)
-            if (s != null && s.id == sessionId && s.senderIp == peerIp && f != null &&
-                f.token == token && !f.settled && f.attempts < MAX_ATTEMPTS
-            ) {
-                f.attempts++
-                s.lastTouch = System.currentTimeMillis()
-                f
-            } else {
-                null
+            val f = if (s != null && s.id == sessionId && s.senderIp == peerIp) s.files[fileId] else null
+            when {
+                f == null || f.token != token || f.settled -> null
+                range != null -> {
+                    // Multi-socket claims bypass the plain attempts cap: a
+                    // healthy 4-stream upload must never be miscounted as
+                    // three failed single-stream tries.
+                    if (!s!!.turbo) null
+                    else {
+                        s.lastTouch = System.currentTimeMillis()
+                        val fresh = f.tracker == null
+                        if (fresh) f.tracker = ChunkTracker(f.file.size)
+                        f to fresh
+                    }
+                }
+                else -> {
+                    if (f.attempts < MAX_ATTEMPTS) {
+                        f.attempts++
+                        s!!.lastTouch = System.currentTimeMillis()
+                        // A plain body now owns the whole file: multi-socket
+                        // piece state is obsolete. Trim the temp to the
+                        // confirmed contiguous prefix (from the live ledger or
+                        // a persisted sidecar from an earlier session) so a
+                        // resume appends behind real data, not behind a sparse
+                        // gap — the gap would be zero-filled garbage forever.
+                        f.tracker?.let { t ->
+                            truncateTo(f.temp, t.base())
+                            f.tracker = null
+                            deletePiecesSidecar(f.temp)
+                        } ?: clearPiecesSidecar(f.temp)
+                        f to false
+                    } else null
+                }
             }
         }
         if (claim == null) {
             call.respondText("Invalid token or IP address", ContentType.Text.Plain, HttpStatusCode.Forbidden)
             return
         }
+        val (pf, freshChunks) = claim
+        if (range != null) {
+            uploadChunkRoute(call, sessionId, fileId, pf, range, peerIp, freshChunks)
+            return
+        }
 
-        val pf = claim
         delegate.onUploadStart(sessionId, fileId, pf.file)
         val md = MessageDigest.getInstance("SHA-256")
         var bytes: Long = 0
@@ -467,6 +527,7 @@ class ProtocolServer(
                     val now = System.nanoTime()
                     if (now - lastEmit > 100_000_000L) { // ~= 10 Hz cap
                         lastEmit = now
+                        pf.sessionRef?.lastTouch = System.currentTimeMillis()
                         delegate.onUploadProgress(sessionId, fileId, pf.file, bytes, pf.file.size)
                     }
                 }
@@ -550,16 +611,235 @@ class ProtocolServer(
         }
     }
 
+    // ---- multi-socket (Flit↔Flit) chunk upload ---------------------------------------------
+
+    /**
+     * One piece of a multi-socket upload. The sender opens up to
+     * [MAX_TURBO_STREAMS] concurrent POSTs against the normal upload route,
+     * each carrying its exact byte range in `Content-Range: bytes s-e/total`.
+     * Chunks land at their offsets; [PendingFile.tracker] keeps coverage.
+     * The request that completes coverage assembles and hashes the whole
+     * temp — the same digest gate, byte-for-byte, that judges plain uploads.
+     */
+    private suspend fun uploadChunkRoute(
+        call: ApplicationCall,
+        sessionId: String,
+        fileId: String,
+        pf: PendingFile,
+        rangeStr: String,
+        peerIp: String,
+        fresh: Boolean,
+    ) {
+        val info = pf.file
+        val total = info.size
+        val r = parseContentRange(rangeStr)
+        if (r == null || r.third != total || r.first >= total || r.second < r.first || r.second >= total) {
+            call.respondText("Bad Content-Range", ContentType.Text.Plain, HttpStatusCode.BadRequest)
+            return
+        }
+        if (fresh) delegate.onUploadStart(sessionId, fileId, info)
+
+        val start = r.first
+        val len = r.second - start + 1
+        val tracker = pf.tracker!!
+        var sentInChunk = 0L
+        try {
+            java.io.RandomAccessFile(pf.temp.toFile(), "rw").use { raf ->
+                val buf = ByteArray(256 * 1024)
+                var lastEmit = 0L
+                val channel = call.receiveChannel()
+                while (true) {
+                    val n = channel.readAvailable(buf, 0, buf.size)
+                    if (n <= 0) break
+                    raf.seek(start + sentInChunk)
+                    raf.write(buf, 0, n)
+                    sentInChunk += n
+                    val now = System.nanoTime()
+                    if (now - lastEmit > 100_000_000L) { // ~= 10 Hz cap
+                        lastEmit = now
+                        pf.sessionRef?.lastTouch = System.currentTimeMillis()
+                        delegate.onUploadProgress(sessionId, fileId, info, minOf(total, tracker.bytesWritten + sentInChunk), total)
+                    }
+                }
+            }
+            // The body is fully in — the chunk's bytes are confirmable.
+            tracker.add(start, len)
+            delegate.onUploadProgress(sessionId, fileId, info, minOf(total, tracker.bytesWritten), total)
+            if (tracker.complete()) {
+                finalizeChunk(call, sessionId, fileId, pf, tracker)
+            } else {
+                call.respond(HttpStatusCode.OK)
+            }
+        } catch (e: CancellationException) {
+            // Sender went away mid-chunk. The bytes so far sit at a known
+            // offset: mark them covered so the salvage base is as long as
+            // the data actually on disk. Peer recovery re-reads it via
+            // /partial and re-sends the rest single-stream.
+            runCatching { if (sentInChunk in 1 until len) tracker.add(start, sentInChunk) }
+            runCatching { keepChunkPart(pf, tracker, peerIp) }
+            pf.sessionRef?.lastTouch = System.currentTimeMillis()
+            markSessionEnded(sessionId, cancelled = false)
+            throw e
+        } catch (e: Throwable) {
+            runCatching { if (sentInChunk in 1 until len) tracker.add(start, sentInChunk) }
+            runCatching { keepChunkPart(pf, tracker, peerIp) }
+            pf.sessionRef?.lastTouch = System.currentTimeMillis()
+            markSessionEnded(sessionId, cancelled = false)
+            call.respondText("Unknown error", ContentType.Text.Plain, HttpStatusCode.InternalServerError)
+        }
+    }
+
+    /**
+     * Coverage complete: hash the assembled temp once, gate on the declared
+     * sha256, promote to the final name exactly like a plain upload would.
+     * Only one racing claim gets this far with [pf.finalizeLock]; the second
+     * sees `settled` and answers its chunk calmly.
+     */
+    private suspend fun finalizeChunk(
+        call: ApplicationCall,
+        sessionId: String,
+        fileId: String,
+        pf: PendingFile,
+        tracker: ChunkTracker,
+    ) {
+        pf.finalizeLock.withLock {
+            if (pf.settled) {
+                call.respond(HttpStatusCode.OK)
+                return
+            }
+            val bytes = runCatching { Files.size(pf.temp) }.getOrDefault(0L)
+            val digestHex = runCatching {
+                val md = MessageDigest.getInstance("SHA-256")
+                Files.newInputStream(pf.temp).use { ins ->
+                    val buf = ByteArray(256 * 1024)
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        md.update(buf, 0, n)
+                    }
+                    md.digest().joinToString("") { "%02x".format(it) }
+                }
+            }.getOrNull()
+            val declared = pf.file.sha256?.trim()
+            val ok = digestHex != null && (declared.isNullOrEmpty() || digestHex.equals(declared, ignoreCase = true))
+
+            if (ok) {
+                Files.createDirectories(pf.target.parent)
+                Files.move(pf.temp, pf.target, StandardCopyOption.REPLACE_EXISTING)
+                parts.remove(Protocol.resumeToken(pf.file))
+                runCatching { deletePiecesSidecar(pf.temp) }
+                tracker.clear()
+                pf.tracker = null
+                call.respond(HttpStatusCode.OK)
+                delegate.onUploadFinish(sessionId, fileId, pf.file, UploadResult.Saved(pf.target, bytes))
+                markSessionEnded(sessionId, cancelled = false)
+            } else {
+                // Assembled-but-wrong: the bytes are not salvageable as a
+                // prefix-suffix story. Count it as an attempt and let the
+                // sender's single-stream path redo the file from whatever it
+                // redefines (a fresh plain body truncates everything).
+                pf.attempts++
+                if (pf.attempts >= MAX_ATTEMPTS) pf.settled = true
+                runCatching { deletePiecesSidecar(pf.temp) }
+                call.respond(HttpStatusCode.UnprocessableEntity)
+                delegate.onUploadFinish(sessionId, fileId, pf.file, UploadResult.Mismatch)
+                markSessionEnded(sessionId, cancelled = false)
+            }
+        }
+    }
+
+    /**
+     * Persist what a half-finished multi-socket exchange still holds: the
+     * sparse temp stays, the contiguous salvage base is mirrored into the
+     * `.pieces` sidecar (survives session evictions), and the registry
+     * exposes the part to the sender's /partial probe.
+     */
+    private fun keepChunkPart(pf: PendingFile, tracker: ChunkTracker, peerIp: String) {
+        runCatching {
+            val base = tracker.base()
+            val token = Protocol.resumeToken(pf.file)
+            if (base <= 0 || runCatching { Files.size(pf.temp) }.getOrDefault(0L) <= 0) {
+                // Nothing contiguous from zero: nothing a plain resume could
+                // extend. Gather nothing; sweep handles the temp.
+                return
+            }
+            Files.writeString(piecesSidecar(pf.temp), base.toString())
+            parts.put(token, pf.temp, peerIp)
+            if (base >= pf.file.size) tracker.clear() // complete-but-unhashed: base is all there is
+        }
+    }
+
+    private fun piecesSidecar(temp: Path): Path =
+        temp.resolveSibling(temp.fileName.toString() + ".pieces")
+
+    private fun deletePiecesSidecar(temp: Path) {
+        runCatching { Files.deleteIfExists(piecesSidecar(temp)) }
+    }
+
+    private fun clearPiecesSidecar(temp: Path) {
+        // Sparse history without a live ledger (e.g. from an already-evicted
+        // session): the sidecar base still tells us exactly where real data
+        // ends. Trim to it so a plain resume never extends over a gap.
+        runCatching {
+            val f = piecesSidecar(temp)
+            if (!Files.exists(f)) return
+            val base = Files.readString(f).trim().toLongOrNull() ?: return
+            if (base in 1 until (Files.size(temp) + 1)) truncateTo(temp, base)
+            Files.deleteIfExists(f)
+        }
+    }
+
+    /** Shrinks `p` to `len` bytes if it is currently longer. Never grows. */
+    private fun truncateTo(p: Path, len: Long) {
+        if (len <= 0) {
+            runCatching { Files.deleteIfExists(p) }
+            return
+        }
+        runCatching {
+            java.io.RandomAccessFile(p.toFile(), "rw").use { if (it.length() > len) it.setLength(len) }
+        }
+    }
+
     /**
      * Flit extension: how many bytes of an interrupted file the receiver
      * still holds. Old peers never call this; a 404 just means "start over".
+     *
+     * Multi-socket aware: the answer for a sparse ledger is the contiguous
+     * salvage base from zero, NOT the temp's on-disk length (its tail holds
+     * unorderable pieces). Only that base can be fold-resumed single-stream;
+     * the plain claim trims the temp to it.
      */
     private suspend fun partialRoute(call: ApplicationCall) {
         val token = call.request.queryParameters["token"]
         val ip = call.peerIp()
+        if (!token.isNullOrBlank()) {
+            val tracked = mutex.withLock {
+                val s = session ?: return@withLock null
+                if (s.senderIp != ip && ip.isNotEmpty()) return@withLock null
+                s.files.values
+                    .filter { Protocol.resumeToken(it.file) == token && it.tracker != null }
+                    .mapNotNull { it.tracker?.base() }
+                    .firstOrNull()
+            }
+            if (tracked != null && tracked > 0) {
+                call.respondText(
+                    WireJson.encode(PartialInfo(tracked)),
+                    ContentType.Application.Json,
+                    HttpStatusCode.OK,
+                )
+                return
+            }
+        }
         val e = if (token.isNullOrBlank()) null else parts.peek(token)
         if (e != null && (e.senderIp == ip || e.senderIp.isEmpty())) {
-            val size = runCatching { Files.size(e.path) }.getOrDefault(0L)
+            // Plain parts serve their byte length. A sparse part from a dead
+            // multi-socket session still carries its `.pieces` sidecar; only
+            // its contiguous base is resumable, so that's what we report.
+            val size = runCatching {
+                val sc = e.path.resolveSibling(e.path.fileName.toString() + ".pieces")
+                val base = runCatching { Files.readString(sc).trim().toLongOrNull() }.getOrNull()
+                if (base != null && base > 0) base else Files.size(e.path)
+            }.getOrDefault(0L)
             if (size > 0) {
                 call.respondText(
                     WireJson.encode(PartialInfo(size)),
@@ -600,6 +880,50 @@ class ProtocolServer(
 
     companion object {
         const val MAX_ATTEMPTS = 3
+
+        /** Suggested chunk size for multi-socket uploads — receiver's hint. */
+        const val TURBO_CHUNK_BYTES = 8L * 1024 * 1024
+
+        /**
+         * Cap on concurrent chunk streams per file for one session. The
+         * sender uses at most 4; the headroom exists so retry overlap never
+         * rounds down a legitimate claim.
+         */
+        const val MAX_TURBO_STREAMS = 6
+    }
+}
+
+/**
+ * `Content-Range: bytes=123-456/678` → (start, lastInclusive, total).
+ * Only the concrete form is supported; suffix and unbounded forms are
+ * nonsense for a fixed-size file and are rejected.
+ */
+internal fun parseContentRange(value: String): Triple<Long, Long, Long>? {
+    val head = value.trim()
+    if (!head.startsWith("bytes=", ignoreCase = true)) return null
+    val slash = head.indexOf('/')
+    if (slash <= "bytes=".length) return null
+    val total = head.substring(slash + 1).trim().toLongOrNull() ?: return null
+    val dash = head.indexOf('-')
+    if (dash < "bytes=".length) return null
+    val start = head.substring("bytes=".length, dash).trim().toLongOrNull() ?: return null
+    val last = head.substring(dash + 1, slash).trim().toLongOrNull() ?: return null
+    if (start < 0 || last < start) return null
+    return Triple(start, last, total)
+}
+
+/** Adds multi-socket sidecar leftovers to the interrupted-parts sweep. */
+internal fun sweepPieceSidecars(dest: Path) {
+    runCatching {
+        Files.walk(dest).use { walk ->
+            walk.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".pieces") }
+                .forEach { p ->
+                    runCatching {
+                        val age = System.currentTimeMillis() - Files.getLastModifiedTime(p).toMillis()
+                        if (age > 24 * 3_600_000L) Files.deleteIfExists(p)
+                    }
+                }
+        }
     }
 }
 

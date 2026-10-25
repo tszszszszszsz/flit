@@ -100,7 +100,7 @@ private fun usage() {
 
 serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--announce-to ip:port,...]
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
-send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N]
+send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
 """
     )
@@ -271,6 +271,7 @@ private suspend fun send(args: ParsedArgs) {
             files = specs,
             pin = args.opt("--pin"),
             parallelism = args.optInt("--parallel", 4),
+            multi = args.has("--multi"),
         )
         println("${ts()} sent ${report.sent.size}/${specs.size} to ${target.ip}:${target.port}")
         for (s in report.sent) println("${ts()}   ok $s")

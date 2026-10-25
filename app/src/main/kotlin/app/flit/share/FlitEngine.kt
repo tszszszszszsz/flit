@@ -710,7 +710,7 @@ val share: StateFlow<ShareIntake?> = _share
                 }
                 val target = SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
                 prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
-                val report = cli.sendFiles(target, self, outgoing, progress = { name, soFar, _ ->
+                val report = cli.sendFiles(target, self, outgoing, multi = prefs().getBoolean("parallelStreams", true), progress = { name, soFar, _ ->
                     prog.tick(name, soFar)
                 })
                 val sent = report.sent.size

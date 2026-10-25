@@ -1084,6 +1084,14 @@ class MainActivity : ComponentActivity() {
                         prefs().edit().putBoolean("crushSend", on).apply()
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    SwitchOption(
+                        title = "Parallel streams on Wi-Fi",
+                        subtitle = "splits big files across several sockets for extra speed — only between Flit devices, every other receiver just gets the normal single-stream send",
+                        initial = prefs().getBoolean("parallelStreams", true),
+                    ) { on ->
+                        prefs().edit().putBoolean("parallelStreams", on).apply()
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     OptionRow(
                         title = "Background battery…",
                         subtitle = "let background sharing run without the system rationing it",

@@ -69,6 +69,16 @@ data class PrepareUploadResponse(
     val sessionId: String,
     /** file id → per-file transfer token; only accepted files. */
     val files: Map<String, String>,
+    /**
+     * Flit↔Flit extension: multi-socket upload capability. Present only when
+     * the sender signaled `X-Flit-Multi` in its prepare-upload request; the
+     * value is the receiver's suggested chunk size in bytes. Chunks are then
+     * POSTed to the normal upload route with a `Content-Range` header.
+     * v2.2 peers never see this (receiver only adds it on the header, and
+     * responses omit nulls) — its absence on a peer's answer is the graceful
+     * fallback to single-stream sending.
+     */
+    val multipart: Long? = null,
 )
 
 /** What the receiver still holds of a previously interrupted file. */
