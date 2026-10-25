@@ -783,7 +783,8 @@ class MainActivity : ComponentActivity() {
 
         if (showAddDialog) {
             var addr by remember { mutableStateOf("") }
-            AlertDialog(
+            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
                 onDismissRequest = { showAddDialog = false },
                 title = { Text("Add device by address") },
                 text = {
@@ -816,11 +817,13 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(onClick = { showAddDialog = false }) { Text("Cancel") }
                 },
             )
+            }
         }
 
         if (showNoteDialog) {
             var note by remember { mutableStateOf("") }
-            AlertDialog(
+            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
                 onDismissRequest = { showNoteDialog = false },
                 title = { Text("Send a note") },
                 text = {
@@ -850,11 +853,13 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = { showNoteDialog = false }) { Text("Cancel") }
                 },
             )
+            }
         }
 
         if (showRenameDialog) {
             var name by remember { mutableStateOf(FlitEngine.currentAlias()) }
-            AlertDialog(
+            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
                 onDismissRequest = { showRenameDialog = false },
                 title = { Text("Device name") },
                 text = {
@@ -875,9 +880,11 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = { showRenameDialog = false }) { Text("Cancel") }
                 },
             )
+            }
         }
 
         if (showThemeDialog) {
+            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
             AlertDialog(
                 onDismissRequest = { showThemeDialog = false },
                 title = { Text("Theme") },
@@ -901,9 +908,11 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = { showThemeDialog = false }) { Text("Cancel") }
                 },
             )
+            }
         }
 
         if (showBatteryDialog) {
+            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
             AlertDialog(
                 onDismissRequest = { showBatteryDialog = false },
                 title = { Text("Background battery") },
@@ -930,10 +939,12 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = { showBatteryDialog = false }) { Text("Not now") }
                 },
             )
+            }
         }
 
         peerMenuFor?.let { peer ->
-            PeerMenuDialog(
+            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+                PeerMenuDialog(
                 peer = peer,
                 onDismiss = { peerMenuFor = null },
                 onChooseDest = { fp ->
@@ -942,6 +953,7 @@ class MainActivity : ComponentActivity() {
                     pickDest.launch(null)
                 },
             )
+            }
         }
     }
 
