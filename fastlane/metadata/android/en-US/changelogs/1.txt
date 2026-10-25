@@ -2,6 +2,16 @@ First release.
 
 * Device discovery over Wi-Fi (multicast + direct by address)
 * File transfers both ways, byte-identical, over mutual TLS
-* Peer fingerprints shown and pinned
+* Interrupted transfers resume instead of restarting from zero
+* Received files stream straight into Downloads/Flit, your default folder, or
+  a per-device folder for trusted devices — no double copies
+* Text notes share the same secure wire as files (share sheet or in-app)
+* Send-later queue: a send waiting on an offline device completes on return
+* Peer fingerprints shown and pinned; optional trusted-senders-only gate
+* Hidden mode: stay off other devices' lists until you send first
+* Material You theming with light/dark/auto
+* Rename your device, start-on-boot toggle, battery-rationing opt-out
+* Received ledger: tap to open, re-share, clear
 * Foreground service keeps transfers alive with the screen off
+* Quick settings tile for one-tap sharing
 * Adaptive app icon with themed (monochrome) support

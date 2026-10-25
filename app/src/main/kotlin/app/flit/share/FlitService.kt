@@ -21,6 +21,10 @@ class FlitService : Service() {
 
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
+    /** Set on a rejected FGS start: the service shuts down but the engine lives. */
+    @Volatile
+    private var engineOnly = false
+
     companion object {
         const val NOTIFICATION_ID = 4711
 
@@ -44,26 +48,44 @@ class FlitService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val st = FlitEngine.state.value
-        if (!st.running && !st.starting) {
-            FlitEngine.start(applicationContext)
+        // Android 15+ refuses a dataSync FGS started from BOOT_COMPLETED. The
+        // refusal is raised by startForeground() here — not by the receiver —
+        // so it lands in this process: degrade to engine-only for that boot
+        // (best effort; check once on the next normal open) instead of crashing.
+        var fgOk = true
+        runCatching { promoteForeground() }.onFailure { e ->
+            engineOnly = true
+            FlitEngine.logLine(
+                "system refused background service (${e.javaClass.simpleName}) — " +
+                    "running engine-only until you open Flit next",
+            )
+            // Engine without the wrapper: no notification, same serving ability.
+            val st = FlitEngine.state.value
+            if (!st.running && !st.starting) FlitEngine.start(applicationContext)
+            stopSelf()
+            fgOk = false
         }
-        promoteForeground()
-
-        // Re-post with the settled state (final port) once start completes; the
-        // first post above is needed before the FGS timeout window.
-        uiScope.launch {
-            var waited = 0L
-            while (waited < 15_000) {
-                delay(300)
-                waited += 300
-                val s = FlitEngine.state.value
-                if (s.running || s.error != null) break
+        if (fgOk) {
+            val st = FlitEngine.state.value
+            if (!st.running && !st.starting) {
+                FlitEngine.start(applicationContext)
             }
-            val settled = FlitEngine.state.value
-            if (settled.error != null) stopSelf() else postNotification(settled)
+
+            // Re-post with the settled state (final port) once start completes; the
+            // first post above is needed before the FGS timeout window.
+            uiScope.launch {
+                var waited = 0L
+                while (waited < 15_000) {
+                    delay(300)
+                    waited += 300
+                    val s = FlitEngine.state.value
+                    if (s.running || s.error != null) break
+                }
+                val settled = FlitEngine.state.value
+                if (settled.error != null) stopSelf() else postNotification(settled)
+            }
         }
-        return START_STICKY
+        return if (engineOnly) START_NOT_STICKY else START_STICKY
     }
 
     private fun promoteForeground() = postNotification(FlitEngine.state.value)
@@ -83,7 +105,9 @@ class FlitService : Service() {
 
     override fun onDestroy() {
         uiScope.cancel()
-        FlitEngine.stop()
+        // Degraded (engine-only) boots: the engine was just started here, so do
+        // not stop it along with the service.
+        if (!engineOnly) FlitEngine.stop()
         super.onDestroy()
     }
 

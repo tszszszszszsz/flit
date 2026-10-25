@@ -30,6 +30,7 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
         lastPaintBytes = 0
         lastPaintMs = 0
         title = if (kind == Kind.SEND) "Sending…" else "Receiving…"
+        FlitEngine.setTransferActive(true)
         paint()
     }
 
@@ -96,6 +97,7 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
 
     /** Final, sticky-until-swiped summary notification replacing the progress bar. */
     fun finish(summary: String, ok: Boolean, iconDone: Boolean) {
+        FlitEngine.setTransferActive(false)
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(
             notifId,
@@ -115,5 +117,17 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
                 .setProgress(0, 0, false)
                 .build(),
         )
+        if (ok) playChime()
+    }
+
+    /** Options → "Sound when transfers finish": a short system notification tone. */
+    private fun playChime() {
+        if (!FlitEngine.prefs().getBoolean("transferSound", false)) return
+        runCatching {
+            val uri = android.media.RingtoneManager
+                .getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                ?: return
+            android.media.RingtoneManager.getRingtone(ctx, uri)?.play()
+        }
     }
 }

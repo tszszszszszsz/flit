@@ -1,20 +1,27 @@
-Flit moves files between the devices around you, directly over your Wi-Fi network.
+Flit moves files between the devices around you, directly over your Wi-Fi
+network.
 
-Open the app, press Share, and everything on the same network appears: phones,
-tablets, laptops, and headless boxes. Tap a device, pick a file, done. No
-accounts, no sign-up, no pairing ceremony, and nothing ever leaves your LAN.
+Open the app and everything on the same network appears: phones, tablets,
+laptops, and headless boxes. Tap a device, pick a file, done. No accounts, no
+sign-up, no pairing ceremony, and nothing ever leaves your LAN.
 
 * Instant: the transfer engine is running the moment the app opens.
 * Local-first: files hop device-to-device, not through any server.
 * Secure: every transfer, including discovery and metadata, rides mutual TLS
   with per-device identities and fingerprint pinning.
+* Resumable: an interrupted transfer keeps what landed and continues from
+  there when the device comes back — no re-sending what you already sent.
 * Native: a small Kotlin app built on Android's own networking stack — no
   webviews, no embedded browsers.
-* Cross-platform: speaks a fully open, documented protocol (version 2.2), so it
-  interoperates with any other compatible client on your network.
+* Cross-platform: speaks a fully open, documented protocol (version 2.2), so
+  it interoperates with any other compatible client on your network.
 
-Received files land in Downloads/Flit. Sending works from the built-in picker,
-so you can share anything any app can produce.
+Receiving works the way you want: files stream directly into Downloads/Flit,
+your own default folder, or the folder you give a trusted device. Received
+files open and re-share with a tap. Text notes travel the same wire as files.
+
+Sending works from the app's picker or your system share sheet; if a device is
+asleep, your send waits for it and completes when it's back.
 
 The core — discovery, transfers, everything you need to move files — is free
 and complete. No ads, no trackers, no analytics.

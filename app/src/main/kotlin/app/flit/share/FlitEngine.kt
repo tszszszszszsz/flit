@@ -122,6 +122,42 @@ val share: StateFlow<ShareIntake?> = _share
 
     private val _queue = MutableStateFlow<List<QueuedSend>>(emptyList())
     val queue: StateFlow<List<QueuedSend>> = _queue
+
+    /** Live "send again" target — rehydrated on start, updated after each successful send. */
+    private val _lastPeer = MutableStateFlow<PeerEntry?>(null)
+    val lastPeerFlow: StateFlow<PeerEntry?> = _lastPeer
+
+    /** True while any transfer (send or receive) runs — used for keep-screen-on. */
+    private val _transferActive = MutableStateFlow(false)
+    val transferActive: StateFlow<Boolean> = _transferActive
+    fun setTransferActive(v: Boolean) { _transferActive.value = v }
+
+    /** The last successfully-served peer (fingerprint, alias) for "send again". */
+    fun lastPeer(): Pair<String, String>? {
+        val fp = prefs().getString("lastPeerFp", null) ?: return null
+        val alias = prefs().getString("lastPeerAlias", null) ?: return null
+        return fp to alias
+    }
+
+    /**
+     * Rehydrated last-served peer for the one-tap "send again": works even if
+     * the peer is offline right now — a failed dispatch falls into the
+     * send-later queue and completes when it reappears.
+     */
+    fun lastPeerEntry(): PeerEntry? {
+        val ip = prefs().getString("lastPeerIp", null) ?: return null
+        val fp = prefs().getString("lastPeerFp", null) ?: return null
+        val alias = prefs().getString("lastPeerAlias", null) ?: return null
+        val port = prefs().getInt("lastPeerPort", Protocol.MULTICAST_PORT)
+        return PeerEntry(
+            ip = ip,
+            info = PeerInfo(
+                alias = alias, version = Protocol.VERSION, deviceModel = null,
+                deviceType = "device", fingerprint = fp, port = port, protocol = "https",
+            ),
+            lastSeenMs = 0,
+        )
+    }
     // ==== internal fields =======================================================
 
         private val scope = CoroutineScope(
@@ -321,7 +357,7 @@ val share: StateFlow<ShareIntake?> = _share
                     // Receive straight into MediaStore (no temp+copy roundtrip);
                     // files for pinned peers' custom folders still take the
                     // file path so publishReceived can copyToTree them.
-                    incomingSink = { _, info -> openIncomingSink(info, FlitRoster.destTree(delegate.rxSenderFp)) },
+                    incomingSink = { _, info -> openIncomingSink(info, receiveTreeFor(delegate.rxSenderFp)) },
                 ),
             )
             srv.start()
@@ -394,6 +430,7 @@ val share: StateFlow<ShareIntake?> = _share
             }
 
             startPruner(seq)
+            _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
             _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
             logLine("start failed: ${t.message ?: t.javaClass.simpleName}")
@@ -426,30 +463,48 @@ val share: StateFlow<ShareIntake?> = _share
                 ?: PeerEntry(ip, info, now)
             m + (info.fingerprint to entry)
         }
-        // A pinned-from-queue peer just came back: dispatch any send-later batch
-        // for it (guarded so an announce storm cannot double-send).
-        if (FlitRoster.queued().any { it.fingerprint == info.fingerprint } &&
-            dispatching.add(info.fingerprint)
-        ) {
-            val peer = PeerEntry(ip, info, now)
-            val batch = FlitRoster.queued().first { it.fingerprint == info.fingerprint }
-            scope.launch(Dispatchers.IO) {
-                try {
-                    val spools = batch.uris.mapNotNull { spoolFileFor(it, "queue") }
-                    if (spools.isEmpty()) {
-                        logLine("queue: nothing left for ${info.alias} — dropping")
-                        FlitRoster.dequeue(peer.info.fingerprint)
-                    } else {
-                        logLine("queue: ${spools.size} queued for ${info.alias} — sending now")
-                        dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
-                        FlitRoster.dequeue(peer.info.fingerprint)
-                    }
-                } finally {
-                    dispatching.remove(info.fingerprint)
-                    _queue.value = FlitRoster.queued()
+        // A peer we owe files to just came back: dispatch its send-later batch
+        // (guarded so an announce storm cannot double-send).
+        if (FlitRoster.queued().any { it.fingerprint == info.fingerprint }) {
+            flushQueueFor(PeerEntry(ip, info, now))
+        }
+    }
+
+    /**
+     * Dispatches this peer's queued send-later batch, or no-ops quietly when
+     * nothing is queued / a dispatch is already in flight. Also the entry
+     * point for the queue's manual "retry now".
+     */
+    private fun flushQueueFor(peer: PeerEntry) {
+        if (FlitRoster.queued().none { it.fingerprint == peer.info.fingerprint }) return
+        if (!dispatching.add(peer.info.fingerprint)) return
+        val batch = FlitRoster.queued().first { it.fingerprint == peer.info.fingerprint }
+        scope.launch(Dispatchers.IO) {
+            try {
+                val spools = batch.uris.mapNotNull { spoolFileFor(it, "queue") }
+                if (spools.isEmpty()) {
+                    logLine("queue: nothing left for ${peer.displayName} — dropping")
+                    FlitRoster.dequeue(peer.info.fingerprint)
+                } else {
+                    logLine("queue: ${spools.size} queued for ${peer.displayName} — sending now")
+                    dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
+                    FlitRoster.dequeue(peer.info.fingerprint)
                 }
+            } finally {
+                dispatching.remove(peer.info.fingerprint)
+                _queue.value = FlitRoster.queued()
             }
         }
+    }
+
+    /** Manual "send the waiting files now" for a peer visible this moment. */
+    fun retryQueued(fingerprint: String) {
+        val peer = _peers.value.values.firstOrNull { it.info.fingerprint == fingerprint }
+        if (peer == null) {
+            toast("not on the network yet — I'll keep waiting")
+            return
+        }
+        flushQueueFor(peer)
     }
 
     /** Fingerprints currently being dispatched from the send-later queue. */
@@ -512,6 +567,12 @@ val share: StateFlow<ShareIntake?> = _share
         dispatchTo(peer, SourceList(intake.files, emptyList()), intake.text, fromQueue = false)
     }
 
+    /** In-app note composer: stages a text note exactly like the share sheet does. */
+    fun stageNote(text: String) {
+        if (text.isBlank()) return
+        _share.value = ShareIntake(ready = true, files = emptyList(), text = text, sourceApp = null)
+    }
+
     /** One of the two lists is non-empty; spools are already local files. */
     private class SourceList(val spools: List<SpooledFile>, val uris: List<Uri>)
 
@@ -553,7 +614,16 @@ val share: StateFlow<ShareIntake?> = _share
                     else -> "sent $sent, $fail failed → ${peer.displayName}"
                 }
                 prog.finish(summary, ok = sent > 0, iconDone = false)
-                if (sent > 0) logLine("$summary: ${report.sent.joinToString(", ")}")
+                if (sent > 0) {
+                    logLine("$summary: ${report.sent.joinToString(", ")}")
+                    prefs().edit()
+                        .putString("lastPeerFp", peer.info.fingerprint)
+                        .putString("lastPeerAlias", peer.displayName)
+                        .putString("lastPeerIp", peer.ip)
+                        .putInt("lastPeerPort", peer.info.port)
+                        .apply()
+                    _lastPeer.value = peer
+                }
                 for (f in report.failed) logLine("FAIL ${f.fileName}: ${f.reason}")
                 if (sent == 0 && fail == 0) logLine("declined by ${peer.displayName}")
                 _share.value = null
@@ -706,6 +776,10 @@ val share: StateFlow<ShareIntake?> = _share
 
     // ==== receive publishing ====================================================
 
+    /** Per-peer folder if the sender is pinned, else the user's global default. */
+    private fun receiveTreeFor(fp: String?): String? =
+        fp?.let { FlitRoster.destTree(it) } ?: prefs().getString("destTreeGlobal", null)
+
     /**
      * Direct receive paths — the POST body streams into its final home without
      * a temp file, no second copy:
@@ -813,8 +887,8 @@ val share: StateFlow<ShareIntake?> = _share
 
     private fun publishReceived(file: File, info: FileInfo, senderFp: String) {
         _received.update { list -> (list + ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file)).takeLast(20) }
-        // Pinned peers may have their own folder; otherwise the Downloads/Flit bucket.
-        val tree = FlitRoster.destTree(senderFp)
+        // A per-peer folder, else the global default, else the Downloads/Flit bucket.
+        val tree = receiveTreeFor(senderFp)
         if (tree != null) {
             scope.launch(Dispatchers.IO) {
                 runCatching { copyToTree(file, tree) }
@@ -935,7 +1009,8 @@ val share: StateFlow<ShareIntake?> = _share
 
     // ==== helpers ===============================================================
 
-    private fun logLine(text: String) {
+    /** Logcat-visible early (boot receiver calls this pre-engine). */
+    fun logLine(text: String) {
         val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         android.util.Log.i("FlitSend", text)
         _log.update { list -> (list + LogLine(ts, text)).takeLast(60) }

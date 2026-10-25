@@ -38,6 +38,7 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -76,7 +77,17 @@ class MainActivity : ComponentActivity() {
     private val pickDest = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
         val fp = pendingDestPeer ?: return@registerForActivityResult
         pendingDestPeer = null
-        if (tree == null) {
+        if (fp == GLOBAL_DEST) {
+            if (tree == null) return@registerForActivityResult
+            runCatching {
+                contentResolver.takePersistableUriPermission(
+                    tree, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
+            globalTree.value = tree.toString()
+            prefs().edit().putString("destTreeGlobal", tree.toString()).apply()
+            FlitEngine.toast("received files now land in the chosen folder")
+        } else if (tree == null) {
             FlitRoster.setDestTree(fp, null)
         } else {
             runCatching {
@@ -91,6 +102,11 @@ class MainActivity : ComponentActivity() {
 
     private var pendingDestPeer: String? = null
 
+    private val GLOBAL_DEST = "global"
+
+    /** Reactive mirror of the global receive folder pref (null = default). */
+    private val globalTree = mutableStateOf<String?>(null)
+
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         startSharing()
     }
@@ -101,6 +117,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FlitEngine.channels(this)
+        globalTree.value = prefs().getString("destTreeGlobal", null)
         ingestIntent(intent)
         setContent { FlitUi() }
     }
@@ -173,18 +190,36 @@ class MainActivity : ComponentActivity() {
         val share by FlitEngine.share.collectAsState()
         val queue by FlitEngine.queue.collectAsState()
         var showAddDialog by remember { mutableStateOf(false) }
+        var showNoteDialog by remember { mutableStateOf(false) }
         var peerMenuFor by remember { mutableStateOf<FlitEngine.PeerEntry?>(null) }
         var showRenameDialog by remember { mutableStateOf(false) }
         var showThemeDialog by remember { mutableStateOf(false) }
         var showBatteryDialog by remember { mutableStateOf(false) }
         var theme by remember { mutableStateOf(prefs().getString("theme", "auto") ?: "auto") }
+        var keepOn by remember { mutableStateOf(prefs().getBoolean("keepScreenOn", true)) }
+        val transferActive by FlitEngine.transferActive.collectAsState()
+        val ctx = LocalContext.current
+
+        // Options → keep-screen-on: held only while a transfer is in flight.
+        DisposableEffect(transferActive, keepOn) {
+            val win = (ctx as android.app.Activity).window
+            if (transferActive && keepOn) {
+                win.addFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                )
+            } else {
+                win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            onDispose {
+                win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
 
         // Share-sheet mode: close ourselves once the dispatch clears the intake.
         if (shareMode) {
             LaunchedEffect(share) { if (share == null && FlitEngine.state.value.running) finish() }
         }
 
-        val ctx = LocalContext.current
         val dark = when (theme) {
             "dark" -> true
             "light" -> false
@@ -266,6 +301,34 @@ class MainActivity : ComponentActivity() {
                     HorizontalDivider()
 
                     Text("Nearby devices", style = MaterialTheme.typography.titleMedium)
+                    val lastPeer by FlitEngine.lastPeerFlow.collectAsState()
+                    if (state.running && lastPeer != null) {
+                        val last = lastPeer!!
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        if (share != null) FlitEngine.sendShare(last) else {
+                                            pendingPeer = last
+                                            pickFiles.launch(arrayOf("*/*"))
+                                        }
+                                    }
+                                    .padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "↻ Send again to ${last.displayName}",
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Text(
+                                        "picks files right away — works even if it's offline (queues for later)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                            }
+                    }
                     if (peers.isEmpty()) {
                         Text(
                             if (state.running) "scanning\u2026 another Flit or LocalSend device on the same Wi\u2011Fi will appear here"
@@ -286,7 +349,16 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                     if (state.running) {
-                        OutlinedButton(onClick = { showAddDialog = true }) { Text("+ Add device by address\u2026") }
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            OutlinedButton(
+                                onClick = { showNoteDialog = true },
+                                modifier = Modifier.weight(1f),
+                            ) { Text("\u2709 Note\u2026") }
+                            OutlinedButton(
+                                onClick = { showAddDialog = true },
+                                modifier = Modifier.weight(1f),
+                            ) { Text("+ Add device\u2026") }
+                        }
                     }
 
                     if (queue.isNotEmpty()) {
@@ -304,6 +376,7 @@ class MainActivity : ComponentActivity() {
                                         style = MaterialTheme.typography.bodySmall,
                                     )
                                 }
+                                TextButton(onClick = { FlitEngine.retryQueued(q.fingerprint) }) { Text("↻") }
                                 TextButton(onClick = { FlitEngine.cancelQueued(q.fingerprint) }) { Text("✕") }
                             }
                         }
@@ -353,6 +426,54 @@ class MainActivity : ComponentActivity() {
                                 FlitEngine.toast("visible again")
                             }, 700)
                         }
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                pendingDestPeer = GLOBAL_DEST
+                                pickDest.launch(null)
+                            }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Default receive folder", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                if (globalTree.value == null) "all incoming files go to Downloads/Flit \u2014 tap to choose your own"
+                                else "custom folder (trusted devices can still have their own)",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        if (globalTree.value != null) {
+                            TextButton(onClick = {
+                                prefs().edit().remove("destTreeGlobal").apply()
+                                globalTree.value = null
+                                FlitEngine.toast("back to Downloads/Flit")
+                            }) { Text("Reset") }
+                        }
+                    }
+                    SwitchOption(
+                        title = "Start on device boot",
+                        subtitle = "be reachable again right after a reboot (best effort — tight systems allow it only after the first unlock)",
+                        initial = prefs().getBoolean("startOnBoot", false),
+                    ) { on ->
+                        prefs().edit().putBoolean("startOnBoot", on).apply()
+                    }
+                    SwitchOption(
+                        title = "Sound when transfers finish",
+                        subtitle = "a short chime plays after a completed transfer",
+                        initial = prefs().getBoolean("transferSound", false),
+                    ) { on ->
+                        prefs().edit().putBoolean("transferSound", on).apply()
+                    }
+                    SwitchOption(
+                        title = "Keep the screen on while transferring",
+                        subtitle = "stops the system from dozing a transfer you're watching",
+                        initial = keepOn,
+                    ) { on ->
+                        keepOn = on
+                        prefs().edit().putBoolean("keepScreenOn", on).apply()
                     }
                     OptionRow(
                         title = "Background battery\u2026",
@@ -432,7 +553,41 @@ class MainActivity : ComponentActivity() {
                     ) { Text("Add") }
                 },
                 dismissButton = {
-                    OutlinedButton(onClick = { showAddDialog = false }) { Text("Cancel") }
+                     OutlinedButton(onClick = { showAddDialog = false }) { Text("Cancel") }
+                },
+            )
+        }
+
+        if (showNoteDialog) {
+            var note by remember { mutableStateOf("") }
+            AlertDialog(
+                onDismissRequest = { showNoteDialog = false },
+                title = { Text("Send a note") },
+                text = {
+                    Column {
+                        Text(
+                            "Plain text, sent as a text note. Prepare it here, then tap a device.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        OutlinedTextField(
+                            value = note,
+                            onValueChange = { note = it.take(2000) },
+                            minLines = 3,
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        showNoteDialog = false
+                        if (note.isNotBlank()) {
+                            FlitEngine.stageNote(note)
+                            FlitEngine.toast("note ready — tap a device below")
+                        }
+                    }) { Text("Prepare") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showNoteDialog = false }) { Text("Cancel") }
                 },
             )
         }

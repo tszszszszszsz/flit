@@ -10,6 +10,8 @@
     <!-- Multicast discovery needs the kernel-level multicast whitelist toggle. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Optional: restart sharing after a reboot (user opt-in in Options). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".FlitApp"
@@ -57,6 +59,18 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- Optional boot start; the receiver checks the user's preference. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Android 15 bans dataSync FGS from BOOT; the ban lifts at first unlock. -->
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".FlitService"
