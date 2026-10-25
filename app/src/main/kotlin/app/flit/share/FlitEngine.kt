@@ -114,6 +114,21 @@ val share: StateFlow<ShareIntake?> = _share
     val state: StateFlow<EngineState> = _state
 
     private val _peers = MutableStateFlow<Map<String, PeerEntry>>(emptyMap())
+
+    /**
+     * Display helper: a `manual@` stub is hidden once the device it stands for
+     * is actually reachable (same ip:port, real fingerprint). The stub itself
+     * survives in `_peers`, so the row reappears when the device goes quiet.
+     */
+    fun dedupedPeers(raw: Map<String, PeerEntry> = _peers.value): Map<String, PeerEntry> {
+        val m = raw
+        val covered = m.entries
+            .filterNot { it.key.startsWith("manual@") }
+            .map { it.value.ip to it.value.info.port }
+            .toSet()
+        return m.filterNot { (k, v) -> k.startsWith("manual@") && (v.ip to v.info.port) in covered }
+    }
+
     val peers: StateFlow<Map<String, PeerEntry>> = _peers
 
     private val _log = MutableStateFlow<List<LogLine>>(emptyList())
@@ -445,6 +460,7 @@ val share: StateFlow<ShareIntake?> = _share
             }
 
             startPruner(seq)
+            startManualProber(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
             _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
@@ -463,6 +479,41 @@ val share: StateFlow<ShareIntake?> = _share
                 val cutoff = System.currentTimeMillis() - PEER_TTL_MS
                 _peers.update { m ->
                     m.filterValues { it.lastSeenMs >= cutoff || it.info.fingerprint.startsWith("manual@") }
+                }
+            }
+        }
+    }
+
+    /**
+     * By-address rows stay honest in the background: every cycle we re-register
+     * with the typed address. A live device then shows its real identity (and
+     * stays fresh despite the TTL); an offline one keeps its stub row so the
+     * user can still queue sends for it.
+     */
+    private fun startManualProber(seq: Int) {
+        scope.launch(Dispatchers.IO) {
+            while (isActive && seq == startSeq) {
+                delay(20_000)
+                if (seq != startSeq) return@launch
+                val cli = client ?: return@launch
+                val self = server?.selfInfo() ?: continue
+                for (addr in _peers.value.keys.filter { it.startsWith("manual@") }) {
+                    if (seq != startSeq) return@launch
+                    val host = addr.removePrefix("manual@").substringBeforeLast(':')
+                    val port = addr.substringAfterLast(':').toIntOrNull() ?: Protocol.DEFAULT_PORT
+                    if (host.isBlank()) continue
+                    val real = try {
+                        cli.register(SendTarget(host, port, true), self, timeoutMs = 3_000)
+                    } catch (e: Exception) {
+                        logLine("mprober $host:$port: ${e.message ?: e.javaClass.simpleName}")
+                        null
+                    }
+                    if (real != null) {
+                        touchPeer(host, real)
+                        logLine("mprober $host:$port ok")
+                    } else {
+                        logLine("mprober $host:$port: no answer")
+                    }
                 }
             }
         }

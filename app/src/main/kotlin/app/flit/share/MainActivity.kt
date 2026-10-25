@@ -248,7 +248,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun FlitUi() {
         val state by FlitEngine.state.collectAsState()
-        val peers by FlitEngine.peers.collectAsState()
+        val rawPeers by FlitEngine.peers.collectAsState()
+        val peers = FlitEngine.dedupedPeers(rawPeers)
         val received by FlitEngine.received.collectAsState()
         val log by FlitEngine.log.collectAsState()
         val share by FlitEngine.share.collectAsState()
@@ -1239,7 +1240,9 @@ class MainActivity : ComponentActivity() {
     ) {
         val cs = MaterialTheme.colorScheme
         val enter = remember(r.name + r.whenMs) { Animatable(0f) }
-        LaunchedEffect(Unit) {
+        // Same contract as PeerCard: restart the entrance when the card's
+        // identity swaps in place (a new file at the same list slot).
+        LaunchedEffect(r.name + r.whenMs) {
             delay(45L * (index % 6))
             enter.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium))
         }
@@ -1306,7 +1309,11 @@ class MainActivity : ComponentActivity() {
         val cs = MaterialTheme.colorScheme
         val trusted = FlitRoster.pinned(peer.info.fingerprint)
         val enter = remember(peer.info.fingerprint) { Animatable(0f) }
-        LaunchedEffect(Unit) {
+        // Keyed identically to the Animatable above: when a card's identity
+        // changes in place (stub → the device it stands for), the remember
+        // yields a NEW Animatable at 0 and this effect must restart with it,
+        // or the fresh instance strands invisible at alpha 0.
+        LaunchedEffect(peer.info.fingerprint) {
             delay(45L * (index % 8))
             enter.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium))
         }
