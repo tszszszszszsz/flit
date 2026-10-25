@@ -94,6 +94,19 @@ object FlitRoster {
 
     fun dequeue(fingerprint: String) = saveQueue(queueList().filterNot { it.fingerprint == fingerprint })
 
+    // ==== scanned pairing codes ================================================
+
+    private const val KEY_SCANNED = "scannedCodes"
+
+    /** Fingerprints whose trust came from scanning their device's QR. */
+    private fun scannedSet(): Set<String> =
+        prefs().getStringSet(KEY_SCANNED, null) ?: emptySet()
+
+    fun markScanned(fingerprint: String) =
+        prefs().edit().putStringSet(KEY_SCANNED, scannedSet() + fingerprint).apply()
+
+    fun scannedCode(fingerprint: String): Boolean = fingerprint in scannedSet()
+
     // ==== manually added addresses =============================================
 
     private const val KEY_MANUAL = "manualPeers"

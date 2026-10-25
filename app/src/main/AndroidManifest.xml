@@ -10,6 +10,8 @@
     <!-- Multicast discovery needs the kernel-level multicast whitelist toggle. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- QR scan-to-pair reads the camera; never used anywhere else. -->
+    <uses-permission android:name="android.permission.CAMERA" />
     <!-- Optional: restart sharing after a reboot (user opt-in in Options). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 

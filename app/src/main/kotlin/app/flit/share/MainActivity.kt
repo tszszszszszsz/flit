@@ -259,6 +259,8 @@ class MainActivity : ComponentActivity() {
         var screen by remember { mutableStateOf(Screen.Home) }
         var showAddDialog by remember { mutableStateOf(false) }
         var showNoteDialog by remember { mutableStateOf(false) }
+        var showQrDialog by remember { mutableStateOf(false) }
+        var showScanDialog by remember { mutableStateOf(false) }
         var peerMenuFor by remember { mutableStateOf<FlitEngine.PeerEntry?>(null) }
         var showRenameDialog by remember { mutableStateOf(false) }
         var showThemeDialog by remember { mutableStateOf(false) }
@@ -787,19 +789,42 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
                 AlertDialog(
                 onDismissRequest = { showAddDialog = false },
-                title = { Text("Add device by address") },
+                title = { Text("Add device") },
                 text = {
                     Column {
                         Text(
-                            "A peer that is never discovered automatically? Enter an IP or address (port defaults to 53317).",
+                            "Zero typing: show your code to them, or scan theirs. No discoverable network? An address works too (port defaults to 53317).",
                             style = MaterialTheme.typography.bodySmall,
                         )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(top = 10.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    showAddDialog = false
+                                    if (!state.running && !state.starting) {
+                                        FlitEngine.toast("starting Wi\u2011Fi sharing\u2026")
+                                        askThenStart()
+                                    }
+                                    showQrDialog = true
+                                },
+                                modifier = Modifier.weight(1f),
+                            ) { Text("My code") }
+                            OutlinedButton(
+                                onClick = {
+                                    showAddDialog = false
+                                    showScanDialog = true
+                                },
+                                modifier = Modifier.weight(1f),
+                            ) { Text("Scan code") }
+                        }
                         OutlinedTextField(
                             value = addr,
                             onValueChange = { addr = it },
                             singleLine = true,
-                            placeholder = { Text("192.168.1.42:53317") },
-                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            placeholder = { Text("192.168.1.42:53317 or flit:// code") },
+                            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
                         )
                     }
                 },
@@ -808,7 +833,11 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             showAddDialog = false
                             if (addr.isNotBlank()) {
-                                FlitEngine.addManualPeer(addr)
+                                if (addr.trim().lowercase().startsWith("flit://")) {
+                                    FlitEngine.addFromScan(addr)
+                                } else {
+                                    FlitEngine.addManualPeer(addr)
+                                }
                                 screen = Screen.Home
                             }
                         },
@@ -819,6 +848,19 @@ class MainActivity : ComponentActivity() {
                 },
             )
             }
+        }
+
+        if (showQrDialog) {
+            MaterialTheme(colorScheme = colors) { QrShowCard(onClose = { showQrDialog = false }) }
+        }
+
+        if (showScanDialog) {
+            QrScanCard(
+                onCode = { raw ->
+                    FlitEngine.addFromScan(raw)
+                },
+                onClose = { showScanDialog = false },
+            )
         }
 
         if (showNoteDialog) {
@@ -1316,6 +1358,7 @@ class MainActivity : ComponentActivity() {
     private fun PeerCard(peer: FlitEngine.PeerEntry, index: Int, onSend: () -> Unit, onMenu: () -> Unit) {
         val cs = MaterialTheme.colorScheme
         val trusted = FlitRoster.pinned(peer.info.fingerprint)
+        val scanned = FlitRoster.scannedCode(peer.info.fingerprint)
         val enter = remember(peer.info.fingerprint) { Animatable(0f) }
         // Keyed identically to the Animatable above: when a card's identity
         // changes in place (stub → the device it stands for), the remember
@@ -1360,8 +1403,10 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(peer.displayName, style = MaterialTheme.typography.titleMedium)
+                    val trustSuffix =
+                        (if (trusted) " · trusted" else "") + (if (scanned) " · code ✓" else "")
                     Text(
-                        "${peer.address} · ${peer.info.deviceType ?: "device"}" + if (trusted) " · trusted" else "",
+                        "${peer.address} · ${peer.info.deviceType ?: "device"}$trustSuffix",
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurfaceVariant,
                     )

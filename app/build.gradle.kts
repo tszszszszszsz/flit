@@ -95,5 +95,15 @@ dependencies {
     // the dock (Send/Email/Add/List/Settings), share and refresh glyphs.
     implementation(libs.androidx.compose.icons)
 
+    // QR pairing: pure-Java encode/decode (Apache-2.0, no Google services).
+    implementation(libs.zxing.core)
+    // CameraX pipeline the scanner previews/analyzes with.
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+
     implementation(project(":protocol"))
+
+    testImplementation(kotlin("test"))
 }

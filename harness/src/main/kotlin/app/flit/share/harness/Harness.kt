@@ -56,11 +56,19 @@ private class ParsedArgs(argv: Array<String>) {
     }
 }
 
-/** Stable identity in ./flit-harness so fingerprints survive restarts (peers remember us). */
+/**
+ * Stable identity at ~/.config/flit/flit-harness so fingerprints survive not
+ * just restarts but rebuilds: installDist syncs build/install and would wipe
+ * any identity tracked inside the build tree (proven 2026-10-25 — the flit‑
+ * harness identity vanished, and serve minted a fresh fingerprint).
+ */
 private fun loadOrCreateIdentity(): TlsIdentity {
-    val dir = Path.of("flit-harness")
-    Files.createDirectories(dir)
-    val file = dir.resolve("identity.p12")
+    val base = System.getenv("FLIT_HARNESS_HOME")
+        ?.takeIf { it.isNotBlank() }
+        ?.let { Path.of(it) }
+        ?: Path.of(System.getProperty("user.home"), ".config", "flit", "flit-harness")
+    Files.createDirectories(base)
+    val file = base.resolve("identity.p12")
     return if (Files.exists(file)) TlsIdentity.load(file.toFile())
     else TlsIdentity.generate().also { it.save(file.toFile()) }
 }
@@ -85,6 +93,7 @@ fun main(argv: Array<String>) {
             "discover" -> kotlinx.coroutines.runBlocking { discover(args) }
             "send" -> kotlinx.coroutines.runBlocking { send(args) }
             "info" -> kotlinx.coroutines.runBlocking { info(args) }
+            "parse-qr" -> parseQr(args)
             else -> usage()
         }
     } catch (e: Exception) {
@@ -102,8 +111,48 @@ serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--announce-to ip
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
+parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 """
     )
+}
+
+/** Dev bench: what does the deployed app actually show on screen? */
+private fun parseQr(args: ParsedArgs) {
+    if (args.positional.size < 2) { usage(); return }
+    for (path in args.positional.drop(1)) {
+        val img = javax.imageio.ImageIO.read(java.io.File(path)) ?: run {
+            println("$path: not an image")
+            return
+        }
+        // Like a real scanner: sample at several scales from one capture —
+        // zxing's binarizer has sweet spots by module size.
+        var hit: Pair<Int, String>? = null
+        val scales = intArrayOf(1, 2, 3, 4)
+        for (d in scales) {
+            val w = img.width / d
+            val h = img.height / d
+            val small = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val g = small.graphics
+            g.drawImage(img, 0, 0, w, h, null)
+            g.dispose()
+            val px = IntArray(w * h).also { small.getRGB(0, 0, w, h, it, 0, w) }
+            val text = try {
+                com.google.zxing.MultiFormatReader()
+                    .decode(
+                        com.google.zxing.BinaryBitmap(
+                            com.google.zxing.common.HybridBinarizer(
+                                com.google.zxing.RGBLuminanceSource(w, h, px),
+                            ),
+                        ),
+                    )
+                    .text
+            } catch (_: Exception) {
+                null
+            }
+            if (text != null) { hit = d to text; break }
+        }
+        println("$path: ${hit?.second ?: "(no code)"}${hit?.let { "  (scale 1/${it.first})" } ?: ""}")
+    }
 }
 
 // ==== shared "console delegate" receiving protocol callbacks ==================

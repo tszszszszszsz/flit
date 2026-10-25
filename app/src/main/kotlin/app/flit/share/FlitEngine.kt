@@ -578,6 +578,90 @@ val share: StateFlow<ShareIntake?> = _share
     /** Fingerprints currently being dispatched from the send-later queue. */
     private val dispatching = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    /**
+     * Payload for the "My code" QR: who we are and exactly where a scanner
+     * should connect. IPv4 on a multicast-capable interface (Wi\u2011Fi beats
+     * ethernet on the sort order), the real serving port, our fingerprint
+     * for the trust badge.
+     */
+    fun selfQrCode(): String? = selfQrAdd()?.uri()
+
+    /**
+     * Payload for the "My code" QR: who we are and exactly where a scanner
+     * should connect. IPv4 on a multicast-capable interface (Wi‑Fi beats
+     * ethernet on the sort order), the real serving port, our fingerprint
+     * for the trust badge.
+     */
+    fun selfQrAdd(): QrAdd? {
+        if (identity == null) return null
+        val ip = pickAnnounceAddress() ?: return null
+        return QrAdd(
+            ip = ip,
+            port = server?.port ?: Protocol.DEFAULT_PORT,
+            tls = true,
+            fingerprint = identity?.fingerprint ?: "",
+            alias = currentAlias(),
+        )
+    }
+
+    /** Our IPv4s, Wi\u2011Fi first. UDP discovery's interface set, applied to unicast. */
+    private fun pickAnnounceAddress(): String? {
+        val ifs = app.flit.share.protocol.discovery.UdpDiscovery.eligibleNetworkInterfaces()
+        data class Cand(val ifaceWifi: Boolean, val host: String)
+        val cands = ifs.flatMap { nii ->
+            nii.inetAddresses.asSequence()
+                .filter { ia -> ia.address.size == 4 && !ia.isLoopbackAddress }
+                .map { Cand(nii.name.startsWith("wlan"), it.hostAddress ?: "") }
+        }.filter { it.host.isNotBlank() }.sortedByDescending { it.ifaceWifi }
+        return cands.firstOrNull()?.host
+    }
+
+    /**
+     * Entry from the QR scanner / paste field. A scanned pairing code is
+     * human-eyeball verified: the address is inserted like any manual peer,
+     * AND \u2014 when the probed device's fingerprint matches the code's \u2014 it
+     * is pinned and marked with visual provenance ("\u2713 code"). Pinning
+     * happens after the probe, never before: trust attaches to the device
+     * that actually answers, not to the round-trip-free copy of the code.
+     */
+    fun addFromScan(raw: String) {
+        val code = parseAddCode(raw)
+        if (code == null) {
+            logLine("scan: not a Flit pairing code")
+            toast("that does not look like a Flit code")
+            return
+        }
+        val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }
+        val host = code.ip
+        FlitRoster.addManual("$host:${code.port}")
+        insertManualStub(host, code.port)
+        logLine("scan $host:${code.port}\u2026")
+        scope.launch(Dispatchers.IO) {
+            val self = server?.selfInfo() ?: run {
+                logLine("scan: not serving yet")
+                return@launch
+            }
+            val real = try {
+                cli.register(SendTarget(host, code.port, true), self, timeoutMs = 4_000)
+            } catch (e: Exception) {
+                logLine("scan $host:${code.port} unreachable (${e.message ?: e.javaClass.simpleName})")
+                null
+            }
+            if (real == null) return@launch
+            touchPeer(host, real)
+            if (code.fingerprint.isNotBlank() && real.fingerprint != code.fingerprint) {
+                logLine("scan: $host:${code.port} answers as ${real.fingerprint.take(12)}, code said ${code.fingerprint.take(12)} \u2014 NOT trusted")
+                toast("device answered, but its fingerprint changed \u2014 verify with the code again")
+                return@launch
+            }
+            if (code.fingerprint.isNotBlank()) {
+                FlitRoster.pin(real.fingerprint, real.alias)
+                FlitRoster.markScanned(real.fingerprint)
+                logLine("scan: pinned ${real.alias} (code verified)")
+            }
+        }
+    }
+
     // ==== sending ===============================================================
 
     /**
