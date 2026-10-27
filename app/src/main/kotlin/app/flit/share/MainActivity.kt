@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -59,6 +60,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Email
@@ -106,6 +109,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -347,15 +351,12 @@ class MainActivity : ComponentActivity() {
                         targetState = screen,
                         transitionSpec = {
                             val dir = if (targetState.ordinal >= initialState.ordinal) 1 else -1
+                            // Expressive spatial springs — md.sys.motion values
+                            // (tokens.md: default 0.8/380, fast 0.6/800).
                             (
-                                slideInHorizontally(
-                                    animationSpec = spring(
-                                        dampingRatio = Spring.DampingRatioNoBouncy,
-                                        stiffness = Spring.StiffnessMediumLow,
-                                    ),
-                                ) { w -> dir * w / 4 } + fadeIn(tween(150))
+                                slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = 380f)) { w -> dir * w / 4 } + fadeIn(FlitSpring.effects())
                             ) togetherWith (
-                                slideOutHorizontally { w -> -dir * w / 5 } + fadeOut(tween(110))
+                                slideOutHorizontally(spring(dampingRatio = 0.6f, stiffness = 800f)) { w -> -dir * w / 5 } + fadeOut(FlitSpring.fastEffects())
                             )
                         },
                         label = "screen",
@@ -1577,61 +1578,96 @@ class MainActivity : ComponentActivity() {
         onNote: () -> Unit,
         onAdd: () -> Unit,
     ) {
-        Surface(
-            modifier = modifier
-                .navigationBarsPadding()
-                .padding(bottom = 12.dp),
-            shape = RoundedCornerShape(34.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHighest,
-            tonalElevation = 3.dp,
-            shadowElevation = 14.dp,
-            border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
+        // Hero entrance (tokens.md): the Send FAB lands first, the toolbar
+        // follows 50 ms later. Runs once per activity instance, not per screen.
+        var fabIn by remember { mutableStateOf(false) }
+        var barIn by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) {
+            fabIn = true
+            delay(50)
+            barIn = true
+        }
+        val cs = MaterialTheme.colorScheme
+        val fabScale by animateFloatAsState(
+            targetValue = if (fabIn) 1f else 0.6f,
+            animationSpec = FlitSpring.spatial<Float>(),
+            label = "dockFabScale",
+        )
+        val fabAlpha by animateFloatAsState(
+            targetValue = if (fabIn) 1f else 0f,
+            animationSpec = FlitSpring.effects<Float>(),
+            label = "dockFabAlpha",
+        )
+        val barInFraction by animateFloatAsState(
+            targetValue = if (barIn) 1f else 0f,
+            animationSpec = FlitSpring.spatial<Float>(),
+            label = "dockBarIn",
+        )
+        val barAlpha by animateFloatAsState(
+            targetValue = if (barIn) 1f else 0f,
+            animationSpec = FlitSpring.effects<Float>(),
+            label = "dockBarAlpha",
+        )
+        Row(
+            modifier = modifier.navigationBarsPadding().padding(bottom = 16.dp).fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            // FAB = Send — "the move is the product" (brief principle 1).
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .padding(start = 16.dp)
+                    .graphicsLayer {
+                        scaleX = fabScale
+                        scaleY = fabScale
+                        alpha = fabAlpha
+                    }
+                    .size(56.dp),
             ) {
-                SendDockButton(transfer, onSend)
-                DockItem(
-                    Icons.Filled.Email,
-                    "Note",
-                    selected = false,
-                    badge = 0,
-                    onClick = onNote,
-                )
-                DockItem(
-                    Icons.Filled.Add,
-                    "Add",
-                    selected = false,
-                    badge = 0,
-                    onClick = {
+                SendFab(transfer, onSend)
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Surface(
+                shape = FlitCorner.full,
+                color = cs.surfaceContainerHighest,
+                tonalElevation = 3.dp,
+                shadowElevation = 6.dp,
+                modifier = Modifier
+                    .graphicsLayer {
+                        translationY = (1f - barInFraction) * 64f
+                        alpha = barAlpha
+                    },
+            ) {
+                Row(
+                    modifier = Modifier
+                        .height(64.dp)
+                        .padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    DockItem(Icons.Filled.Email, "Note", false, 0, onNote)
+                    DockItem(Icons.Filled.Add, "Add", false, 0) {
                         onAdd()
                         onGoHome()
-                    },
-                )
-                DockItem(
-                    Icons.Filled.List,
-                    "History",
-                    selected = screen == Screen.History,
-                    badge = fresh,
-                    onClick = {
+                    }
+                    DockItem(Icons.AutoMirrored.Filled.List, "History", screen == Screen.History, fresh) {
                         // Tapping the selected tab again always returns home.
                         onScreen(if (screen == Screen.History) Screen.Home else Screen.History)
-                    },
-                )
-                DockItem(
-                    Icons.Filled.Settings,
-                    "Options",
-                    selected = screen == Screen.Options,
-                    badge = queueCount,
-                    onClick = {
+                    }
+                    DockItem(Icons.Filled.Settings, "Options", screen == Screen.Options, queueCount) {
                         onScreen(if (screen == Screen.Options) Screen.Home else Screen.Options)
-                    },
-                )
+                    }
+                }
             }
         }
     }
 
+    /**
+     * M3 floating-toolbar item: 40dp icon button, pressed shape-morphs to
+     * 8dp (buttons.md pressed shape for this size); active screen marks
+     * itself with the filled treatment (primary/onPrimary).
+     */
     @Composable
     private fun DockItem(
         icon: androidx.compose.ui.graphics.vector.ImageVector,
@@ -1641,23 +1677,34 @@ class MainActivity : ComponentActivity() {
         onClick: () -> Unit,
     ) {
         val cs = MaterialTheme.colorScheme
-        val bg by animateColorAsState(
-            targetValue = if (selected) cs.secondaryContainer else Color.Transparent,
-            animationSpec = spring(stiffness = Spring.StiffnessMedium),
-            label = "dockbg",
+        val interaction = remember { MutableInteractionSource() }
+        val pressed by interaction.collectIsPressedAsState()
+        val corner by animateDpAsState(
+            targetValue = if (pressed) 8.dp else 40.dp,
+            animationSpec = FlitSpring.fastSpatial<Dp>(),
+            label = "dockCorner",
         )
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        val bg by animateColorAsState(
+            targetValue = if (selected) cs.primary else Color.Transparent,
+            animationSpec = FlitSpring.effects(),
+            label = "dockTint",
+        )
+        IconButton(
+            onClick = onClick,
+            interactionSource = interaction,
+            modifier = Modifier.size(40.dp),
+        ) {
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(bg)
-                    .clickable(onClick = onClick)
-                    .padding(horizontal = 13.dp, vertical = 7.dp),
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(corner))
+                    .background(bg),
+                contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     icon,
                     contentDescription = label,
-                    tint = if (selected) cs.onSecondaryContainer else cs.onSurfaceVariant,
+                    tint = if (selected) cs.onPrimary else cs.onSurfaceVariant,
                     modifier = Modifier.size(24.dp),
                 )
                 if (badge > 0) {
@@ -1669,70 +1716,58 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
-            Text(
-                label,
-                fontSize = 10.sp,
-                lineHeight = 12.sp,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                color = if (selected) cs.onSurface else cs.onSurfaceVariant,
-            )
         }
     }
 
+    /** Medium FAB (56dp); pressed shape-morphs to 12dp (buttons.md, size M). */
     @Composable
-    private fun SendDockButton(transfer: FlitEngine.TransferTelemetry?, onClick: () -> Unit) {
+    private fun SendFab(
+        transfer: FlitEngine.TransferTelemetry?,
+        onClick: () -> Unit,
+    ) {
         val cs = MaterialTheme.colorScheme
         val interaction = remember { MutableInteractionSource() }
         val pressed by interaction.collectIsPressedAsState()
-        val scale by animateFloatAsState(
-            targetValue = if (pressed) 0.86f else 1f,
-            animationSpec = spring(
-                dampingRatio = Spring.DampingRatioMediumBouncy,
-                stiffness = Spring.StiffnessMediumLow,
-            ),
-            label = "sendScale",
+        val corner by animateDpAsState(
+            targetValue = if (pressed) 12.dp else 28.dp,
+            animationSpec = FlitSpring.fastSpatial<Dp>(),
+            label = "fabCorner",
         )
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(horizontal = 8.dp),
-        ) {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(54.dp).scale(scale)) {
-                Surface(
-                    onClick = onClick,
-                    interactionSource = interaction,
-                    shape = CircleShape,
-                    color = cs.primary,
-                    shadowElevation = 7.dp,
-                    modifier = Modifier.size(54.dp),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Filled.Send,
-                            contentDescription = "Send files",
-                            tint = cs.onPrimary,
-                            modifier = Modifier.size(22.dp),
-                        )
-                    }
-                }
-                // Progress ring orbits the send button while bytes flow.
-                if (transfer != null) {
-                    CircularProgressIndicator(
-                        progress = {
-                            if (transfer.totalBytes > 0) {
-                                (transfer.doneBytes.toDouble() / transfer.totalBytes).toFloat().coerceIn(0f, 1f)
-                            } else 0.1f
-                        },
-                        modifier = Modifier
-                            .size(54.dp)
-                            .padding(3.dp),
-                        color = cs.tertiary,
-                        trackColor = Color.Transparent,
-                        strokeWidth = 4.dp,
-                        strokeCap = StrokeCap.Round,
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(56.dp)) {
+            Surface(
+                onClick = onClick,
+                interactionSource = interaction,
+                shape = RoundedCornerShape(corner),
+                color = cs.primaryContainer,
+                shadowElevation = 6.dp,
+                modifier = Modifier.size(56.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send files",
+                        tint = cs.onPrimaryContainer,
+                        modifier = Modifier.size(24.dp),
                     )
                 }
             }
-            Text("Send", fontSize = 10.sp, color = cs.primary, fontWeight = FontWeight.SemiBold)
+            // Progress ring orbits the send button while bytes flow.
+            if (transfer != null) {
+                CircularProgressIndicator(
+                    progress = {
+                        if (transfer.totalBytes > 0) {
+                            (transfer.doneBytes.toDouble() / transfer.totalBytes).toFloat().coerceIn(0f, 1f)
+                        } else 0.1f
+                    },
+                    modifier = Modifier
+                        .size(56.dp)
+                        .padding(3.dp),
+                    color = cs.primary,
+                    trackColor = Color.Transparent,
+                    strokeWidth = 4.dp,
+                    strokeCap = StrokeCap.Round,
+                )
+            }
         }
     }
 
