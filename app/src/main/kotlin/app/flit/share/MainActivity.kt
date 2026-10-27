@@ -41,6 +41,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -66,6 +67,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.List
@@ -82,6 +84,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -110,6 +113,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -1041,11 +1045,35 @@ class MainActivity : ComponentActivity() {
                             "light" to "Light",
                             "dark" to "Dark",
                         ).forEach { (key, label) ->
-                            TextButton(onClick = {
-                                prefs().edit().putString("theme", key).apply()
-                                theme = key
-                                showThemeDialog = false
-                            }) { Text(if (theme == key) "● $label" else "○ $label") }
+                            // M3 selection row: whole row selectable, trailing
+                            // state handled by the RadioButton (onClick = null).
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .selectable(
+                                        selected = theme == key,
+                                        role = Role.RadioButton,
+                                        onClick = {
+                                            prefs().edit().putString("theme", key).apply()
+                                            theme = key
+                                            showThemeDialog = false
+                                        },
+                                    )
+                                    .padding(vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(selected = theme == key, onClick = null)
+                                Spacer(Modifier.width(12.dp))
+                                Text(
+                                    label,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = if (theme == key) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    },
+                                )
+                            }
                         }
                     }
                 },
@@ -1133,7 +1161,7 @@ class MainActivity : ComponentActivity() {
                 fontWeight = FontWeight.Bold,
             )
             Surface(
-                shape = RoundedCornerShape(26.dp),
+                shape = RoundedCornerShape(FlitCorner.largeIncreased),
                 color = MaterialTheme.colorScheme.surfaceContainerLow,
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -1156,7 +1184,7 @@ class MainActivity : ComponentActivity() {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     SwitchOption(
                         title = "Only trusted devices can send me files",
-                        subtitle = "offers from devices you haven't starred (★) are declined automatically",
+                        subtitle = "offers from devices you haven't trusted are declined automatically",
                         initial = prefs().getBoolean("onlyTrusted", false),
                     ) { on ->
                         prefs().edit().putBoolean("onlyTrusted", on).apply()
@@ -1251,7 +1279,7 @@ class MainActivity : ComponentActivity() {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(
-                    "Flit 0.1.0 — speaks the LocalSend v2 protocol natively",
+                    "Flit 0.1.0 — speaks the open LAN-share protocol natively",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1264,7 +1292,7 @@ class MainActivity : ComponentActivity() {
 
             var showLog by remember { mutableStateOf(false) }
             Surface(
-                shape = RoundedCornerShape(26.dp),
+                shape = RoundedCornerShape(FlitCorner.largeIncreased),
                 color = MaterialTheme.colorScheme.surfaceContainerLow,
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -1287,10 +1315,17 @@ class MainActivity : ComponentActivity() {
                         if (showLog) {
                             TextButton(onClick = { FlitEngine.clearLog() }) { Text("Clear") }
                         }
-                        Text(
-                            if (showLog) "▾" else "▸",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        // Rotating chevron (spatial — position may bounce).
+                        val chevron by animateFloatAsState(
+                            targetValue = if (showLog) 0f else -90f,
+                            animationSpec = FlitSpring.spatial<Float>(),
+                            label = "logChevron",
+                        )
+                        Icon(
+                            Icons.Filled.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.graphicsLayer { rotationZ = chevron },
                         )
                     }
                     AnimatedVisibility(visible = showLog) {
@@ -1846,7 +1881,7 @@ class MainActivity : ComponentActivity() {
                         // Trust decisions are direct-share decisions: the sheet
                         // follows the roster in the same breath.
                         FlitShortcuts.sync(this@MainActivity)
-                    }) { Text(if (trusted) "★ trusted (tap to forget)" else "☆ trust this device") }
+                    }) { Text(if (trusted) "trusted — tap to forget" else "Trust this device") }
                     if (trusted) {
                         Text(
                             "folder: " + when {
