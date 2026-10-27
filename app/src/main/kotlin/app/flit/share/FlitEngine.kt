@@ -531,6 +531,13 @@ val share: StateFlow<ShareIntake?> = _share
                 ?: PeerEntry(ip, info, now)
             m + (info.fingerprint to entry)
         }
+        // A trusted peer that renamed itself: roster + direct-share shortcuts
+        // must not advertise the old name forever.
+        val pinned = FlitRoster.all().firstOrNull { it.fingerprint == info.fingerprint }
+        if (pinned != null && info.alias.isNotBlank() && pinned.alias != info.alias) {
+            FlitRoster.refreshAlias(info.fingerprint, info.alias)
+            FlitShortcuts.sync(appCtx)
+        }
         // A peer we owe files to just came back: dispatch its send-later batch
         // (guarded so an announce storm cannot double-send).
         if (FlitRoster.queued().any { it.fingerprint == info.fingerprint }) {
@@ -770,6 +777,23 @@ val share: StateFlow<ShareIntake?> = _share
         override fun openStream() = s.f.inputStream()
     }
 
+    /** Share/auto-send gate: engine has the serving identity AND an outbound client. */
+    fun readyForSend(): Boolean = client != null && server?.selfInfo() != null
+
+    /**
+     * User said "never mind" on the staged intake: the banner closes, spooled
+     * copies-in-waiting wander back to disk, and a still-running spool coroutine
+     * will not resurrect the intake (it checks the generation before committing).
+     */
+    fun discardIntake() {
+        intakeGen.incrementAndGet()
+        _share.value = null
+    }
+
+    private fun cleanSpools(spools: List<SpooledFile>) {
+        for (s in spools) runCatching { s.f.delete() }
+    }
+
     private fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean) {
         val cli = client ?: run { logLine("not sharing — start sharing first"); return }
         val self = server?.selfInfo() ?: return
@@ -817,6 +841,10 @@ val share: StateFlow<ShareIntake?> = _share
                 }
                 for (f in report.failed) logLine("FAIL ${f.fileName}: ${f.reason}")
                 if (sent == 0 && fail == 0) logLine("declined by ${peer.displayName}")
+                // Spools served their session — sent or refused, the cache copy
+                // has no future role here (a failed batch sent to the
+                // send-later queue keeps its files; the queue owns them now).
+                cleanSpools(src.spools)
                 _share.value = null
             } catch (e: Exception) {
                 val reason = e.message ?: e.javaClass.simpleName
@@ -845,6 +873,10 @@ val share: StateFlow<ShareIntake?> = _share
                     logLine("send failed: $reason")
                     prog.finish("send failed — $reason", ok = false, iconDone = false)
                 }
+                // Not queued (nothing queueable or enqueue refused): the
+                // spooled copies have no future — drop them. Queue-originated
+                // dispatches never clean here: the batch retains its file.
+                if (!queuedLog && !fromQueue) cleanSpools(src.spools)
                 _share.value = null
             } finally {
                 crushedTmp.forEach { runCatching { it.delete() } }
@@ -893,9 +925,13 @@ val share: StateFlow<ShareIntake?> = _share
 
     // ==== share intake ==========================================================
 
+    /** Bumped whenever the intake lifecycle changes hands (new share, discard). */
+    private val intakeGen = java.util.concurrent.atomic.AtomicLong(0)
+
     /** Called by MainActivity for ACTION_SEND / ACTION_SEND_MULTIPLE intents. */
     fun handleShareIntent(intent: Intent?, referrerHost: String?) {
         if (intent == null) return
+        intakeGen.incrementAndGet()
         val uris: List<Uri> = when (intent.action) {
             Intent.ACTION_SEND -> {
                 val u = intent.extras?.get(Intent.EXTRA_STREAM) as? Uri
@@ -920,6 +956,7 @@ val share: StateFlow<ShareIntake?> = _share
      */
     private fun spoolIntake(uris: List<Uri>, text: String?) {
         scope.launch(Dispatchers.IO) {
+            val gen = intakeGen.get()
             var waitedMs = 0
             while (!::appCtx.isInitialized && waitedMs < 20_000) {
                 delay(250)
@@ -942,6 +979,11 @@ val share: StateFlow<ShareIntake?> = _share
             }
             if ((dropped == uris.size || uris.isEmpty()) && spooled.isEmpty() && text.isNullOrBlank()) {
                 _share.value = null
+                return@launch
+            }
+            if (intakeGen.get() != gen) {
+                // Discarded while we were copying: nobody wants the copies now.
+                spooled.forEach { runCatching { it.f.delete() } }
                 return@launch
             }
             _share.update { it?.copy(ready = true, files = spooled) }

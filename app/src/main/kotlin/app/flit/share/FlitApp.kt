@@ -12,6 +12,9 @@ class FlitApp : Application() {
     override fun onCreate() {
         super.onCreate()
         FlitEngine.initAppCtx(this)
+        // Roster reads must be safe from the first activity touch: the share
+        // sheet fires MainActivity before any engine start.
+        FlitRoster.init(this)
         System.setProperty("io.netty.transport.noNative", "true")
     }
 }

@@ -59,6 +59,8 @@ object FlitRoster {
 
     fun pinned(fingerprint: String): Boolean = all().any { it.fingerprint == fingerprint }
 
+    fun alias(fingerprint: String): String? = all().firstOrNull { it.fingerprint == fingerprint }?.alias
+
     fun pin(fingerprint: String, alias: String) {
         if (fingerprint.startsWith("manual@")) return // stub rows are not pinnable yet
         val list = all().filterNot { it.fingerprint == fingerprint }
@@ -66,6 +68,11 @@ object FlitRoster {
     }
 
     fun unpin(fingerprint: String) = save(all().filterNot { it.fingerprint == fingerprint })
+
+    /** A trusted peer renamed itself: the roster follows (shortcuts ride along). */
+    fun refreshAlias(fingerprint: String, alias: String) = save(
+        all().map { if (it.fingerprint == fingerprint) it.copy(alias = alias) else it },
+    )
 
     fun setDestTree(fingerprint: String, treeUri: String?) {
         save(all().map { if (it.fingerprint == fingerprint) it.copy(destTree = treeUri) else it })

@@ -60,6 +60,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Refresh
@@ -71,6 +72,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -123,6 +125,9 @@ class MainActivity : ComponentActivity() {
 
     private var pendingPeer: FlitEngine.PeerEntry? = null
     private var shareMode = false
+
+    /** Direct-share target from the sheet: dispatch the intake to this fp the moment both it and the device are ready. */
+    private val autoPeerFp = mutableStateOf<String?>(null)
 
     private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val peer = pendingPeer
@@ -195,6 +200,14 @@ class MainActivity : ComponentActivity() {
         when (intent.action) {
             Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE -> {
                 shareMode = true
+                // The fp rides in our own extra; on some OEM sheets (MIUI)
+                // only the standard shortcut id survives — the id IS the
+                // fingerprint by contract, so both roads end at the truth.
+                val raw = intent.getStringExtra(FlitShortcuts.EXTRA_PEER_FP)
+                    ?: intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID)
+                val fp = raw?.takeIf { FlitRoster.pinned(it) }
+                if (fp != null) android.util.Log.i("FlitSend", "share-in: direct target ${FlitRoster.alias(fp) ?: fp.take(8)}")
+                autoPeerFp.value = fp
                 FlitEngine.handleShareIntent(intent, referrerHost = referrer?.host)
                 // The engine may not be running yet; share flows auto-start silently.
                 if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
@@ -290,7 +303,42 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(share) { if (share == null && FlitEngine.state.value.running) finish() }
         }
 
+        // Direct-share target: the sheet aimed at a trusted peer. Dispatch the
+        // moment intake AND that device are ready — the second tap the sheet
+        // already paid for. Offline targets never auto-send: content would fly
+        // at a stale address; the user chooses manually instead.
+        val autoFp = this@MainActivity.autoPeerFp.value
+        if (autoFp != null) {
+            LaunchedEffect(autoFp) {
+                var waited = 0
+                while (waited < 15_000) {
+                    val s = FlitEngine.share.value
+                    if (s == null) return@LaunchedEffect // intake discarded mid-flight
+                    val peer = FlitEngine.peers.value.values.firstOrNull { it.info.fingerprint == autoFp }
+                    if (peer != null && s.ready && FlitEngine.readyForSend()) {
+                        android.util.Log.i("FlitSend", "direct-share dispatch to ${peer.displayName}")
+                        FlitShortcuts.reportUsed(ctx, autoFp)
+                        FlitEngine.sendShare(peer)
+                        this@MainActivity.autoPeerFp.value = null
+                        return@LaunchedEffect
+                    }
+                    delay(400)
+                    waited += 400
+                }
+                this@MainActivity.autoPeerFp.value = null
+                if (FlitEngine.share.value != null) {
+                    FlitEngine.toast("${FlitRoster.all().firstOrNull { it.fingerprint == autoFp }?.alias ?: "that device"} is offline — tap it in the list to queue")
+                }
+            }
+        }
+
         BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
+
+        // Direct-share targets live from the first second of the app. Trust
+        // toggles and renames arriving via registration resync on their own;
+        // the boot sweep covers everything left (offline pin without peers).
+        LaunchedEffect(Unit) { FlitShortcuts.sync(this@MainActivity) }
+        LaunchedEffect(state.running) { if (state.running) FlitShortcuts.sync(this@MainActivity) }
 
         val dark = when (theme) {
             "dark" -> true
@@ -468,18 +516,34 @@ class MainActivity : ComponentActivity() {
                                                 modifier = Modifier.padding(16.dp),
                                                 verticalArrangement = Arrangement.spacedBy(4.dp),
                                             ) {
+                                                val bytes = s.files.sumOf { it.size }
                                                 val parts = if (s.ready) {
                                                     buildList {
-                                                        if (n > 0) add("$n file${if (n > 1) "s" else ""}")
+                                                        if (n > 0) {
+                                                            add(SheetUi.countSummary(n))
+                                                            if (bytes > 0) add(FlitEngine.fmtBytes(bytes))
+                                                        }
                                                         if (!s.text.isNullOrBlank()) add("a text note")
                                                     }
                                                 } else listOf("files (preparing…)")
-                                                Text(
-                                                    "Ready to send ${parts.joinToString(" + ")}",
-                                                    style = MaterialTheme.typography.titleSmall,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                                )
+                                                Row(verticalAlignment = Alignment.Top) {
+                                                    Text(
+                                                        "Ready to send ${parts.joinToString(" + ")}",
+                                                        style = MaterialTheme.typography.titleSmall,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                        modifier = Modifier.weight(1f),
+                                                    )
+                                                    IconButton(
+                                                        onClick = { FlitEngine.discardIntake() },
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Default.Close,
+                                                            contentDescription = "discard staged share",
+                                                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                        )
+                                                    }
+                                                }
                                                 if (!s.text.isNullOrBlank() && n == 0) {
                                                     Text(
                                                         s.text.take(160),
@@ -509,7 +573,10 @@ class MainActivity : ComponentActivity() {
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .clickable {
-                                                    if (share != null) FlitEngine.sendShare(last) else {
+                                                    if (share != null) {
+                                                        FlitShortcuts.reportUsed(ctx, last.info.fingerprint)
+                                                        FlitEngine.sendShare(last)
+                                                    } else {
                                                         pendingPeer = last
                                                         pickFiles.launch(arrayOf("*/*"))
                                                     }
@@ -654,7 +721,10 @@ class MainActivity : ComponentActivity() {
                                             p,
                                             index = idx,
                                             onSend = {
-                                                if (share != null) FlitEngine.sendShare(p) else {
+                                                if (share != null) {
+                                                    FlitShortcuts.reportUsed(ctx, p.info.fingerprint)
+                                                    FlitEngine.sendShare(p)
+                                                } else {
                                                     pendingPeer = p
                                                     pickFiles.launch(arrayOf("*/*"))
                                                 }
@@ -1703,6 +1773,9 @@ class MainActivity : ComponentActivity() {
                             FlitRoster.pin(peer.info.fingerprint, peer.displayName)
                             trusted = true
                         }
+                        // Trust decisions are direct-share decisions: the sheet
+                        // follows the roster in the same breath.
+                        FlitShortcuts.sync(this@MainActivity)
                     }) { Text(if (trusted) "★ trusted (tap to forget)" else "☆ trust this device") }
                     if (trusted) {
                         Text(
