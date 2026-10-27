@@ -14,6 +14,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -39,6 +41,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -66,6 +69,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
@@ -73,6 +77,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -418,24 +423,45 @@ class MainActivity : ComponentActivity() {
                                                         color = onHero,
                                                     )
                                                 }
-                                                if (state.running || state.starting) {
-                                                    // Disabled while starting: a tap here used to
-                                                    // cancel a start that hadn't announced itself yet.
-                                                    OutlinedButton(
-                                                        onClick = { stopSharing() },
-                                                        enabled = !state.starting,
-                                                        shape = CircleShape,
-                                                    ) {
-                                                        Text(if (state.starting) "starting…" else "Stop")
+                                                    // Engine pill: start/stop is hero moment #2 —
+                                                    // the swap rides spatial springs; effects
+                                                    // (opacity) never overshoot (tokens.md).
+                                                    AnimatedContent(
+                                                        targetState = state.running || state.starting,
+                                                        transitionSpec = {
+                                                            (
+                                                                scaleIn(
+                                                                    animationSpec = FlitSpring.spatial<Float>(),
+                                                                    initialScale = 0.6f,
+                                                                ) + fadeIn(FlitSpring.effects())
+                                                                ) togetherWith (
+                                                                scaleOut(
+                                                                    animationSpec = FlitSpring.fastEffects(),
+                                                                    targetScale = 0.95f,
+                                                                ) + fadeOut(FlitSpring.fastEffects())
+                                                                )
+                                                        },
+                                                        label = "enginePill",
+                                                    ) { on ->
+                                                        if (on) {
+                                                            // Disabled while starting: a tap here used to
+                                                            // cancel a start that hadn't announced itself yet.
+                                                            OutlinedButton(
+                                                                onClick = { stopSharing() },
+                                                                enabled = !state.starting,
+                                                                shape = CircleShape,
+                                                            ) {
+                                                                Text(if (state.starting) "starting…" else "Stop")
+                                                            }
+                                                        } else {
+                                                            Button(
+                                                                onClick = { askThenStart() },
+                                                                shape = CircleShape,
+                                                            ) {
+                                                                Text("Share on Wi‑Fi")
+                                                            }
+                                                        }
                                                     }
-                                                } else {
-                                                    Button(
-                                                        onClick = { askThenStart() },
-                                                        shape = CircleShape,
-                                                    ) {
-                                                        Text("Share on Wi‑Fi")
-                                                    }
-                                                }
                                             }
                                             if (state.running) {
                                                 Text(
@@ -470,7 +496,8 @@ class MainActivity : ComponentActivity() {
                                                             )
                                                             if (t.speedBytesPerSec > 0) Text(
                                                                 "${FlitEngine.fmtBytes(t.speedBytesPerSec)}/s",
-                                                                style = MaterialTheme.typography.labelLarge,
+                                                                style = MaterialTheme.typography.labelLarge
+                                                                    .copy(fontFeatureSettings = "tnum"),
                                                                 fontWeight = FontWeight.Bold,
                                                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
                                                             )
@@ -479,14 +506,15 @@ class MainActivity : ComponentActivity() {
                                                             progress = { frac },
                                                             modifier = Modifier
                                                                 .fillMaxWidth()
-                                                                .height(12.dp)
+                                                                .height(6.dp)
                                                                 .clip(CircleShape),
                                                             trackColor = MaterialTheme.colorScheme.onPrimaryContainer
                                                                 .copy(alpha = 0.18f),
                                                         )
                                                         Text(
                                                             "${FlitEngine.fmtBytes(t.doneBytes)} / ${FlitEngine.fmtBytes(t.totalBytes)}",
-                                                            style = MaterialTheme.typography.bodySmall,
+                                                            style = MaterialTheme.typography.bodySmall
+                                                                .copy(fontFeatureSettings = "tnum"),
                                                             color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
                                                         )
                                                     }
@@ -499,7 +527,7 @@ class MainActivity : ComponentActivity() {
                                     share?.let { s ->
                                         val n = s.files.size + s.uris.size
                                         Surface(
-                                            shape = RoundedCornerShape(24.dp),
+                                            shape = RoundedCornerShape(FlitCorner.large),
                                             color = MaterialTheme.colorScheme.secondaryContainer,
                                             modifier = Modifier.fillMaxWidth(),
                                         ) {
@@ -559,7 +587,7 @@ class MainActivity : ComponentActivity() {
                                     if (state.running && lastPeer != null) {
                                         val last = lastPeer!!
                                         Surface(
-                                            shape = RoundedCornerShape(24.dp),
+                                            shape = RoundedCornerShape(FlitCorner.large),
                                             color = MaterialTheme.colorScheme.secondaryContainer,
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -618,7 +646,7 @@ class MainActivity : ComponentActivity() {
                                         exit = shrinkVertically() + fadeOut(tween(140)),
                                     ) {
                                         Surface(
-                                            shape = RoundedCornerShape(24.dp),
+                                            shape = RoundedCornerShape(FlitCorner.large),
                                             color = MaterialTheme.colorScheme.surfaceContainer,
                                             modifier = Modifier.fillMaxWidth(),
                                         ) {
@@ -647,8 +675,22 @@ class MainActivity : ComponentActivity() {
                                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                             )
                                                         }
-                                                        TextButton(onClick = { FlitEngine.retryQueued(q.fingerprint) }) { Text("↻") }
-                                                        TextButton(onClick = { FlitEngine.cancelQueued(q.fingerprint) }) { Text("✕") }
+                                                        IconButton(onClick = { FlitEngine.retryQueued(q.fingerprint) }) {
+                                                            Icon(
+                                                                Icons.Filled.Refresh,
+                                                                contentDescription = "retry now",
+                                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                modifier = Modifier.size(20.dp),
+                                                            )
+                                                        }
+                                                        IconButton(onClick = { FlitEngine.cancelQueued(q.fingerprint) }) {
+                                                            Icon(
+                                                                Icons.Filled.Close,
+                                                                contentDescription = "cancel send-later",
+                                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                modifier = Modifier.size(20.dp),
+                                                            )
+                                                        }
                                                     }
                                                 }
                                             }
@@ -690,7 +732,7 @@ class MainActivity : ComponentActivity() {
                                                     ScanningDots()
                                                     Text("scanning…", style = MaterialTheme.typography.titleSmall)
                                                     Text(
-                                                        "Flit and LocalSend devices on this Wi‑Fi appear here on their own",
+                                                        "devices speaking this protocol appear here on their own",
                                                         style = MaterialTheme.typography.bodySmall,
                                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                         textAlign = TextAlign.Center,
@@ -767,7 +809,7 @@ class MainActivity : ComponentActivity() {
                                                 contentAlignment = Alignment.Center,
                                             ) {
                                                 Icon(
-                                                    Icons.Filled.List,
+                                                    Icons.AutoMirrored.Filled.List,
                                                     contentDescription = null,
                                                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                                                     modifier = Modifier.size(38.dp),
@@ -1427,12 +1469,15 @@ class MainActivity : ComponentActivity() {
         // or the fresh instance strands invisible at alpha 0.
         LaunchedEffect(peer.info.fingerprint) {
             delay(45L * (index % 8))
-            enter.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium))
+            enter.animateTo(1f, FlitSpring.spatial<Float>())
         }
+        // Identity avatar — stable hue per fingerprint (SheetUi palette),
+        // tuned for the scheme in force; hue is content, not chrome.
+        val hue = SheetUi.hueFor(peer.info.fingerprint).toFloat()
+        val avatar = Color.hsl(hue, 0.55f, 0.82f)
+        val onAvatar = Color.hsl(hue, 0.45f, 0.26f)
         Surface(
-            shape = RoundedCornerShape(26.dp),
-            color = cs.surfaceContainerLow,
-            tonalElevation = 1.dp,
+            color = Color.Transparent,
             modifier = Modifier
                 .fillMaxWidth()
                 .graphicsLayer {
@@ -1444,26 +1489,30 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(onClick = onSend)
-                    .padding(start = 14.dp, top = 12.dp, bottom = 12.dp, end = 12.dp),
+                    .padding(start = 4.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(
                     modifier = Modifier
                         .size(46.dp)
                         .clip(CircleShape)
-                        .background(if (trusted) cs.primaryContainer else cs.surfaceContainerHighest),
+                        .background(avatar),
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        peer.displayName.trim().take(1).uppercase().ifBlank { "?" },
+                        SheetUi.initials(peer.displayName).ifBlank { "?" },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
-                        color = if (trusted) cs.onPrimaryContainer else cs.onSurface,
+                        color = onAvatar,
                     )
                 }
-                Spacer(Modifier.width(12.dp))
+                Spacer(Modifier.width(14.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(peer.displayName, style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        peer.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
                     val trustSuffix =
                         (if (trusted) " · trusted" else "") + (if (scanned) " · code ✓" else "")
                     Text(
@@ -1472,27 +1521,22 @@ class MainActivity : ComponentActivity() {
                         color = cs.onSurfaceVariant,
                     )
                 }
-                TextButton(onClick = onMenu) {
-                    Text(
-                        if (trusted) "★" else "☆",
-                        fontSize = 20.sp,
-                        color = if (trusted) cs.primary else cs.onSurfaceVariant,
+                IconButton(onClick = onMenu) {
+                    Icon(
+                        Icons.Filled.MoreVert,
+                        contentDescription = "device options",
+                        tint = cs.onSurfaceVariant,
                     )
                 }
-                Surface(
+                FilledTonalButton(
+                    onClick = onSend,
                     shape = CircleShape,
-                    color = cs.primaryContainer,
+                    contentPadding = PaddingValues(horizontal = 16.dp),
                     modifier = Modifier
-                        .clickable(onClick = onSend)
+                        .height(40.dp)
                         .padding(start = 2.dp),
                 ) {
-                    Text(
-                        "send",
-                        modifier = Modifier.padding(horizontal = 15.dp, vertical = 9.dp),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = cs.onPrimaryContainer,
-                    )
+                    Text("send", style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
