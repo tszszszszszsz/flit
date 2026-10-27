@@ -340,17 +340,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) { FlitShortcuts.sync(this@MainActivity) }
         LaunchedEffect(state.running) { if (state.running) FlitShortcuts.sync(this@MainActivity) }
 
-        val dark = when (theme) {
-            "dark" -> true
-            "light" -> false
-            else -> isSystemInDarkTheme()
-        }
-        val colors = if (Build.VERSION.SDK_INT >= 31) {
-            if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
-        } else {
-            if (dark) darkColorScheme() else lightColorScheme()
-        }
-        MaterialTheme(colorScheme = colors) {
+        FlitTheme(themeOverride = theme) {
             Surface(modifier = Modifier.fillMaxSize()) {
                 Box(modifier = Modifier.fillMaxSize()) {
                     AnimatedContent(
@@ -856,7 +846,7 @@ class MainActivity : ComponentActivity() {
 
         if (showAddDialog) {
             var addr by remember { mutableStateOf("") }
-            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                 AlertDialog(
                 onDismissRequest = { showAddDialog = false },
                 title = { Text("Add device") },
@@ -921,7 +911,7 @@ class MainActivity : ComponentActivity() {
         }
 
         if (showQrDialog) {
-            MaterialTheme(colorScheme = colors) { QrShowCard(onClose = { showQrDialog = false }) }
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { QrShowCard(onClose = { showQrDialog = false }) }
         }
 
         if (showScanDialog) {
@@ -935,7 +925,7 @@ class MainActivity : ComponentActivity() {
 
         if (showNoteDialog) {
             var note by remember { mutableStateOf("") }
-            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                 AlertDialog(
                 onDismissRequest = { showNoteDialog = false },
                 title = { Text("Send a note") },
@@ -971,7 +961,7 @@ class MainActivity : ComponentActivity() {
 
         if (showRenameDialog) {
             var name by remember { mutableStateOf(FlitEngine.currentAlias()) }
-            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                 AlertDialog(
                 onDismissRequest = { showRenameDialog = false },
                 title = { Text("Device name") },
@@ -997,7 +987,7 @@ class MainActivity : ComponentActivity() {
         }
 
         if (showThemeDialog) {
-            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
             AlertDialog(
                 onDismissRequest = { showThemeDialog = false },
                 title = { Text("Theme") },
@@ -1025,7 +1015,7 @@ class MainActivity : ComponentActivity() {
         }
 
         if (showBatteryDialog) {
-            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
             AlertDialog(
                 onDismissRequest = { showBatteryDialog = false },
                 title = { Text("Background battery") },
@@ -1056,7 +1046,7 @@ class MainActivity : ComponentActivity() {
         }
 
         peerMenuFor?.let { peer ->
-            MaterialTheme(colorScheme = colors) { // MIUI dialog windows resolve a light scheme — pin ours
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                 PeerMenuDialog(
                 peer = peer,
                 onDismiss = { peerMenuFor = null },
