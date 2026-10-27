@@ -59,6 +59,10 @@ object FlitRoster {
 
     fun pinned(fingerprint: String): Boolean = all().any { it.fingerprint == fingerprint }
 
+    /** The alias we best know a trusted device by (locally renamed → wins). */
+    fun aliasFor(fingerprint: String): String? =
+        all().firstOrNull { it.fingerprint == fingerprint }?.alias?.takeIf { it.isNotBlank() }
+
     fun alias(fingerprint: String): String? = all().firstOrNull { it.fingerprint == fingerprint }?.alias
 
     fun pin(fingerprint: String, alias: String) {
@@ -125,8 +129,15 @@ object FlitRoster {
     } ?: emptyList()
 
     fun addManual(address: String): Boolean {
+        // Loopback is never a neighbor: refuse at the single write choke
+        // point (the pre-fix self-ghost bug wrote junk here). Returns false
+        // only for refuse-worthy rows; duplicates are already ours → true.
+        val host = address.substringBeforeLast(':').trim().lowercase()
+        if (host.isBlank() || host.startsWith("127.") || host == "::1" || host == "localhost" || host == "0.0.0.0") {
+            return false
+        }
         val cur = manual()
-        if (cur.contains(address)) return false
+        if (cur.contains(address)) return true
         prefs().edit().putString(KEY_MANUAL, json.encodeToString(ListSerializer(String.serializer()), cur + address)).apply()
         return true
     }

@@ -43,6 +43,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 
 /** Peers vanish from the list after this long without an announce/register. */
 const val PEER_TTL_MS = 30_000L
@@ -72,7 +75,12 @@ object FlitEngine {
         val info: PeerInfo,
         val lastSeenMs: Long,
     ) {
-        val displayName: String get() = info.alias
+        // Trust wins over the wire: a locally pinned/renamed alias shadows
+        // whatever the announce carries; a device we know nothing about still
+        // labels its row honestly with its address. (Fixes rows rendering
+        // blank/raw for peers whose announce lacked an alias.)
+        val displayName: String
+            get() = FlitRoster.aliasFor(info.fingerprint) ?: info.alias.ifBlank { address }
         val address: String get() = "$ip:${info.port}"
     }
 
@@ -120,13 +128,26 @@ val share: StateFlow<ShareIntake?> = _share
      * is actually reachable (same ip:port, real fingerprint). The stub itself
      * survives in `_peers`, so the row reappears when the device goes quiet.
      */
-    fun dedupedPeers(raw: Map<String, PeerEntry> = _peers.value): Map<String, PeerEntry> {
+    fun dedupedPeers(
+        raw: Map<String, PeerEntry> = _peers.value,
+        selfFp: String? = identity?.fingerprint,
+    ): Map<String, PeerEntry> {
         val m = raw
         val covered = m.entries
             .filterNot { it.key.startsWith("manual@") }
             .map { it.value.ip to it.value.info.port }
             .toSet()
-        return m.filterNot { (k, v) -> k.startsWith("manual@") && (v.ip to v.info.port) in covered }
+        return m
+            // Self-announces that slip in before my identity loads (loopback
+            // multicast ghosts) are not devices: this is the UI-seam belt to
+            // the fingerprint check at ingest. The pre-fix bug also recorded
+            // loopback manual stubs — 127.x is never a neighbor.
+            .filterNot { (_, v) -> selfFp != null && v.info.fingerprint == selfFp }
+            .filterNot { (k, v) ->
+                k.startsWith("manual@") &&
+                    v.ip.let { it.startsWith("127.") || it == "::1" || it == "0.0.0.0" }
+            }
+            .filterNot { (k, v) -> k.startsWith("manual@") && (v.ip to v.info.port) in covered }
     }
 
     val peers: StateFlow<Map<String, PeerEntry>> = _peers
@@ -136,6 +157,59 @@ val share: StateFlow<ShareIntake?> = _share
 
     private val _received = MutableStateFlow<List<ReceivedFile>>(emptyList())
     val received: StateFlow<List<ReceivedFile>> = _received
+
+    // ==== received history ======================================================
+
+    /** Entries survive restarts: a tiny (~1 KB) JSON in app-private files. */
+    private const val RECEIVED_HISTORY_FILE = "received-history.json"
+    private var receivedLoaded = false
+
+    /** Disk mirror of [ReceivedFile] (paths/uris as strings — File isn't JSON). */
+    @Serializable
+    private data class ReceivedRec(
+        val name: String,
+        val bytes: Long,
+        val whenMs: Long,
+        val path: String? = null,
+        val uri: String? = null,
+    )
+
+    private val receivedJson = Json { ignoreUnknownKeys = true }
+
+    /** Payload → rows (pure core, unit-tested without an Android context). */
+    internal fun decodeReceived(payload: String): List<ReceivedFile> =
+        runCatching {
+            receivedJson.decodeFromString(ListSerializer(ReceivedRec.serializer()), payload)
+        }.getOrDefault(emptyList()).map {
+            ReceivedFile(it.name, it.bytes, it.whenMs, it.path?.let(::File), it.uri)
+        }
+
+    internal fun encodeReceived(list: List<ReceivedFile>): String {
+        val rows = list.map {
+            ReceivedRec(it.name, it.bytes, it.whenMs, it.path?.absolutePath, it.uri)
+        }
+        return receivedJson.encodeToString(ListSerializer(ReceivedRec.serializer()), rows)
+    }
+
+    /** One history row on any receive path, then the store is rewritten. */
+    private fun addReceived(r: ReceivedFile) {
+        _received.update { (it + r).takeLast(20) }
+        persistReceived()
+    }
+
+    /** Loaded at app boot: history is visible before the engine ever starts. */
+    private fun loadReceived(boot: Context) {
+        if (receivedLoaded) return
+        receivedLoaded = true
+        runCatching {
+            val f = boot.filesDir.resolve(RECEIVED_HISTORY_FILE)
+            _received.value = decodeReceived(f.takeIf { it.length() > 0 }?.readText() ?: "").takeLast(20)
+        }
+    }
+
+    private fun persistReceived() {
+        runCatching { appCtx.filesDir.resolve(RECEIVED_HISTORY_FILE).writeText(encodeReceived(_received.value)) }
+    }
 
     private val _queue = MutableStateFlow<List<QueuedSend>>(emptyList())
     val queue: StateFlow<List<QueuedSend>> = _queue
@@ -302,6 +376,7 @@ val share: StateFlow<ShareIntake?> = _share
 
     fun initAppCtx(ctx: Context) {
         if (bootCtx == null) bootCtx = ctx.applicationContext
+        loadReceived(bootCtx!!)
     }
 
     fun prefs(): android.content.SharedPreferences =
@@ -657,8 +732,7 @@ val share: StateFlow<ShareIntake?> = _share
         }
         val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }
         val host = code.ip
-        FlitRoster.addManual("$host:${code.port}")
-        insertManualStub(host, code.port)
+        if (FlitRoster.addManual("$host:${code.port}")) insertManualStub(host, code.port)
         logLine("scan $host:${code.port}\u2026")
         scope.launch(Dispatchers.IO) {
             val self = server?.selfInfo() ?: run {
@@ -705,8 +779,7 @@ val share: StateFlow<ShareIntake?> = _share
         val port = raw.substringAfterLast(':').toIntOrNull()?.takeIf { it in 1..65535 }
             ?: Protocol.DEFAULT_PORT
         // Manual rows persist across restarts (roster) and never age out.
-        FlitRoster.addManual("$host:$port")
-        insertManualStub(host, port)
+        if (FlitRoster.addManual("$host:$port")) insertManualStub(host, port)
         logLine("probe $host:$port\u2026")
         val self = server?.selfInfo() ?: return
         scope.launch(Dispatchers.IO) {
@@ -1069,9 +1142,7 @@ val share: StateFlow<ShareIntake?> = _share
                         if (ok) {
                             val (name, size) = runCatching { finalizeRow(url) }
                                 .getOrDefault(info.fileName to info.size)
-                            _received.update { list ->
-                                (list + ReceivedFile(name, size, System.currentTimeMillis(), null, url.toString())).takeLast(20)
-                            }
+                            addReceived(ReceivedFile(name, size, System.currentTimeMillis(), null, url.toString()))
                             logLine("→ Downloads/Flit/$name")
                         } else {
                             runCatching { resolver.delete(url, null, null) }
@@ -1100,9 +1171,7 @@ val share: StateFlow<ShareIntake?> = _share
             done = { ok ->
                 if (finished.compareAndSet(false, true)) {
                     if (ok) {
-                        _received.update { list ->
-                            (list + ReceivedFile(name, info.size, System.currentTimeMillis(), null, docUri.toString())).takeLast(20)
-                        }
+                        addReceived(ReceivedFile(name, info.size, System.currentTimeMillis(), null, docUri.toString()))
                         logLine("→ $name (chosen folder)")
                     } else {
                         // Aborted/partial transfer: remove the half-written
@@ -1155,7 +1224,7 @@ val share: StateFlow<ShareIntake?> = _share
                     logLine("could not unpack ${file.name} — keeping the gzip (${it.message ?: it.javaClass.simpleName})")
                 }
         }
-        _received.update { list -> (list + ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file)).takeLast(20) }
+        addReceived(ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file))
         // A per-peer folder, else the global default, else the Downloads/Flit bucket.
         val tree = receiveTreeFor(senderFp)
         if (tree != null) {
@@ -1291,6 +1360,7 @@ val share: StateFlow<ShareIntake?> = _share
 
     fun clearReceived() {
         _received.value = emptyList()
+        persistReceived()
     }
 
     /** Debug escape hatch: `adb shell setprop debug.flit.nopin 1` before starting the engine. */
