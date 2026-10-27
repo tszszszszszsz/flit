@@ -1,5 +1,6 @@
 package app.flit.share.protocol.client
 
+import app.flit.share.protocol.tls.StreamTls
 import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -61,5 +62,35 @@ private class SocketLink(private val socket: Socket) : Link {
     override val output: OutputStream get() = socket.getOutputStream()
     override fun close() {
         runCatching { socket.close() }
+    }
+}
+
+/**
+ * Any [Link] upgraded to mutual TLS across its streams — this is how the
+ * Bluetooth phase speaks the same wire TLS the TCP path uses, without
+ * sockets. Handshake runs at construction (blocking, like
+ * [javax.net.ssl.SSLSocket.startHandshake]); [input]/[output] are the
+ * decrypted plain-text streams.
+ *
+ * @param clientMode true = presents as TLS client (senders); false = server.
+ */
+class TlsLink(
+    private val raw: Link,
+    identity: TlsIdentity,
+    clientMode: Boolean,
+) : Link {
+
+    private val tls = if (clientMode) {
+        StreamTls.startClient(raw.input, raw.output, identity)
+    } else {
+        StreamTls.startServer(raw.input, raw.output, identity)
+    }
+
+    override val input: InputStream = tls.input
+    override val output: OutputStream = tls.output
+
+    override fun close() {
+        runCatching { tls.close() } // close_notify so the peer sees clean EOF, not an abrupt carrier drop
+        raw.close()
     }
 }
