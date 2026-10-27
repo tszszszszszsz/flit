@@ -109,7 +109,7 @@ fun QrShowCard(onClose: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp),
         ) {
-            Surface(color = Color.White, shape = RoundedCornerShape(24.dp)) {
+            Surface(color = Color.White, shape = RoundedCornerShape(FlitCorner.extraLarge)) {
                 Box(modifier = Modifier.padding(18.dp)) {
                     val c = self
                     if (c != null) {
