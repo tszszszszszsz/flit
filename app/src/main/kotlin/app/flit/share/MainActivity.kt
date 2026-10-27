@@ -1397,11 +1397,11 @@ class MainActivity : ComponentActivity() {
         // identity swaps in place (a new file at the same list slot).
         LaunchedEffect(r.name + r.whenMs) {
             delay(45L * (index % 6))
-            enter.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium))
+            enter.animateTo(1f, FlitSpring.spatial<Float>())
         }
         Surface(
-            shape = RoundedCornerShape(24.dp),
-            color = cs.surfaceContainerLow,
+            shape = RoundedCornerShape(FlitCorner.large),
+            color = cs.surfaceContainerHighest,
             tonalElevation = 1.dp,
             modifier = Modifier
                 .fillMaxWidth()
@@ -1441,11 +1441,12 @@ class MainActivity : ComponentActivity() {
                     )
                     Text(
                         "${ts(r.whenMs)} · ${FlitEngine.fmtBytes(r.bytes)} · tap to open",
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MaterialTheme.typography.bodySmall
+                            .copy(fontFeatureSettings = "tnum"),
                         color = cs.onSurfaceVariant,
                     )
                 }
-                TextButton(onClick = onShare) {
+                IconButton(onClick = onShare) {
                     Icon(
                         Icons.Filled.Share,
                         contentDescription = "Re-share ${r.name}",
