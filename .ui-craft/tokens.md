@@ -38,7 +38,7 @@ Deliberate color exceptions:
 |---|---|---|
 | none | 0 | blocks, app bar |
 | extra small | 4 | text field default |
-| small | 8 | snackbar, dense chips |
+| small | 8 | dense chips |
 | medium | 12 | mid-size containers |
 | large | 16 | cards, banners |
 | large increased | 20 | roomy cards |
@@ -95,7 +95,7 @@ FAB/toolbar entrance, and the engine start/stop morph. Entrance stagger (ours, n
 | Received items | M3 filled cards, 16dp corners, list-style single column | docs: weapon variant is styling-only |
 | Options | list rows + M3 `Switch` (52×32) | input.md |
 | Note dialog | M3 text field in `AlertDialog` | containment.md |
-| Snackbar | inverse-surface colors, one at a time, 4–10 s, anchored above the dock | feedback.md |
+| Snackbar | inverse-surface trio, one at a time, 48dp, extra-small (4) radius, 4 s, above the dock — shipped, measured 48.0 dp + 16 margins on device | expressive component tokens (CornerExtraSmall) |
 
 When material3 ships `HorizontalFloatingToolbar` / `LoadingIndicator` / `MaterialShapes` in a
 stable line, replace the marked substitutes — geometry tokens above were kept component-faithful
