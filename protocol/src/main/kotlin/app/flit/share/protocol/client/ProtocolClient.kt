@@ -34,9 +34,11 @@ class TransferException(val status: Int, val detail: String) :
 /** LocalSend v2.2 client: register, info, and file sending over the upload API. */
 class ProtocolClient(
     private val identity: TlsIdentity,
+    /** Own links: TCP+TLS default; Bluetooth providers ride this in Phase B. */
+    links: LinkProvider = TcpLinkProvider(identity),
 ) : AutoCloseable {
 
-    private val http = PeerHttpClient(identity)
+    private val http = PeerHttpClient(identity, links)
 
     private fun enc(v: String): String = URLEncoder.encode(v, "UTF-8")
 

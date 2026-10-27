@@ -6,10 +6,6 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.InputStream
-import java.net.InetSocketAddress
-import java.net.Socket
-import javax.net.ssl.SSLSocket
-import javax.net.ssl.SSLSocketFactory
 
 /**
  * A deliberately tiny HTTP/1.1 client for LocalSend peers.
@@ -23,7 +19,11 @@ import javax.net.ssl.SSLSocketFactory
  * Hostname verification is intentionally absent (SSLSocket default): peers are
  * reached by IP and authenticated by the announced fingerprint instead.
  */
-class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
+class PeerHttpClient(
+    private val identity: TlsIdentity,
+    /** Where fresh links come from; TCP+TLS is the native default. */
+    private val links: LinkProvider = TcpLinkProvider(identity),
+) : AutoCloseable {
 
     /** Test hooks (never set in shipping code paths). */
     companion object {
@@ -42,8 +42,6 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
         fun text(): String = String(body, Charsets.UTF_8)
     }
 
-    private val sslFactory: SSLSocketFactory = identity.sslContext().socketFactory
-
     suspend fun exchange(
         method: String,
         host: String,
@@ -59,7 +57,7 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
         raw(method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength, bodyProgress, timeoutMs)
     }
 
-    private fun raw(
+    private suspend fun raw(
         method: String,
         host: String,
         port: Int,
@@ -71,14 +69,8 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
         bodyProgress: ((Long) -> Unit)?,
         timeoutMs: Long,
     ): Response {
-        val socket: Socket = if (tls) sslFactory.createSocket() else Socket()
-        try {
-            socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(host, port), timeoutMs.toInt())
-            socket.soTimeout = timeoutMs.toInt()
-            if (tls) (socket as SSLSocket).startHandshake()
-
-            val out = socket.getOutputStream()
+        links.connect(host, port, tls, timeoutMs.toInt()).use { link ->
+            val out = link.output
             val head = StringBuilder().apply {
                 append(method).append(' ').append(pathAndQuery).append(" HTTP/1.1\r\n")
                 append("Host: ").append(host).append(':').append(port).append("\r\n")
@@ -109,14 +101,14 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
                     sent += n
                     if (bodyProgress != null) bodyProgress(sent)
                     if (sent >= abortAfter && attemptUnused()) { // dead-sender simulation, once
-                        runCatching { socket.close() }
+                        runCatching { link.close() }
                         throw java.io.IOException("FLIT_TEST_ABORT after $sent bytes")
                     }
                 }
                 out.flush()
             }
 
-            val inp = socket.getInputStream().buffered()
+            val inp = link.input.buffered()
             val statusLine = readLine(inp) ?: throw EOFException("server sent no response")
             val status = statusLine.split(" ").getOrNull(1)?.toIntOrNull()
                 ?: throw IllegalStateException("bad status line from peer: $statusLine")
@@ -136,8 +128,6 @@ class PeerHttpClient(private val identity: TlsIdentity) : AutoCloseable {
                 else -> readAll(inp)
             }
             return Response(status, respHeaders, body)
-        } finally {
-            runCatching { socket.close() }
         }
     }
 
