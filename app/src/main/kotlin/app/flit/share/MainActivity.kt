@@ -49,6 +49,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -85,6 +86,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -103,6 +107,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -123,11 +128,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Launches as the main screen AND as a system share target (SEND / SEND_MULTIPLE).
@@ -352,6 +362,42 @@ class MainActivity : ComponentActivity() {
         // the boot sweep covers everything left (offline pin without peers).
         LaunchedEffect(Unit) { FlitShortcuts.sync(this@MainActivity) }
         LaunchedEffect(state.running) { if (state.running) FlitShortcuts.sync(this@MainActivity) }
+
+        // ---- in-app feedback -----------------------------------------------
+        // Engine messages surface as an M3 snackbar while this UI is visible;
+        // backgrounded flows (notification send, roster pinning) fall back to
+        // system toasts — same message, same channel rules as before.
+        val snackbar = remember { SnackbarHostState() }
+        var pendingToast by remember { mutableStateOf<Job?>(null) }
+        val toastScope = rememberCoroutineScope()
+        val uiSink = remember {
+            // One at a time: a fresh message cancels the in-flight one and
+            // relaunches — showSnackbar replaces whatever is on screen.
+            { msg: String ->
+                pendingToast?.cancel()
+                pendingToast = toastScope.launch {
+                    snackbar.showSnackbar(msg, duration = SnackbarDuration.Short)
+                }
+            }
+        }
+        val lifecycleOwner = LocalLifecycleOwner.current
+        DisposableEffect(lifecycleOwner, uiSink) {
+            val observer = LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_START -> FlitEngine.uiSink = uiSink
+                    Lifecycle.Event.ON_STOP -> if (FlitEngine.uiSink === uiSink) FlitEngine.uiSink = null
+                    else -> Unit
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            FlitEngine.uiSink = uiSink // composition exists only while the activity does
+            onDispose {
+                lifecycleOwner.lifecycle.removeObserver(observer)
+                if (FlitEngine.uiSink === uiSink) FlitEngine.uiSink = null
+                pendingToast?.cancel()
+                pendingToast = null
+            }
+        }
 
         FlitTheme(themeOverride = theme) {
             Surface(modifier = Modifier.fillMaxSize()) {
@@ -887,6 +933,42 @@ class MainActivity : ComponentActivity() {
                         onNote = { showNoteDialog = true },
                         onAdd = { showAddDialog = true },
                     )
+
+                    // Engine feedback hovers above the dock (dock = nav bars +
+                    // 16 gap + 56 FAB; snackbar sits 8 above that). Visually
+                    // the M3 snackbar contract: 48dp single line, extra-small
+                    // radius, inverse-surface trio — constants match the m3
+                    // defaults, spelled out so the contract is auditable in
+                    // one place (an action, if ever added, takes inversePrimary;
+                    // none today — engine toasts carry no actions).
+                    SnackbarHost(
+                        hostState = snackbar,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .navigationBarsPadding()
+                            .padding(bottom = 80.dp)
+                            .padding(horizontal = 16.dp),
+                    ) { data ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(FlitCorner.extraSmall),
+                            color = MaterialTheme.colorScheme.inverseSurface,
+                            shadowElevation = 3.dp,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .padding(horizontal = 16.dp)
+                                    .defaultMinSize(minHeight = 48.dp),
+                                contentAlignment = Alignment.CenterStart,
+                            ) {
+                                Text(
+                                    data.visuals.message,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

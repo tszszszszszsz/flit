@@ -312,7 +312,24 @@ val share: StateFlow<ShareIntake?> = _share
     /** For nested/delegate access to the app context. */
     internal fun ctx(): Context = appCtx
 
+    /**
+     * Where user-facing feedback goes: set while the main UI is visible
+     * (messages ride the in-app snackbar), null otherwise so they fall back to
+     * system toasts — parity for flows started while backgrounded (dock peer
+     * send, roster pin renewals, …). Set/cleared from the MAIN thread on
+     * lifecycle ON_START/ON_STOP; read on engine threads via volatile.
+     */
+    @Volatile
+    internal var uiSink: ((String) -> Unit)? = null
+
     internal fun toast(msg: String) {
+        // Snapshot once: a message racing the visible/hidden boundary either
+        // rides the snackbar or falls back to the system toast — never lost.
+        val sink = uiSink
+        if (sink != null) {
+            sink(msg)
+            return
+        }
         runCatching { android.widget.Toast.makeText(appCtx, msg, android.widget.Toast.LENGTH_SHORT).show() }
     }
 
