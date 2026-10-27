@@ -6,6 +6,7 @@ import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.model.WireJson
 import app.flit.share.protocol.server.ProtocolServer
+import app.flit.share.protocol.server.ServerCore
 import app.flit.share.protocol.tls.TlsIdentity
 import java.io.File
 import kotlin.io.path.createTempDirectory
@@ -119,12 +120,12 @@ class DtoParityTest {
     @Test
     fun `multi socket response carries the chunk hint and decodes back`() {
         val json = app.flit.share.protocol.model.PrepareUploadResponse(
-            sessionId = "s", files = mapOf("f1" to "t"), multipart = ProtocolServer.TURBO_CHUNK_BYTES,
+            sessionId = "s", files = mapOf("f1" to "t"), multipart = ServerCore.TURBO_CHUNK_BYTES,
         )
         val encoded = WireJson.encode(json)
-        assertTrue(encoded.contains("\"multipart\":${ProtocolServer.TURBO_CHUNK_BYTES}"), encoded)
+        assertTrue(encoded.contains("\"multipart\":${ServerCore.TURBO_CHUNK_BYTES}"), encoded)
         val back = WireJson.decode<app.flit.share.protocol.model.PrepareUploadResponse>(encoded)
-        assertEquals(ProtocolServer.TURBO_CHUNK_BYTES, back.multipart)
+        assertEquals(ServerCore.TURBO_CHUNK_BYTES, back.multipart)
     }
 
     @Test

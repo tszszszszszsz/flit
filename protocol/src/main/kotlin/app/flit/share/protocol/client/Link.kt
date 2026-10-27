@@ -21,6 +21,13 @@ import javax.net.ssl.SSLSocketFactory
 interface Link : AutoCloseable {
     val input: InputStream
     val output: OutputStream
+
+    /**
+     * Remote-side label when the pipe knows one: an IP on TCP, a device
+     * address over Bluetooth. Drives the receiver's trust checks and the
+     * interrupted-parts registry; null when the carrier can't tell.
+     */
+    val origin: String? get() = null
 }
 
 /** Fresh link per exchange — we always send `Connection: close`. */
@@ -60,6 +67,11 @@ class TcpLinkProvider(identity: TlsIdentity) : LinkProvider {
 private class SocketLink(private val socket: Socket) : Link {
     override val input: InputStream get() = socket.getInputStream()
     override val output: OutputStream get() = socket.getOutputStream()
+
+    /** Pure string conversion — never hostName, which reverse-resolves and blocks. */
+    override val origin: String?
+        get() = runCatching { (socket.remoteSocketAddress as? InetSocketAddress)?.address?.hostAddress }.getOrNull()
+
     override fun close() {
         runCatching { socket.close() }
     }
@@ -88,6 +100,9 @@ class TlsLink(
 
     override val input: InputStream = tls.input
     override val output: OutputStream = tls.output
+
+    /** The carrier is still who it was; TLS never changes the peer label. */
+    override val origin: String? get() = raw.origin
 
     override fun close() {
         runCatching { tls.close() } // close_notify so the peer sees clean EOF, not an abrupt carrier drop
