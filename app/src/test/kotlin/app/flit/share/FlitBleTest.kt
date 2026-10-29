@@ -136,4 +136,41 @@ class FlitBleTest {
         // the radio refreshes an entry the reaper is about to reap anyway.
         assertTrue(FlitBle.rowIsFree(0L, FlitBle.FRESH_TOUCH_MS))
     }
+
+    @Test
+    fun `ask — access point up owes nothing, asked or not`() {
+        assertNull(FlitBle.raiseAsk(apUp = true, permsOk = false, radioOn = false, askedPerms = false, askedPower = false))
+        assertNull(FlitBle.raiseAsk(apUp = true, permsOk = true, radioOn = true, askedPerms = true, askedPower = true))
+    }
+
+    @Test
+    fun `ask — permissions go first, even with the radio dark`() {
+        assertEquals(
+            FlitBle.DirectAsk.PERMISSIONS,
+            FlitBle.raiseAsk(apUp = false, permsOk = false, radioOn = false, askedPerms = false, askedPower = false),
+            "without rights the radio fact is unreadable; the sheet takes its turn first",
+        )
+    }
+
+    @Test
+    fun `ask — power only after the sheet had its turn`() {
+        assertEquals(
+            FlitBle.DirectAsk.POWER,
+            FlitBle.raiseAsk(apUp = false, permsOk = true, radioOn = false, askedPerms = true, askedPower = false),
+        )
+        assertEquals(
+            FlitBle.DirectAsk.POWER,
+            FlitBle.raiseAsk(apUp = false, permsOk = false, radioOn = false, askedPerms = true, askedPower = false),
+        )
+    }
+
+    @Test
+    fun `ask — an answer shuts the book for good, a healed fact retires it`() {
+        // Both asked: never nag again, whatever the facts are.
+        assertNull(FlitBle.raiseAsk(apUp = false, permsOk = false, radioOn = false, askedPerms = true, askedPower = true))
+        // Half-asked: silence only for the question that was answered.
+        assertNull(FlitBle.raiseAsk(apUp = false, permsOk = true, radioOn = true, askedPerms = true, askedPower = true))
+        // Crisis healed by facts: grants arrived on their own.
+        assertNull(FlitBle.raiseAsk(apUp = false, permsOk = true, radioOn = true, askedPerms = false, askedPower = false))
+    }
 }

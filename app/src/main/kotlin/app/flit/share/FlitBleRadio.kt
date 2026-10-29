@@ -197,8 +197,16 @@ internal class FlitBleRadio(
 
     private fun scanner(): BluetoothLeScanner? = runCatching { adapter()?.bluetoothLeScanner }.getOrNull()
 
-    private companion object {
+    companion object {
         const val TAG = "FlitBle"
+
+        /**
+         * The nearby-device permission names the no-AP moment's system sheet
+         * carries, readable without an instantiation: the activity launches
+         * the sheet with these verbatim — the vocabulary shown is the
+         * system's own, never ours.
+         */
+        val nearbyPerms: Array<String> get() = BLE_PERMS.toTypedArray()
 
         /** The dump dedupe rewrites when environments get crowded. */
         const val DUMP_CAP = 128

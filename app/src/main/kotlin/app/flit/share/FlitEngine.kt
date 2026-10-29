@@ -125,6 +125,14 @@ val share: StateFlow<ShareIntake?> = _share
     private val _state = MutableStateFlow(EngineState())
     val state: StateFlow<EngineState> = _state
 
+    /**
+     * A pending ask from the no-AP moment (see [FlitBle.raiseAsk]). The
+     * surface carries it to the system dialogs when it can; whichever way
+     * they conclude, [directAskAnswered] closes the book — one ask, once.
+     */
+    private val _directAsk = MutableStateFlow<FlitBle.DirectAsk?>(null)
+    val directAsk: StateFlow<FlitBle.DirectAsk?> = _directAsk
+
     private val _peers = MutableStateFlow<Map<String, PeerEntry>>(emptyMap())
 
     /**
@@ -457,6 +465,7 @@ val share: StateFlow<ShareIntake?> = _share
         runCatching { bleRadio?.stopAll() }
         bleRadio = null
         bleAdvertised = false
+        _directAsk.value = null
         runCatching { multicastLock?.takeIf { it.isHeld }?.release() }
         multicastLock = null
         server = null
@@ -465,6 +474,25 @@ val share: StateFlow<ShareIntake?> = _share
         _peers.value = emptyMap()
         _state.value = _state.value.copy(running = false, starting = false)
         logLine("stopped")
+    }
+
+    /**
+     * The surface reported a conclusion of a no-AP ask's system sheet. Each
+     * launcher names the question it rode; a stale conclusion (the sheet out
+     *living the ask that published it) closes its own book without touching
+     * whatever question is pending now. Any conclusion counts — grant, deny,
+     * dismissal — that closing is what makes "one ask, once per device"
+     * real: the flag lives in the engine's own store and survives every
+     * restart. The facts themselves are re-verified every tick, so a grant
+     * lights the radio and a grant refusal leaves it dark — quietly.
+     */
+    fun directAskAnswered(kind: FlitBle.DirectAsk?) {
+        when (kind) {
+            FlitBle.DirectAsk.PERMISSIONS -> prefs().edit().putBoolean("directAskPermsDone", true).apply()
+            FlitBle.DirectAsk.POWER -> prefs().edit().putBoolean("directAskPowerDone", true).apply()
+            null -> return
+        }
+        if (_directAsk.value == kind) _directAsk.value = null
     }
 
     private suspend fun run(seq: Int) {
@@ -649,10 +677,13 @@ val share: StateFlow<ShareIntake?> = _share
                 val info = server?.selfInfo() ?: continue
                 val forced = debugProp("debug.flit.forceble") == "1"
                 val dump = debugProp("debug.flit.bledump") == "1"
+                val apUp = !forced && wifiNetwork(cm()) != null
+                val permsOk = radio.hasPermissions()
+                val radioOn = radio.radioOn()
                 val stance = FlitBle.stance(
-                    apUp = !forced && wifiNetwork(cm()) != null,
-                    perms = radio.hasPermissions(),
-                    radioOn = radio.radioOn(),
+                    apUp = apUp,
+                    perms = permsOk,
+                    radioOn = radioOn,
                     hidden = prefs().getBoolean("hiddenMode", false),
                 )
                 runCatching { radio.apply(stance, info.alias, info.fingerprint, dump) }
@@ -662,6 +693,26 @@ val share: StateFlow<ShareIntake?> = _share
                         if (stance.advertise) "no Wi\u2011Fi network; direct discovery on"
                         else "access point back; direct discovery dark",
                     )
+                }
+                // The no-AP moment: if the radio owes anything to the system
+                // sheets, the pending ask becomes the surface's business
+                // (until answered, or until the facts heal themselves).
+                // Self-clearing by facts means a granted state or an access
+                // point arriving in the next tick retires the ask without
+                // ever having pushed the user.
+                val ask = FlitBle.raiseAsk(
+                    apUp = apUp,
+                    permsOk = permsOk,
+                    radioOn = radioOn,
+                    askedPerms = prefs().getBoolean("directAskPermsDone", false),
+                    askedPower = prefs().getBoolean("directAskPowerDone", false),
+                )
+                if (ask != _directAsk.value) {
+                    _directAsk.value = ask
+                    // Engine-log only, and only on the raise: the borrowed
+                    // voice says *that* a question is pending, never what its
+                    // subject is called — the system sheet speaks for itself.
+                    if (ask != null) logLine("no Wi\u2011Fi network; direct discovery waiting on the system")
                 }
             }
         }

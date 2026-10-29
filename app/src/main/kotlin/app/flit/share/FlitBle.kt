@@ -148,6 +148,38 @@ object FlitBle {
     }
 
     /**
+     * What the no-AP moment may owe the surface: one ask, never both, never
+     * a nag. The truth table is pure so it's testable off-device and the
+     * surface keeps none of the vocabulary — it only sees the enum.
+     *
+     * Permissions go first: without them the honest radio fact is unreadable
+     * anyway (the state call needs connect rights on modern Android). The
+     * power ask follows only when the permission sheet has had its turn and
+     * the radio itself is still dark. Hidden mode changes stance, not asks:
+     * even ears-only discovery needs the radio lit.
+     *
+     * "Once per device" silence isn't decided here — every answer (grant,
+     * deny, dismiss) closes the book via the engine's flags, so the same
+     * question never rises twice. Until then the ask survives: a sheet that
+     * was never seen is a question no one answered.
+     */
+    fun raiseAsk(
+        apUp: Boolean,
+        permsOk: Boolean,
+        radioOn: Boolean,
+        askedPerms: Boolean,
+        askedPower: Boolean,
+    ): DirectAsk? = when {
+        apUp -> null
+        !permsOk && !askedPerms -> DirectAsk.PERMISSIONS
+        !radioOn && !askedPower -> DirectAsk.POWER
+        else -> null
+    }
+
+    /** One-shot ask the surface carries to the system dialogs, verbatim. */
+    enum class DirectAsk { PERMISSIONS, POWER }
+
+    /**
      * Clips a UTF-8 string to the byte budget without splitting a codepoint,
      * dropping the alias whole when even one character doesn't fit.
      */

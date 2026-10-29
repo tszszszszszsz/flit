@@ -3,6 +3,7 @@ package app.flit.share
 import android.Manifest
 import android.content.ClipData
 import android.content.Context
+import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -201,6 +202,19 @@ class MainActivity : ComponentActivity() {
         startSharing()
     }
 
+    // The no-AP moment's two asks (see FlitEngine.directAsk). The system's
+    // own sheet and dialog do all the talking; whichever way they conclude,
+    // the engine closes that question's book — one ask, once. Each launcher
+    // names its own kind on the result: a conclusion binds to the question
+    // it concluded, not to whatever the engine holds while it lands late.
+    private val directPerms = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { FlitEngine.directAskAnswered(FlitBle.DirectAsk.PERMISSIONS) }
+
+    private val radioPower = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { FlitEngine.directAskAnswered(FlitBle.DirectAsk.POWER) }
+
     /** App-wide settings — same store the engine/roster read ("flit"). */
     private fun prefs() = getSharedPreferences("flit", Context.MODE_PRIVATE)
 
@@ -324,6 +338,22 @@ class MainActivity : ComponentActivity() {
         // Share-sheet mode: close ourselves once the dispatch clears the intake.
         if (shareMode) {
             LaunchedEffect(share) { if (share == null && FlitEngine.state.value.running) finish() }
+        }
+
+        // The no-AP moment: the engine holds a pending ask it can't present
+        // alone. Launching the system's own sheet/dialog here is the whole
+        // surface story — the sheet's vocabulary is the system's, nothing is
+        // ours, and every conclusion (grant/deny/dismiss) shuts the book for
+        // good. If this screen never opens while the ask lives, the ask waits.
+        LaunchedEffect(Unit) {
+            FlitEngine.directAsk.collect { ask ->
+                when (ask) {
+                    FlitBle.DirectAsk.PERMISSIONS -> directPerms.launch(FlitBleRadio.nearbyPerms)
+                    FlitBle.DirectAsk.POWER ->
+                        radioPower.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                    null -> Unit
+                }
+            }
         }
 
         // Direct-share target: the sheet aimed at a trusted peer. Dispatch the
