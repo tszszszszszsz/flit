@@ -15,9 +15,10 @@ import app.flit.share.protocol.server.ServerConfig
 import app.flit.share.protocol.server.ServerCore
 import app.flit.share.protocol.server.ServerDelegate
 import app.flit.share.protocol.tls.TlsIdentity
+import app.flit.share.protocol.transport.PipePair
+import app.flit.share.protocol.transport.SimLinkProvider
 import java.io.ByteArrayInputStream
 import java.io.InputStream
-import java.io.OutputStream
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.Random
@@ -44,131 +45,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  * resume to a byte-exact file, cancel — runs from [PeerHttpClient] (the real
  * client) into [LinkServer] (the binder Bluetooth rides) over in-memory
  * conduits, once plain and once with TlsLink wrapping both ends via
- * StreamTls. If this passes over pipes, "over RFCOMM" is just wiring.
+ * StreamTls. The carrier ([PipePair], [SimLinkProvider]) now lives in the
+ * protocol's own testables (app.flit.share.protocol.transport) so the
+ * harness's bt-sim rig proves exactly what this test proves.
  */
 class LinkServerParityTest {
-
-    // ---- in-memory conduits ------------------------------------------------
-
-    /**
-     * One direction: an in-memory carrier half. Writes chunk into an
-     * unbounded queue (the wire never blocks the writer); [In] drains it;
-     * a writer close delivers EOF.
-     */
-    private class Conduit {
-        private val q = LinkedBlockingQueue<Any>()
-        private val EOF = Any()
-        @Volatile
-        private var readerGone = false
-
-        inner class Out : OutputStream() {
-            override fun write(b: ByteArray, off: Int, len: Int) {
-                if (len <= 0) return
-                if (readerGone) return // destination neither reads nor cares
-                q.put(b.copyOfRange(off, off + len))
-            }
-
-            override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
-
-            override fun close() {
-                readerGone = true
-                q.put(EOF)
-            }
-        }
-
-        /** Strictly one reader per direction, sequential — the exchange shape. */
-        inner class In : InputStream() {
-            private var cur: ByteArray? = null
-            private var at = 0
-            private var eof = false
-
-            override fun read(): Int {
-                val one = ByteArray(1)
-                return if (read(one, 0, 1) == 1) one[0].toInt() and 0xFF else -1
-            }
-
-            override fun read(b: ByteArray, off: Int, len: Int): Int {
-                if (len == 0) return 0
-                while (true) {
-                    val c = cur
-                    if (c != null) {
-                        val n = minOf(len, c.size - at)
-                        System.arraycopy(c, at, b, off, n)
-                        at += n
-                        if (at == c.size) {
-                            cur = null
-                            at = 0
-                        }
-                        return n
-                    }
-                    if (eof) return -1
-                    val next = q.take()
-                    if (next == EOF) {
-                        eof = true
-                        continue
-                    }
-                    cur = next as ByteArray
-                    at = 0
-                }
-            }
-
-            override fun close() {
-                eof = true
-                readerGone = true
-                q.clear()
-            }
-        }
-
-        fun out(): OutputStream = Out()
-        fun inp(): InputStream = In()
-    }
-
-    private class PipePair {
-        val toServer = Conduit()
-        val toClient = Conduit()
-
-        private val clientIn: InputStream by lazy { toClient.inp() }
-        private val clientOut: OutputStream by lazy { toServer.out() }
-        private val serverIn: InputStream by lazy { toServer.inp() }
-        private val serverOut: OutputStream by lazy { toClient.out() }
-
-        fun clientLink(): Link = object : Link {
-            // ONE stream object per direction, forever: a carrier side that
-            // hands out a fresh wrapper per access would orphan whatever a
-            // previous access buffered mid-chunk (real RFCOMM carriers keep
-            // one stream per connection; so does SocketLink/TlsLink).
-            override val input: InputStream get() = clientIn
-            override val output: OutputStream get() = clientOut
-            override fun close() {
-                runCatching { clientOut.close() }
-                runCatching { clientIn.close() }
-            }
-        }
-
-        fun serverLink(origin: String): Link = object : Link {
-            override val input: InputStream get() = serverIn
-            override val output: OutputStream get() = serverOut
-            override val origin: String get() = origin
-            override fun close() {
-                runCatching { serverOut.close() }
-                runCatching { serverIn.close() }
-            }
-        }
-    }
-
-    /** Dials by handing the server half of a fresh conduit pair to the loop. */
-    private class MemProvider(
-        private val identity: TlsIdentity,
-        private val tls: Boolean,
-        private val inbox: Channel<PipePair>,
-    ) : LinkProvider {
-        override suspend fun connect(host: String, port: Int, tls: Boolean, timeoutMs: Int): Link {
-            val p = PipePair()
-            inbox.send(p)
-            val raw = p.clientLink()
-            return if (tls) TlsLink(raw, identity, clientMode = true) else raw
-        }
-    }
 
     // ---- recording delegate ------------------------------------------------
 
@@ -261,7 +142,7 @@ class LinkServerParityTest {
                 }
             }
         }
-        val cli = PeerHttpClient(identity, links = MemProvider(identity, tls, inbox))
+        val cli = PeerHttpClient(identity, links = SimLinkProvider(identity, tls, inbox))
 
         // 1. info — the same JSON the TCP binder answers
         val info = cli.exchange("GET", "127.0.0.1", 53317, tls, Protocol.PATH_INFO, timeoutMs = 20_000)

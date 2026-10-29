@@ -27,7 +27,7 @@ import kotlin.system.exitProcess
 
 // ==== tiny arg parser ========================================================
 
-private class ParsedArgs(argv: Array<String>) {
+internal class ParsedArgs(argv: Array<String>) {
     val flags = LinkedHashMap<String, String>()
     val positional = mutableListOf<String>()
 
@@ -52,7 +52,7 @@ private class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to")
+        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender")
     }
 }
 
@@ -82,7 +82,7 @@ private fun announceTargets(arg: String?): List<InetSocketAddress> =
     }.orEmpty()
 
 private val fmt = DateTimeFormatter.ofPattern("HH:mm:ss")
-private fun ts(): String = LocalTime.now().format(fmt)
+internal fun ts(): String = LocalTime.now().format(fmt)
 
 fun main(argv: Array<String>) {
     val args = ParsedArgs(argv)
@@ -93,6 +93,7 @@ fun main(argv: Array<String>) {
             "discover" -> kotlinx.coroutines.runBlocking { discover(args) }
             "send" -> kotlinx.coroutines.runBlocking { send(args) }
             "info" -> kotlinx.coroutines.runBlocking { info(args) }
+            "bt-sim" -> kotlinx.coroutines.runBlocking { btSim(args) }
             "parse-qr" -> parseQr(args)
             else -> usage()
         }
@@ -111,6 +112,7 @@ serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--announce-to ip
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
+bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 """
     )
@@ -372,7 +374,7 @@ private fun splitHostPort(s: String): Pair<String, Int> {
     return s.substring(0, idx) to port
 }
 
-private fun expandSpecs(paths: List<String>): List<PathOutgoing> {
+internal fun expandSpecs(paths: List<String>): List<PathOutgoing> {
     val out = mutableListOf<PathOutgoing>()
     for (raw in paths) {
         val root = Path.of(raw)
