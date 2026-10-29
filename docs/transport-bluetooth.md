@@ -92,8 +92,13 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
   `ConnectionProvider` seam, injectable — the entire protocol-parity suite runs the
   **same tests over an in-memory duplex pipe through the real hand-HTTP + TLS shim
   stack** (that's the "most complex" made testable without a radio).
-- Harness gains a `bt-sim` mode: host-side pipe endpoints so the existing serve/send
-  rig exercises v2 semantics over the simulated transport end-to-end.
+- Harness `bt-sim` (B4, shipped): both ends of a run in one process — the receiver
+  is the same `ServerCore` the TCP binder feeds, spoken to through the same
+  `LinkServer` the RFCOMM binder rides, wrapped in the same `TlsLink`; the sender is
+  the production `ProtocolClient` over `SimLinkProvider`. Green runs (TLS/plain, pin,
+  multi-file, synthetic worst-case bodies) print the send rig's usual report with the
+  same exit codes; `--no-tls` runs label `/info` `http` honestly. The pipe carrier
+  lives in `protocol.transport`, shared verbatim with the parity suite.
 - On-device checklist (bluetooth radio real, second device pending): advertise visible
   from another BT source (laptop/earbuds appear in the scan dump), permission sheet
   wording, radio-off flow, arbiter flip when hotspot dies mid-idle. True two-phone
