@@ -100,6 +100,28 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
   transfers wait for a second device — against the harness-rig standard, that is a
   listed limitation, not a silent gap.
 
+## Walkthrough record (2026-10-29, Redmi Note 10S / API 36)
+
+- **B2 smoke**: radio-off first observed as honest silence (no flip line, no surface
+  noise); enabling → flip line once; stack's own advertiser map shows our service UUID
+  with a 52-byte extended payload (2 magic+ver + 32 fp + 18 alias — the arithmetic
+  closes to the byte), legacy path unnecessary on this chip, connectable/scannable
+  down, device name withheld; dump knob heard 7 nearby radios (RPA phones + an IoT
+  neighbor), each address once; flip-back line once, map empty again. Both ask kinds:
+  granted via adb mid-walk — engine tracked facts, never reasoned about them.
+- **B3 walk**: grants revoked + no-AP forced → permissions ask raised once ("direct
+  discovery waiting on the system", borrowed voice only) and the system sheet
+  presented (`GrantPermissionsActivity`, result wired to the launcher) — the sheet's
+  wording is Android's, zero strings ours. adb grants → ask advanced to radio power
+  (radio still dark) → the enable dialog concluded itself ~45 s in with no user touch
+  (MIUI quirk: the stack's enable log records nothing for it) → radio-on flip line
+  once → flip-back line once. Ask-flags written per-launcher as designed. Device left
+  in pre-walk state (grants restored, radio off, ask-flags clear) so the real
+  first no-AP moment still earns its sheet.
+- **Pending user-gated**: hotspot-on/off walkthrough (MIUI exposes no adb toggle for
+  softAP on this build), roster screenshots (keyguard blocks screencap), and the
+  real two-device contact.
+
 ## Milestone ladder
 
 - **B0** — this doc + `ConnectionProvider` seam introduced *without behavior change*
