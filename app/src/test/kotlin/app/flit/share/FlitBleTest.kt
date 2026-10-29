@@ -125,4 +125,15 @@ class FlitBleTest {
             FlitBle.stance(apUp = false, perms = true, radioOn = false, hidden = false),
         )
     }
+
+    @Test
+    fun `rank rule — radio touches only lapses, never fresh address-bearing rows`() {
+        val now = 1_000_000L
+        assertTrue(FlitBle.rowIsFree(null, now), "unknown peer row is free")
+        assertTrue(FlitBle.rowIsFree(now - FlitBle.FRESH_TOUCH_MS, now), "expired row is free")
+        assertFalse(FlitBle.rowIsFree(now - 100, now), "fresh UDP/manual rows are owned")
+        // Boundary honesty: exactly at the window edge the row judges free —
+        // the radio refreshes an entry the reaper is about to reap anyway.
+        assertTrue(FlitBle.rowIsFree(0L, FlitBle.FRESH_TOUCH_MS))
+    }
 }

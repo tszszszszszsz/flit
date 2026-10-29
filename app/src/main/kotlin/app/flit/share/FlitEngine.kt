@@ -81,7 +81,11 @@ object FlitEngine {
         // blank/raw for peers whose announce lacked an alias.)
         val displayName: String
             get() = FlitRoster.aliasFor(info.fingerprint) ?: info.alias.ifBlank { address }
-        val address: String get() = "$ip:${info.port}"
+        // A direct-radio row has no address-bearing socket, hence port 0 — and
+        // a port without a network would be a lie on the wire row. Only the
+        // address speaks for it.
+        val address: String
+            get() = if (info.port > 0) "$ip:${info.port}" else ip
     }
 
     data class LogLine(val ts: String, val text: String)
@@ -274,6 +278,11 @@ val share: StateFlow<ShareIntake?> = _share
     private var server: ProtocolServer? = null
     private var client: ProtocolClient? = null
     private var discovery: UdpDiscovery? = null
+    private var bleRadio: FlitBleRadio? = null
+
+    /** What the flipper last decided for the radio's advertise half (log once per flip). */
+    @Volatile
+    private var bleAdvertised = false
     private var multicastLock: WifiManager.MulticastLock? = null
     private var startSeq = 0
 
@@ -445,6 +454,9 @@ val share: StateFlow<ShareIntake?> = _share
         runCatching { discovery?.stop() }
         runCatching { server?.close() }
         runCatching { client?.close() }
+        runCatching { bleRadio?.stopAll() }
+        bleRadio = null
+        bleAdvertised = false
         runCatching { multicastLock?.takeIf { it.isHeld }?.release() }
         multicastLock = null
         server = null
@@ -511,11 +523,7 @@ val share: StateFlow<ShareIntake?> = _share
             disc.create()
 
             val cm = appCtx.getSystemService(android.net.ConnectivityManager::class.java)
-            val wifiNet = cm?.allNetworks?.firstOrNull { n ->
-                val caps = cm.getNetworkCapabilities(n)
-                caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                    caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) != true
-            }
+            val wifiNet = wifiNetwork(cm)
             when {
                 debugProp("debug.flit.nopin") == "1" ->
                     logLine("egress pin skipped (debug.flit.nopin)")
@@ -528,8 +536,15 @@ val share: StateFlow<ShareIntake?> = _share
 
             disc.start()
 
+            // Direct-peer radio: dormant while the roster is Wi-Fi's (the
+            // flipper decides from real facts each tick); the radio itself is
+            // built here so a start failure below can still tear it down.
+            val radio = FlitBleRadio(appCtx, ::touchBlePeer, ::logLine)
+            bleRadio = radio
+
             if (seq != startSeq) { // stopped/restarted meanwhile
                 runCatching { disc.stop(); srv.close(); cli.close() }
+                runCatching { radio.stopAll() }
                 runCatching { lock.takeIf { it.isHeld }?.release() }
                 return
             }
@@ -553,12 +568,14 @@ val share: StateFlow<ShareIntake?> = _share
 
             startPruner(seq)
             startManualProber(seq)
+            startBleFlipper(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
             _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
             logLine("start failed: ${t.message ?: t.javaClass.simpleName}")
             // Full stack goes to logcat (obfuscated in release; use mapping.txt to deobfuscate).
             android.util.Log.e("FlitEngine", "engine start failed", t)
+            runCatching { bleRadio?.stopAll() }
         }
     }
 
@@ -610,6 +627,83 @@ val share: StateFlow<ShareIntake?> = _share
             }
         }
     }
+
+    /**
+     * Direct-discovery flipper: each tick recomputes the stance from plain
+     * facts — access point, permissions, radio power, hidden mode — and hands
+     * it to the radio. Flips are logged once, never per tick. The radios
+     * stay dark while the access point owns discovery; nothing asks the
+     * surface for a decision because there isn't one to make.
+     *
+     * debug.flit.forceble=1 fakes the "no access point" fact so the radio half
+     * of a device walkthrough runs without touching the real Wi‑Fi setup;
+     * debug.flit.bledump=1 scans unfiltered, dumping the radios nearby (the
+     * dump doubles as evidence the phone's own announcement is on the air).
+     */
+    private fun startBleFlipper(seq: Int) {
+        scope.launch(Dispatchers.IO) {
+            while (isActive && seq == startSeq) {
+                delay(5_000)
+                if (seq != startSeq) return@launch
+                val radio = bleRadio ?: return@launch
+                val info = server?.selfInfo() ?: continue
+                val forced = debugProp("debug.flit.forceble") == "1"
+                val dump = debugProp("debug.flit.bledump") == "1"
+                val stance = FlitBle.stance(
+                    apUp = !forced && wifiNetwork(cm()) != null,
+                    perms = radio.hasPermissions(),
+                    radioOn = radio.radioOn(),
+                    hidden = prefs().getBoolean("hiddenMode", false),
+                )
+                runCatching { radio.apply(stance, info.alias, info.fingerprint, dump) }
+                if (stance.advertise != bleAdvertised) {
+                    bleAdvertised = stance.advertise
+                    logLine(
+                        if (stance.advertise) "no Wi\u2011Fi network; direct discovery on"
+                        else "access point back; direct discovery dark",
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * A direct-radio announce landed. Transports rank silently: a row the
+     * address-bearing transports (UDP announces, manual probes) touched
+     * within the fresh window is theirs — the radio only fills lapses, so it
+     * can never rewrite a Wi-Fi row's address to something without a socket.
+     */
+    private fun touchBlePeer(addr: String, ann: FlitBle.Ann) {
+        if (FlitBle.isSelf(ann.fingerprint, ann.truncated, identity?.fingerprint)) return
+        val now = System.currentTimeMillis()
+        if (!FlitBle.rowIsFree(_peers.value[ann.fingerprint]?.lastSeenMs, now)) return
+        val info = PeerInfo(
+            alias = ann.alias,
+            version = Protocol.VERSION,
+            fingerprint = ann.fingerprint,
+            // No address-bearing socket on this row yet: transfers ride the
+            // full fingerprint during first contact, and the address label
+            // stays the radio address (port would be a lie).
+            port = 0,
+        )
+        touchPeer(addr, info)
+    }
+
+    /**
+     * A usable Wi\u2011Fi network exists, VPNs excluded — the arbiter's
+     * access-point fact and the egress pin's target share this criterion.
+     * Self-hosted hotspots are a coarse corner on purpose: their refinement
+     * rides the walkthroughs, not this helper.
+     */
+    private fun wifiNetwork(cm: android.net.ConnectivityManager?): android.net.Network? =
+        cm?.allNetworks?.firstOrNull { n ->
+            val caps = cm.getNetworkCapabilities(n)
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) != true
+        }
+
+    private fun cm(): android.net.ConnectivityManager? =
+        appCtx.getSystemService(android.net.ConnectivityManager::class.java)
 
     private fun touchPeer(ip: InetAddress, info: PeerInfo) {
         touchPeer(ip.hostAddress ?: return, info)

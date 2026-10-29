@@ -80,6 +80,21 @@ class FlitEngineTest {
     }
 
     @Test
+    fun `direct radio rows label their address without a phantom port`() {
+        // Wi-Fi rows keep ip:port; a direct-radio row (no address-bearing
+        // socket, port 0) speaks only its radio address — a port without a
+        // network would be a lie, not a label.
+        val wifi = peerEntry("WIFI_FP", "host", ip = "192.168.100.9")
+        val direct = FlitEngine.PeerEntry(
+            ip = "AA:BB:CC:DD:EE:FF",
+            info = PeerInfo(alias = "", version = "2.2", fingerprint = "DIRECT_FP", port = 0),
+            lastSeenMs = 0L,
+        )
+        assertEquals("192.168.100.9:53317", wifi.second.address)
+        assertEquals("AA:BB:CC:DD:EE:FF", direct.address)
+    }
+
+    @Test
     fun `deduped peers hides manual stubs once the real device covers them`() {
         val real = peerEntry("REAL_FP", "host", ip = "192.168.100.12", key = "REAL_FP")
         val stubCovered = FlitEngine.PeerEntry(

@@ -117,6 +117,19 @@ object FlitBle {
     )
 
     /**
+     * How fresh an address-bearing touch (UDP announce, manual probe) must be
+     * to own its roster row over the radio: transports rank silently, so a
+     * direct announce may only fill lapses — it can never rewrite a Wi-Fi
+     * row's address to something without a socket. The rule of the one-list
+     * roster the design doc pins.
+     */
+    const val FRESH_TOUCH_MS = 10_000L
+
+    /** True when the radio may write the row: the last touch is a lapse. */
+    fun rowIsFree(lastTouchMs: Long?, now: Long): Boolean =
+        lastTouchMs == null || now - lastTouchMs >= FRESH_TOUCH_MS
+
+    /**
      * Decides the next stance. The rule is short on purpose: any reason the
      * usual Wi-Fi path can't carry discovery turns this radio on; the exact
      * reverse holds when the access point is back. Hidden mode keeps listen

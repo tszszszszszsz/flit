@@ -9,6 +9,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Multicast discovery needs the kernel-level multicast whitelist toggle. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Direct-peer discovery: radios stay dark while Wi-Fi owns the roster
+         (docs/transport-bluetooth.md); granted contextually at the no-AP moment. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Background radio use from the running engine's foreground service
+         requires the connected-device service type on Android 14+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- QR scan-to-pair reads the camera; never used anywhere else. -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -76,7 +86,7 @@
         <service
             android:name=".FlitService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|connectedDevice" />
 
         <!-- Quick Settings toggle for the share engine. -->
         <service
