@@ -694,10 +694,16 @@ val share: StateFlow<ShareIntake?> = _share
                 runCatching { radio.apply(stance, info.alias, info.fingerprint, dump) }
                 if (stance.advertise != bleAdvertised) {
                     bleAdvertised = stance.advertise
-                    logLine(
-                        if (stance.advertise) "no Wi\u2011Fi network; direct discovery on"
-                        else "access point back; direct discovery dark",
-                    )
+                    when {
+                        stance.advertise -> logLine("no Wi\u2011Fi network; direct discovery on")
+                        // The borrowed voice tells the AP story only when the
+                        // AP is the story: a radio going dark for its own
+                        // reasons (ask pending, radio resting) never claims
+                        // the access point returned — that log would
+                        // contradict the ask's own line in the same tick.
+                        apUp -> logLine("access point back; direct discovery dark")
+                        else -> Unit
+                    }
                 }
                 // The no-AP moment: if the radio owes anything to the system
                 // sheets, the pending ask becomes the surface's business
