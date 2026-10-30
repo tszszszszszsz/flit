@@ -509,6 +509,11 @@ val share: StateFlow<ShareIntake?> = _share
             val dest = (appCtx.getExternalFilesDir(null) ?: appCtx.filesDir)
                 .resolve("received").also { it.mkdirs() }
 
+            // One sweep per start: spool copies whose session died (killed
+            // process) and that the send-later queue doesn't remember. The
+            // queue's whitelist wins; young staging files stay out of this.
+            sweepStaleSpools()
+
             val srv = ProtocolServer(
                 id, delegate,
                 ServerConfig(
@@ -1027,6 +1032,24 @@ val share: StateFlow<ShareIntake?> = _share
 
     private fun cleanSpools(spools: List<SpooledFile>) {
         for (s in spools) runCatching { s.f.delete() }
+    }
+
+    /**
+     * Phase C hygiene: one sweep per engine start over the spool litter a
+     * killed process leaves ([FlitSpool]). Crush temp copies live in their own
+     * dir and are never queue-referenced; top-level spools are guarded by the
+     * send-later queue's own tokens. Errors kept out of start's way — the
+     * sweep is hygiene, not a gate.
+     */
+    private fun sweepStaleSpools() {
+        runCatching {
+            val queueTokens = FlitRoster.queued().flatMap { it.uris }
+            val now = System.currentTimeMillis()
+            val candidates: List<File> =
+                (appCtx.cacheDir.listFiles()?.toList() ?: emptyList()) +
+                    (File(appCtx.cacheDir, "crush").listFiles()?.toList() ?: emptyList())
+            FlitSpool.stale(candidates, queueTokens, now).forEach { runCatching { it.delete() } }
+        }
     }
 
     private fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean) {
