@@ -153,9 +153,30 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
   asks and to the surface, and the flipper must keep telling the truth about whatever
   instant it surveys. The `FlitEngine` comment's coarse corner resolves: on this
   build, coarse is honest.
-- **Pending user-gated**: the real two-device contact (BLE end-to-end and hotspot
-  transfers with an actual peer need a second phone — listed limitation, not a
-  silent gap).
+- **Queue on hardware (2026-10-30 D1 walk)**: with the harness `serve` running on
+  the author's box (192.168.100.12 — the manual row's own address), the manual peer row
+  lit ("mprober … ok") and the phone sent a text note and a picked file for real —
+  phone → box, TLS, received on disk. Then the full queue story, all on device: serve
+  killed → picked file dispatched into the refusal → `kept, sends when it reappears`
+  and the "Send later" row ("1 file(s) waiting for it to reconnect"); a second picked
+  file into the same dead peer **merged** into that one row ("2 file(s) waiting") —
+  the pre-fix behavior would have been a "send failed" lie and a deleted copy; serve
+  restarted → the probe loop noticed within a beat → `queue: 2 queued … — sending
+  now` → `sent 2/2` and both files landed on the box (the receiver's duplicate naming
+  — `batch-a (1).bin` — held). Cancel walked too: a third intake queued, the row's
+  X pressed, `queued send cancelled`, row gone. Persistable-grant observation: picker
+  files are spooled at intake, so queue tokens are cache paths and no grants are in
+  play for this flow — the release path is structure, exercised by any SAF-token
+  batch. One transient noted without a charge: the peer row briefly presented the
+  address-as-name presentation ("11" tile) while offers raced a restart, then
+  returned to the named state by itself.
+- **Interoperated on hardware (same walk)**: the harness `send` — the production
+  protocol client — discovering the phone and delivering a file (`from-box.bin`) that
+  landed in `Downloads/Flit/` with ledger row "_received_ from Flit-sender". Reference
+  CLI, our engine, real radio.
+- **Still parked, still listed**: the two-phone *Bluetooth* end-to-end — today's box
+  contacts prove the protocol and queue on the Wi-Fi carrier; the BLE carrier's full
+  phone-to-phone transfer needs an actual second phone with the app.
 
 ## Milestone ladder
 

@@ -36,7 +36,8 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   never expire and every shared file can queue for later (`Send later` row; auto-dispatches when
   the peer reappears). The queue's promise is kept: a second intake joins the waiting batch
   instead of dying as "send failed", a flush broken by the peer leaving keeps its row, and
-  delivered batches release their storage grants — everything keeps its sentence.
+  delivered batches release their storage grants — everything keeps its sentence. (Walked
+  on device against a harness server: kept → merged → auto-sent 2/2 → cancel, all live.)
 - Multi-file sends stream concurrently (4 parallel), and a dropped connection mid-file is
   recovered automatically: the receiver keeps the received prefix, the sender probes
   `GET /api/flit/v1/partial`, and the transfer resumes from there (Flit↔Flit only; plain v2.2
