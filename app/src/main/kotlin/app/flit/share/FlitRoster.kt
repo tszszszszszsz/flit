@@ -26,7 +26,21 @@ data class QueuedSend(
     val uris: List<String>,
     val names: List<String>,
     val createdMs: Long,
-)
+) {
+    /**
+     * One batch per peer: a second intake JOINS the waiting batch instead of
+     * dying as "send failed" with its spooled copies deleted. Tokens union
+     * with dedupe (a repeated token carries no new grant or content); names
+     * append as spoken — two files may legitimately share one; the batch's
+     * age stays its oldest member; the alias follows the peer's latest name.
+     */
+    fun mergedWith(next: QueuedSend): QueuedSend = copy(
+        alias = next.alias.ifBlank { alias },
+        uris = (uris + next.uris).distinct(),
+        names = names + next.names,
+        createdMs = minOf(createdMs, next.createdMs),
+    )
+}
 
 /**
  * Everything F-Droid reviewers like to see: tiny, local, and inspectable.
@@ -98,8 +112,14 @@ object FlitRoster {
 
     fun enqueue(entry: QueuedSend): Boolean {
         val queue = queueList()
-        if (queue.any { it.fingerprint == entry.fingerprint }) return false // one batch per peer
-        saveQueue(queue + entry)
+        val waiting = queue.firstOrNull { it.fingerprint == entry.fingerprint }
+            ?: run { saveQueue(queue + entry); return true }
+        // One row per peer, but nothing the queue was told about may vanish:
+        // a second batch joins the waiting one (data loss dressed as "send
+        // failed" is the refuse path this replaces).
+        saveQueue(
+            queue.map { if (it.fingerprint == entry.fingerprint) waiting.mergedWith(entry) else it },
+        )
         return true
     }
 

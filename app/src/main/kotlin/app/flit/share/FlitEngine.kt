@@ -810,11 +810,24 @@ val share: StateFlow<ShareIntake?> = _share
                 val spools = batch.uris.mapNotNull { spoolFileFor(it, "queue") }
                 if (spools.isEmpty()) {
                     logLine("queue: nothing left for ${peer.displayName} — dropping")
-                    FlitRoster.dequeue(peer.info.fingerprint)
+                    dropQueue(batch)
                 } else {
                     logLine("queue: ${spools.size} queued for ${peer.displayName} — sending now")
-                    dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
-                    FlitRoster.dequeue(peer.info.fingerprint)
+                    try {
+                        dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
+                        // A completed exchange (sent or declined — the far
+                        // side spoke) concludes the row's story; grants go
+                        // back with the tokens.
+                        dropQueue(batch)
+                    } catch (e: Exception) {
+                        // The row's keep IS the queue's promise: a send that
+                        // never settled (the peer walked out mid-transfer,
+                        // the engine not serving yet) leaves the batch and
+                        // its grants exactly as they were — the next
+                        // announce or "retry now" resumes.
+                        val why = e.message ?: e.javaClass.simpleName
+                        logLine("$why — kept, sends when it reappears")
+                    }
                 }
             } finally {
                 dispatching.remove(peer.info.fingerprint)
@@ -1062,8 +1075,15 @@ val share: StateFlow<ShareIntake?> = _share
     }
 
     private fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean) {
-        val cli = client ?: run { logLine("not sharing — start sharing first"); return }
-        val self = server?.selfInfo() ?: return
+        val cli = client ?: run {
+            if (fromQueue) throw NotServingYet()
+            logLine("not sharing — start sharing first")
+            return
+        }
+        val self = server?.selfInfo() ?: run {
+            if (fromQueue) throw NotServingYet()
+            return
+        }
         scope.launch(Dispatchers.IO) {
             var outgoing: List<OutgoingFile> = emptyList()
             var prog = FlitProgress(appCtx, peer.info.fingerprint.hashCode() and 0x7fffffff)
@@ -1145,11 +1165,39 @@ val share: StateFlow<ShareIntake?> = _share
                 // dispatches never clean here: the batch retains its file.
                 if (!queuedLog && !fromQueue) cleanSpools(src.spools)
                 _share.value = null
+                // A queue run's break rethrows so flushQueueFor keeps the
+                // row's promise (keeps batch and grants, retries later);
+                // non-queue runs end here.
+                if (fromQueue) throw e
             } finally {
                 crushedTmp.forEach { runCatching { it.delete() } }
             }
         }
     }
+
+    /**
+     * The only way a queue row ends: its tokens return from the roster and
+     * the persistable SAF grants taken at queue time go back with them —
+     * grants kept forever would fill Android's per-app ledger until
+     * takePersistableUriPermission starts failing. Dead or expired grants
+     * release as nothing; spool-path tokens bear no grants at all.
+     */
+    private fun dropQueue(batch: QueuedSend) {
+        FlitRoster.dequeue(batch.fingerprint)
+        for (t in batch.uris) {
+            val uri = runCatching { Uri.parse(t) }.getOrNull() ?: continue
+            if (uri.scheme != "content") continue
+            runCatching {
+                appCtx.contentResolver.releasePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+        }
+        _queue.value = FlitRoster.queued()
+    }
+
+    /** A queue flush that could never reach the wire (not serving yet). */
+    private class NotServingYet : Exception("queue flush before serving")
 
     /**
      * Tokens for the send-later queue, or null if this source cannot outlive
@@ -1173,8 +1221,7 @@ val share: StateFlow<ShareIntake?> = _share
     }
 
     fun cancelQueued(fingerprint: String) {
-        FlitRoster.dequeue(fingerprint)
-        _queue.value = FlitRoster.queued()
+        FlitRoster.queued().firstOrNull { it.fingerprint == fingerprint }?.let { dropQueue(it) }
         logLine("queued send cancelled")
     }
 
