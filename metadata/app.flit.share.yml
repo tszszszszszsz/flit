@@ -24,8 +24,14 @@ FullDescription: >-
   transfers resume, and received files stream straight into your chosen
   folder.
 
+  When there is no Wi-Fi network between two devices at all — mobile data
+  only, a dead access point — the roster keeps working: discovery and the
+  exchange ride Bluetooth at exactly that moment, the same secure protocol,
+  the same list. There are no settings for any of it; the only prompts are
+  the system's own, each asked once per device.
+
 # Anti-tamper: only this signing key may publish APKs.
 AllowedAPKSigningKeys: e5491353aeb15e3270f160ae6f04eef642d847221fcf25d1606dce0408c90379
 
-CurrentVersion: 0.1.0
-CurrentVersionCode: 1
+CurrentVersion: 0.2.0
+CurrentVersionCode: 2

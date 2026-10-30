@@ -1,0 +1,6 @@
+First release: send and receive files device-to-device over the local Wi-Fi
+network — mutual TLS with per-device identities and fingerprint pinning,
+interrupted transfers resume from where they stopped, received files stream
+straight into your chosen folder. Send later to a device that is offline,
+text notes, per-device trusted senders with their own receive folder,
+Material You theme, quick settings tile.

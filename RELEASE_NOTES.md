@@ -1,6 +1,29 @@
-# Flit v0.1.0 — release notes (GitHub Releases / Play "What's new")
+# Flit — release notes
 
-## Highlights
+## v0.2.0
+
+* **Works when Wi‑Fi doesn't.** With no network between the phones (mobile data only,
+  dead access point) the roster keeps working: the engine lights Bluetooth discovery at
+  exactly that moment, and the same secure v2.2 exchange rides it. No new settings, no
+  new vocabulary — the prompts you see are the OS's own (nearby-devices permission, radio
+  power), each asked once per device.
+* **The "send later" queue keeps its promise end to end:** a second share to an
+  already-waiting peer joins that batch instead of failing; a flush broken by the peer
+  walking out keeps its row and retries when they're back; completed batches release
+  their storage grants.
+* **Cache hygiene:** a start-time sweep reclaims disk from staged copies a previous
+  process left behind (queue-referenced copies are remembered and kept).
+* Harness: `bt-sim` runs a full protocol exchange (both ends one process) through the
+  simulated Bluetooth pipe against the production server and client — the
+  transport-agnostic regression gate for everything above.
+* Same wire protocol v2.2, byte-identical on the Bluetooth pipe; TLS and resume behave
+  exactly as over Wi‑Fi.
+
+---
+
+## v0.1.0 — (GitHub Releases / Play "What's new")
+
+### Highlights
 
 * **Device-to-device over your own Wi-Fi.** No accounts, no cloud, no cables —
   everything, including discovery metadata, rides mutual TLS with pinned

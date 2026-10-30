@@ -1391,7 +1391,7 @@ class MainActivity : ComponentActivity() {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(
-                    "Flit 0.1.0 — speaks the open LAN-share protocol natively",
+                    "Flit 0.2.0 — speaks the open LAN-share protocol natively",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
