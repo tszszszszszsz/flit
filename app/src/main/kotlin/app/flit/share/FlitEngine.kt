@@ -755,7 +755,10 @@ val share: StateFlow<ShareIntake?> = _share
      * A usable Wi\u2011Fi network exists, VPNs excluded — the arbiter's
      * access-point fact and the egress pin's target share this criterion.
      * Self-hosted hotspots are a coarse corner on purpose: their refinement
-     * rides the walkthroughs, not this helper.
+     * rode the 2026-10-30 walkthrough, which concluded that coarse is
+     * honest — a SoftAP appears in allNetworks as its own LOCAL_NETWORK,
+     * so a live hotspot (station up or station gone) keeps the fact true,
+     * and brief agent churn re-locks within a tick.
      */
     private fun wifiNetwork(cm: android.net.ConnectivityManager?): android.net.Network? =
         cm?.allNetworks?.firstOrNull { n ->

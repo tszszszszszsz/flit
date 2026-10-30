@@ -99,11 +99,11 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
   multi-file, synthetic worst-case bodies) print the send rig's usual report with the
   same exit codes; `--no-tls` runs label `/info` `http` honestly. The pipe carrier
   lives in `protocol.transport`, shared verbatim with the parity suite.
-- On-device checklist (bluetooth radio real, second device pending): advertise visible
-  from another BT source (laptop/earbuds appear in the scan dump), permission sheet
-  wording, radio-off flow, arbiter flip when hotspot dies mid-idle. True two-phone
-  transfers wait for a second device — against the harness-rig standard, that is a
-  listed limitation, not a silent gap.
+- On-device checklist (bluetooth radio real): permission-sheet wording, radio-off
+  flow and the arbiter's hotspot moments — all walked 2026-10-29/30 (record below).
+  Our advertisement seen by *another* BT source stays parked with the two-device
+  contact. True two-phone transfers wait for a second phone — against the
+  harness-rig standard, that is a listed limitation, not a silent gap.
 
 ## Walkthrough record (2026-10-29, Redmi Note 10S / API 36)
 
@@ -123,9 +123,39 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
   once → flip-back line once. Ask-flags written per-launcher as designed. Device left
   in pre-walk state (grants restored, radio off, ask-flags clear) so the real
   first no-AP moment still earns its sheet.
-- **Pending user-gated**: hotspot-on/off walkthrough (MIUI exposes no adb toggle for
-  softAP on this build), roster screenshots (keyguard blocks screencap), and the
-  real two-device contact.
+- **B3 UI walk + hotspot classification (2026-10-30, phone unlocked)**: the asks
+  consumed their real, once-per-device lifetime on hardware — grants revoked, no-AP
+  forced, "Share on Wi-Fi" tapped like a user → the system's permission sheet
+  presented ("Allow Flit to find, connect to… nearby devices?", Android's own
+  wording), Allow tapped → radio flipped live, and the *power* book stayed shut
+  (radio already on; `directAskPermsDone` alone written, exactly the one
+  question/one answer design). Radio deliberately dropped → the system's enable
+  dialog presented ("Flit wants to turn on Bluetooth"), Allow → radio on, flip line
+  once. Ask-flags are now legitimately set and stay set as the shipped lifecycle. The
+  roster was screencapped as visual evidence: zero new strings/vocabulary anywhere on
+  the surface. Flip-back walked on the honesty fix: with the radio dimmed under a
+  pending ask, the dark line tells the AP story only when the AP is the story.
+- **Hotspot walkthrough, same day**: classifier proven on hardware, in three parts.
+  ① Station + hotspot coexist on this build (status-bar fan intact, `wlan0` agent
+  validated throughout) → the arbiter goes dark **in silence** — a user starting a
+  hotspot is not a no-AP moment; the device still owns a Wi‑Fi network *and becomes
+  one* (SoftAP hands out `10.29.15.0/24` on `ap0`, and the server binds all
+  interfaces, so peers that join the hotspot reach it by IP while BLE rests). ② The
+  system-level fact is structural, not incidental: the SoftAP rides `allNetworks` as
+  its own network (interface `ap0`, `TRANSPORT_WIFI`, `NET_CAPABILITY_LOCAL_NETWORK`,
+  not VPN) — exactly what `wifiNetwork()` matches; hotspot-as-access-point is true
+  even with the station gone. ③ Induced churn (`svc wifi disable` under a live
+  hotspot) made the SoftAP's agent vanish from the app's view for under a tick: the
+  arbiter flipped ON once (`no Wi‑Fi network; direct discovery on`), then re-locked
+  dark within one tick as the agents re-entered. The engine mirrored the system's
+  churn honestly — no ask raised, ≤5 s of advertising, self-healing. Deliberately not
+  smoothed with hysteresis: facts-by-tick IS the design, the flutter is invisible to
+  asks and to the surface, and the flipper must keep telling the truth about whatever
+  instant it surveys. The `FlitEngine` comment's coarse corner resolves: on this
+  build, coarse is honest.
+- **Pending user-gated**: the real two-device contact (BLE end-to-end and hotspot
+  transfers with an actual peer need a second phone — listed limitation, not a
+  silent gap).
 
 ## Milestone ladder
 
