@@ -1,0 +1,42 @@
+# The rig standard, green before any commit merges:
+# 22 protocol tests + 43 app tests + debug/release assemblies + harness install.
+name: rig
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: rig-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Android SDK (platform 36, licenses)
+        uses: android-actions/setup-android@v3
+      - run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-36" >/dev/null
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: rig
+        # No env.sh here — that pins the author's local JDK paths; JAVA_HOME
+        # from setup-java is enough. Release builds without the (local-only,
+        # gitignored) keystore.properties fall back to the debug key.
+        run: >
+          ./gradlew --no-daemon --stacktrace
+          :protocol:test :app:testDebugUnitTest
+          :app:assembleDebug :app:assembleRelease
+          :harness:installDist
