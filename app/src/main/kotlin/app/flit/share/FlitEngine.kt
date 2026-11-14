@@ -29,6 +29,8 @@ import app.flit.share.protocol.tls.TlsIdentity
 import java.io.File
 import java.io.IOException
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,18 +39,32 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
 /** Peers vanish from the list after this long without an announce/register. */
 const val PEER_TTL_MS = 30_000L
+
+/** Rescue sweep cadence: one walk per this many ms while discovery is silent. */
+const val SWEEP_INTERVAL_MS = 120_000L
+
+/** Found peers stay fresh by cheap targeted re-registers between walks. */
+const val SWEEP_KEEP_INTERVAL_MS = 15_000L
+
+/** Consecutive keeper misses that retire a found peer's row. */
+const val SWEEP_KEEP_MAX_MISSES = 3
 
 internal const val CHANNEL_SERVICE = "service"
 internal const val CHANNEL_TRANSFERS = "transfers"
@@ -291,6 +307,12 @@ val share: StateFlow<ShareIntake?> = _share
     /** What the flipper last decided for the radio's advertise half (log once per flip). */
     @Volatile
     private var bleAdvertised = false
+    private var nextSweepAt = 0L
+    private var sweepEmptyLogged = false
+    // The keeper: peers a walk found, kept fresh between walks (fp → host).
+    private val sweepKept = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val sweepKeptMisses = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val sweepKeptNextAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private var multicastLock: WifiManager.MulticastLock? = null
     private var startSeq = 0
 
@@ -465,6 +487,11 @@ val share: StateFlow<ShareIntake?> = _share
         runCatching { bleRadio?.stopAll() }
         bleRadio = null
         bleAdvertised = false
+        nextSweepAt = 0L
+        sweepEmptyLogged = false
+        sweepKept.clear()
+        sweepKeptMisses.clear()
+        sweepKeptNextAt.clear()
         _directAsk.value = null
         runCatching { multicastLock?.takeIf { it.isHeld }?.release() }
         multicastLock = null
@@ -602,6 +629,7 @@ val share: StateFlow<ShareIntake?> = _share
             startPruner(seq)
             startManualProber(seq)
             startBleFlipper(seq)
+            startSweeper(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
             _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
@@ -659,6 +687,169 @@ val share: StateFlow<ShareIntake?> = _share
                 }
             }
         }
+    }
+
+    /**
+     * The rescue sweep: a multicast-blocked access point makes discovery
+     * silent, but both machines sit on the same LAN — addressable, and
+     * running the very same v2.2 server. This worker walks the device's own
+     * Wi-Fi subnets (station and SoftAP alike) and knocks on the serving
+     * port; a knock answered by a real v2.2 peer lands as a row exactly
+     * like a manual add does.
+     *
+     * Restraints, each load-bearing: only while discovery is going silent
+     * (no live neighbor row), never in hidden mode (its promise is to stay
+     * off other devices' rosters entirely, and a register is an
+     * announcement), rested a round per [SWEEP_INTERVAL_MS], twenty-four
+     * knocks in flight at most, and whole ranges past 1024 hosts are left
+     * alone (a /16 is not a neighborhood). Empty rounds say so once, then
+     * keep silent — the rounds keep running, the log stays readable.
+     */
+    private fun startSweeper(seq: Int) {
+        scope.launch(Dispatchers.IO) {
+            val burst = Semaphore(24)
+            while (isActive && seq == startSeq) {
+                delay(5_000)
+                if (seq != startSeq) return@launch
+                try {
+                    sweepKeep(seq)
+                } catch (t: Throwable) {
+                    logLine("sweep keep: ${t.message ?: t.javaClass.simpleName}")
+                }
+                try {
+                    sweepOnce(seq, burst)
+                } catch (t: Throwable) {
+                    logLine("sweep: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Between walks, the peers a round found stay fresh: a cheap targeted
+     * re-register every [SWEEP_KEEP_INTERVAL_MS] keeps their rows alive —
+     * the roster's TTL is shorter than the walk's cadence, and a dial-only
+     * peer announces nothing to refresh itself (same reason the mprober
+     * re-probes typed addresses). [SWEEP_KEEP_MAX_MISSES] consecutive
+     * misses retire the keeper and the row ages out on its own: a peer
+     * that stopped serving disappears, exactly like one that stopped
+     * announcing. Re-touches stay silent; the retirement is the one line.
+     */
+    private suspend fun sweepKeep(seq: Int) {
+        val cli = client ?: return
+        val self = server?.selfInfo() ?: return
+        val now = System.currentTimeMillis()
+        for ((fp, host) in sweepKept) {
+            if (seq != startSeq) return
+            if (now < (sweepKeptNextAt[fp] ?: 0L)) continue
+            sweepKeptNextAt[fp] = now + SWEEP_KEEP_INTERVAL_MS
+            val real = sweepProbe(cli, self, seq, host)
+            if (real != null) {
+                sweepKeptMisses.remove(fp)
+                if (real.fingerprint != fp) {
+                    // A different machine now serves this address: the old
+                    // keeper retires, the new machine keeps itself.
+                    sweepKept.remove(fp)
+                    sweepKeptNextAt.remove(fp)
+                }
+                sweepKept[real.fingerprint] = host
+                sweepKeptNextAt[real.fingerprint] = now + SWEEP_KEEP_INTERVAL_MS
+                touchPeer(host, real)
+            } else {
+                val misses = (sweepKeptMisses[fp] ?: 0) + 1
+                sweepKeptMisses[fp] = misses
+                if (misses >= SWEEP_KEEP_MAX_MISSES) {
+                    sweepKept.remove(fp)
+                    sweepKeptMisses.remove(fp)
+                    sweepKeptNextAt.remove(fp)
+                    logLine("sweep: $host quiet — its row retires")
+                }
+            }
+        }
+    }
+
+    private suspend fun sweepOnce(seq: Int, burst: Semaphore) {
+        if (System.currentTimeMillis() < nextSweepAt) return
+        val cli = client ?: return
+        val self = server?.selfInfo() ?: return
+        if (prefs().getBoolean("hiddenMode", false)) return
+        // An alive neighbor means discovery is NOT silent — the roster is fed.
+        if (_peers.value.any { !it.key.startsWith("manual@") }) return
+        val subnets = wifiSubnets()
+        if (subnets.isEmpty()) return
+        // Typed addresses stay the mprober's turf; the walk skips them.
+        val manualHosts = _peers.value.keys
+            .filter { it.startsWith("manual@") }
+            .map { it.removePrefix("manual@").substringBeforeLast(':') }
+            .toSet()
+
+        val t0 = System.currentTimeMillis()
+        val found = ArrayList<String>()
+        var probed = 0
+        for ((netIp, prefix) in subnets) if (seq == startSeq) {
+            val hosts = FlitSubnet.hosts(netIp, prefix).filterNot { it in manualHosts }
+            if (hosts.isEmpty()) continue
+            probed += hosts.size
+            val landed = coroutineScope {
+                hosts.map { h -> async { burst.withPermit { sweepProbe(cli, self, seq, h) } } }
+                    .awaitAll()
+            }
+            landed.forEachIndexed { i, peer ->
+                if (peer != null) {
+                    touchPeer(hosts[i], peer)
+                    sweepKept[peer.fingerprint] = hosts[i]
+                    sweepKeptMisses.remove(peer.fingerprint)
+                    sweepKeptNextAt[peer.fingerprint] =
+                        System.currentTimeMillis() + SWEEP_KEEP_INTERVAL_MS
+                    found += "${peer.alias}@${hosts[i]}"
+                }
+            }
+        }
+        val ms = System.currentTimeMillis() - t0
+        val label = subnets.joinToString(" ") { FlitSubnet.label(it.first, it.second) }
+        when {
+            found.isNotEmpty() -> {
+                sweepEmptyLogged = false
+                logLine("sweep $label: $probed hosts, found ${found.size} (${found.joinToString()}) in ${ms}ms")
+            }
+            !sweepEmptyLogged -> {
+                sweepEmptyLogged = true
+                logLine("sweep $label: $probed hosts, nothing found in ${ms}ms — rounds continue, quiet until a find")
+            }
+            else -> Unit
+        }
+        nextSweepAt = System.currentTimeMillis() + SWEEP_INTERVAL_MS
+    }
+
+    /**
+     * One knock: a short dial to skip the port-closed hosts cheaply, then
+     * the real question to the v2.2 server — TLS first, plain for the
+     * servers that ride http. Only an answered register becomes a row.
+     */
+    private suspend fun sweepProbe(
+        cli: ProtocolClient,
+        self: PeerInfo,
+        seq: Int,
+        host: String,
+    ): PeerInfo? {
+        if (seq != startSeq) return null
+        if (!tcpOpen(host, Protocol.DEFAULT_PORT)) return null
+        for (tls in booleanArrayOf(true, false)) {
+            try {
+                cli.register(SendTarget(host, Protocol.DEFAULT_PORT, tls), self, timeoutMs = 400)
+                    ?.let { return it }
+            } catch (t: Throwable) {
+                // The next carrier — or, after plain, nothing.
+            }
+        }
+        return null
+    }
+
+    /** A dial that answers inside [timeoutMs], or nothing: the cheap filter. */
+    private fun tcpOpen(host: String, port: Int, timeoutMs: Int = 250): Boolean = try {
+        Socket().use { s -> s.connect(InetSocketAddress(host, port), timeoutMs); true }
+    } catch (t: Throwable) {
+        false
     }
 
     /**
@@ -769,6 +960,29 @@ val share: StateFlow<ShareIntake?> = _share
 
     private fun cm(): android.net.ConnectivityManager? =
         appCtx.getSystemService(android.net.ConnectivityManager::class.java)
+
+    /**
+     * Every v4 (ip, prefix) range this device could knock on: all its Wi-Fi
+     * networks — station and SoftAP alike, the sweep's "same LAN" fact made
+     * specific — VPNs excluded, loopback never. Empty means no walkable
+     * neighborhood: no sweep fires.
+     */
+    private fun wifiSubnets(cm: android.net.ConnectivityManager? = cm()): List<Pair<String, Int>> {
+        if (cm == null) return emptyList()
+        val out = ArrayList<Pair<String, Int>>()
+        for (n in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(n) ?: continue
+            if (!caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
+            ) continue
+            val lp = cm.getLinkProperties(n) ?: continue
+            for (la in lp.linkAddresses) {
+                if (la.address.address.size != 4 || la.address.isLoopbackAddress) continue
+                out += la.address.hostAddress?.let { it to la.prefixLength } ?: continue
+            }
+        }
+        return out
+    }
 
     private fun touchPeer(ip: InetAddress, info: PeerInfo) {
         touchPeer(ip.hostAddress ?: return, info)

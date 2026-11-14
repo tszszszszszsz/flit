@@ -86,6 +86,28 @@ incoming RFCOMM from an unpaired device raises the system pairing consent sheet.
 maps that moment onto its existing roster-trust flow (accept once → trusted → roster
 remembers). This is one dialog per new device, once — it can't be removed, only placed.
 
+**5. The rescue sweep (milestone 1).** A multicast-blocked access point (hotel Wi-Fi,
+corporate VLANs, some routers) swallows discovery announces while both machines sit on
+the same LAN — addressable, and running the very same v2.2 server. The sweeper
+(`FlitEngine.startSweeper`, pure math in `FlitSubnet`) walks the device's own Wi-Fi
+subnets (station and SoftAP alike, VPNs excluded) and knocks on the serving port
+(250 ms dial filter, then `register` TLS-first with a plain fallback); an answered
+register lands as a row through the same `touchPeer` path a manual add uses — no new
+surface, no asks, no vocabulary. Restraints, each load-bearing: only while discovery
+is silent (no live non-manual row), never in hidden mode (its promise is to stay off
+other devices' rosters entirely, and a register is an announcement), one round per
+~120 s, twenty-four knocks in flight at most, ranges beyond 1024 knocks refused (a /16
+is not a neighborhood), typed `manual@` addresses left to the mprober. Found peers
+stay fresh between walks by a cheap targeted re-register every ~15 s (the keeper:
+the roster's TTL is shorter than the walk's cadence, and a dial-only peer announces
+nothing to refresh itself); [SWEEP_KEEP_MAX_MISSES] consecutive misses retire the
+keeper and the row ages out honestly. Empty rounds say so once, then stay quiet
+while the rounds keep running. Honest edges: the sweep
+knocks only the default port (custom-port servers stay reachable by address or
+multicast, not by sweep), it rides Wi-Fi subnets only (cellular or wired networks are
+not walked), and a peer found by sweep is found *because it serves* — a powered-off or
+firewalled machine is invisible, same as for any connect-based discovery.
+
 ## Verification reality (one Android test device)
 
 - `PeerHttpClient`'s socket construction and the RFCOMM binder both sit behind a
@@ -170,6 +192,11 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
   batch. One transient noted without a charge: the peer row briefly presented the
   address-as-name presentation ("11" tile) while offers raced a restart, then
   returned to the named state by itself.
+- **Idle soak, 0.2.0 on hardware (2026-10-30, D1 close)**: 8 minutes screen-off with
+  the engine serving — empty crash buffer, process alive, radios in the state the user
+  left them (Bluetooth off), and the only log lines the mprober's honest refusals
+  against the serve-down box. Silence = evidence: the arbiter and rationing earned
+  their rest without a surprise.
 - **Interoperated on hardware (same walk)**: the harness `send` — the production
   protocol client — discovering the phone and delivering a file (`from-box.bin`) that
   landed in `Downloads/Flit/` with ledger row "_received_ from Flit-sender". Reference
@@ -177,6 +204,54 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
 - **Still parked, still listed**: the two-phone *Bluetooth* end-to-end — today's box
   contacts prove the protocol and queue on the Wi-Fi carrier; the BLE carrier's full
   phone-to-phone transfer needs an actual second phone with the app.
+- **Rescue sweep on hardware (2026-11-14, milestone 1)**: fresh release install
+  (0.2.0 + sweep; the rig's release key proved stable across rebuilds — one earlier
+  debug-signed device build needed a single uninstall before the signed update took,
+  after which `adb install -r` updates in place). The phone (192.168.100.80) and the
+  box (192.168.100.12) share "Bojan i Stefan 5g". Walk, all on device:
+  - *Empty rounds*: engine start → first round within ~8 s — `sweep
+    192.168.100.0/24: 253 hosts, nothing found in 2774ms — rounds continue, quiet
+    until a find` (serve down). A second empty round ~120 s later printed nothing
+    (by design, the empty line says once) — the throttle's spacing read from the
+    timestamps of the lines that do print.
+  - *The find, unassisted*: the box's serve restarted **dial-only** (`--udp-port
+    9999` sends announces to a port nobody listens on — multicast out of the
+    picture), and the install was fresh (no manual rows, no QR trust): the next
+    walk knocked, the register answered, and the round line named it — `sweep …
+    found 1 (Flit (szszszs)@192.168.100.12) in 2773ms` — row on the glass, born
+    from the sweep alone.
+  - *A real defect caught by the walk*: the walk's cadence (~120 s) outlives the
+    roster's freshness (30 s TTL), so a dial-only peer (announces nothing, not a
+    manual row) **blinked** — found, pruned ~30 s later, re-found two minutes
+    later. Fixed with the keeper: found peers get a cheap targeted re-register
+    every ~15 s (the mprober's trick, pointed at discovered peers); three
+    consecutive misses retire it and the row ages out honestly. After the fix the
+    row held at 2.5 min ("1 online") with exactly one found line in the log — the
+    walk stood down once the roster was fed.
+  - *A working peer, not a ghost*: the send chip on the sweep-born row opened the
+    picker; the picked file went through — `sent 1/1 to Flit (szszszs):
+    batch-b.bin`, received on the box's disk. No multicast, no typed address, no
+    QR anywhere in the story.
+  - *Retire honesty*: serve killed → the row pruned itself (~25 s, the roster's
+    TTL telling the truth about a peer that stopped serving) → the next walk ran
+    and said `nothing found` → the keeper's third miss printed `sweep:
+    192.168.100.12 quiet — its row retires` → serve returned → the throttled next
+    walk re-found it (`found 1`, 17:44:21) → row back, keeper re-engaged.
+  - *Hidden stand-down*: hidden ON (the toggle restarts the engine itself) → 26 s
+    with a fresh throttle, an empty roster and Wi-Fi up produced **zero** sweep
+    lines (a round would have fired within ~10 s) — the sweep keeps hidden mode's
+    promise of staying off other devices' rosters, because a register IS an
+    announcement. Hidden OFF → the walk resumed within 7 s (`nothing found` —
+    serve still down) → serve restored → `found 1`, end state "1 online".
+  - Observation, no charge: a second host on this LAN answers 53317 dials with a
+    Flit-subject certificate (192.168.100.66) but did not answer the sweep's
+    register inside 400 ms — not a row, honestly not found. Its server's response
+    timing is not ours to fix; the walk reported what it saw.
+- **Sweep restraint matrix, all on device (same walk)**: rounds only when the
+  roster holds no live row (log silence throughout every live-row stretch, firing
+  within one tick of the pruner emptying it); ≥120 s between walks; ≤24 knocks in
+  flight; empty rounds logged once; found rows kept fresh and retired honestly;
+  hidden mode stand-down absolute.
 
 ## Milestone ladder
 
@@ -193,3 +268,21 @@ remembers). This is one dialog per new device, once — it can't be removed, onl
 
 Each milestone: full suite green, assembleRelease, device evidence where a radio is
 involved. Same discipline as the look rewrite.
+
+## Post-ship ladder (agreed 2026-10-30)
+
+- **1 — subnet sweep** (rescue mode for multicast-blocked APs) — **done**: pure
+  math + sweeper + keeper, rig green (76 tests), full hardware walk recorded above.
+- **2 — CLI companion**: the harness graduates from test rig to shipped desktop
+  client (install script, README section, CI artifact).
+- **C — process-death checkpoints**: every send persisted before bytes move; crash,
+  OOM, reboot resume into the same prefix. (Prerequisite of A.)
+- **D — album mirror**: trusted-peer forward-sync of new camera files, deduped,
+  checkpointed, queue-flush driven.
+- **A — carrier migration mid-transfer**: the sender re-probes in priority order and
+  re-attaches a running transfer onto whichever transport answers.
+- **B — Wi-Fi Aware fat pipe** (hardware-gated: check `pm has-feature` on the rig
+  before committing; BLE stays discovery, Aware becomes the data road).
+- **E — self-hosted relay**: parked last, opt-in only, largest scope.
+- Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
+  measure-then-act only.
