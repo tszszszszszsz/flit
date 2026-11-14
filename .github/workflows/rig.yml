@@ -1,5 +1,5 @@
 # The rig standard, green before any commit merges:
-# 22 protocol tests + 43 app tests + debug/release assemblies + harness install.
+# 22 protocol tests + 54 app tests + debug/release assemblies + the CLI dist.
 name: rig
 
 on:
@@ -39,4 +39,11 @@ jobs:
           ./gradlew --no-daemon --stacktrace
           :protocol:test :app:testDebugUnitTest
           :app:assembleDebug :app:assembleRelease
-          :harness:installDist
+          :harness:installDist :harness:distZip
+
+      - name: CLI dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flit-cli
+          path: harness/build/distributions/flit-cli-*.zip
+          if-no-files-found: error

@@ -106,9 +106,9 @@ fun main(argv: Array<String>) {
 
 private fun usage() {
     println(
-        """flit harness — LocalSend v2.2 interop checker
+        """flit-cli — the LocalSend v2.2 command line (same stack as the Flit app)
 
-serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--announce-to ip:port,...]
+serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--hidden] [--announce-to ip:port,...]
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
@@ -233,11 +233,18 @@ private suspend fun serve(args: ParsedArgs) {
             client.register(SendTarget(ip, port, protocol == "https"), self)
         },
         fallbackPeers = announceTargets(args.opt("--announce-to")),
+        // Hidden mode, same semantics as the app: never announce, never
+        // register back — this machine stays reachable only by address, by
+        // a rescue sweep, or by sending first.
+        announce = !args.has("--hidden"),
     )
     discovery.create()
     discovery.start()
 
     println("${ts()} serving ${server.scheme}://0.0.0.0:${server.port} dir=${config.destDir.toAbsolutePath()}")
+    if (args.has("--hidden")) {
+        println("${ts()} hidden: not announcing — peers find this machine by address, by their own rescue sweep, or when it sends first")
+    }
     println("${ts()} fingerprint ${identity.fingerprint}")
 
     Runtime.getRuntime().addShutdownHook(Thread {

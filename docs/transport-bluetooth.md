@@ -105,8 +105,11 @@ keeper and the row ages out honestly. Empty rounds say so once, then stay quiet
 while the rounds keep running. Honest edges: the sweep
 knocks only the default port (custom-port servers stay reachable by address or
 multicast, not by sweep), it rides Wi-Fi subnets only (cellular or wired networks are
-not walked), and a peer found by sweep is found *because it serves* — a powered-off or
-firewalled machine is invisible, same as for any connect-based discovery.
+not walked), a peer found by sweep is found *because it serves* — a powered-off or
+firewalled machine is invisible, same as for any connect-based discovery — and the
+probe's register budget (400 ms) can be outrun by a cold or slow TLS server: a peer
+whose handshake is slower than the budget stays invisible to the sweep while
+remaining visible to multicast and manual address.
 
 ## Verification reality (one Android test device)
 
@@ -243,15 +246,35 @@ firewalled machine is invisible, same as for any connect-based discovery.
     promise of staying off other devices' rosters, because a register IS an
     announcement. Hidden OFF → the walk resumed within 7 s (`nothing found` —
     serve still down) → serve restored → `found 1`, end state "1 online".
-  - Observation, no charge: a second host on this LAN answers 53317 dials with a
-    Flit-subject certificate (192.168.100.66) but did not answer the sweep's
-    register inside 400 ms — not a row, honestly not found. Its server's response
-    timing is not ours to fix; the walk reported what it saw.
+  - Solved mid-walk: a second host answering 53317 dials with a Flit-subject
+    certificate (192.168.100.66) never answered the sweep's register inside
+    400 ms — it turned out to be **this very phone**, whose Wi-Fi address
+    drifted .80 → .66 during the day (DHCP). The phone dialing itself pays its
+    own server's cold TLS handshake on every probe, and that handshake outruns
+    the 400 ms register budget. Honest edge, now listed: a slow or cold v2.2
+    server is invisible to the sweep; it still arrives by multicast when it
+    announces, by manual address, and answers a probe once its handshake is
+    fast (a warmed desktop JVM). The walk reported what it saw; the wrong
+    story in the first draft got the correction it deserved.
 - **Sweep restraint matrix, all on device (same walk)**: rounds only when the
   roster holds no live row (log silence throughout every live-row stretch, firing
   within one tick of the pruner emptying it); ≥120 s between walks; ≤24 knocks in
   flight; empty rounds logged once; found rows kept fresh and retired honestly;
   hidden mode stand-down absolute.
+- **flit-cli ships (2026-11-14, milestone 2)**: the desktop companion is the same
+  v2.2 stack under a bin that doesn't wear test-bench vocabulary. Shipped pieces:
+  `install-cli.sh` (installs from a build or a CI zip; a java-21 gate guards both
+  the build and the installed launcher — a bare shell holding java 8 gets one
+  readable line, not the JVM's class-version stack trace), a README section, and
+  a CI artifact (`flit-cli-0.2.0.zip` from every rig run). Artifact walked on the
+  box: installer → `~/.local/bin/flit-cli serve --hidden` (never announces, never
+  registers back — the app's hidden semantics, now a real flag instead of the
+  dial-only `--udp-port` trick) → the phone's rescue sweep found it on the next
+  throttled round (`found 1 … 192.168.100.12`) → phone→CLI transfer landed on
+  disk (`batch-b (1).bin`, dedup honest against the earlier arrival) → CLI→phone
+  send landed in the phone's `Downloads/Flit/` (`sent 1/1 … ok cli-hello.txt`).
+  Identity home stays `~/.config/flit/flit-harness`, so fingerprints survived the
+  rename: every peer that trusted the rig keeps trusting the product.
 
 ## Milestone ladder
 
@@ -273,8 +296,9 @@ involved. Same discipline as the look rewrite.
 
 - **1 — subnet sweep** (rescue mode for multicast-blocked APs) — **done**: pure
   math + sweeper + keeper, rig green (76 tests), full hardware walk recorded above.
-- **2 — CLI companion**: the harness graduates from test rig to shipped desktop
-  client (install script, README section, CI artifact).
+- **2 — CLI companion** — **done**: the desktop client ships as `flit-cli`
+  (installer with a guarded launcher, README section, CI dist artifact);
+  evidence below.
 - **C — process-death checkpoints**: every send persisted before bytes move; crash,
   OOM, reboot resume into the same prefix. (Prerequisite of A.)
 - **D — album mirror**: trusted-peer forward-sync of new camera files, deduped,

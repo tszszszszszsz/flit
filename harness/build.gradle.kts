@@ -16,5 +16,12 @@ dependencies {
 
 application {
     mainClass.set("app.flit.share.harness.HarnessKt")
+    // The module stays the rig; the shipped desktop client is flit-cli — same
+    // code, a bin name that doesn't wear test-bench vocabulary. The identity
+    // home is hardcoded (~/.config/flit/flit-harness), so fingerprints survive
+    // the rename and every peer that trusted this machine keeps trusting it.
+    applicationName = "flit-cli"
+    // Keep in step with the app's versionName (app/build.gradle.kts).
+    version = "0.2.0"
     applicationDefaultJvmArgs = listOf("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn")
 }

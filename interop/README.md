@@ -44,12 +44,14 @@ Our stack: `:protocol` module (Kotlin), Netty server, own `PeerHttpClient` (JDK 
 
 ## Incident notes
 - A timed-out CLI prepare leaves its TUI dialog behind; dismiss with `N` before retrying.
-- Rebuild ritual: restart `harness serve` after every `installDist` (JVM holds the old
+- Rebuild ritual: restart `flit-cli serve` after every `installDist` (JVM holds the old
   jars; a stale session also blocks the single slot until `POST …/cancel?sessionId=…`).
+  Bin renamed 2026-11-14: the same code ships as `flit-cli` — earlier records here
+  say `harness serve`; those are history, the lines above are how to run it now.
 
 ## Repro bootstraps
-- Node A: `harness serve --dir received --port 53318 --udp-port 53319 --alias FlitAlpha --announce-to 127.0.0.1:53317`
-- Node B send: `harness send --to 127.0.0.1:53318 <files>` (T0), `--to 127.0.0.1:53216` (T1 reverse).
+- Node A: `flit-cli serve --dir received --port 53318 --udp-port 53319 --alias FlitAlpha --announce-to 127.0.0.1:53317`
+- Node B send: `flit-cli send --to 127.0.0.1:53318 <files>` (T0), `--to 127.0.0.1:53216` (T1 reverse).
 - CLI receive driving: `mkfifo cli-stdin`, `exec 3<> cli-stdin`, launch `script -qec "$HOME/.local/opt/localsend-cli" /dev/null <&3 > cli-tui.log 2>&1 &`,
   then `printf 'Y' >&3` when the offer dialog shows (same shell invocation; fd3 dies with the shell).
 
@@ -122,7 +124,7 @@ phone↔box multicast delivers both directions once announce TX is wired properl
 ### Tooling / observation notes
 - Harness `ConsoleDelegate` dedupes **every** `seen` print (UDP announce *and* HTTP
   register) by fingerprint. After a peer's first register, its announces are logged
-  nowhere; **use a fresh listener (`harness discover --wait 3`) for clean announce
+  nowhere; **use a fresh listener (`flit-cli discover --wait 3`) for clean announce
   observations**. Multiple "phone multicasts never arrive" debug readings were this
   mask — the register-based `seen` line made every later check a false negative.
 - UDP probes over adb: `cmd | nc -u …` never exits and wedges the session — always
@@ -131,7 +133,7 @@ phone↔box multicast delivers both directions once announce TX is wired properl
   egress pinning for that start — escape hatch for pin-related experiments.
 - Android main route table is empty; routes live in per-netid tables (e.g. Wi-Fi =
   `table 1000000033`, holding `224.0.0.0/24 dev wlan0`).
-- Session-restart ritual stays: restart `harness serve` after every `installDist`.
+- Session-restart ritual stays: restart `flit-cli serve` after every `installDist`.
 
 ## Day 3 (2026-10-23) — release build (R8) shipped to real Wi-Fi, all green
 

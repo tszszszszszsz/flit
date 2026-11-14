@@ -37,7 +37,7 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   the peer reappears). The queue's promise is kept: a second intake joins the waiting batch
   instead of dying as "send failed", a flush broken by the peer leaving keeps its row, and
   delivered batches release their storage grants — everything keeps its sentence. (Walked
-  on device against a harness server: kept → merged → auto-sent 2/2 → cancel, all live.)
+  on device against a flit-cli server: kept → merged → auto-sent 2/2 → cancel, all live.)
 - Multi-file sends stream concurrently (4 parallel), and a dropped connection mid-file is
   recovered automatically: the receiver keeps the received prefix, the sender probes
   `GET /api/flit/v1/partial`, and the transfer resumes from there (Flit↔Flit only; plain v2.2
@@ -58,8 +58,8 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
 
 ```
 protocol/   wire protocol engine (pure Kotlin; JSON DTOs, UDP discovery, TLS+mTLS, HTTP server/client)
-harness/    headless CLI used to verify interop with the official LocalSend CLI
-app/        Android shell (Jetpack Compose) — added once an Android SDK is available
+app/        Android shell (Jetpack Compose) — the phone app
+harness/    the desktop companion, shipped as flit-cli (doubles as the rig that verifies interop with official LocalSend)
 ```
 
 ## Dev quickstart
@@ -69,7 +69,7 @@ Toolchain (JDK 21 + Gradle + reference CLI) lives in `~/.local/`:
 ```bash
 source env.sh                 # puts JDK 21 first on PATH
 ./gradlew :harness:installDist
-cd harness/build/install/harness/bin && ./harness
+cd harness/build/install/flit-cli/bin && ./flit-cli
 ```
 
 commands: `serve`, `discover`, `send <ip[:port]|alias> <file...>`, `info <ip[:port]>`,
@@ -85,6 +85,34 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDe
 
 Interop testing uses the official `localsend-cli` v1.18.2 binary at
 `~/.local/opt/localsend-cli` (see `interop/`).
+
+## Desktop companion (`flit-cli`)
+
+The app's protocol stack also runs on the desktop: the same v2.2 client and server
+(TLS with mutual certificate auth, UDP register discovery, sha256 receipts, resumable
+uploads) behind a command line — the same binary that serves as this repo's interop
+rig, shipped under a name that doesn't wear test-bench vocabulary.
+
+```bash
+./install-cli.sh                            # build from source → ~/.local/bin/flit-cli
+./install-cli.sh --zip flit-cli-0.2.0.zip   # or install a CI artifact directly
+```
+
+```bash
+flit-cli serve --dir ~/Public               # receive; announces on the LAN like the app
+flit-cli serve --dir ~/Public --hidden      # receive; stays off other devices' rosters entirely
+flit-cli discover --wait 5                  # who else is speaking v2.2 here?
+flit-cli send <ip[:port]|alias> <file...> [--parallel N]
+flit-cli info <ip[:port]>
+```
+
+Needs java 21 at run time — the installed launcher says so in one line if the
+ambient `java` is older (`JAVA_HOME` or PATH wins). Identity lives at
+`~/.config/flit/flit-harness` — stable across rebuilds and updates, so peers that
+trusted this machine keep trusting it. Honest edges, listed not silent: `serve`
+auto-accepts incoming offers (the app's trusted-senders gate has no CLI counterpart
+yet), and a machine hidden with `--hidden` is invisible to multicast discovery —
+which is exactly the peer the phone app's rescue sweep exists to find.
 
 ## Licensing / provenance note
 
