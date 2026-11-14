@@ -418,3 +418,53 @@ One death was simulated twice over and the transfer still cost only the bytes
 that never landed. The queue row was the checkpoint, the receiver's disk was
 the progress, and neither side was told anything the other didn't already
 speak.
+
+## Milestone D design — album mirror (written before code)
+
+The ladder line: trusted-peer forward-sync of new camera files, deduped,
+checkpointed, queue-flush driven. Read against the code, the shape is
+already there — **the mirror is a producer into the queue machinery that
+milestone C just made bulletproof, not a new pipeline.**
+
+- **One target, chosen and trusted.** Options gains a switch
+  ("mirror new camera shots") and, when it is on, a target row that opens a
+  picker over the trusted (pinned) peers. One fingerprint, stored. The row
+  speaks no transport vocabulary — it names a device, not a mechanism.
+- **The watcher.** A `FileObserver` on `DCIM/Camera` (the stock camera's
+  folder) notices `CLOSE_WRITE` and `MOVED_TO` — a finished file, not a
+  half-written one. Camera shots, videos, everything the stock camera
+  saves; screenshots and downloads stay out.
+- **The ledger is the dedup.** Keyed `name∥size` (camera names are
+  timestamped; size separates an edit), persisted JSON, capped at 2000 with
+  FIFO eviction. Seeded at enable time with the folder as it stands — the
+  feature syncs *forward*, it does not replay the album's history. Marked
+  **only on send success**; between notice and success the queue row (the
+  checkpoint) carries the file, so a death loses nothing — the next
+  re-notice or scan just merges into the surviving row.
+- **Scan on engine start.** The observer covers liveness; a stat-only scan
+  of the folder at every engine start covers completeness — anything that
+  landed while the app was dead (or that an OEM FUSE quirk swallowed) is
+  caught by the diff, then, and nothing is re-hashed or re-sent.
+- **The flush is the queue's.** Notice → ledger check → `FlitRoster.enqueue`
+  of a `QueuedSend` for the target fingerprint (path tokens, exactly what
+  the queue-flush already consumes) → the same row manual queue entries
+  ride: merges with anything pending, auto-flushes on the peer's touch
+  (sweep, keeper, multicast — at most one keeper beat of latency),
+  checkpoints through any death, drops precisely on success. A live peer
+  gets a direct flush nudge at enqueue; an absent one catches the batch on
+  its next touch.
+- **Success marks the ledger** in the same `dropSent` door every sent batch
+  leaves through — filtered to tokens that are files inside the camera
+  folder, so manual sends never write it.
+- **Honest edges, listed:** mirroring runs only while sharing runs (the
+  flush needs the engine); the target must stay pinned — unpinning pauses
+  the mirror rather than re-pointing it silently; files the user deletes
+  from the phone after mirroring are not deleted on the peer (forward-sync
+  only, never backwards); a phone whose camera saves elsewhere (pro modes,
+  third-party cameras) is not watched.
+
+Tests: the pure diff (plan: existing folder vs ledger → candidates), ledger
+seeding and cap, the enqueue-merge with a manual row. The observer, the
+scan, and the flush are device truth — walked on hardware: a synthetic shot
+pushed into `DCIM/Camera` while the box's row is live, arriving on the box
+auto-accepted and hash-exact; a restart with nothing new re-sending nothing.
