@@ -210,9 +210,14 @@ class ProtocolClient(
         while (attempt < 3) { // mirrors upstream MAX_UPLOAD_ATTEMPTS
             attempt++
             // A Flit receiver may still hold an interrupted prefix of this
-            // file (resume); the probe doubles as a liveness ping.
+            // file: not only from a connection this process lost (the catch
+            // below probes), but from a previous RUN whose sender died
+            // mid-file — the receiver's parts registry answers from its own
+            // disk. A fresh entry probes on the first attempt; old v2.2
+            // receivers 404 and cost one round trip. The probe doubles as a
+            // liveness ping.
             var base = 0L
-            if (carried > 0) {
+            if (carried > 0 || attempt == 1) {
                 base = queryPartial(target, contentToken) ?: 0
                 if (base >= total) base = 0 // full-size buffer with wrong hash: resend
                 if (base !in 1 until total) base = 0

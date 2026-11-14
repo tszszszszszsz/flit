@@ -2,7 +2,10 @@ package app.flit.share.protocol
 
 import app.flit.share.protocol.client.Link
 import app.flit.share.protocol.client.LinkProvider
+import app.flit.share.protocol.client.OutgoingFile
 import app.flit.share.protocol.client.PeerHttpClient
+import app.flit.share.protocol.client.ProtocolClient
+import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PartialInfo
@@ -268,4 +271,170 @@ class LinkServerParityTest {
 
     @Test
     fun `full flow rides pipes wrapped in TLS both ends`() = parityRun(tls = true)
+
+    /**
+     * Milestone C, in one exchange chain: the receiver DIES mid-upload (the
+     * whole core is discarded — session, registry, everything in-memory) and
+     * a fresh core over the same dest directory comes back. The kept part
+     * must carry its own discoverability: a token sidecar beside the `.part`,
+     * read back by the start sweep, so the sender's /partial probe still
+     * answers with the prefix and the re-attach lands hash-exact. TLS only —
+     * the sidecar/sweep machinery is carrier-independent and the plain
+     * carrier is already covered by the parity runs above.
+     */
+    private fun deathRun() {
+        val harnessWd = thread(isDaemon = true, name = "death-watchdog") {
+            try {
+                Thread.sleep(60_000)
+            } catch (_: InterruptedException) {
+                return@thread
+            }
+            System.err.println("[watchdog] stuck death run — dumping all threads")
+            Thread.getAllStackTraces().forEach { (t, st) ->
+                if (st.isNotEmpty()) {
+                    System.err.println("[watchdog] ${t.name}:")
+                    st.take(14).forEach { System.err.println("[watchdog]   $it") }
+                }
+            }
+            Runtime.getRuntime().halt(97)
+        }
+        try {
+            runBlocking {
+                withTimeoutOrNull(90_000) { driveDeath() } ?: fail("death run timed out")
+            }
+        } finally {
+            harnessWd.interrupt()
+        }
+    }
+
+    private suspend fun driveDeath() {
+        val identity = TlsIdentity.generate()
+        val dest = Files.createTempDirectory("flit-death")
+        val tls = true
+        val serverRef = java.util.concurrent.atomic.AtomicReference<app.flit.share.protocol.server.LinkServer>()
+        val inbox = Channel<PipePair>(Channel.UNLIMITED)
+        val connections = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                val p = inbox.receive()
+                val s = serverRef.get()
+                launch(Dispatchers.IO) {
+                    val raw = p.serverLink("192.0.2.77")
+                    try {
+                        s.serve(TlsLink(raw, identity, clientMode = false))
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        System.err.println("serve crashed: $t")
+                    }
+                }
+            }
+        }
+        val cli = PeerHttpClient(identity, links = SimLinkProvider(identity, tls, inbox))
+        val sender = PeerInfo(
+            alias = "death-sender", version = "2.2",
+            fingerprint = "SENDER_FP_0000000000000000000000000000000000000",
+        )
+
+        // 1. live core takes half a body and loses its process to the abort.
+        val payload = ByteArray(1536 * 1024).also { Random(777).nextBytes(it) }
+        val fi = FileInfo(
+            id = "f1", fileName = "parity-death.bin",
+            size = payload.size.toLong(), fileType = "application/octet-stream",
+            sha256 = MessageDigest.getInstance("SHA-256").digest(payload).joinToString("") { "%02x".format(it) },
+        )
+        val core1 = ServerCore(identity, ServerConfig(destDir = dest, alias = "parity-node"), ParityDelegate())
+        serverRef.set(LinkServer(core1))
+        val reqBytes = WireJson.encode(PrepareUploadRequest(sender.sansAnnounce(), mapOf("f1" to fi))).toByteArray()
+        val prepared = cli.exchange(
+            "POST", "127.0.0.1", 53317, tls, Protocol.PATH_PREPARE_UPLOAD,
+            headers = mapOf("Content-Type" to "application/json"),
+            bodyProvider = { ByteArrayInputStream(reqBytes) },
+            contentLength = reqBytes.size.toLong(),
+            timeoutMs = 20_000,
+        )
+        assertEquals(200, prepared.status)
+        val pr = WireJson.decode<PrepareUploadResponse>(prepared.text())
+        val rt = Protocol.resumeToken(fi)
+
+        PeerHttpClient.testAbortBytes = payload.size / 2L
+        val aborted = runCatching {
+            cli.exchange(
+                "POST", "127.0.0.1", 53317, tls,
+                "${Protocol.PATH_UPLOAD}?sessionId=${enc(pr.sessionId)}&fileId=f1&token=${pr.files["f1"]}",
+                headers = mapOf("Content-Type" to "application/octet-stream"),
+                bodyProvider = { ByteArrayInputStream(payload) },
+                contentLength = payload.size.toLong(),
+                bodyProgress = { },
+                timeoutMs = 45_000,
+            )
+        }
+        PeerHttpClient.testAbortBytes = 0L
+        assertTrue(aborted.isFailure, "upload body must have aborted mid-flight")
+
+        // 2. the death leaves a part AND its token sidecar on disk — the
+        // sidecar is the whole trick: discoverability that outlives the
+        // process, written at keep time.
+        val part = dest.resolve(".parity-death.bin.part")
+        val sidecar = app.flit.share.protocol.server.tokenSidecar(part)
+        var sidecarSeen = false
+        for (attempt in 0 until 100) {
+            if (Files.exists(sidecar)) {
+                sidecarSeen = true
+                break
+            }
+            delay(50)
+        }
+        assertTrue(sidecarSeen, "token sidecar never appeared beside the kept part")
+        assertEquals(rt, Files.readString(sidecar).trim(), "sidecar must carry the sender's probe token")
+
+        // 3. the process is gone. A fresh core over the same dest sweeps the
+        // part back into its registry — the probe answers across death.
+        val delegate2 = ParityDelegate()
+        val core2 = ServerCore(identity, ServerConfig(destDir = dest, alias = "parity-node"), delegate2)
+        core2.sweepOnStart()
+        serverRef.set(LinkServer(core2))
+        val probed = cli.exchange(
+            "GET", "127.0.0.1", 53317, tls,
+            "${Protocol.PATH_PARTIAL}?token=${rt}",
+            timeoutMs = 20_000,
+        )
+        assertEquals(200, probed.status, "probe after death answered ${probed.status}: ${probed.text().take(200)}")
+        val prefix = WireJson.decode<PartialInfo>(probed.text()).size
+        assertTrue(prefix > 0 && prefix < payload.size, "probe says $prefix of ${payload.size}")
+
+        // 4. the real re-entry: the production client's sendFiles — attempt 1
+        // probes /partial (the swept prefix answers from the receiver's
+        // disk), attaches with X-Flit-Resume on its own, and lands
+        // hash-exact. No manual headers: the fresh sender re-learns the
+        // prefix, which is the whole point of milestone C.
+        val sent = ProtocolClient(identity, links = SimLinkProvider(identity, tls, inbox)).let { full ->
+            full.sendFiles(
+                SendTarget("127.0.0.1", 53317, tls),
+                sender,
+                listOf(object : OutgoingFile {
+                    override val wireName = "parity-death.bin"
+                    override val size = payload.size.toLong()
+                    override val mime = "application/octet-stream"
+                    override fun openStream(): InputStream = ByteArrayInputStream(payload)
+                }),
+                multi = false,
+            ).also { full.close() }
+        }
+        assertTrue(sent.failed.isEmpty(), "sendFiles after death failed: ${sent.failed}")
+        assertEquals(1, sent.sent.size)
+        assertContentEquals(payload, Files.readAllBytes(dest.resolve("parity-death.bin")))
+        val ev = delegate2.events.snapshot()
+        assertTrue(ev.any { it == "resume:$prefix" }, "resume event missing: ${ev.takeLast(8)}")
+        assertTrue(ev.any { it.endsWith(":Saved") }, "finish event missing: ${ev.takeLast(8)}")
+
+        // 5. the story is over: part and sidecar are gone from the disk.
+        assertTrue(!Files.exists(part), "part file must be consumed by the landing")
+        assertTrue(!Files.exists(sidecar), "token sidecar must go with the part")
+
+        cli.close()
+        connections.cancel()
+    }
+
+    @Test
+    fun `a kept part survives the receiver's death and resumes hash-exact`() = deathRun()
 }

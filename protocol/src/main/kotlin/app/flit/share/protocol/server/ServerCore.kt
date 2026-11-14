@@ -105,6 +105,7 @@ internal class PartRegistry {
             map.entries.removeIf { (k, e) ->
                 if (map.size <= CAP / 2) false else {
                     runCatching { Files.deleteIfExists(e.path) }
+                    runCatching { Files.deleteIfExists(tokenSidecar(e.path)) }
                     map.remove(k)
                     true
                 }
@@ -122,6 +123,9 @@ internal class PartRegistry {
             val (_, e) = it.next()
             if (now - e.added > TTL_MS || !Files.exists(e.path)) {
                 if (now - e.added > TTL_MS) runCatching { Files.deleteIfExists(e.path) }
+                // The sidecar is the part's discoverability — no part, no
+                // sidecar, whatever killed the part.
+                runCatching { Files.deleteIfExists(tokenSidecar(e.path)) }
                 it.remove()
             }
         }
@@ -219,6 +223,9 @@ class ServerCore(
     fun sweepOnStart() {
         sweepOldParts(config.destDir)
         sweepPieceSidecars(config.destDir)
+        // Parts from an earlier run of this server go back into the registry,
+        // so a probe after a process death still answers with the prefix.
+        repopulateParts(config.destDir, parts)
     }
 
     // ---- dispatch ------------------------------------------------------------------------
@@ -398,7 +405,13 @@ class ServerCore(
         var resumed = false
         if (resumeToken != null) {
             val e = parts.peek(resumeToken)
-            if (e != null && e.senderIp == peerIp) {
+            // Empty senderIp = a part repopulated from disk by an earlier run
+            // of this server. Safe to accept from any peer: the token binds
+            // content identity (name ∥ size ∥ sha256), so a tail appended
+            // under the same token matches the prefix by construction — and
+            // the final digest gate still rules. The re-put below re-binds
+            // the entry to the live peer's IP.
+            if (e != null && (e.senderIp == peerIp || e.senderIp.isEmpty())) {
                 if (e.path != pf.temp && Files.exists(e.path)) {
                     Files.createDirectories(pf.temp.parent)
                     Files.copy(e.path, pf.temp, StandardCopyOption.REPLACE_EXISTING)
@@ -467,18 +480,21 @@ class ServerCore(
                 if (sink == null) {
                     Files.createDirectories(pf.target.parent)
                     Files.move(pf.temp, pf.target, StandardCopyOption.REPLACE_EXISTING)
+                    // The part's whole story is over — the sidecar that made
+                    // it discoverable across restarts goes with the part.
+                    runCatching { Files.deleteIfExists(tokenSidecar(pf.temp)) }
                 }
                 if (resumed) resumeToken?.let { parts.remove(it) }
             } else if (sink == null) {
                 if (resumed) {
                     // keep the prefix — the sender (or a retry) can extend it
-                    parts.put(resumeToken!!, pf.temp, peerIp)
+                    keepPart(resumeToken!!, pf.temp, peerIp)
                 } else {
                     // A truncated body (sender died) looks exactly like a
                     // digest mismatch: as bytes they are an honest prefix of
                     // what was shipped. Keep it; resume + final sha still
                     // gate acceptance.
-                    parts.put(Protocol.resumeToken(pf.file), pf.temp, peerIp)
+                    keepPart(Protocol.resumeToken(pf.file), pf.temp, peerIp)
                 }
             }
             sink?.done(ok)
@@ -522,6 +538,17 @@ class ServerCore(
     }
 
     /** Interrupted without claim of completion: keep any usable prefix. */
+    /**
+     * A kept part must answer probes from a LATER run of this server, not
+     * just this one: the registry gets it now, and the token goes into a
+     * sidecar beside the part so the start sweep can re-register it after
+     * a process death (docs, milestone C).
+     */
+    private fun keepPart(token: String, temp: Path, senderIp: String) {
+        parts.put(token, temp, senderIp)
+        runCatching { Files.writeString(tokenSidecar(temp), token) }
+    }
+
     private fun keepPartAfterAbort(
         temp: Path,
         token: String,
@@ -530,9 +557,10 @@ class ServerCore(
     ) {
         val keep = keepable && runCatching { Files.size(temp) }.getOrDefault(0L) > 0
         if (keep) {
-            parts.put(token, temp, peerIp)
+            keepPart(token, temp, peerIp)
         } else {
             runCatching { Files.deleteIfExists(temp) }
+            runCatching { Files.deleteIfExists(tokenSidecar(temp)) }
         }
     }
 
@@ -694,7 +722,7 @@ class ServerCore(
                 return
             }
             Files.writeString(piecesSidecar(pf.temp), base.toString())
-            parts.put(token, pf.temp, peerIp)
+            keepPart(token, pf.temp, peerIp)
             if (base >= pf.file.size) tracker.clear() // complete-but-unhashed: base is all there is
         }
     }
@@ -849,6 +877,34 @@ internal fun sweepPieceSidecars(dest: Path) {
     }
 }
 
+/** The part's token sidecar: what makes a part discoverable by a LATER run
+ *  of this server — the start sweep reads the token and re-registers the
+ *  part so the sender's probe still answers with the prefix. */
+internal fun tokenSidecar(part: Path): Path =
+    part.resolveSibling(part.fileName.toString() + ".token")
+
+/**
+ * Parts left behind by a run that died: their `.token` sidecars say which
+ * probe token answers for each. Entries re-register with an empty senderIp —
+ * the probe and the resume-attach accept those from anyone (the token binds
+ * content identity, the final digest gate rules), and the first re-attach
+ * re-binds the entry to the live peer's IP. Orphan sidecars whose part is
+ * gone are ignored here and aged out by [sweepOldParts].
+ */
+internal fun repopulateParts(dest: Path, parts: PartRegistry) {
+    runCatching {
+        Files.walk(dest).use { walk ->
+            walk.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".part") }
+                .forEach { p ->
+                    runCatching {
+                        val token = Files.readString(tokenSidecar(p)).trim()
+                        if (token.isNotEmpty()) parts.put(token, p, "")
+                    }
+                }
+        }
+    }
+}
+
 /** Keeps only relative, traversal-safe path segments; returns "" when invalid. */
 internal fun sanitizeRelative(fileName: String): String {
     val raw = fileName.trim()
@@ -862,11 +918,16 @@ internal fun sanitizeRelative(fileName: String): String {
     }
 }
 
-/** Interrupted uploads left by earlier runs: parts older than a day go. */
+/** Interrupted uploads left by earlier runs: parts older than a day go —
+ *  and token sidecars whose part is already gone (an aborted story) age out
+ *  with them. */
 private fun sweepOldParts(dest: Path) {
     runCatching {
         Files.walk(dest).use { walk ->
-            walk.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".part") }
+            walk.filter { Files.isRegularFile(it) && (
+                it.fileName.toString().endsWith(".part") ||
+                    it.fileName.toString().endsWith(".part.token")
+                ) }
                 .forEach { p ->
                     runCatching {
                         val age = System.currentTimeMillis() - Files.getLastModifiedTime(p).toMillis()

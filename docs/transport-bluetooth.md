@@ -299,8 +299,12 @@ involved. Same discipline as the look rewrite.
 - **2 — CLI companion** — **done**: the desktop client ships as `flit-cli`
   (installer with a guarded launcher, README section, CI dist artifact);
   evidence below.
-- **C — process-death checkpoints**: every send persisted before bytes move; crash,
-  OOM, reboot resume into the same prefix. (Prerequisite of A.)
+- **C — process-death checkpoints** — **done**: the queue row written before
+  bytes move (the queue IS the checkpoint), the receiver's token sidecar +
+  start sweep make interrupted prefixes survive receiver restarts, fresh
+  dispatches probe on their first attempt; killed sender + restarted
+  receiver on hardware resumed hash-exact from a 128 MB prefix (evidence
+  above). (Prerequisite of A.)
 - **D — album mirror**: trusted-peer forward-sync of new camera files, deduped,
   checkpointed, queue-flush driven.
 - **A — carrier migration mid-transfer**: the sender re-probes in priority order and
@@ -362,3 +366,55 @@ Tests: token sidecar round-trip; a fresh `ServerCore` over a dirty dest answers
 `/partial` with the sidecar base; the fresh dispatch owes before bytes (row
 visible the moment dispatch starts); the death walk on hardware — transfer
 running, `am kill`, restart, same prefix, hash-exact end.
+
+### Milestone C on hardware (2026-11-14) — the walk that proves both truths
+
+Fixture: the box serves the freshly rebuilt `flit-cli` (the C build — verified
+by the `.part.token` literal in its installed jar); the phone runs the freshly
+installed 0.2.0 release APK (owe-first dispatch + attempt-1 probe), parallel
+streams toggled OFF in Options so the walk exercises the plain single-stream
+path. The payload: `/tmp/opencode/bigresume.bin`, 400,000,000 bytes,
+sha256 `8a4acb100cd4ea4596ce4c495a4080ad19f2fd0b8346823dd225e9dc00a79849`,
+pushed to the phone's `Download/`. Then, chronologically:
+
+1. **Owe before bytes.** The send chip on the roster row → SAF picker
+   (`OpenMultipleDocuments` — persistable grants, so the batch is
+   checkpointable) → `bigresume.bin`. With the C build the queue row is written
+   *before* any byte moves; 3–4 s later, mid-body, the sender's process is
+   killed outright: `adb shell am force-stop app.flit.share`.
+2. **The receiver's disk keeps the prefix — and its own discoverability.**
+   The abrupt disconnect surfaces as a checksum mismatch, which is exactly an
+   honest prefix: the server kept it as `.bigresume.bin.part` —
+   **127,959,040 bytes (32 %)** — and wrote the token sidecar
+   `.bigresume.bin.part.token` beside it at keep time
+   (`41133d96bf74e2023c12bfa26f953f0d`, the content-bound
+   name∥size∥sha256 token the sender probes with). The serve log shows
+   `recv-start` → `recv-BAD checksum mismatch` — no special death path, the
+   ordinary keep rules did it.
+3. **The receiver dies too.** The `flit-cli` serve process is killed and
+   restarted — the in-memory parts registry is gone; the only trace of the
+   prefix is the sidecar on disk. `sweepOnStart` → `repopulateParts` reads it
+   back with an empty senderIp.
+4. **The sender comes back owed.** `am start` relaunches the app; sharing
+   starts from the dock; the queue row survived the force-stop in prefs. The
+   engine's first sweep round re-finds the hidden box on its own
+   (`sweep … found 1 (Flit (szszszs)@192.168.100.12)`), and the row's touch
+   auto-flushes the owed batch — one log line, no user action:
+   `queue: 1 queued for Flit (szszszs) — sending now`.
+5. **The fresh sender re-learns the prefix.** The flush's `sendFiles` probes
+   `/partial` on its first attempt (the C change: `carried > 0 || attempt == 1`)
+   and the restarted receiver answers **from its disk** with 127,959,040 —
+   the sender attaches with `X-Flit-Resume` on its own and streams only the
+   remaining 272 MB. Seven seconds later:
+   `sent 1/1 to Flit (szszszs): bigresume.bin`.
+6. **The verdict.** The receiver's log says it plainly —
+   `recv-resume bigresume.bin from 127959040 bytes` — and the landing is
+   hash-exact: `sha256sum` on the box equals the reference hash above. The
+   part and its sidecar are gone from the directory (consumed by the success
+   move); the queue row is gone from the phone (precise drop, sent tokens
+   out, grants released). Screenshot: `/tmp/opencode/ui-resume-done.png`.
+
+One death was simulated twice over and the transfer still cost only the bytes
+that never landed. The queue row was the checkpoint, the receiver's disk was
+the progress, and neither side was told anything the other didn't already
+speak.

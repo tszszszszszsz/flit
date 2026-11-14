@@ -46,4 +46,27 @@ class FlitRosterTest {
         val nameless = batch(alias = "", uris = listOf("/s/b"), names = listOf("b"))
         assertEquals("André", waiting.mergedWith(nameless).alias)
     }
+
+    @Test
+    fun `a sent batch leaves its tokens — a batch merged in mid-flight stays owed`() {
+        val row = batch(uris = listOf("/s/a", "/s/b"), names = listOf("a.jpg", "b.jpg"))
+        val flew = batch(uris = listOf("/s/a"), names = listOf("a.jpg"))
+        val left = row.without(flew.uris, flew.names)!!
+        assertEquals(listOf("/s/b"), left.uris)
+        assertEquals(listOf("b.jpg"), left.names)
+    }
+
+    @Test
+    fun `dropping the last tokens ends the row`() {
+        val row = batch(uris = listOf("/s/a"), names = listOf("a.jpg"))
+        assertEquals(null, row.without(listOf("/s/a"), listOf("a.jpg")))
+    }
+
+    @Test
+    fun `display twins leave by first occurrence — the survivor keeps its name`() {
+        val row = batch(uris = listOf("/s/a", "/s/b"), names = listOf("same.jpg", "same.jpg"))
+        val left = row.without(listOf("/s/a"), listOf("same.jpg"))!!
+        assertEquals(listOf("/s/b"), left.uris)
+        assertEquals(listOf("same.jpg"), left.names)
+    }
 }

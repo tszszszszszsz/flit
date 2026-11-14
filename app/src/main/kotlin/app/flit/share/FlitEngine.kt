@@ -1030,9 +1030,10 @@ val share: StateFlow<ShareIntake?> = _share
                     try {
                         dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
                         // A completed exchange (sent or declined — the far
-                        // side spoke) concludes the row's story; grants go
-                        // back with the tokens.
-                        dropQueue(batch)
+                        // side spoke) concludes the row's story — but only
+                        // the tokens that flew: a batch that merged in while
+                        // this one was in the air stays owed.
+                        dropSent(batch)
                     } catch (e: Exception) {
                         // The row's keep IS the queue's promise: a send that
                         // never settled (the peer walked out mid-transfer,
@@ -1302,6 +1303,7 @@ val share: StateFlow<ShareIntake?> = _share
             var outgoing: List<OutgoingFile> = emptyList()
             var prog = FlitProgress(appCtx, peer.info.fingerprint.hashCode() and 0x7fffffff)
             val crushedTmp = ArrayList<File>()
+            var owe: QueuedSend? = null
             try {
                 outgoing = buildList {
                     if (text != null && text.isNotBlank()) add(TextNoteOutgoing(text))
@@ -1316,6 +1318,29 @@ val share: StateFlow<ShareIntake?> = _share
                     logLine("nothing openable selected")
                     _share.value = null
                     return@launch
+                }
+                // Checkpoint before bytes: a checkpointable fresh dispatch
+                // owes its batch to the queue first — the row IS the
+                // checkpoint, and it leaves only when the far side spoke.
+                // A process death mid-flight leaves the row on disk with its
+                // grants; the next restart flushes it back into the same
+                // prefix (the receiver's /partial probe answers from its own
+                // disk — docs, milestone C).
+                if (!fromQueue) {
+                    val tokens = queueTokensFor(src)
+                    if (tokens != null) {
+                        val row = QueuedSend(
+                            fingerprint = peer.info.fingerprint,
+                            alias = peer.displayName,
+                            uris = tokens,
+                            names = outgoing.map { it.wireName },
+                            createdMs = System.currentTimeMillis(),
+                        )
+                        if (FlitRoster.enqueue(row)) {
+                            owe = row
+                            _queue.value = FlitRoster.queued()
+                        }
+                    }
                 }
                 val target = SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
                 prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
@@ -1342,6 +1367,10 @@ val share: StateFlow<ShareIntake?> = _share
                 }
                 for (f in report.failed) logLine("FAIL ${f.fileName}: ${f.reason}")
                 if (sent == 0 && fail == 0) logLine("declined by ${peer.displayName}")
+                // The far side spoke: the owe's story concludes — precisely
+                // its tokens and names leave the row (a batch that merged in
+                // mid-flight stays owed), grants go back with the tokens.
+                owe?.let { dropSent(it) }
                 // Spools served their session — sent or refused, the cache copy
                 // has no future role here (a failed batch sent to the
                 // send-later queue keeps its files; the queue owns them now).
@@ -1349,35 +1378,20 @@ val share: StateFlow<ShareIntake?> = _share
                 _share.value = null
             } catch (e: Exception) {
                 val reason = e.message ?: e.javaClass.simpleName
-                var queuedLog = false
-                if (!fromQueue) {
-                    val tokens = queueTokensFor(src)
-                    if (!tokens.isNullOrEmpty()) {
-                        val ok = FlitRoster.enqueue(
-                            QueuedSend(
-                                fingerprint = peer.info.fingerprint,
-                                alias = peer.displayName,
-                                uris = tokens,
-                                names = outgoing.map { it.wireName },
-                                createdMs = System.currentTimeMillis(),
-                            )
-                        )
-                        if (ok) {
-                            _queue.value = FlitRoster.queued()
-                            logLine("${peer.displayName} unreachable ($reason) — kept, sends when it reappears")
-                            prog.finish("queued for later", ok = false, iconDone = false)
-                            queuedLog = true
-                        }
-                    }
-                }
-                if (!queuedLog) {
+                if (owe != null) {
+                    // The owe row already kept its promise: batch and grants
+                    // are on disk, so no new decision is needed here — the
+                    // next touch of this peer re-enters the flush.
+                    logLine("$reason — kept, sends when ${peer.displayName} reappears")
+                    prog.finish("queued for later", ok = false, iconDone = false)
+                } else {
                     logLine("send failed: $reason")
                     prog.finish("send failed — $reason", ok = false, iconDone = false)
+                    // Nothing was owed (nothing checkpointable): the spooled
+                    // copies have no future. Queue-originated dispatches
+                    // never clean here: the batch retains its file.
+                    if (!fromQueue) cleanSpools(src.spools)
                 }
-                // Not queued (nothing queueable or enqueue refused): the
-                // spooled copies have no future — drop them. Queue-originated
-                // dispatches never clean here: the batch retains its file.
-                if (!queuedLog && !fromQueue) cleanSpools(src.spools)
                 _share.value = null
                 // A queue run's break rethrows so flushQueueFor keeps the
                 // row's promise (keeps batch and grants, retries later);
@@ -1389,16 +1403,9 @@ val share: StateFlow<ShareIntake?> = _share
         }
     }
 
-    /**
-     * The only way a queue row ends: its tokens return from the roster and
-     * the persistable SAF grants taken at queue time go back with them —
-     * grants kept forever would fill Android's per-app ledger until
-     * takePersistableUriPermission starts failing. Dead or expired grants
-     * release as nothing; spool-path tokens bear no grants at all.
-     */
-    private fun dropQueue(batch: QueuedSend) {
-        FlitRoster.dequeue(batch.fingerprint)
-        for (t in batch.uris) {
+    /** Persistable content grants go back with the tokens that carried them. */
+    private fun releaseGrants(tokens: List<String>) {
+        for (t in tokens) {
             val uri = runCatching { Uri.parse(t) }.getOrNull() ?: continue
             if (uri.scheme != "content") continue
             runCatching {
@@ -1407,6 +1414,32 @@ val share: StateFlow<ShareIntake?> = _share
                 )
             }
         }
+    }
+
+    /**
+     * The only way a whole queue row ends: its tokens return from the roster
+     * and the persistable SAF grants taken at queue time go back with them —
+     * grants kept forever would fill Android's per-app ledger until
+     * takePersistableUriPermission starts failing. Dead or expired grants
+     * release as nothing; spool-path tokens bear no grants at all. Cancels
+     * and empty rows end here; a SENT batch ends at [dropSent].
+     */
+    private fun dropQueue(batch: QueuedSend) {
+        FlitRoster.dequeue(batch.fingerprint)
+        releaseGrants(batch.uris)
+        _queue.value = FlitRoster.queued()
+    }
+
+    /**
+     * The way a sent batch ends: precisely its tokens and names leave the
+     * row — a batch that merged in while this one flew stays owed — and the
+     * sent tokens' grants go back with them. Dropping the whole row here
+     * would eat a merged-in batch that never flew; the owe-before-bytes
+     * design makes that merge ordinary, so the drop is surgical.
+     */
+    private fun dropSent(batch: QueuedSend) {
+        FlitRoster.dequeueTokens(batch.fingerprint, batch)
+        releaseGrants(batch.uris)
         _queue.value = FlitRoster.queued()
     }
 

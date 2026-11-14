@@ -40,6 +40,21 @@ data class QueuedSend(
         names = names + next.names,
         createdMs = minOf(createdMs, next.createdMs),
     )
+
+    /**
+     * The way a sent batch leaves the row: its tokens and spoken names go,
+     * anything that merged in while it flew stays owed. Null when the row's
+     * story is over. Names leave by first occurrence — two files sharing a
+     * name are interchangeable on the glass, and [mergedWith] appends names
+     * in merge order, so what remains stays aligned with what remains owed.
+     */
+    fun without(sentUris: Collection<String>, sentNames: Collection<String>): QueuedSend? {
+        val left = uris.filterNot { it in sentUris }
+        if (left.isEmpty()) return null
+        val spoken = names.toMutableList()
+        for (n in sentNames) spoken.remove(n)
+        return copy(uris = left, names = spoken)
+    }
 }
 
 /**
@@ -124,6 +139,18 @@ object FlitRoster {
     }
 
     fun dequeue(fingerprint: String) = saveQueue(queueList().filterNot { it.fingerprint == fingerprint })
+
+    /**
+     * The way a sent batch leaves the queue: precisely its tokens and names —
+     * a batch that merged into the same row while this one was flying stays
+     * owed, and a row whose last token went is gone. Whole-row [dequeue]
+     * stays for cancels.
+     */
+    fun dequeueTokens(fingerprint: String, sent: QueuedSend) = saveQueue(
+        queueList().mapNotNull {
+            if (it.fingerprint == fingerprint) it.without(sent.uris, sent.names) else it
+        },
+    )
 
     // ==== scanned pairing codes ================================================
 
