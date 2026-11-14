@@ -310,3 +310,55 @@ involved. Same discipline as the look rewrite.
 - **E — self-hosted relay**: parked last, opt-in only, largest scope.
 - Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
   measure-then-act only.
+
+## Milestone C design — process-death checkpoints (written before code)
+
+Read out of the code as it stands (2026-11-14), then converged. Three facts:
+
+1. **The sender's owe-state already survives death — for queue batches.**
+   `dropQueue` fires only after `dispatchTo` *returns* (the far side spoke:
+   sent or declined). A batch killed mid-flight keeps its roster row, its
+   spooled files, its persistable grants — all on disk — and the next
+   `touchPeer` (multicast, keeper, sweep, manual add) re-enters
+   `flushQueueFor`, whose per-file `/partial` probe resumes into the
+   receiver's prefix. What is missing is the *fresh* dispatch: a send the
+   user started right now is not owed anywhere until it fails — a process
+   death mid-flight loses it silently and strands its spool copies.
+2. **The receiver's progress lives on disk but is unreachable after death.**
+   Interrupted parts persist as `.part` files (plus `.pieces` sidecars) beside
+   their targets, but the `parts` registry is in-memory: after a restart the
+   `/partial` probe answers 404 and the sender re-sends whole — hash-gated and
+   correct, but the prefix is squandered. (The start sweeps only *age out*
+   parts older than a day; they never repopulate.)
+3. **The flush-on-restart path exists.** Queue rows survive reboot;
+   any path that lands the peer as a live row auto-flushes. No new machinery
+   needed there.
+
+The design, in one sentence each:
+
+- **One truth for owe-state: the queue row, written *before* bytes move.**
+  A fresh dispatch converges onto the queue's machinery — enqueue the row at
+  dispatch time, send through the same path, `dropQueue` on confirmed success
+  exactly as the flush path does today. The enqueue-on-failure dance in the
+  fresh path dies; every send the engine attempts is owed somewhere first.
+  This is the convergence the milestone names: the queue IS the checkpoint.
+- **One truth for progress: the receiver's disk.** No sender-side byte
+  counters to persist — the sender re-learns the prefix through `/partial` on
+  every re-entry, and the hash gate verifies every landing. A file that fully
+  landed before the death re-enters as a zero-byte resume and settles.
+- **Receiver durability: the token rides beside the part.** At part-creation
+  the receiver writes `resumeToken(file)` into a sidecar next to the `.part`;
+  server start sweeps parts (and sidecars) back into the `parts` registry
+  with an empty senderIp — which the probe already accepts from anyone.
+  The 24-hour aging stays as-is.
+- **Honest edges, listed:** non-persistable sources (mixed spool+URI grants)
+  cannot be checkpointed and stay best-effort; a resumed-after-death prefix is
+  served with an empty senderIp, trusted only because the probe is a read of
+  byte count, not of content; the checkpoint covers deaths of *our* process —
+  a receiver that died loses nothing (its parts are durable), a sender that
+  died keeps its owe and re-enters.
+
+Tests: token sidecar round-trip; a fresh `ServerCore` over a dirty dest answers
+`/partial` with the sidecar base; the fresh dispatch owes before bytes (row
+visible the moment dispatch starts); the death walk on hardware — transfer
+running, `am kill`, restart, same prefix, hash-exact end.
