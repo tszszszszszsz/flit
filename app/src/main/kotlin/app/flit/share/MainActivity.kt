@@ -198,6 +198,46 @@ class MainActivity : ComponentActivity() {
     /** Reactive mirror of the global receive folder pref (null = default). */
     private val globalTree = mutableStateOf<String?>(null)
 
+    /** Reactive mirror-on state — the Options row reads it, the ask reverts it. */
+    private val mirrorOnState = mutableStateOf(FlitRoster.mirrorOn())
+
+    /** Album mirror: the one system ask (photo/video read). Pure system dialog. */
+    private val mirrorPerms = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        if (grants.isNotEmpty() && grants.values.all { it }) {
+            FlitRoster.setMirrorOn(true)
+            FlitEngine.mirrorSeed(this)
+            FlitEngine.mirrorRefresh()
+            mirrorOnState.value = true
+        } else {
+            // Refused: the mirror stays off, honestly — nothing is watched.
+            FlitRoster.setMirrorOn(false)
+            mirrorOnState.value = false
+            FlitEngine.toast("photo access is needed — mirroring stays off")
+        }
+    }
+
+    private fun mediaReadGranted(): Boolean {
+        val c = this
+        return if (Build.VERSION.SDK_INT >= 33) {
+            c.checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED &&
+                c.checkSelfPermission(android.Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
+        } else {
+            c.checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun mirrorPermissions(): Array<String> =
+        if (Build.VERSION.SDK_INT >= 33) {
+            arrayOf(
+                android.Manifest.permission.READ_MEDIA_IMAGES,
+                android.Manifest.permission.READ_MEDIA_VIDEO,
+            )
+        } else {
+            arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         startSharing()
     }
@@ -1375,6 +1415,106 @@ class MainActivity : ComponentActivity() {
                         initial = prefs().getBoolean("parallelStreams", true),
                     ) { on ->
                         prefs().edit().putBoolean("parallelStreams", on).apply()
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        var showMirrorPicker by remember { mutableStateOf(false) }
+                    var mirrorTarget by remember { mutableStateOf(FlitRoster.mirrorTarget()) }
+                    val mirrorOn = mirrorOnState.value
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                if (!mirrorOn && !mediaReadGranted()) {
+                                    mirrorPerms.launch(mirrorPermissions())
+                                } else {
+                                    mirrorOnState.value = !mirrorOn
+                                    FlitRoster.setMirrorOn(!mirrorOn)
+                                    if (!mirrorOn) FlitEngine.mirrorSeed(this@MainActivity)
+                                    FlitEngine.mirrorRefresh()
+                                }
+                            }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Mirror new camera shots", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                when {
+                                    !mirrorOn -> "off — nothing is watched"
+                                    mirrorTarget == null -> "on — choose the device to mirror to below"
+                                    else -> "every shot the camera saves is sent to ${
+                                        FlitRoster.aliasFor(mirrorTarget ?: "") ?: "the chosen device"
+                                    } when it shows up"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Switch(checked = mirrorOn, onCheckedChange = { v ->
+                            if (v && !mediaReadGranted()) {
+                                mirrorPerms.launch(mirrorPermissions())
+                            } else {
+                                mirrorOnState.value = v
+                                FlitRoster.setMirrorOn(v)
+                                if (v) FlitEngine.mirrorSeed(this@MainActivity)
+                                FlitEngine.mirrorRefresh()
+                            }
+                        })
+                    }
+                    OptionRow(
+                        title = "Mirror to",
+                        subtitle = when (val fp = mirrorTarget) {
+                            null -> "choose a trusted device — new camera shots go to it"
+                            else -> FlitRoster.aliasFor(fp) ?: fp.take(12)
+                        },
+                        onClick = { showMirrorPicker = true },
+                    )
+                    if (showMirrorPicker) {
+                        val pinned = FlitRoster.all()
+                        AlertDialog(
+                            onDismissRequest = { showMirrorPicker = false },
+                            title = { Text("Mirror camera shots to") },
+                            text = {
+                                Column {
+                                    if (pinned.isEmpty()) {
+                                        Text(
+                                            "no trusted devices yet — add one on the Nearby screen first (send it something once, or scan its code)",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                        )
+                                    } else {
+                                        pinned.forEach { p ->
+                                            Text(
+                                                p.alias.ifBlank { p.fingerprint.take(12) },
+                                                style = MaterialTheme.typography.bodyLarge,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable {
+                                                        FlitRoster.setMirrorTarget(p.fingerprint)
+                                                        mirrorTarget = p.fingerprint
+                                                        FlitEngine.mirrorRefresh()
+                                                        showMirrorPicker = false
+                                                    }
+                                                    .padding(vertical = 12.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                            confirmButton = {
+                                TextButton(onClick = {
+                                    FlitRoster.setMirrorTarget(null)
+                                    mirrorTarget = null
+                                    FlitEngine.mirrorRefresh()
+                                    showMirrorPicker = false
+                                }) { Text("Nobody") }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { showMirrorPicker = false }) { Text("Cancel") }
+                            },
+                        )
+                    }
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     OptionRow(

@@ -26,19 +26,23 @@ data class QueuedSend(
     val uris: List<String>,
     val names: List<String>,
     val createdMs: Long,
+    /** Carries the album mirror's duty: sent tokens mark the mirror ledger. */
+    val mirror: Boolean = false,
 ) {
     /**
      * One batch per peer: a second intake JOINS the waiting batch instead of
      * dying as "send failed" with its spooled copies deleted. Tokens union
      * with dedupe (a repeated token carries no new grant or content); names
      * append as spoken — two files may legitimately share one; the batch's
-     * age stays its oldest member; the alias follows the peer's latest name.
+     * age stays its oldest member; the alias follows the peer's latest name;
+     * the mirror duty rides along if either side carries it.
      */
     fun mergedWith(next: QueuedSend): QueuedSend = copy(
         alias = next.alias.ifBlank { alias },
         uris = (uris + next.uris).distinct(),
         names = names + next.names,
         createdMs = minOf(createdMs, next.createdMs),
+        mirror = mirror || next.mirror,
     )
 
     /**
@@ -151,6 +155,41 @@ object FlitRoster {
             if (it.fingerprint == fingerprint) it.without(sent.uris, sent.names) else it
         },
     )
+
+    // ==== album mirror ==========================================================
+
+    private const val KEY_MIRROR_ON = "mirrorOn"
+    private const val KEY_MIRROR_TARGET = "mirrorTarget"
+    private const val KEY_MIRROR_LEDGER = "mirrorLedger"
+    private const val MIRROR_LEDGER_CAP = 2000
+
+    fun mirrorOn(): Boolean = prefs().getBoolean(KEY_MIRROR_ON, false)
+
+    fun setMirrorOn(on: Boolean) = prefs().edit().putBoolean(KEY_MIRROR_ON, on).apply()
+
+    /** The one trusted peer new camera shots go to (null = not chosen yet). */
+    fun mirrorTarget(): String? = prefs().getString(KEY_MIRROR_TARGET, null)?.takeIf { it.isNotBlank() }
+
+    fun setMirrorTarget(fingerprint: String?) =
+        prefs().edit().putString(KEY_MIRROR_TARGET, fingerprint).apply()
+
+    /**
+     * The mirrored ledger — `name∥size` tokens of camera files already sent,
+     * oldest first, FIFO-capped: the oldest entries are the likeliest to be
+     * gone forever, and a re-mirror of a long-gone edited file is harmless
+     * (the receiver's own dedup just renames it).
+     */
+    fun mirrorLedger(): List<String> = prefs().getString(KEY_MIRROR_LEDGER, null)?.let {
+        runCatching { json.decodeFromString(ListSerializer(String.serializer()), it) }.getOrDefault(emptyList())
+    } ?: emptyList()
+
+    fun mirrorMark(tokens: Collection<String>) {
+        if (tokens.isEmpty()) return
+        val next = (mirrorLedger() + tokens).takeLast(MIRROR_LEDGER_CAP)
+        prefs().edit()
+            .putString(KEY_MIRROR_LEDGER, json.encodeToString(ListSerializer(String.serializer()), next))
+            .apply()
+    }
 
     // ==== scanned pairing codes ================================================
 

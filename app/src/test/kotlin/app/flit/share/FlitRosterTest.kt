@@ -2,6 +2,7 @@ package app.flit.share
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 /**
  * Queue truth that must hold without a device: the one-batch-per-peer merge
@@ -68,5 +69,16 @@ class FlitRosterTest {
         val left = row.without(listOf("/s/a"), listOf("same.jpg"))!!
         assertEquals(listOf("/s/b"), left.uris)
         assertEquals(listOf("same.jpg"), left.names)
+    }
+
+    @Test
+    fun `the mirror duty rides a merge — and survives the manual half leaving`() {
+        val manual = batch(uris = listOf("/s/a"), names = listOf("a.jpg"))
+        val mirror = manual.copy(mirror = true, uris = listOf("content://media/1"), names = listOf("IMG_1.jpg"))
+        val joined = manual.mergedWith(mirror)
+        assertTrue(joined.mirror, "a merged row keeps the mirror duty")
+        val left = joined.without(listOf("/s/a"), listOf("a.jpg"))!!
+        assertTrue(left.mirror, "the duty survives the manual half leaving")
+        assertEquals(listOf("content://media/1"), left.uris)
     }
 }

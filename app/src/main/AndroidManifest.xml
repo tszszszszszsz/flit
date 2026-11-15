@@ -22,6 +22,14 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- QR scan-to-pair reads the camera; never used anywhere else. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Album mirror (opt-in in Options): reading camera shots and clips. The
+         ask happens only when mirroring is switched on; without it nothing is
+         watched and nothing is sent. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
     <!-- Optional: restart sharing after a reboot (user opt-in in Options). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 

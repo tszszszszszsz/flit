@@ -314,6 +314,7 @@ val share: StateFlow<ShareIntake?> = _share
     private val sweepKeptMisses = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private val sweepKeptNextAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var mirrorObserver: android.os.FileObserver? = null
     private var startSeq = 0
 
     private val delegate = FlitDelegate()
@@ -481,6 +482,7 @@ val share: StateFlow<ShareIntake?> = _share
 
     fun stop() {
         startSeq++
+        stopMirrorWatcher()
         runCatching { discovery?.stop() }
         runCatching { server?.close() }
         runCatching { client?.close() }
@@ -630,6 +632,7 @@ val share: StateFlow<ShareIntake?> = _share
             startManualProber(seq)
             startBleFlipper(seq)
             startSweeper(seq)
+            startMirrorWatcher(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
             _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
@@ -1010,6 +1013,196 @@ val share: StateFlow<ShareIntake?> = _share
         }
     }
 
+    // ==== album mirror ==========================================================
+
+    /**
+     * Album mirror (docs, milestone D): new files the stock camera saves go to
+     * the one trusted peer chosen in Options — through the send-later queue,
+     * so everything milestone C built carries them: one row per peer that
+     * merges, auto-flushes on the peer's touch, checkpoints through process
+     * death, and drops precisely on success. The scan runs at every engine
+     * start (a MediaStore diff against the ledger — it catches whatever
+     * landed while the app was dead), the watcher covers the liveness in
+     * between. Tokens are MediaStore uris: shared storage is never readable
+     * by raw path (the first walk proved it with an EACCES), and the
+     * media-read ask is the mirror's one system dialog.
+     */
+    private fun startMirrorWatcher(seq: Int) {
+        stopMirrorWatcher()
+        if (!FlitRoster.mirrorOn() || FlitRoster.mirrorTarget() == null) return
+        val dir = cameraDir() ?: return
+        scope.launch(Dispatchers.IO) {
+            if (seq != startSeq) return@launch
+            scanMirror()
+        }
+        val obs = object : android.os.FileObserver(dir, CLOSE_WRITE or MOVED_TO) {
+            override fun onEvent(event: Int, path: String?) {
+                if (path.isNullOrBlank()) return
+                if (event and (CLOSE_WRITE or MOVED_TO) == 0) return
+                scope.launch(Dispatchers.IO) {
+                    if (seq != startSeq) return@launch
+                    noticeMirror(dir, path)
+                }
+            }
+        }
+        obs.startWatching()
+        mirrorObserver = obs
+        logLine("mirror: watching ${dir.absolutePath}")
+    }
+
+    fun stopMirrorWatcher() {
+        runCatching { mirrorObserver?.stopWatching() }
+        mirrorObserver = null
+    }
+
+    /** The Options toggles land here: a running engine re-reads its mirror wiring. */
+    fun mirrorRefresh() {
+        if (!_state.value.running) return
+        startMirrorWatcher(startSeq)
+    }
+
+    /**
+     * Enable-time seeding: the folder as it stands is the baseline. Nothing
+     * that exists when mirroring is switched on is replayed — the feature
+     * syncs forward. Runs inline and BEFORE [mirrorRefresh], so the scan the
+     * watcher starts reads a seeded ledger. Takes the caller's context: the
+     * toggle can fire before the engine ever started.
+     */
+    fun mirrorSeed(ctx: Context) {
+        runCatching {
+            val tokens = cameraShots(ctx).map { it.ledgerToken }
+            if (tokens.isNotEmpty()) {
+                FlitRoster.mirrorMark(tokens)
+                logLine("mirror: baseline seeded — ${tokens.size} existing camera file(s) stay put")
+            }
+        }
+    }
+
+    /** The stock camera's folder — the only folder the mirror watches. */
+    private fun cameraDir(): java.io.File? =
+        runCatching {
+            java.io.File(
+                android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DCIM),
+                "Camera",
+            )
+        }.getOrNull()
+
+    /**
+     * One MediaStore query answers for the whole camera folder — names,
+     * sizes, and the uris the queue can actually open (scoped storage
+     * forbids raw paths). Empty without the media-read grant or below
+     * API 29 (no RELATIVE_PATH): the mirror simply finds nothing there.
+     */
+    /**
+     * Camera shots come from the Images and Video collections — the homes a
+     * granted media read actually answers for (the Files collection proved
+     * silent under the very same grant; the walk caught it). One query per
+     * collection, merged.
+     */
+    private fun cameraShots(ctx: Context = appCtx): List<FlitMirror.Shot> {
+        if (android.os.Build.VERSION.SDK_INT < 29) return emptyList()
+        val cols = arrayOf(
+            android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+            android.provider.MediaStore.MediaColumns.SIZE,
+            android.provider.MediaStore.MediaColumns._ID,
+        )
+        val out = ArrayList<FlitMirror.Shot>()
+        val seen = HashSet<String>()
+        for (uri in listOf(
+            android.provider.MediaStore.Images.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            android.provider.MediaStore.Video.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        )) {
+            val cur = try {
+                ctx.contentResolver.query(
+                    uri, cols,
+                    "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                    arrayOf("DCIM/Camera/"), null,
+                )
+            } catch (t: Throwable) {
+                // Never silent: a folder this device's camera doesn't feed,
+                // or a grant revoked mid-flight, must say so.
+                logLine("mirror: camera query failed — ${t.message ?: t.javaClass.simpleName}")
+                continue
+            } ?: continue
+            cur.use { c ->
+                val nameIdx = c.getColumnIndexOrThrow(android.provider.MediaStore.MediaColumns.DISPLAY_NAME)
+                val sizeIdx = c.getColumnIndexOrThrow(android.provider.MediaStore.MediaColumns.SIZE)
+                val idIdx = c.getColumnIndexOrThrow(android.provider.MediaStore.MediaColumns._ID)
+                while (c.moveToNext()) {
+                    val name = c.getString(nameIdx) ?: continue
+                    val size = c.getLong(sizeIdx)
+                    val token = android.content.ContentUris
+                        .withAppendedId(uri, c.getLong(idIdx)).toString()
+                    if (seen.add(token)) out.add(FlitMirror.Shot(name, size, token))
+                }
+            }
+        }
+        if (out.isEmpty()) logLine("mirror: camera query answered nothing (grant or folder empty?)")
+        return out
+    }
+
+    private fun scanMirror() {
+        val ledger = FlitRoster.mirrorLedger().toSet()
+        val fresh = FlitMirror.plan(cameraShots(), ledger)
+        if (fresh.isEmpty()) return
+        logLine("mirror: scan found ${fresh.size} new camera file(s)")
+        mirrorEnqueue(fresh)
+    }
+
+    private suspend fun noticeMirror(dir: java.io.File, name: String) {
+        val ledger = FlitRoster.mirrorLedger().toSet()
+        // A freshly closed file may not be indexed yet: nudge the scanner,
+        // then wait a moment for MediaStore. If it never lands, the next
+        // scan catches it — nothing is lost, nothing is re-sent. An
+        // already-mirrored file (re-saved, re-closed) drops out at the
+        // ledger check inside the loop.
+        runCatching {
+            val path = java.io.File(dir, name).absolutePath
+            android.media.MediaScannerConnection.scanFile(
+                appCtx, arrayOf(path), arrayOf(guessMime(name)), null,
+            )
+        }
+        var shot: FlitMirror.Shot? = null
+        for (i in 0 until 15) {
+            delay(200)
+            val s = cameraShots().firstOrNull { it.name == name }
+            if (s == null) continue
+            if (!FlitMirror.notice(s.name, s.size, ledger)) break // already mirrored
+            shot = s
+            break
+        }
+        val s = shot ?: return
+        logLine("mirror: ${s.name} (${s.size} bytes) — new camera file")
+        mirrorEnqueue(listOf(s))
+    }
+
+    /**
+     * The mirror's only queue interaction: enqueue the batch as a normal
+     * QueuedSend (MediaStore uri tokens — exactly what the flush's spool
+     * step consumes), marked with the mirror duty so the ledger closes on
+     * success; then nudge a live peer at once — an absent one catches the
+     * batch on its next touch.
+     */
+    private fun mirrorEnqueue(shots: List<FlitMirror.Shot>) {
+        val fp = FlitRoster.mirrorTarget() ?: return
+        val row = QueuedSend(
+            fingerprint = fp,
+            alias = FlitRoster.aliasFor(fp) ?: FlitRoster.alias(fp) ?: fp.take(8),
+            uris = shots.map { it.token },
+            names = shots.map { it.name },
+            createdMs = System.currentTimeMillis(),
+            mirror = true,
+        )
+        FlitRoster.enqueue(row)
+        _queue.value = FlitRoster.queued()
+        val entry = _peers.value[fp]
+        if (entry != null) {
+            flushQueueFor(entry)
+        } else {
+            logLine("mirror: ${shots.size} shot(s) wait for ${row.alias} to appear")
+        }
+    }
+
     /**
      * Dispatches this peer's queued send-later batch, or no-ops quietly when
      * nothing is queued / a dispatch is already in flight. Also the entry
@@ -1033,7 +1226,7 @@ val share: StateFlow<ShareIntake?> = _share
                         // side spoke) concludes the row's story — but only
                         // the tokens that flew: a batch that merged in while
                         // this one was in the air stays owed.
-                        dropSent(batch)
+                        dropSent(batch, spools)
                     } catch (e: Exception) {
                         // The row's keep IS the queue's promise: a send that
                         // never settled (the peer walked out mid-transfer,
@@ -1437,9 +1630,19 @@ val share: StateFlow<ShareIntake?> = _share
      * would eat a merged-in batch that never flew; the owe-before-bytes
      * design makes that merge ordinary, so the drop is surgical.
      */
-    private fun dropSent(batch: QueuedSend) {
+    private fun dropSent(batch: QueuedSend, spools: List<SpooledFile> = emptyList()) {
         FlitRoster.dequeueTokens(batch.fingerprint, batch)
         releaseGrants(batch.uris)
+        // The mirror's ledger closes its own loop here: a mirror-duty batch
+        // marks everything it spooled (the camera files it just sent), so the
+        // scan never re-offers them. A merged-in manual file over-marks
+        // harmlessly — the ledger is only ever consulted for DCIM/Camera
+        // diffs, and camera names are timestamped.
+        if (batch.mirror && spools.isNotEmpty()) {
+            runCatching {
+                FlitRoster.mirrorMark(spools.map { FlitMirror.ledgerToken(it.name, it.size) })
+            }
+        }
         _queue.value = FlitRoster.queued()
     }
 
