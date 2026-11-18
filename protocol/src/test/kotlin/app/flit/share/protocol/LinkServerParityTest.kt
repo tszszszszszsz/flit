@@ -7,6 +7,7 @@ import app.flit.share.protocol.client.PeerHttpClient
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
+import app.flit.share.protocol.client.TransferUnreachable
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PartialInfo
 import app.flit.share.protocol.model.PeerInfo
@@ -21,6 +22,7 @@ import app.flit.share.protocol.tls.TlsIdentity
 import app.flit.share.protocol.transport.PipePair
 import app.flit.share.protocol.transport.SimLinkProvider
 import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
 import java.security.MessageDigest
@@ -437,4 +439,130 @@ class LinkServerParityTest {
 
     @Test
     fun `a kept part survives the receiver's death and resumes hash-exact`() = deathRun()
+
+    @Test
+    fun `a carrier death throws instead of reporting`() = unreachableRun()
+
+    /**
+     * Milestone A's contract, sim-side: a carrier death is a THROW, never a
+     * returned report. Two shapes:
+     *  1. nobody is there at all — the batch prepare cannot even connect,
+     *     and sendFiles throws TransferUnreachable;
+     *  2. a receiver takes half a body, then the carrier dies for good —
+     *     the salvage probes fail, the attempts exhaust, and the sender
+     *     throws instead of returning a report the caller could misread as
+     *     "the far side spoke". The receiver's keep (part + token sidecar)
+     *     must survive the throw untouched: that on-disk prefix is exactly
+     *     what the next flush's resume rides.
+     * The receiver-alive half of this story — death, sweep, hash-exact
+     * resume — is `deathRun` above.
+     */
+    private fun unreachableRun() {
+        runBlocking {
+            withTimeoutOrNull(90_000) { driveUnreachable() } ?: fail("unreachable run timed out")
+        }
+    }
+
+    private suspend fun driveUnreachable() {
+        val identity = TlsIdentity.generate()
+        val dest = Files.createTempDirectory("flit-dead")
+        val sender = PeerInfo(
+            alias = "unreach-sender", version = "2.2",
+            fingerprint = "UNREACH_FP_00000000000000000000000000000000000",
+        )
+
+        // 1. nothing listens at all: the prepare handshake cannot connect.
+        val dead = ProtocolClient(identity, links = object : LinkProvider {
+            override suspend fun connect(host: String, port: Int, tls: Boolean, timeoutMs: Int): Link =
+                throw IOException("connect refused (sim: nobody is there)")
+        })
+        val alone = runCatching {
+            dead.sendFiles(
+                SendTarget("127.0.0.1", 53317, tls = true),
+                sender,
+                listOf(plainOutgoing("unreachable.bin", 4096)),
+            )
+        }
+        dead.close()
+        assertTrue(alone.isFailure, "a prepare against a dead carrier must throw")
+        val aloneErr = alone.exceptionOrNull()
+        assertTrue(
+            aloneErr is TransferUnreachable,
+            "prepare death surfaced as ${aloneErr?.javaClass?.simpleName}, not TransferUnreachable",
+        )
+
+        // 2. a live receiver takes half a body, then the carrier dies for
+        // good: dials 1-3 serve the prepare, the first /partial probe and
+        // the aborted body; every later dial is refused.
+        val tls = true
+        val serverRef = java.util.concurrent.atomic.AtomicReference<LinkServer>()
+        val inbox = Channel<PipePair>(Channel.UNLIMITED)
+        val connections = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                val p = inbox.receive()
+                val s = serverRef.get() ?: continue
+                launch(Dispatchers.IO) {
+                    val raw = p.serverLink("192.0.2.77")
+                    try {
+                        s.serve(TlsLink(raw, identity, clientMode = false))
+                    } catch (t: Throwable) {
+                        System.err.println("serve crashed: $t")
+                    }
+                }
+            }
+        }
+        var dials = 0
+        val carrier = object : LinkProvider {
+            override suspend fun connect(host: String, port: Int, tls: Boolean, timeoutMs: Int): Link {
+                dials++
+                if (dials > 3) throw IOException("carrier gone (dial $dials)")
+                return SimLinkProvider(identity, tls, inbox).connect(host, port, tls, timeoutMs)
+            }
+        }
+        val payload = ByteArray(1536 * 1024).also { Random(909).nextBytes(it) }
+        val outgoing = plainOutgoing("unreachable.bin", payload.size.toLong()) { ByteArrayInputStream(payload) }
+        val core = ServerCore(identity, ServerConfig(destDir = dest, alias = "parity-node"), ParityDelegate())
+        serverRef.set(LinkServer(core))
+        val cli = ProtocolClient(identity, links = carrier)
+        PeerHttpClient.testAbortBytes = payload.size / 2L
+        val cut = runCatching {
+            cli.sendFiles(SendTarget("127.0.0.1", 53317, tls), sender, listOf(outgoing))
+        }
+        PeerHttpClient.testAbortBytes = 0L
+        assertTrue(dials > 2, "expected dials past the carrier's death, saw $dials")
+        val cutErr = cut.exceptionOrNull()
+        assertTrue(cut.isFailure, "mid-body carrier death must throw, got report: ${cut.getOrNull()}")
+        assertTrue(
+            cutErr is TransferUnreachable,
+            "mid-body death surfaced as ${cutErr?.javaClass?.simpleName}, not TransferUnreachable",
+        )
+
+        // The throw left the receiver's checkpoint untouched — the part and
+        // its token sidecar sit on disk, waiting for the next flush.
+        val part = dest.resolve(".unreachable.bin.part")
+        val sidecar = app.flit.share.protocol.server.tokenSidecar(part)
+        var keptSeen = false
+        for (attempt in 0 until 100) {
+            if (Files.exists(part) && Files.exists(sidecar)) {
+                keptSeen = true
+                break
+            }
+            delay(50)
+        }
+        assertTrue(keptSeen, "part/sidecar must survive the sender's throw (part=${Files.exists(part)} sidecar=${Files.exists(sidecar)})")
+
+        cli.close()
+        connections.cancel()
+    }
+
+    private fun plainOutgoing(
+        name: String,
+        size: Long,
+        stream: () -> InputStream = { ByteArrayInputStream(ByteArray(size.toInt())) },
+    ): OutgoingFile = object : OutgoingFile {
+        override val wireName = name
+        override val size = size
+        override val mime = "application/octet-stream"
+        override fun openStream(): InputStream = stream()
+    }
 }

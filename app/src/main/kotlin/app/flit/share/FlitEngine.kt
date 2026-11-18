@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.client.OutgoingFile
 import app.flit.share.protocol.client.ProtocolClient
+import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.discovery.UdpDiscovery
 import app.flit.share.protocol.server.IncomingSink
@@ -494,6 +495,9 @@ val share: StateFlow<ShareIntake?> = _share
         sweepKept.clear()
         sweepKeptMisses.clear()
         sweepKeptNextAt.clear()
+        huntNextAt.clear()
+        huntAttempts.clear()
+        huntLogged.clear()
         _directAsk.value = null
         runCatching { multicastLock?.takeIf { it.isHeld }?.release() }
         multicastLock = null
@@ -632,6 +636,7 @@ val share: StateFlow<ShareIntake?> = _share
             startManualProber(seq)
             startBleFlipper(seq)
             startSweeper(seq)
+            startHunter(seq)
             startMirrorWatcher(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
@@ -825,24 +830,38 @@ val share: StateFlow<ShareIntake?> = _share
     }
 
     /**
-     * One knock: a short dial to skip the port-closed hosts cheaply, then
-     * the real question to the v2.2 server — TLS first, plain for the
-     * servers that ride http. Only an answered register becomes a row.
+     * One knock to the sweep's neighborhood: a short dial to skip the
+     * port-closed hosts cheaply, then the real question to the v2.2 server —
+     * TLS first, plain for the servers that ride http. Only an answered
+     * register becomes a row. The default-port special case of [probeRoute].
      */
     private suspend fun sweepProbe(
         cli: ProtocolClient,
         self: PeerInfo,
         seq: Int,
         host: String,
+    ): PeerInfo? = probeRoute(cli, self, seq, FlitRoute.Route(host, Protocol.DEFAULT_PORT, true))
+
+    /**
+     * One knock to a known route — the sweeper's dial-then-register, but
+     * honoring the route's own port and trying its scheme first (a route
+     * remembered as plain is asked plain first). Returns the answering
+     * peer's identity, or nothing.
+     */
+    private suspend fun probeRoute(
+        cli: ProtocolClient,
+        self: PeerInfo,
+        seq: Int,
+        route: FlitRoute.Route,
     ): PeerInfo? {
         if (seq != startSeq) return null
-        if (!tcpOpen(host, Protocol.DEFAULT_PORT)) return null
-        for (tls in booleanArrayOf(true, false)) {
+        if (!tcpOpen(route.host, route.port)) return null
+        for (tls in if (route.tls) booleanArrayOf(true, false) else booleanArrayOf(false, true)) {
             try {
-                cli.register(SendTarget(host, Protocol.DEFAULT_PORT, tls), self, timeoutMs = 400)
+                cli.register(SendTarget(route.host, route.port, tls), self, timeoutMs = 400)
                     ?.let { return it }
             } catch (t: Throwable) {
-                // The next carrier — or, after plain, nothing.
+                // The next scheme — or, after the second, nothing.
             }
         }
         return null
@@ -853,6 +872,95 @@ val share: StateFlow<ShareIntake?> = _share
         Socket().use { s -> s.connect(InetSocketAddress(host, port), timeoutMs); true }
     } catch (t: Throwable) {
         false
+    }
+
+    // ==== carrier migration ======================================================
+
+    /** Hunter bookkeeping per owed fingerprint: next due time, attempt count, one-line-per-episode flag. */
+    private val huntNextAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val huntAttempts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val huntLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * The hunter (docs, milestone A): while the queue owes a peer, the sender
+     * looks for it instead of waiting for discovery to introduce them. Ticked
+     * every couple of seconds over the owed fingerprints — one mid-dispatch
+     * is skipped, one due gets its candidate routes probed on the backoff,
+     * and the first fingerprint-matched answer walks through the ordinary
+     * `touchPeer` door, whose queued-check auto-flushes the row and whose
+     * flush resumes from the receiver's disk. The hunter owns no sending.
+     */
+    private fun startHunter(seq: Int) {
+        scope.launch(Dispatchers.IO) {
+            while (isActive && seq == startSeq) {
+                delay(2_000)
+                if (seq != startSeq) return@launch
+                try {
+                    huntOnce(seq)
+                } catch (t: Throwable) {
+                    logLine("hunt: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    private suspend fun huntOnce(seq: Int) {
+        val cli = client ?: return
+        val self = server?.selfInfo() ?: return
+        val now = System.currentTimeMillis()
+        val owed = FlitRoster.queued().map { it.fingerprint }.distinct()
+        // Rows the queue no longer owes end their hunt with themselves.
+        huntNextAt.keys.retainAll(owed.toSet())
+        huntAttempts.keys.retainAll(owed.toSet())
+        huntLogged.retainAll(owed.toSet())
+        for (fp in owed) {
+            if (seq != startSeq) return
+            if (fp in dispatching) continue // a send is being attempted on some route right now
+            if (now < (huntNextAt[fp] ?: 0L)) continue
+            huntRoutes(seq, cli, self, fp)
+        }
+    }
+
+    private suspend fun huntRoutes(seq: Int, cli: ProtocolClient, self: PeerInfo, fp: String) {
+        val attempt = huntAttempts.getOrDefault(fp, 0)
+        huntAttempts[fp] = attempt + 1
+        huntNextAt[fp] = System.currentTimeMillis() + FlitRoute.huntDelayMs(attempt)
+        val live = _peers.value[fp]?.let {
+            FlitRoute.Route(it.ip, it.info.port, it.info.protocol == "https")
+        }?.takeIf { it.port in 1..65535 }
+        val remembered = runCatching { FlitRoster.routeFor(fp) }.getOrNull()
+        val manual = FlitRoster.manual().map { addr ->
+            FlitRoute.Route(
+                addr.substringBeforeLast(':'),
+                addr.substringAfterLast(':').toIntOrNull() ?: Protocol.DEFAULT_PORT,
+                true,
+            )
+        }
+        val cands = FlitRoute.candidates(live, remembered, manual)
+        val alias = FlitRoster.queued().firstOrNull { it.fingerprint == fp }?.alias
+            ?: FlitRoster.aliasFor(fp) ?: fp.take(8)
+        if (huntLogged.add(fp)) {
+            logLine(
+                if (cands.isEmpty()) "hunt: $alias — no known routes; discovery carries the search"
+                else "hunt: $alias — probing ${cands.size} known route(s)",
+            )
+        }
+        for (route in cands) {
+            if (seq != startSeq) return
+            val answer = probeRoute(cli, self, seq, route) ?: continue
+            // The fingerprint is the whole accept rule: a reassigned address
+            // that serves a stranger is simply not this peer's route.
+            if (!FlitRoute.accepts(answer.fingerprint, fp)) continue
+            logLine("hunt: ${route.host}:${route.port} answered as ${answer.alias.ifBlank { fp.take(12) }}")
+            huntAttempts.remove(fp)
+            huntNextAt.remove(fp)
+            huntLogged.remove(fp)
+            // The ordinary door does the rest: the row's queued-check
+            // flushes the owed batch, and the flush's first-attempt probe
+            // resumes from the receiver's own disk.
+            touchPeer(route.host, answer)
+            return
+        }
     }
 
     /**
@@ -1005,6 +1113,13 @@ val share: StateFlow<ShareIntake?> = _share
         if (pinned != null && info.alias.isNotBlank() && pinned.alias != info.alias) {
             FlitRoster.refreshAlias(info.fingerprint, info.alias)
             FlitShortcuts.sync(appCtx)
+        }
+        // The route that last answered, remembered for the hunter (milestone
+        // A): a register answer or an announce — both carry the peer's real
+        // identity and its serving port. Address-less rows (direct radio,
+        // port 0) remember nothing.
+        runCatching {
+            FlitRoster.rememberRoute(info.fingerprint, ip, info.port, info.protocol == "https")
         }
         // A peer we owe files to just came back: dispatch its send-later batch
         // (guarded so an announce storm cannot double-send).
@@ -1210,7 +1325,7 @@ val share: StateFlow<ShareIntake?> = _share
      */
     private fun flushQueueFor(peer: PeerEntry) {
         if (FlitRoster.queued().none { it.fingerprint == peer.info.fingerprint }) return
-        if (!dispatching.add(peer.info.fingerprint)) return
+        if (peer.info.fingerprint in dispatching) return
         val batch = FlitRoster.queued().first { it.fingerprint == peer.info.fingerprint }
         scope.launch(Dispatchers.IO) {
             try {
@@ -1221,24 +1336,34 @@ val share: StateFlow<ShareIntake?> = _share
                 } else {
                     logLine("queue: ${spools.size} queued for ${peer.displayName} — sending now")
                     try {
-                        dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
-                        // A completed exchange (sent or declined — the far
-                        // side spoke) concludes the row's story — but only
-                        // the tokens that flew: a batch that merged in while
-                        // this one was in the air stays owed.
-                        dropSent(batch, spools)
+                        // Synchronous with the row's fate, and the claim is
+                        // dispatchTo's (see there): a returned report means
+                        // the far side SPOKE (sent, refused, declined) — the
+                        // story concluded, so the row's tokens leave now,
+                        // after the bytes, and the spooled copies with them.
+                        // A throw means the carrier died with no answer at
+                        // all: the row and its spools stay exactly as they
+                        // were — the hunt re-enters this flush and the
+                        // receiver's on-disk prefix carries the resume
+                        // (docs, milestones C and A).
+                        val report = dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
+                        if (report == null) {
+                            logLine("nothing concluded for ${peer.displayName} — kept")
+                        } else {
+                            dropSent(batch, spools)
+                            cleanSpools(spools)
+                        }
                     } catch (e: Exception) {
                         // The row's keep IS the queue's promise: a send that
                         // never settled (the peer walked out mid-transfer,
                         // the engine not serving yet) leaves the batch and
                         // its grants exactly as they were — the next
-                        // announce or "retry now" resumes.
+                        // announce, hunt answer or "retry now" resumes.
                         val why = e.message ?: e.javaClass.simpleName
                         logLine("$why — kept, sends when it reappears")
                     }
                 }
             } finally {
-                dispatching.remove(peer.info.fingerprint)
                 _queue.value = FlitRoster.queued()
             }
         }
@@ -1400,7 +1525,7 @@ val share: StateFlow<ShareIntake?> = _share
 
     /** Files picked in-app (SAF). Persistable grants → these can also queue. */
     fun send(peer: PeerEntry, uris: List<Uri>, fromQueue: Boolean = false) {
-        dispatchTo(peer, SourceList(emptyList(), uris), null, fromQueue)
+        scope.launch(Dispatchers.IO) { dispatchTo(peer, SourceList(emptyList(), uris), null, fromQueue) }
     }
 
     /** Share-sheet dispatch: spooled files + optional text note; clears intake. */
@@ -1411,7 +1536,7 @@ val share: StateFlow<ShareIntake?> = _share
             return
         }
         val picked = intake.uris.mapNotNull { runCatching { Uri.parse(it) }.getOrNull() }
-        dispatchTo(peer, SourceList(intake.files, picked), intake.text, fromQueue = false)
+        scope.launch(Dispatchers.IO) { dispatchTo(peer, SourceList(intake.files, picked), intake.text, fromQueue = false) }
     }
 
     /** In-app note composer: stages a text note exactly like the share sheet does. */
@@ -1482,117 +1607,141 @@ val share: StateFlow<ShareIntake?> = _share
         }
     }
 
-    private fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean) {
+    /**
+     * The whole send story for one peer, run INLINE in the caller's
+     * coroutine. Returns the receiver's [SendReport] — null only when no
+     * exchange could even begin (not serving, nothing openable). Throws
+     * when the carrier died and the far side never answered
+     * ([app.flit.share.protocol.client.TransferUnreachable], IO failures
+     * while re-preparing): the caller owns the row's fate then. The
+     * send-later flush rides this synchronously — the row's tokens leave
+     * only after a report comes back, never on a throw — and the fresh
+     * dispatches ([send], [sendShare]) run it fire-and-forget inside
+     * [scope].
+     */
+    private suspend fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean): SendReport? {
         val cli = client ?: run {
             if (fromQueue) throw NotServingYet()
             logLine("not sharing — start sharing first")
-            return
+            return null
         }
         val self = server?.selfInfo() ?: run {
             if (fromQueue) throw NotServingYet()
-            return
+            return null
         }
-        scope.launch(Dispatchers.IO) {
-            var outgoing: List<OutgoingFile> = emptyList()
-            var prog = FlitProgress(appCtx, peer.info.fingerprint.hashCode() and 0x7fffffff)
-            val crushedTmp = ArrayList<File>()
-            var owe: QueuedSend? = null
-            try {
-                outgoing = buildList {
-                    if (text != null && text.isNotBlank()) add(TextNoteOutgoing(text))
-                    addAll(src.spools.map { FileOutgoing(it) })
-                    addAll(src.uris.mapNotNull { uri -> outgoingFrom(appCtx, uri) })
-                }
-                // Crush & send: optional gzip on the wire for compressible files.
-                if (prefs().getBoolean("crushSend", false)) {
-                    outgoing = crushOutgoing(appCtx, outgoing, crushedTmp)
-                }
-                if (outgoing.isEmpty()) {
-                    logLine("nothing openable selected")
-                    _share.value = null
-                    return@launch
-                }
-                // Checkpoint before bytes: a checkpointable fresh dispatch
-                // owes its batch to the queue first — the row IS the
-                // checkpoint, and it leaves only when the far side spoke.
-                // A process death mid-flight leaves the row on disk with its
-                // grants; the next restart flushes it back into the same
-                // prefix (the receiver's /partial probe answers from its own
-                // disk — docs, milestone C).
-                if (!fromQueue) {
-                    val tokens = queueTokensFor(src)
-                    if (tokens != null) {
-                        val row = QueuedSend(
-                            fingerprint = peer.info.fingerprint,
-                            alias = peer.displayName,
-                            uris = tokens,
-                            names = outgoing.map { it.wireName },
-                            createdMs = System.currentTimeMillis(),
-                        )
-                        if (FlitRoster.enqueue(row)) {
-                            owe = row
-                            _queue.value = FlitRoster.queued()
-                        }
+        // One dispatch per peer at a time, fresh or queue-originated: the
+        // owe row exists before bytes move, so an announce mid-fresh-send
+        // would otherwise re-enter the flush and double-fly the batch. The
+        // hunter consults the same claim.
+        if (!dispatching.add(peer.info.fingerprint)) {
+            logLine("send to ${peer.displayName} already in flight — one at a time")
+            return null
+        }
+        var outgoing: List<OutgoingFile> = emptyList()
+        var prog = FlitProgress(appCtx, peer.info.fingerprint.hashCode() and 0x7fffffff)
+        val crushedTmp = ArrayList<File>()
+        var owe: QueuedSend? = null
+        try {
+            outgoing = buildList {
+                if (text != null && text.isNotBlank()) add(TextNoteOutgoing(text))
+                addAll(src.spools.map { FileOutgoing(it) })
+                addAll(src.uris.mapNotNull { uri -> outgoingFrom(appCtx, uri) })
+            }
+            // Crush & send: optional gzip on the wire for compressible files.
+            if (prefs().getBoolean("crushSend", false)) {
+                outgoing = crushOutgoing(appCtx, outgoing, crushedTmp)
+            }
+            if (outgoing.isEmpty()) {
+                logLine("nothing openable selected")
+                _share.value = null
+                return null
+            }
+            // Checkpoint before bytes: a checkpointable fresh dispatch
+            // owes its batch to the queue first — the row IS the
+            // checkpoint, and it leaves only when the far side spoke.
+            // A process death mid-flight leaves the row on disk with its
+            // grants; the next restart flushes it back into the same
+            // prefix (the receiver's /partial probe answers from its own
+            // disk — docs, milestone C).
+            if (!fromQueue) {
+                val tokens = queueTokensFor(src)
+                if (tokens != null) {
+                    val row = QueuedSend(
+                        fingerprint = peer.info.fingerprint,
+                        alias = peer.displayName,
+                        uris = tokens,
+                        names = outgoing.map { it.wireName },
+                        createdMs = System.currentTimeMillis(),
+                    )
+                    if (FlitRoster.enqueue(row)) {
+                        owe = row
+                        _queue.value = FlitRoster.queued()
                     }
                 }
-                val target = SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
-                prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
-                val report = cli.sendFiles(target, self, outgoing, multi = prefs().getBoolean("parallelStreams", true), progress = { name, soFar, _ ->
-                    prog.tick(name, soFar)
-                })
-                val sent = report.sent.size
-                val fail = report.failed.size
-                val summary = when {
-                    fail == 0 -> "sent $sent/${outgoing.size} to ${peer.displayName}"
-                    sent == 0 -> "all $fail failed"
-                    else -> "sent $sent, $fail failed → ${peer.displayName}"
-                }
-                prog.finish(summary, ok = sent > 0, iconDone = false)
-                if (sent > 0) {
-                    logLine("$summary: ${report.sent.joinToString(", ")}")
-                    prefs().edit()
-                        .putString("lastPeerFp", peer.info.fingerprint)
-                        .putString("lastPeerAlias", peer.displayName)
-                        .putString("lastPeerIp", peer.ip)
-                        .putInt("lastPeerPort", peer.info.port)
-                        .apply()
-                    _lastPeer.value = peer
-                }
-                for (f in report.failed) logLine("FAIL ${f.fileName}: ${f.reason}")
-                if (sent == 0 && fail == 0) logLine("declined by ${peer.displayName}")
-                // The far side spoke: the owe's story concludes — precisely
-                // its tokens and names leave the row (a batch that merged in
-                // mid-flight stays owed), grants go back with the tokens.
-                owe?.let { dropSent(it) }
-                // Spools served their session — sent or refused, the cache copy
-                // has no future role here (a failed batch sent to the
-                // send-later queue keeps its files; the queue owns them now).
-                cleanSpools(src.spools)
-                _share.value = null
-            } catch (e: Exception) {
-                val reason = e.message ?: e.javaClass.simpleName
-                if (owe != null) {
-                    // The owe row already kept its promise: batch and grants
-                    // are on disk, so no new decision is needed here — the
-                    // next touch of this peer re-enters the flush.
-                    logLine("$reason — kept, sends when ${peer.displayName} reappears")
-                    prog.finish("queued for later", ok = false, iconDone = false)
-                } else {
-                    logLine("send failed: $reason")
-                    prog.finish("send failed — $reason", ok = false, iconDone = false)
-                    // Nothing was owed (nothing checkpointable): the spooled
-                    // copies have no future. Queue-originated dispatches
-                    // never clean here: the batch retains its file.
-                    if (!fromQueue) cleanSpools(src.spools)
-                }
-                _share.value = null
-                // A queue run's break rethrows so flushQueueFor keeps the
-                // row's promise (keeps batch and grants, retries later);
-                // non-queue runs end here.
-                if (fromQueue) throw e
-            } finally {
-                crushedTmp.forEach { runCatching { it.delete() } }
             }
+            val target = SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
+            prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
+            val report = cli.sendFiles(target, self, outgoing, multi = prefs().getBoolean("parallelStreams", true), progress = { name, soFar, _ ->
+                prog.tick(name, soFar)
+            })
+            val sent = report.sent.size
+            val fail = report.failed.size
+            val summary = when {
+                fail == 0 -> "sent $sent/${outgoing.size} to ${peer.displayName}"
+                sent == 0 -> "all $fail failed"
+                else -> "sent $sent, $fail failed → ${peer.displayName}"
+            }
+            prog.finish(summary, ok = sent > 0, iconDone = false)
+            if (sent > 0) {
+                logLine("$summary: ${report.sent.joinToString(", ")}")
+                prefs().edit()
+                    .putString("lastPeerFp", peer.info.fingerprint)
+                    .putString("lastPeerAlias", peer.displayName)
+                    .putString("lastPeerIp", peer.ip)
+                    .putInt("lastPeerPort", peer.info.port)
+                    .apply()
+                _lastPeer.value = peer
+            }
+            for (f in report.failed) logLine("FAIL ${f.fileName}: ${f.reason}")
+            if (sent == 0 && fail == 0) logLine("declined by ${peer.displayName}")
+            // The far side spoke: the owe's story concludes — precisely
+            // its tokens and names leave the row (a batch that merged in
+            // mid-flight stays owed), grants go back with the tokens.
+            owe?.let { dropSent(it) }
+            // Spools served their session — sent or refused, the cache
+            // copy has no future role here (a failed batch sent to the
+            // send-later queue keeps its files; the queue owns them
+            // now). A queue run's spools die in flushQueueFor, right
+            // after its row concludes — never here, where a throw must
+            // leave them untouched for the next flush.
+            if (!fromQueue) cleanSpools(src.spools)
+            _share.value = null
+            return report
+        } catch (e: Exception) {
+            val reason = e.message ?: e.javaClass.simpleName
+            if (owe != null) {
+                // The owe row already kept its promise: batch and grants
+                // are on disk, so no new decision is needed here — the
+                // next touch of this peer re-enters the flush.
+                logLine("$reason — kept, sends when ${peer.displayName} reappears")
+                prog.finish("queued for later", ok = false, iconDone = false)
+            } else {
+                logLine("send failed: $reason")
+                prog.finish("send failed — $reason", ok = false, iconDone = false)
+                // Nothing was owed (nothing checkpointable): the spooled
+                // copies have no future. Queue-originated dispatches
+                // never clean here: the batch retains its file.
+                if (!fromQueue) cleanSpools(src.spools)
+            }
+            _share.value = null
+            // A queue run's break rethrows so flushQueueFor keeps the
+            // row's promise (keeps batch and grants, retries later);
+            // non-queue runs end here — the story is already logged.
+            if (fromQueue) throw e
+            return null
+        } finally {
+            dispatching.remove(peer.info.fingerprint)
+            crushedTmp.forEach { runCatching { it.delete() } }
         }
     }
 

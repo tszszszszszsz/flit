@@ -15,6 +15,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.EOFException
+import java.io.IOException
 import java.io.InputStream
 import java.net.URLEncoder
 import java.security.MessageDigest
@@ -27,6 +28,15 @@ data class SendTarget(val ip: String, val port: Int, val tls: Boolean) {
 data class SendError(val fileName: String, val reason: String)
 
 data class SendReport(val sent: List<String>, val failed: List<SendError>, val sessionId: String?)
+
+/**
+ * The carrier died and there is no receiver answer to speak of — connect
+ * refused, reset mid-body, EOF. The contract this type enforces: a returned
+ * [SendReport] means the far side SPOKE (sent, refused, declined — the
+ * batch's story is over); this means the exchange never concluded, so the
+ * batch stays owed exactly as it was and the engine hunts the peer later.
+ */
+class TransferUnreachable(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 class TransferException(val status: Int, val detail: String) :
     Exception("prepare-upload failed: $status $detail")
@@ -108,13 +118,22 @@ class ProtocolClient(
         }
 
         val preparePath = Protocol.PATH_PREPARE_UPLOAD + (pin?.let { "?pin=" + enc(it) } ?: "")
-        val prepare = postJson(
-            target,
-            preparePath,
-            WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap)),
-            timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
-            extraHeaders = if (multi) mapOf(MULTI_HEADER to "1") else emptyMap(),
-        )
+        val prepare = try {
+            postJson(
+                target,
+                preparePath,
+                WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap)),
+                timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
+                extraHeaders = if (multi) mapOf(MULTI_HEADER to "1") else emptyMap(),
+            )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            // The batch's first handshake never reached a receiver: there is
+            // no answer to report, so the caller learns the carrier died —
+            // same contract the per-file attempts enforce below.
+            throw TransferUnreachable("receiver unreachable: ${e.message ?: e.javaClass.simpleName}", e)
+        }
         if (prepare.status == 204) {
             return SendReport(emptyList(), emptyList(), null)
         }
@@ -171,6 +190,15 @@ class ProtocolClient(
                             }
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
+                        } catch (e: TransferUnreachable) {
+                            throw e
+                        } catch (e: IOException) {
+                            // A carrier-shaped failure anywhere in the per-file
+                            // attempts (connect refused, reset mid-body, EOF —
+                            // even a source that suddenly cannot be read) never
+                            // concludes an exchange: there is no receiver answer
+                            // to report, so the batch stays owed.
+                            throw TransferUnreachable(e.message ?: "carrier died mid-exchange", e)
                         } catch (e: Throwable) {
                             fileId to (e.message ?: "error")
                         }
@@ -252,7 +280,14 @@ class ProtocolClient(
                 // Transport died mid-body. The receiver records its prefix as
                 // it winds down, and the sender is usually a few ms ahead of
                 // that — poll briefly instead of one-shot probing.
-                if (attempt >= 3) return fileId to "send failed: ${e.message ?: e.javaClass.simpleName}"
+                if (attempt >= 3) {
+                    // Attempts exhausted on the carrier itself: no receiver
+                    // answer exists. Throwing (not reporting) is the contract
+                    // the engine's checkpoint rides — a report would read as
+                    // "the far side spoke" and conclude a story that never
+                    // happened.
+                    throw TransferUnreachable("send failed: ${e.message ?: e.javaClass.simpleName}", e)
+                }
                 var probed = 0L
                 for (idx in 0 until 4) {
                     val v = try { queryPartial(target, contentToken) } catch (t: Throwable) {

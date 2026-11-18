@@ -3,6 +3,7 @@ package app.flit.share
 import android.content.Context
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
@@ -104,7 +105,10 @@ object FlitRoster {
         save(list + Pinned(fingerprint, alias, System.currentTimeMillis()))
     }
 
-    fun unpin(fingerprint: String) = save(all().filterNot { it.fingerprint == fingerprint })
+    fun unpin(fingerprint: String) {
+        save(all().filterNot { it.fingerprint == fingerprint })
+        forgetRoute(fingerprint)
+    }
 
     /** A trusted peer renamed itself: the roster follows (shortcuts ride along). */
     fun refreshAlias(fingerprint: String, alias: String) = save(
@@ -116,6 +120,57 @@ object FlitRoster {
     }
 
     fun destTree(fingerprint: String): String? = all().firstOrNull { it.fingerprint == fingerprint }?.destTree
+
+    // ==== routes (carrier migration, milestone A) ================================
+
+    private const val KEY_ROUTES = "routes"
+
+    /**
+     * The route each peer was last spoken to on, remembered across process
+     * deaths — the hunter's candidate when the live row is gone or dead.
+     * Written on every touch that arrived over the wire, and ONLY when it
+     * changed: announce storms must not churn prefs.
+     */
+    fun routeFor(fingerprint: String): FlitRoute.Route? =
+        prefs().getString(KEY_ROUTES, null)?.let {
+            runCatching {
+                json.decodeFromString(
+                    MapSerializer(String.serializer(), FlitRoute.Route.serializer()), it,
+                )[fingerprint]
+            }.getOrNull()
+        }
+
+    fun rememberRoute(fingerprint: String, host: String, port: Int, tls: Boolean) {
+        if (port !in 1..65535) return // a row without an address-bearing socket remembers nothing
+        val fresh = FlitRoute.Route(host, port, tls)
+        val cur = runCatching { routeFor(fingerprint) }.getOrNull()
+        if (cur == fresh) return
+        val routes = prefs().getString(KEY_ROUTES, null)?.let {
+            runCatching {
+                json.decodeFromString(
+                    MapSerializer(String.serializer(), FlitRoute.Route.serializer()), it,
+                )
+            }.getOrNull()
+        } ?: emptyMap()
+        prefs().edit()
+            .putString(KEY_ROUTES, json.encodeToString(MapSerializer(String.serializer(), FlitRoute.Route.serializer()), routes + (fingerprint to fresh)))
+            .apply()
+    }
+
+    /** Trust died: the remembered route dies with it — no candidate outlives an unpin. */
+    fun forgetRoute(fingerprint: String) {
+        val routes = prefs().getString(KEY_ROUTES, null)?.let {
+            runCatching {
+                json.decodeFromString(
+                    MapSerializer(String.serializer(), FlitRoute.Route.serializer()), it,
+                )
+            }.getOrNull()
+        } ?: return
+        if (fingerprint !in routes) return
+        prefs().edit()
+            .putString(KEY_ROUTES, json.encodeToString(MapSerializer(String.serializer(), FlitRoute.Route.serializer()), routes - fingerprint))
+            .apply()
+    }
 
     // ==== send-later queue ======================================================
 
