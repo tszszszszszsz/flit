@@ -52,7 +52,7 @@ internal class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender")
+        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout")
     }
 }
 
@@ -94,6 +94,7 @@ fun main(argv: Array<String>) {
             "send" -> kotlinx.coroutines.runBlocking { send(args) }
             "info" -> kotlinx.coroutines.runBlocking { info(args) }
             "bt-sim" -> kotlinx.coroutines.runBlocking { btSim(args) }
+            "relay" -> relay(args)
             "parse-qr" -> parseQr(args)
             else -> usage()
         }
@@ -113,6 +114,7 @@ discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
 bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
+relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 """
     )
@@ -336,6 +338,27 @@ private suspend fun send(args: ParsedArgs) {
         for (f in report.failed) println("${ts()}   FAIL ${f.fileName}: ${f.reason}")
         if (report.failed.isNotEmpty()) exitProcess(3)
     }
+}
+
+/**
+ * Milestone E's operator door: `flit-cli relay`. A blind pairer — it
+ * matches a sender's `req <fp>` with a receiver's long-lived `sub <fp>`,
+ * then copies bytes; the transfer inside is the peers' own TLS and
+ * protocol (docs, milestone E).
+ */
+private fun relay(args: ParsedArgs) {
+    val token = args.opt("--token")
+    val server = RelayServer(
+        token = token,
+        parkTimeoutMs = args.optInt("--park-timeout", 0) * 1000L,
+    ).start(args.optInt("--port", Protocol.DEFAULT_PORT + 1))
+    println("${ts()} relaying on 0.0.0.0:${server.port} token=${if (token != null) "set" else "none"}")
+    println("${ts()} pairing requests and subscriptions by fingerprint; the pipe inside is opaque")
+    Runtime.getRuntime().addShutdownHook(Thread {
+        runCatching { server.close() }
+        println("\n${ts()} bye")
+    })
+    while (true) Thread.sleep(1_000_000)
 }
 
 /** ip[:port] directly, or a short discovery rendez-vous by alias. */

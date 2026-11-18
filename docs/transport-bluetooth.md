@@ -324,10 +324,11 @@ involved. Same discipline as the look rewrite.
 - **B — Wi-Fi Aware fat pipe** (hardware-gated: check `pm has-feature` on the rig
   before committing; BLE stays discovery, Aware becomes the data road).
 - **E — self-hosted relay**: parked last as agreed; the design is written
-  (end of this file) and the pure core has landed — `RelayHello` + the
-  `RelayCore` pairing registry, 11 tests, I/O- and clock-free; the
-  harness `relay` command, the dialer/subscription workers and the engine
-  surface still wait behind B, opt-in only, largest scope.
+  (end of this file), the pure core has landed (`RelayHello` +
+  `RelayCore`, 11 tests) and the harness surface runs — `flit-cli relay`
+  with 4 end-to-end tests (a real protocol send lands hash-exact through
+  the pairer); the app dialer/subscription workers and the engine
+  surface still wait behind B, opt-in only.
 - Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
   measure-then-act only.
 
@@ -822,7 +823,13 @@ token. Each is a later ladder item only if a real use demands it.
 `RelayHello` (the one-line preamble, strict parse, bounded reads) and
 `RelayCore` (FIFO pairing per fingerprint, same-mode never pairs, ghost
 tickets retired by `withdraw`, constant-time token gate), 11 tests in
-`RelayCoreTest`. The harness `relay` command, the app dialer/subscription
-workers and the engine/Options surface wait behind B, per the ladder.
+`RelayCoreTest`. The harness surface landed too: `flit-cli relay
+--port P [--token T] [--park-timeout S]` runs the accept/pair/blind-copy
+loop over the same core, with 4 harness tests proving a real 3 MB
+protocol send lands hash-exact through the pairer, a wrong token is
+refused on the wire, an unpaired subscription times out cleanly, and a
+dead relay dial surfaces as `TransferUnreachable` (never a report). The
+app dialer/subscription workers and the engine/Options surface wait
+behind B, per the ladder.
 
 

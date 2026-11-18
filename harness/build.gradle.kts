@@ -12,6 +12,13 @@ dependencies {
     implementation(libs.slf4j.simple)
     // Dev bench: decode pairing codes out of app screenshots (parse-qr).
     implementation(libs.zxing.core)
+
+    testImplementation(kotlin("test"))
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
 }
 
 application {

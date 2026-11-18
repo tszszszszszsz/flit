@@ -104,6 +104,7 @@ flit-cli serve --dir ~/Public --hidden      # receive; stays off other devices' 
 flit-cli discover --wait 5                  # who else is speaking v2.2 here?
 flit-cli send <ip[:port]|alias> <file...> [--parallel N]
 flit-cli info <ip[:port]>
+flit-cli relay --port 53318 [--token T]     # blind pairer for peers that can't reach each other
 ```
 
 Needs java 21 at run time — the installed launcher says so in one line if the
@@ -112,7 +113,13 @@ ambient `java` is older (`JAVA_HOME` or PATH wins). Identity lives at
 trusted this machine keep trusting it. Honest edges, listed not silent: `serve`
 auto-accepts incoming offers (the app's trusted-senders gate has no CLI counterpart
 yet), and a machine hidden with `--hidden` is invisible to multicast discovery —
-which is exactly the peer the phone app's rescue sweep exists to find.
+which is exactly the peer the phone app's rescue sweep exists to find. `relay` is
+the milestone-E pairer for peers that cannot open a route to each other: it pairs a
+sender's `req <fingerprint>` with a receiver's long-lived `sub <fingerprint>` and
+copies bytes without ever parsing the protocol — TLS and the fingerprint proof run
+end-to-end between the peers, so the relay operator sees metadata (who paired, when,
+how many bytes), never content. Both peers must be live; there is no relay-side
+queueing, and the address is configured by hand (no relay discovery, by design).
 
 ## Licensing / provenance note
 
