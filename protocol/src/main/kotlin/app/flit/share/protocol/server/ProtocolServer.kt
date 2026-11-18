@@ -176,6 +176,18 @@ class ProtocolServer(
         }
     }
 
+    /**
+     * Serve one externally-arrived link through exactly the same route
+     * semantics the TCP listener uses — the door a relayed pipe
+     * (milestone E) or a radio carrier (milestone B) walks through. The
+     * [Link] is already connected; TLS wrapping, if the carrier wants it,
+     * is the carrier's business. One link, one exchange, then closed —
+     * [LinkServer]'s contract.
+     */
+    suspend fun serve(link: app.flit.share.protocol.client.Link) {
+        LinkServer(core).serve(link)
+    }
+
     override fun close() {
         server?.stop(gracePeriodMillis = 300, timeoutMillis = 2000)
         server = null

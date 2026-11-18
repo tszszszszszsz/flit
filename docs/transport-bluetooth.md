@@ -775,9 +775,11 @@ file, a fingerprint or a finished hash.
 - **App module gains two thin Android-side pieces:** the relay dialer
   (TCP to relay, preamble, wrap in `TlsLink(clientMode = true)`) and the
   subscription worker (engine start → dial relay as self, hand each
-  paired pipe to `LinkServer.serve(TlsLink(...))`; reconnect with the
-  same calm backoff as the keeper). No new wire formats on the app side —
-  the preamble is the relay core's, already tested.
+  paired pipe to the server's external door — `ProtocolServer.serve`,
+  which rides the exact same `ServerCore` and route semantics as the TCP
+  listener, landed with E and shared with B; reconnect with the same calm
+  backoff as the keeper). No new wire formats on the app side — the
+  preamble is the relay core's, already tested.
 - **Harness gains `flit-cli relay --port N [--token T]`** — a thin CLI
   wrapper over the same `RelayCore`, so the thing users self-host is the
   thing the tests exercise, not a lookalike.
