@@ -324,8 +324,10 @@ involved. Same discipline as the look rewrite.
 - **B — Wi-Fi Aware fat pipe** (hardware-gated: check `pm has-feature` on the rig
   before committing; BLE stays discovery, Aware becomes the data road).
 - **E — self-hosted relay**: parked last as agreed; the design is written
-  (end of this file) so implementation starts from a settled shape, opt-in
-  only, largest scope.
+  (end of this file) and the pure core has landed — `RelayHello` + the
+  `RelayCore` pairing registry, 11 tests, I/O- and clock-free; the
+  harness `relay` command, the dialer/subscription workers and the engine
+  surface still wait behind B, opt-in only, largest scope.
 - Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
   measure-then-act only.
 
@@ -815,5 +817,12 @@ relay, and a mid-body relay kill exercises the throw/keep/resume loop.
 selection or failover, no relay directory/discovery, no per-peer relay
 routing (one relay per device), no auth beyond the optional shared
 token. Each is a later ladder item only if a real use demands it.
+
+**Status (2026-11-18):** the pure core landed exactly as specified —
+`RelayHello` (the one-line preamble, strict parse, bounded reads) and
+`RelayCore` (FIFO pairing per fingerprint, same-mode never pairs, ghost
+tickets retired by `withdraw`, constant-time token gate), 11 tests in
+`RelayCoreTest`. The harness `relay` command, the app dialer/subscription
+workers and the engine/Options surface wait behind B, per the ladder.
 
 
