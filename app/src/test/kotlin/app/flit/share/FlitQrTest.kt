@@ -42,7 +42,7 @@ class FlitQrTest {
         assertNull(parseAddCode(""))
         assertNull(parseAddCode("192.168.1.42:53317"))      // address path, not a code
         assertNull(parseAddCode("flit://add"))               // no query
-        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1")) // unknown version
+        assertNull(parseAddCode("flit://add?v=4&ip=1.2.3.4&port=1")) // unknown version
         assertNull(parseAddCode("flit://add?ip=&port=53317"))  // empty ip
         assertNull(parseAddCode("flit://add?ip=x&port=0"))     // port out of range
         assertNull(parseAddCode("flit://add?ip=x&port=99999"))
@@ -132,6 +132,85 @@ class FlitQrTest {
         assertNull(parseAddCode("flit://add?v=2&relay=host:70000"))
         assertNull(parseAddCode("flit://add?v=2&ip=1.2.3.4&port=1&relay=host:port"))
         assertNull(parseAddCode("flit://add?v=nope&relay=host:443"))
+    }
+
+    /**
+     * v3 is an invite, not a device pairing: host fingerprint + circle id +
+     * invite token + v2 route hints. No group key ever rides on the code.
+     */
+    private val v3Invite = QrAdd(
+        ip = "192.168.100.80",
+        port = 53317,
+        tls = true,
+        fingerprint = "B68ABD124F4062D9BD3459F981F7CF5514BC75372441798FA32B9A7364085E4A",
+        alias = "Host",
+        mac = "AA:BB:CC:DD:EE:FF",
+        relay = "relay.example.org:443",
+        token = "relay-secret",
+        circle = "circle-9f2c",
+        invite = "invite-token-abc123",
+        v = 3,
+    )
+
+    @Test
+    fun `v3 roundtrip carries circle and invite plus every v2 hint`() {
+        val uri = v3Invite.uri()
+        assertTrue(uri.startsWith("flit://add?v=3&"))
+        assertTrue(uri.contains("&circle=circle-9f2c"))
+        assertTrue(uri.contains("&invite=invite-token-abc123"))
+        val parsed = parseAddCode(uri)
+        assertEquals(v3Invite, parsed)
+        assertEquals("circle-9f2c", parsed?.circle)
+        assertEquals("invite-token-abc123", parsed?.invite)
+        assertEquals(3, parsed?.v)
+    }
+
+    @Test
+    fun `v3 invite never puts a group key on the wire`() {
+        val uri = v3Invite.uri()
+        assertTrue("no key on a scannable code: $uri".let {
+            !uri.contains("key=") && !uri.contains("secret=")
+        })
+        val parsed = parseAddCode(uri) ?: error("v3 invite must parse")
+        // The only tokens here are the relay credential and the invite token.
+        assertEquals("relay-secret", parsed.token)
+        assertEquals("invite-token-abc123", parsed.invite)
+    }
+
+    @Test
+    fun `url-encoded circle and invite survive a roundtrip`() {
+        val weird = v3Invite.copy(circle = "circle / π", invite = "tok en&x=y")
+        val uri = weird.uri()
+        assertTrue(uri.contains("circle=circle+%2F+%CF%80"))
+        assertEquals(weird, parseAddCode(uri))
+    }
+
+    @Test
+    fun `malformed v3 is refused`() {
+        assertNull(parseAddCode("flit://add?v=4&ip=1.2.3.4&port=1&circle=c&invite=i")) // unknown version
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1"))                    // no invite fields
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1&invite=i"))           // no circle id
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1&circle=c"))           // no invite token
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1&circle=&invite=i"))   // blank circle
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1&circle=c&invite="))   // blank invite
+        assertNull(parseAddCode("flit://add?v=3"))                                      // no route
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=0&circle=c&invite=i"))   // bad port
+        assertNull(parseAddCode("flit://add?v=3&relay=host:0&circle=c&invite=i"))        // bad relay
+    }
+
+    @Test
+    fun `relay-only v3 invite needs no local address`() {
+        val relayOnly = v3Invite.copy(ip = "", port = 0, mac = null)
+        val uri = relayOnly.uri()
+        assertTrue("no ip on relay-only invite: $uri".let { !uri.contains("&ip=") })
+        assertEquals(relayOnly, parseAddCode(uri))
+    }
+
+    @Test
+    fun `v3 payload still decodes off a rendered code`() {
+        val uri = v3Invite.uri()
+        val size = 240
+        assertEquals(uri, Qr.decodeGray(Qr.gray(Qr.encode(uri, size)), size, size))
     }
 
     @Test

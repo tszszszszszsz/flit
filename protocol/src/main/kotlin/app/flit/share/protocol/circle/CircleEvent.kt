@@ -1,0 +1,56 @@
+package app.flit.share.protocol.circle
+
+import kotlinx.serialization.Serializable
+
+/**
+ * One immutable, signed entry in a Circle's append-only event log.
+ *
+ * Every field except [sig] is covered by the author's signature over the
+ * canonical bytes (see `CircleCore.canonical`). [type] is one of the nine
+ * verbs below; [body] is a small JSON object whose shape depends on [type]:
+ *
+ * ```
+ * message  {"text":"..."}
+ * file     {"name":"...","size":123,"sha256":"...","token":"..."}
+ * poll     {"pollId":"...","question":"...","options":["a","b"]}
+ * vote     {"pollId":"...","option":1}  |  {"kickId":"...","approve":true}
+ * join     {"alias":"..."}
+ * leave    {}
+ * kick     {"kickId":"...","targetFp":"...","mode":"admin"|"vote","approve":true}
+ * role     {"targetFp":"...","role":"ADMIN"|"MEMBER"}
+ * rekey    {"keyB64":"...","gen":1}
+ * ```
+ *
+ * The event never carries file bytes or a group key. It does carry the
+ * signer's certificate so a receiver that has never met the author can pin
+ * it and verify the signature; [authorFp] must equal that certificate's
+ * fingerprint. File bytes travel the existing queue.
+ */
+@Serializable
+data class CircleEvent(
+    val id: String,
+    val circleId: String,
+    val authorFp: String,
+    val lamport: Long,
+    val type: String,
+    val body: String,
+    val sig: String,
+    val createdMs: Long,
+    /** Base64 DER of the author's cert; pins on first sight, never a key. */
+    val cert: String = "",
+) {
+    companion object {
+        const val MESSAGE = "message"
+        const val FILE = "file"
+        const val POLL = "poll"
+        const val VOTE = "vote"
+        const val JOIN = "join"
+        const val LEAVE = "leave"
+        const val KICK = "kick"
+        const val ROLE = "role"
+        const val REKEY = "rekey"
+
+        /** The only types a well-formed log may contain. */
+        val TYPES: Set<String> = setOf(MESSAGE, FILE, POLL, VOTE, JOIN, LEAVE, KICK, ROLE, REKEY)
+    }
+}

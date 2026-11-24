@@ -1,6 +1,9 @@
 package app.flit.share.protocol.client
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.model.CircleRequest
+import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PanicAlert
 import app.flit.share.protocol.model.PartialInfo
@@ -120,6 +123,75 @@ class ProtocolClient(
             extraHeaders = mapOf(Protocol.HEADER_PANIC_CERT to certDer),
         )
         return response.status == 200
+    }
+
+    /**
+     * Flit-only Circle join: presents the bearer invite and our fingerprint,
+     * receives the group key (inside the pinned TLS session), current members
+     * and any seed events. The sender cert rides in a header so the receiver
+     * can pin it before verifying our events. [target]'s [SendTarget.relayFor]
+     * flows through [postJson], so Wi-Fi, Bluetooth and the blind relay all
+     * work without a separate code path.
+     *
+     * @return the decoded decision, or null when no decodable answer arrived.
+     */
+    suspend fun circleJoin(
+        target: SendTarget,
+        request: CircleRequest,
+        timeoutMs: Long = 5_000,
+    ): CircleResponse? = circleCall(target, Protocol.PATH_CIRCLE_JOIN, request, timeoutMs)
+
+    /** Convenience join from the fields a QR v3 invite carries. */
+    suspend fun circleJoin(
+        target: SendTarget,
+        circleId: String,
+        invite: String,
+        memberFp: String,
+        timeoutMs: Long = 5_000,
+    ): CircleResponse? = circleJoin(
+        target,
+        CircleRequest(CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = memberFp),
+        timeoutMs,
+    )
+
+    /**
+     * Flit-only Circle sync: sends our bounded event-log delta, receives the
+     * events we are missing. Same transport and identity story as [circleJoin].
+     */
+    suspend fun circleSync(
+        target: SendTarget,
+        request: CircleRequest,
+        timeoutMs: Long = 5_000,
+    ): CircleResponse? = circleCall(target, Protocol.PATH_CIRCLE_SYNC, request, timeoutMs)
+
+    /** Convenience sync of a full event list. */
+    suspend fun circleSync(
+        target: SendTarget,
+        circleId: String,
+        memberFp: String,
+        events: List<CircleEvent>,
+        timeoutMs: Long = 5_000,
+    ): CircleResponse? = circleSync(
+        target,
+        CircleRequest(CircleRequest.ACTION_SYNC, circleId, memberFp = memberFp, events = events),
+        timeoutMs,
+    )
+
+    private suspend fun circleCall(
+        target: SendTarget,
+        path: String,
+        request: CircleRequest,
+        timeoutMs: Long,
+    ): CircleResponse? = withTimeoutOrNull(timeoutMs) {
+        val certDer = Base64.getEncoder().encodeToString(identity.certificate.encoded)
+        runCatching {
+            json<CircleResponse>(
+                postJson(
+                    target, path, WireJson.encode(request), timeoutMs,
+                    extraHeaders = mapOf(Protocol.HEADER_CIRCLE_CERT to certDer),
+                ),
+            )
+        }.getOrNull()
     }
 
     suspend fun cancelTransfer(target: SendTarget, sessionId: String) {

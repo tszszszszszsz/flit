@@ -165,6 +165,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Circle attach: pick one file, spool it grant-proof, post its manifest. */
+    private val pickCircleFile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) circleAttach(uri)
+    }
+
     private val pickDest = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
         val fp = pendingDestPeer ?: return@registerForActivityResult
         pendingDestPeer = null
@@ -348,6 +353,13 @@ class MainActivity : ComponentActivity() {
         val transfer by FlitEngine.transfer.collectAsState()
         val knownDevices by FlitEngine.knownDevices.collectAsState()
         val panicEvents by FlitEngine.panicEvents.collectAsState()
+        val circleState by FlitEngine.circleState.collectAsState()
+        val circleEvents by FlitEngine.circleEvents.collectAsState()
+        // Full fingerprint (not the short hero form) is what event authors are
+        // compared against in the feed; identity loads async, so track it.
+        val meFp by remember(circleState) {
+            mutableStateOf(FlitEngine.selfQrAdd()?.fingerprint.orEmpty())
+        }
         var screen by remember { mutableStateOf(Screen.Home) }
         var showAddDialog by remember { mutableStateOf(false) }
         var showNoteDialog by remember { mutableStateOf(false) }
@@ -360,6 +372,20 @@ class MainActivity : ComponentActivity() {
         var showThemeDialog by remember { mutableStateOf(false) }
         var showBatteryDialog by remember { mutableStateOf(false) }
         var showRelayDialog by remember { mutableStateOf(false) }
+        // Circle is a Home action + a full-screen feed, never a dock tab.
+        var showCircle by remember { mutableStateOf(false) }
+        var showCircleStart by remember { mutableStateOf(false) }
+        var showCircleJoin by remember { mutableStateOf(false) }
+        var showCircleScan by remember { mutableStateOf(false) }
+        var showCircleInvite by remember { mutableStateOf(false) }
+        var circleInvite by remember { mutableStateOf<QrAdd?>(null) }
+        var pendingCircleOpen by remember { mutableStateOf(false) }
+        LaunchedEffect(circleState) {
+            if (circleState != null && pendingCircleOpen) {
+                showCircle = true
+                pendingCircleOpen = false
+            }
+        }
         var theme by remember { mutableStateOf(prefs().getString("theme", "auto") ?: "auto") }
         var keepOn by remember { mutableStateOf(prefs().getBoolean("keepScreenOn", true)) }
         val transferActive by FlitEngine.transferActive.collectAsState()
@@ -430,7 +456,8 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
+        BackHandler(enabled = !showCircle && screen != Screen.Home) { screen = Screen.Home }
+        BackHandler(enabled = showCircle) { showCircle = false }
 
         // Direct-share targets live from the first second of the app. Trust
         // toggles and renames arriving via registration resync on their own;
@@ -831,6 +858,65 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
 
+                                    // ---- circle entry -------------------------------------------
+                                    // A small Home action, not a dock tab: the feed opens as its
+                                    // own surface, and a circle that does not exist yet starts
+                                    // from the founding sheet.
+                                    Surface(
+                                        shape = RoundedCornerShape(FlitCorner.large),
+                                        color = MaterialTheme.colorScheme.surfaceContainer,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                if (circleState != null) showCircle = true
+                                                else showCircleStart = true
+                                            },
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(36.dp)
+                                                    .background(
+                                                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f),
+                                                        CircleShape,
+                                                    ),
+                                                contentAlignment = Alignment.Center,
+                                            ) {
+                                                Text(
+                                                    "C",
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    "Circle",
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                )
+                                                Text(
+                                                    if (circleState == null) {
+                                                        "a temporary group for messages, files and polls"
+                                                    } else {
+                                                        "${circleState?.members?.size ?: 0} members · ${circleEvents.size} events"
+                                                    },
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                            Text(
+                                                if (circleState == null) "Start" else "Open",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = MaterialTheme.colorScheme.primary,
+                                            )
+                                        }
+                                    }
+
                                     // ---- nearby devices ----------------------------------------
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
@@ -1028,6 +1114,40 @@ class MainActivity : ComponentActivity() {
                         onAdd = { showAddDialog = true },
                     )
 
+                    // Circle feed: a full-surface overlay hosted by Home, with
+                    // every action routed straight to the engine's Circle APIs.
+                    if (showCircle) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.background),
+                        ) {
+                            CircleScreen(
+                                state = circleState,
+                                events = circleEvents,
+                                members = circleState?.members ?: emptyList(),
+                                meFp = meFp,
+                                onPost = { text -> FlitEngine.circlePost(text) },
+                                onFile = { pickCircleFile.launch(arrayOf("*/*")) },
+                                onPoll = { question, options ->
+                                    FlitEngine.circlePostPoll(question, options)
+                                },
+                                onVote = { pollId, option -> FlitEngine.circleVote(pollId, option) },
+                                onStartKick = { fp -> FlitEngine.circleStartKick(fp) },
+                                onVoteKick = { kickId, approve ->
+                                    FlitEngine.circleVoteKick(kickId, approve)
+                                },
+                                onKick = { fp -> FlitEngine.circleKick(fp) },
+                                onLeave = {
+                                    FlitEngine.circleLeave()
+                                    showCircle = false
+                                },
+                                onQr = { showCircleInvite = true },
+                                onBack = { showCircle = false },
+                            )
+                        }
+                    }
+
                     // Engine feedback hovers above the dock (dock = nav bars +
                     // 16 gap + 56 FAB; snackbar sits 8 above that). Visually
                     // the M3 snackbar contract: 48dp single line, extra-small
@@ -1184,6 +1304,139 @@ class MainActivity : ComponentActivity() {
                 },
                 onClose = { showScanDialog = false },
             )
+        }
+
+        // ---- Circle sheets -------------------------------------------------
+        // Founding: start a fresh circle (then share its QR), or join one.
+        if (showCircleStart) {
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
+                    onDismissRequest = { showCircleStart = false },
+                    title = { Text("Circle") },
+                    text = {
+                        Text(
+                            "A temporary group on your devices only — no accounts, no server. " +
+                                "Messages, file references and polls stay with the devices that joined. " +
+                                "Anyone holding the invite can join until you leave the circle.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            val code = FlitEngine.startCircle()
+                            showCircleStart = false
+                            if (code != null) {
+                                circleInvite = code
+                                showCircleInvite = true
+                            } else {
+                                FlitEngine.toast("sharing is not ready yet — start sharing first")
+                            }
+                        }) { Text("Start a Circle") }
+                    },
+                    dismissButton = {
+                        OutlinedButton(onClick = {
+                            showCircleStart = false
+                            showCircleJoin = true
+                        }) { Text("Join by QR") }
+                    },
+                )
+            }
+        }
+
+        if (showCircleJoin) {
+            var pasted by remember { mutableStateOf("") }
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
+                    onDismissRequest = { showCircleJoin = false },
+                    title = { Text("Join a Circle") },
+                    text = {
+                        Column {
+                            Text(
+                                "Scan the founder's invite, or paste the flit:// code text. The group key arrives only over the pinned connection to the host.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            OutlinedTextField(
+                                value = pasted,
+                                onValueChange = { pasted = it },
+                                singleLine = true,
+                                placeholder = { Text("flit://add?v=2&…") },
+                                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                            )
+                            TextButton(onClick = {
+                                showCircleJoin = false
+                                showCircleScan = true
+                            }) { Text("Scan code") }
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            enabled = pasted.isNotBlank(),
+                            onClick = {
+                                val code = parseAddCode(pasted)
+                                showCircleJoin = false
+                                if (code == null) {
+                                    FlitEngine.toast("that does not look like a Flit code")
+                                } else {
+                                    pendingCircleOpen = true
+                                    FlitEngine.joinCircle(code)
+                                }
+                            },
+                        ) { Text("Join") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showCircleJoin = false }) { Text("Cancel") }
+                    },
+                )
+            }
+        }
+
+        if (showCircleScan) {
+            QrScanCard(
+                onCode = { raw ->
+                    showCircleScan = false
+                    val code = parseAddCode(raw)
+                    if (code == null) {
+                        FlitEngine.toast("that does not look like a Flit code")
+                    } else {
+                        pendingCircleOpen = true
+                        FlitEngine.joinCircle(code)
+                    }
+                },
+                onClose = { showCircleScan = false },
+            )
+        }
+
+        if (showCircleInvite) {
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
+                    onDismissRequest = { showCircleInvite = false },
+                    title = { Text("Circle invite") },
+                    text = {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            val invite = circleInvite
+                            if (invite != null) {
+                                QrCanvas(text = invite.uri(), side = 200.dp)
+                                Spacer(Modifier.height(12.dp))
+                                Text(
+                                    "Anyone who scans this can join until the circle is left. Treat it like a key to the door — a new circle retires it.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            } else {
+                                Text(
+                                    "Only the founder can show this circle's invite. To share a fresh one, start a new circle.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            showCircleInvite = false
+                            showCircle = true
+                        }) { Text("Done") }
+                    },
+                )
+            }
         }
 
         if (showNoteDialog) {
@@ -1739,6 +1992,51 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Circle file drop: the event carries only name/size/SHA-256 and a local
+     * spool token — bytes still travel through Flit's existing queue path.
+     * Copying out of SAF here makes the token survive grant revocation.
+     */
+    private fun circleAttach(uri: Uri) {
+        val resolver = contentResolver
+        val name = resolver.query(
+            uri,
+            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+            null, null, null,
+        )?.use { c ->
+            if (c.moveToFirst()) {
+                c.getString(c.getColumnIndexOrThrow(android.provider.OpenableColumns.DISPLAY_NAME))
+            } else null
+        }?.ifBlank { "file" } ?: "file"
+        val safe = name.replace(Regex("[\\/:*?\"<>|]"), "_").takeLast(64)
+        val dir = File(cacheDir, "circle").apply { mkdirs() }
+        val dest = File(dir, "${System.currentTimeMillis()}-$safe")
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        var size = 0L
+        try {
+            val input = resolver.openInputStream(uri) ?: run {
+                FlitEngine.toast("could not read that file")
+                return
+            }
+            input.use { stream ->
+                java.io.FileOutputStream(dest).use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        digest.update(buf, 0, n)
+                        size += n
+                    }
+                }
+            }
+            val sha = digest.digest().joinToString("") { "%02x".format(it) }
+            FlitEngine.circlePostFile(name, size, sha, dest.absolutePath)
+        } catch (_: Exception) {
+            FlitEngine.toast("could not attach that file")
         }
     }
 

@@ -17,6 +17,10 @@ import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
+import app.flit.share.protocol.circle.CircleCore
+import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.model.CircleRequest
+import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.discovery.UdpDiscovery
 import app.flit.share.protocol.relay.RelayLinkProvider
 import app.flit.share.protocol.relay.RelaySubscriber
@@ -40,6 +44,7 @@ import java.net.Socket
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -61,6 +66,9 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 
 /** Peers vanish from the list after this long without an announce/register. */
 const val PEER_TTL_MS = 30_000L
@@ -289,6 +297,25 @@ val share: StateFlow<ShareIntake?> = _share
     private val _panicEvents = MutableStateFlow<List<PanicEvent>>(emptyList())
     val panicEvents: StateFlow<List<PanicEvent>> = _panicEvents
 
+    /** Circle: one active group, its members and the bounded event feed. */
+    data class CircleRoute(val client: ProtocolClient, val target: SendTarget)
+
+    /** Bearer invite for this device's Circle; never the group key. */
+    private var circleInvite: String? = null
+
+    private val _circleState = MutableStateFlow<FlitCircleStore.CircleState?>(null)
+    val circleState: StateFlow<FlitCircleStore.CircleState?> = _circleState
+
+    private val _circleEvents = MutableStateFlow<List<CircleEvent>>(emptyList())
+    val circleEvents: StateFlow<List<CircleEvent>> = _circleEvents
+
+    private fun refreshCircle() {
+        if (!::appCtx.isInitialized) return
+        val st = FlitCircleStore.load(appCtx)
+        _circleState.value = st
+        _circleEvents.value = st?.events?.let { CircleCore.order(it) } ?: emptyList()
+    }
+
     /** Incoming alert: signed, from a QR-known device, deduped, never auto-acting. */
     internal fun onPanicReceived(alert: PanicAlert, ip: String) {
         if (!PanicCore.verify(alert) || !knownFingerprint(alert.senderFp)) {
@@ -367,6 +394,178 @@ val share: StateFlow<ShareIntake?> = _share
                 }
             }
             if (!sent) logLine("panic: no live route to ${d.alias.ifBlank { d.fingerprint.take(12) }}")
+        }
+    }
+
+    /** Calm Circle sync: one pull shortly after start, then on a 15 s beat. */
+    private fun startCircleSyncWorker(seq: Int) {
+        scope.launch(Dispatchers.IO) {
+            var first = true
+            while (isActive && seq == startSeq) {
+                delay(if (first) 3_000L else 15_000L)
+                val active = _circleState.value ?: continue
+                if (first) logLine("circle sync armed for ${active.members.size} member(s)")
+                first = false
+                runCatching { FlitCircleSync.sync() }
+                    .onFailure { logLine("circle sync: ${it.message ?: it.javaClass.simpleName}") }
+                refreshCircle()
+            }
+        }
+    }
+
+    // ==== Circle ================================================================
+
+    /** Create a Circle: owner role, fresh id/invite/key, self as first member. */
+    fun startCircle(): QrAdd? {
+        val idf = identity ?: return null
+        if (!::appCtx.isInitialized) return null
+        val id = UUID.randomUUID().toString().replace("-", "").take(16)
+        val invite = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
+        val key = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        val st = FlitCircleStore.CircleState(
+            id = id,
+            keyB64 = android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP),
+            role = FlitCircleStore.Role.OWNER,
+            members = listOf(
+                FlitCircleStore.Member(idf.fingerprint, currentAlias(), FlitCircleStore.Role.OWNER, System.currentTimeMillis()),
+            ),
+            events = emptyList(),
+        )
+        FlitCircleStore.save(appCtx, st)
+        circleInvite = invite
+        refreshCircle()
+        logLine("circle: started $id as owner")
+        return QrAdd(
+            ip = pickAnnounceAddress() ?: "",
+            port = server?.port ?: Protocol.DEFAULT_PORT,
+            tls = true,
+            fingerprint = idf.fingerprint,
+            alias = currentAlias(),
+            mac = bluetoothAddress(),
+            relay = relayConfig()?.let { "${it.host}:${it.port}" },
+            token = relayConfig()?.token,
+            circle = id,
+            invite = invite,
+            v = 3,
+        )
+    }
+
+    fun joinCircle(code: QrAdd) {
+        if (!::appCtx.isInitialized) return
+        circleInvite = code.invite
+        scope.launch(Dispatchers.IO) {
+            runCatching { FlitCircleSync.join(code) }
+                .onFailure { logLine("circle join failed: ${it.message ?: it.javaClass.simpleName}") }
+            refreshCircle()
+        }
+    }
+
+    fun circlePost(text: String) = scope.launch(Dispatchers.IO) {
+        val body = buildJsonObject { put("text", JsonPrimitive(text)) }.toString()
+        runCatching { FlitCircleSync.post("message", body) }
+            .onFailure { logLine("circle post failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    fun circlePostFile(name: String, size: Long, sha: String, token: String) =
+        scope.launch(Dispatchers.IO) {
+            val body = buildJsonObject {
+                put("name", JsonPrimitive(name))
+                put("size", JsonPrimitive(size))
+                put("sha256", JsonPrimitive(sha))
+                put("token", JsonPrimitive(token))
+            }.toString()
+            runCatching { FlitCircleSync.post("file", body) }
+                .onFailure { logLine("circle file event failed: ${it.message}") }
+            refreshCircle()
+        }
+
+    fun circlePostPoll(question: String, options: List<String>) = scope.launch(Dispatchers.IO) {
+        val pollId = UUID.randomUUID().toString()
+        val body = buildJsonObject {
+            put("pollId", JsonPrimitive(pollId))
+            put("question", JsonPrimitive(question))
+            put("options", buildJsonArray { options.forEach { add(JsonPrimitive(it)) } })
+        }.toString()
+        runCatching { FlitCircleSync.post("poll", body) }
+            .onFailure { logLine("circle poll failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    fun circleVote(pollId: String, option: Int) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.vote(pollId, option) }
+            .onFailure { logLine("circle vote failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    fun circleStartKick(targetFp: String) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.startKick(targetFp) }
+            .onFailure { logLine("circle kick vote failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    fun circleVoteKick(kickId: String, approve: Boolean) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.voteKick(kickId, approve) }
+            .onFailure { logLine("circle kick vote failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    fun circleKick(targetFp: String) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.kick(targetFp) }
+            .onFailure { logLine("circle kick failed: ${it.message}") }
+        refreshCircle()
+    }
+
+    fun circleLeave() {
+        if (!::appCtx.isInitialized) return
+        scope.launch(Dispatchers.IO) {
+            runCatching { FlitCircleSync.leave() }
+            FlitCircleStore.clear(appCtx)
+            refreshCircle()
+            logLine("circle: left fully — key discarded")
+        }
+    }
+
+    /** Per-peer carrier choice for Circle sync: Bluetooth, relay, then Wi‑Fi. */
+    internal suspend fun circleDial(fp: String): CircleRoute? {
+        val known = _knownDevices.value.firstOrNull { it.fingerprint.equals(fp, true) }
+        val policy = known?.routePolicy ?: FlitKnown.RoutePolicy.AUTO
+        if (policy != FlitKnown.RoutePolicy.WIFI_ONLY && !known?.mac.isNullOrBlank() && btClient != null) {
+            return CircleRoute(btClient!!, SendTarget(known!!.mac, 0, tls = true))
+        }
+        if (policy != FlitKnown.RoutePolicy.BLUETOOTH_ONLY) {
+            val relay = relayRouteFor[fp] ?: relayConfig()
+            if (relay != null) {
+                return CircleRoute(
+                    client ?: return null,
+                    SendTarget(relay.host, relay.port, tls = true, relayFor = fp),
+                )
+            }
+            val r = runCatching { FlitRoster.routeFor(fp) }.getOrNull()
+            if (r != null && !r.isBluetooth && r.port in 1..65535) {
+                return CircleRoute(client ?: return null, SendTarget(r.host, r.port, r.tls))
+            }
+        }
+        return null
+    }
+
+    /** Server-side Circle route: JOIN hands out the key over authenticated TLS. */
+    internal fun onCircleRequest(req: CircleRequest): CircleResponse {
+        val st = _circleState.value ?: return CircleResponse(false, reason = "no circle")
+        if (req.circleId != st.id) return CircleResponse(false, reason = "wrong circle")
+        return when (req.action) {
+            "join" -> {
+                if (circleInvite.isNullOrBlank() || circleInvite != req.invite) {
+                    return CircleResponse(false, reason = "bad invite")
+                }
+                CircleResponse(
+                    ok = true, key = st.keyB64,
+                    members = st.members.map { it.fp },
+                    events = st.events,
+                )
+            }
+            "sync" -> CircleResponse(ok = true, members = st.members.map { it.fp }, events = st.events)
+            else -> CircleResponse(false, reason = "unknown action")
         }
     }
 
@@ -455,6 +654,9 @@ val share: StateFlow<ShareIntake?> = _share
         override fun onPanic(alert: PanicAlert, ip: String) {
             FlitEngine.onPanicReceived(alert, ip)
         }
+
+        override fun onCircle(request: CircleRequest): CircleResponse =
+            FlitEngine.onCircleRequest(request)
 
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
             // QR-only is a carrier gate, not just a discoverability setting:
@@ -823,6 +1025,7 @@ val share: StateFlow<ShareIntake?> = _share
             }
 
             refreshKnown()
+            refreshCircle()
             startPruner(seq)
             if (!qrOnly()) {
                 startManualProber(seq)
@@ -833,6 +1036,7 @@ val share: StateFlow<ShareIntake?> = _share
                 bleAdvertised = false
             }
             startHunter(seq)
+            startCircleSyncWorker(seq)
             startMirrorWatcher(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {

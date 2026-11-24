@@ -58,16 +58,23 @@ class TlsIdentity private constructor(
     val fingerprint: String by lazy { certificateFingerprint(certificate) }
 
     /** Signs caller-supplied canonical bytes with this device's private key. */
-    fun signPanic(canonical: ByteArray): String {
+    fun sign(bytes: ByteArray): String {
         val signer = Signature.getInstance(signatureAlgorithm(privateKey.algorithm))
         signer.initSign(privateKey)
-        signer.update(canonical)
+        signer.update(bytes)
         return Base64.getEncoder().encodeToString(signer.sign())
     }
 
     /** Instance form of the fingerprint-pinned signature check (see companion). */
+    fun verify(fp: String, bytes: ByteArray, sig: String): Boolean =
+        TlsIdentity.verify(fp, bytes, sig)
+
+    /** Panic compatibility wrapper — identical bytes and algorithm, no second crypto path. */
+    fun signPanic(canonical: ByteArray): String = sign(canonical)
+
+    /** Panic compatibility wrapper — identical check, no second crypto path. */
     fun verifyPanic(senderFp: String, canonical: ByteArray, sig: String): Boolean =
-        verifyPanicSignature(senderFp, canonical, sig)
+        verify(senderFp, canonical, sig)
 
     /** Fresh mutable copy per call — consumers may zero it after use. */
     fun secretChars(): CharArray = secret.toCharArray()
@@ -152,8 +159,9 @@ class TlsIdentity private constructor(
         const val DEFAULT_PASSWORD = "flit"
 
         /**
-         * Certificates trusted for panic signatures, keyed by the SHA-256 of
-         * their DER — the very same value announced as a device fingerprint.
+         * Certificates trusted for device signatures (panic alerts and Circle
+         * events alike), keyed by the SHA-256 of their DER — the very same
+         * value announced as a device fingerprint.
          * Pinning by the certificate's OWN digest (never a caller-supplied
          * label) is what makes a claimed senderFp unforgeable: an attacker's
          * cert lands under the attacker's fingerprint, not the victim's.
@@ -175,9 +183,13 @@ class TlsIdentity private constructor(
 
         fun fingerprintOf(cert: X509Certificate): String = certificateFingerprint(cert)
 
-        /** Static form of the pinned signature check, usable by PanicCore.verify. */
+        /** Static form of the pinned signature check, usable by CircleCore/PanicCore. */
+        fun verify(fp: String, bytes: ByteArray, sig: String): Boolean =
+            verifySignature(fp, bytes, sig)
+
+        /** Panic compatibility wrapper — identical check, no second crypto path. */
         fun verifyPanic(senderFp: String, canonical: ByteArray, sig: String): Boolean =
-            verifyPanicSignature(senderFp, canonical, sig)
+            verify(senderFp, canonical, sig)
 
         fun generate(alias: String = DEFAULT_ALIAS): TlsIdentity {
             val password = DEFAULT_PASSWORD.toCharArray()
@@ -244,8 +256,8 @@ private fun certificateFingerprint(cert: X509Certificate): String =
 private fun signatureAlgorithm(keyAlgorithm: String): String =
     if (keyAlgorithm.equals("EC", ignoreCase = true)) "SHA256withECDSA" else "SHA256withRSA"
 
-/** Shared by the instance and companion verifyPanic entry points. */
-private fun verifyPanicSignature(senderFp: String, canonical: ByteArray, sig: String): Boolean {
+/** Shared by the instance and companion verify/verifyPanic entry points. */
+private fun verifySignature(senderFp: String, canonical: ByteArray, sig: String): Boolean {
     val fp = senderFp.trim().uppercase()
     val cert = TlsIdentity.pinned(fp) ?: return false
     if (TlsIdentity.fingerprintOf(cert) != fp) return false

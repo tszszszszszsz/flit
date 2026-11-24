@@ -1,7 +1,9 @@
 # Circle — accountless group coordination (design, written before code)
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
-> **Status: design only, 2026-11-24. No code has been written for Circle yet.**
+> **Status: v1 built, 2026-11-24.** JVM-pure event core, governance store,
+> QR v3 invites, app sync worker, M3 feed, harness CLI and the two-node walks
+> are in. See the evidence section at the end.
 
 ## Why this exists
 
@@ -33,6 +35,13 @@ accounts, no cloud, no phone numbers, no public directory, no auto-actions.
      can change their answer by publishing a newer vote; the tally uses each
      member's latest vote, while the feed keeps the change visible.
 - One active Circle per device in v1. Bounded local log (≈500 events).
+- **Governance (revised 2026-11-24):** the founder is the owner; the owner may
+  appoint admins. An admin can kick a member directly. Any member can open a
+  vote-kick against another member (not the owner in v1); one latest vote per
+  member, changeable, simple majority of current members decides. Every
+  membership change — leave, admin kick, successful vote-kick — triggers an
+  immediate **rekey** to the remaining members: full leave really means full
+  leave, and a departed device cannot read a single later event.
 
 ## Founding and key distribution
 
@@ -82,18 +91,19 @@ changes another device. There is no remote auto-action of any kind.
 
 ## Transport and battery
 
-Events ride the already-existing route policy: Wi‑Fi, RFCOMM or relay, chosen
-per peer, never silently. Using Wi‑Fi and Bluetooth *simultaneously* is bonded
-link work and is deliberately out of scope here. Sync happens on foreground
+Events ride the already-existing route policy: **Wi‑Fi and Bluetooth are both
+first-class carriers**, chosen per peer, never silently — plus the blind relay
+when neither local carrier answers. Each member can sync over either radio;
+bonded aggregation of both at once is deliberately out of scope here. Sync happens on foreground
 and on a calm periodic tick; no always-on scanning, no new radio duty cycle.
 Message/poll events are tiny; file bytes use the bulk queue path unchanged.
 
 ## Explicit scope cuts for v1
 
 No voice, video, reactions, threads, read receipts, search beyond the bounded
-log, multi-hop mesh, bonded carriers, group-key rotation or member removal.
-Removal is honest: a member leaves and deletes the key; a host wanting a real
-revocation starts a new Circle. These are later items only if a real use
+log, multi-hop mesh or bonded aggregation of both radios at once. Group-key
+rotation **is** in v1 because leave/kick must be real. Voting is limited to
+kicks in v1; polls cover decisions. These are later items only if a real use
 demands them.
 
 ## Test story
@@ -113,3 +123,31 @@ Circle reuses QR v2, known devices, route policy, TLS pinning, the relay, the
 queue with process-death checkpoints, the resume gate and the SHA-256 landing
 proof. The only new machinery is the pure event log and a thin feed UI. That is
 the difference between a Swiss‑Army knife and a drawer of half-finished tools.
+
+## Build and verification record (2026-11-24)
+
+**Built:** `CircleCore` with signer-certificate transport on every event (a
+receiver can pin an author it has never met), generalized `TlsIdentity`
+signing, additive `/circle/join` and `/circle/sync` routes, a default-refusing
+delegate hook, `FlitCircleStore` governance (full leave, admin kick,
+changeable majority vote-kick, rekey generation), QR v3 invite codes with no
+key on the wire, a calm app sync worker, an M3 activity feed, and
+`flit-cli circle <create|join|post|poll|vote|kick|leave|sync>`.
+
+**Harness:** two in-process TLS nodes synced a message, a poll with a changed
+vote (tally flipped 0→1 with both votes retained), a file-drop manifest, and a
+kick that removed the member, rotated the key and refused a later sync from
+the departed fingerprint.
+
+**Device (phone + box CLI):** joined a two-node circle by v3 QR
+paste; posted a message from the CLI; after adding signer-cert transport the
+phone logged `circle sync: +1 event(s) from AFF5EBF981DE` and rendered the
+message with author and timestamp in the M3 feed. Full leave was walked: the
+member sheet's Leave action logged `circle: left fully — key discarded` and
+the feed disappeared.
+
+**Honest limitation:** the phone→host fan-out path did not produce a device
+log line in this walk even though the event landed locally and the harness
+two-node test proves fan-out. Inbound sync, join, leave and the governance
+logic are device-evidenced; that one direction is test-evidenced only and is
+listed rather than hidden.

@@ -1,6 +1,8 @@
 package app.flit.share.protocol.server
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.model.CircleRequest
+import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PanicAlert
 import app.flit.share.protocol.model.PartialInfo
@@ -64,6 +66,20 @@ interface ServerDelegate {
      * human sees, and any forwarding is an explicit user action.
      */
     fun onPanic(alert: PanicAlert, ip: String) {}
+
+    /**
+     * Flit-only Circle join/sync, delivered after the request body decodes.
+     * The app owns governance and the local event store: this protocol layer
+     * never acts on a membership change itself. The default refusal keeps
+     * every existing delegate (harnesses included) source-compatible.
+     *
+     * A returned [CircleResponse] is always encoded as a 200 body — a refused
+     * join/sync is an honest answer with `ok = false` and a [reason], not a
+     * dead carrier. Signature/replay checks belong to the delegate, which can
+     * reuse `CircleCore.verify` / `CircleCore.evaluate`.
+     */
+    fun onCircle(request: CircleRequest): CircleResponse =
+        CircleResponse(ok = false, reason = "Circle support not enabled")
 }
 
 data class ServerConfig(
@@ -255,6 +271,8 @@ class ServerCore(
             x.method == "POST" && x.path == Protocol.PATH_CANCEL -> cancelRoute(x)
             x.method == "GET" && x.path == Protocol.PATH_PARTIAL -> partialRoute(x)
             x.method == "POST" && x.path == Protocol.PATH_PANIC -> panicRoute(x)
+            x.method == "POST" && x.path == Protocol.PATH_CIRCLE_JOIN -> circleRoute(x)
+            x.method == "POST" && x.path == Protocol.PATH_CIRCLE_SYNC -> circleRoute(x)
             else -> x.respondStatus(404)
         }
     }
@@ -910,6 +928,42 @@ class ServerCore(
             delegate.onPanic(alert, x.origin)
         }
         x.respondStatus(200)
+    }
+
+    /**
+     * Flit-only Circle route. Thin by design: decode the request, hand it to
+     * the delegate (which owns governance, the key and the event store) and
+     * encode whatever decision it returns. Malformed wire gets 400; a delegate
+     * that throws gets 500; every real decision — including refusal — is a
+     * decodable 200 [CircleResponse]. The same semantics serve TCP and pipes.
+     */
+    private suspend fun circleRoute(x: HttpExchange) {
+        val raw = x.readBodyText()
+        val request = runCatching { WireJson.decode<CircleRequest>(raw) }.getOrNull()
+        if (request == null || request.action.isBlank() || request.circleId.isBlank()) {
+            x.respondText(400, MIME_TEXT, "Invalid circle request")
+            return
+        }
+        // Same pinning discipline as the panic route: the requester's own
+        // certificate is pinned under its real SHA-256 DER, so its events can
+        // be verified without trusting a self-declared authorFp. A missing or
+        // malformed header is tolerated (older/relayed senders); it simply
+        // leaves this peer unpinned.
+        x.header(Protocol.HEADER_CIRCLE_CERT)?.trim()?.takeIf { it.isNotBlank() }?.let { encoded ->
+            val der = runCatching { Base64.getDecoder().decode(encoded) }.getOrNull()
+            der?.let {
+                runCatching {
+                    CertificateFactory.getInstance("X.509").generateCertificate(it.inputStream()) as X509Certificate
+                }.getOrNull()
+            }?.let { cert -> TlsIdentity.pin(cert) }
+        }
+        val response = try {
+            delegate.onCircle(request)
+        } catch (_: Throwable) {
+            x.respondText(500, MIME_TEXT, "Circle delegate error")
+            return
+        }
+        x.respondText(200, MIME_JSON, WireJson.encode(response))
     }
 
     /**

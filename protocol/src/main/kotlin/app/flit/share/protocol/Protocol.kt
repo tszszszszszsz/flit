@@ -38,6 +38,10 @@ object Protocol {
     /** Flit-only panic route: never registered under the v2.2 API root. */
     const val PATH_PANIC: String = "$FLIT_ROOT/panic"
 
+    /** Flit-only Circle routes: bearer-invite join and signed event-log sync. */
+    const val PATH_CIRCLE_JOIN: String = "$FLIT_ROOT/circle/join"
+    const val PATH_CIRCLE_SYNC: String = "$FLIT_ROOT/circle/sync"
+
     /**
      * Base64 DER of the sender's self-signed cert. The receiver pins it under
      * the SHA-256 of its DER (the same value as the announced fingerprint)
@@ -45,6 +49,13 @@ object Protocol {
      * anchor — not the TLS transport.
      */
     const val HEADER_PANIC_CERT: String = "X-Flit-Panic-Cert"
+
+    /**
+     * Base64 DER of the Circle requester's own cert. Pinned by the receiver
+     * under its own SHA-256 DER before it verifies that requester's events;
+     * a claimed authorFp can never borrow another device's signature.
+     */
+    const val HEADER_CIRCLE_CERT: String = "X-Flit-Circle-Cert"
 
     /**
      * Identity of a resumable file across sessions: name + size + content

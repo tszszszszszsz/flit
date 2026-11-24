@@ -1,12 +1,16 @@
 package app.flit.share.harness
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.circle.CircleCore
+import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.discovery.UdpDiscovery
 import app.flit.share.protocol.relay.RelaySubscriber
+import app.flit.share.protocol.model.CircleRequest
+import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
@@ -17,14 +21,23 @@ import app.flit.share.protocol.server.ServerConfig
 import app.flit.share.protocol.server.ServerDelegate
 import app.flit.share.protocol.server.UploadResult
 import app.flit.share.protocol.tls.TlsIdentity
+import java.io.ByteArrayInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.isRegularFile
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlin.system.exitProcess
 
 // ==== tiny arg parser ========================================================
@@ -54,7 +67,11 @@ internal class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout", "--relay", "--text")
+        val VALUE_FLAGS = setOf(
+            "--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin",
+            "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
+            "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host",
+        )
     }
 }
 
@@ -64,11 +81,14 @@ internal class ParsedArgs(argv: Array<String>) {
  * any identity tracked inside the build tree (proven 2026-10-25 — the flit‑
  * harness identity vanished, and serve minted a fresh fingerprint).
  */
-private fun loadOrCreateIdentity(): TlsIdentity {
-    val base = System.getenv("FLIT_HARNESS_HOME")
+private fun harnessHome(): Path =
+    System.getenv("FLIT_HARNESS_HOME")
         ?.takeIf { it.isNotBlank() }
         ?.let { Path.of(it) }
         ?: Path.of(System.getProperty("user.home"), ".config", "flit", "flit-harness")
+
+private fun loadOrCreateIdentity(): TlsIdentity {
+    val base = harnessHome()
     Files.createDirectories(base)
     val file = base.resolve("identity.p12")
     return if (Files.exists(file)) TlsIdentity.load(file.toFile())
@@ -99,6 +119,7 @@ fun main(argv: Array<String>) {
             "relay" -> relay(args)
             "panic" -> kotlinx.coroutines.runBlocking { panicCmd(args) }
             "parse-qr" -> parseQr(args)
+            "circle" -> kotlinx.coroutines.runBlocking { circle(args) }
             else -> usage()
         }
     } catch (e: Exception) {
@@ -121,6 +142,24 @@ bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
+circle <create|join|post|poll|vote|kick|leave|sync> [--circle ID] [--invite TOKEN]
+       [--text TEXT] [--file PATH] [--target FP] [--option N] [--host ip[:port]]
+       -- accountless group coordination over the production Circle routes
+"""
+    )
+}
+
+private fun circleUsage() {
+    println(
+        """circle <create|join|post|poll|vote|kick|leave|sync>
+  create          mint a circle id + invite token; print the host command
+  join            --host ip[:port] --circle ID --invite TOKEN — fetch the group key
+  post            --text NOTE | --file PATH — signed message / file-drop event
+  poll            --text QUESTION --option A --option B ... — signed poll event
+  vote            --option N — change your answer on the latest poll
+  kick            --target FP — kick a member (host rekeys the log)
+  leave           publish a leave event, then discard the local key
+  sync            pull the shared log and print the feed + poll tally
 """
     )
 }
@@ -178,11 +217,141 @@ private suspend fun panicCmd(args: ParsedArgs) {
     }
 }
 
+// ==== Circle: host-side state served through the production onCircle route ====
+
+/** A read-only view of the host's Circle at one instant (used by the CLI + tests). */
+internal data class CircleHostSnapshot(
+    val circleId: String,
+    val invite: String,
+    val key: String,
+    val members: List<String>,
+    val events: List<CircleEvent>,
+    val rekeyGen: Int,
+)
+
+/**
+ * The host's half of a Circle, in the rig: the append-only event log, the
+ * roster and the group key. It lives behind [ServerDelegate.onCircle] — the
+ * production route — so the two-node walk uses the same wire the app does.
+ *
+ * Governance follows the design: every membership change (leave or a kick)
+ * rotates the group key and removes the departed device from the roster, so a
+ * later sync from that fingerprint is refused instead of leaking new events.
+ */
+internal class CircleHostState {
+    private val lock = Any()
+    @Volatile private var id: String = ""
+    @Volatile private var token: String = ""
+    @Volatile private var groupKey: String = ""
+    @Volatile private var ownerIdentity: TlsIdentity? = null
+    @Volatile private var gen: Int = 0
+    private val roster = LinkedHashSet<String>()
+    private val log = LinkedHashMap<String, CircleEvent>()
+
+    fun seed(circleId: String, invite: String, keyB64: String, ownerFp: String, identity: TlsIdentity) =
+        synchronized(lock) {
+            if (id.isBlank()) id = circleId
+            if (token.isBlank()) token = invite
+            if (groupKey.isBlank()) groupKey = keyB64
+            ownerIdentity = identity
+            roster.add(ownerFp.trim().uppercase())
+        }
+
+    fun snapshot(): CircleHostSnapshot = synchronized(lock) {
+        CircleHostSnapshot(id, token, groupKey, roster.toList(), CircleCore.order(log.values), gen)
+    }
+
+    fun onCircle(req: CircleRequest): CircleResponse = synchronized(lock) {
+        if (id.isBlank()) return@synchronized CircleResponse(false, reason = "Circle support not enabled")
+        if (req.circleId != id) return@synchronized CircleResponse(false, reason = "wrong circle")
+        when (req.action) {
+            CircleRequest.ACTION_JOIN -> {
+                if (token.isNotBlank() && !token.equals(req.invite, ignoreCase = true)) {
+                    return@synchronized CircleResponse(false, reason = "bad invite")
+                }
+                if (req.memberFp.isNotBlank()) roster.add(req.memberFp.trim().uppercase())
+                CircleResponse(true, key = groupKey, members = roster.toList(), events = CircleCore.order(log.values))
+            }
+            CircleRequest.ACTION_SYNC -> {
+                val fp = req.memberFp.trim().uppercase()
+                if (fp.isNotBlank() && fp !in roster) {
+                    return@synchronized CircleResponse(false, reason = "not-a-member")
+                }
+                for (e in req.events) {
+                    if (e.circleId != id || !CircleCore.verify(e) || e.id in log) continue
+                    log[e.id] = e
+                    applyGovernanceLocked(e)
+                }
+                CircleResponse(true, key = groupKey, members = roster.toList(), events = CircleCore.order(log.values))
+            }
+            else -> CircleResponse(false, reason = "unknown action")
+        }
+    }
+
+    /** Leave and kick both rekey; a departed fingerprint cannot read later events. */
+    private fun applyGovernanceLocked(e: CircleEvent) {
+        val obj = circleBody(e.body) ?: return
+        val removed = when (e.type) {
+            CircleEvent.LEAVE -> circleText(obj, "memberFp") ?: e.authorFp
+            CircleEvent.KICK -> {
+                val target = circleText(obj, "targetFp") ?: circleText(obj, "target") ?: return
+                if (circleBool(obj, "approve") == false) return
+                target
+            }
+            else -> return
+        }
+        if (roster.remove(removed.trim().uppercase())) rekeyLocked()
+    }
+
+    private fun rekeyLocked() {
+        gen++
+        groupKey = freshCircleKey()
+        val identity = ownerIdentity ?: return
+        val body = buildJsonObject {
+            put("gen", JsonPrimitive(gen))
+            put("members", buildJsonArray { roster.forEach { add(JsonPrimitive(it)) } })
+        }.toString()
+        val owner = ownerFingerprint(identity)
+        val ev = CircleCore.create(id, owner, identity, CircleEvent.REKEY, body, lamport = gen.toLong())
+        log[ev.id] = ev
+    }
+
+    private fun ownerFingerprint(identity: TlsIdentity): String =
+        roster.firstOrNull()?.takeIf { it.equals(identity.fingerprint, ignoreCase = true) }
+            ?: identity.fingerprint
+}
+
+private fun freshCircleKey(): String {
+    val bytes = ByteArray(32)
+    java.security.SecureRandom().nextBytes(bytes)
+    return Base64.getEncoder().encodeToString(bytes)
+}
+
+private fun circleBody(body: String): JsonObject? =
+    runCatching { Json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+
+private fun circleText(obj: JsonObject, key: String): String? =
+    (obj[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+
+private fun circleBool(obj: JsonObject, key: String): Boolean? {
+    val p = obj[key] as? JsonPrimitive ?: return null
+    return if (p.isString) {
+        when (p.content.lowercase()) {
+            "true", "yes" -> true
+            "false", "no" -> false
+            else -> null
+        }
+    } else p.content.toBooleanStrictOrNull()
+}
+
 // ==== shared "console delegate" receiving protocol callbacks ==================
 
 /** Registers collect into `seen` (dedup by fingerprint, both UDP announce + HTTP register). */
 internal class ConsoleDelegate : ServerDelegate {
     val seen = ConcurrentHashMap<String, Pair<String, PeerInfo>>() // fingerprint → (ip, info)
+    val circleHost = CircleHostState()
+
+    override fun onCircle(request: CircleRequest): CircleResponse = circleHost.onCircle(request)
 
     override fun onRegister(info: PeerInfo, ip: String) {
         if (seen.containsKey(info.fingerprint)) return
@@ -246,6 +415,10 @@ private suspend fun serve(args: ParsedArgs) {
         deviceType = "headless",
     )
     val delegate = ConsoleDelegate()
+    val circleId = args.opt("--circle") ?: UUID.randomUUID().toString().replace("-", "").take(16)
+    val circleInvite = args.opt("--invite")
+        ?: (UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", ""))
+    delegate.circleHost.seed(circleId, circleInvite, freshCircleKey(), identity.fingerprint, identity)
     val server = ProtocolServer(identity, delegate, config)
 
     // Milestone E's operator door: serve ONLY inside the blind pairer, with
@@ -298,6 +471,9 @@ private suspend fun serve(args: ParsedArgs) {
         println("${ts()} hidden: not announcing — peers find this machine by address, by their own rescue sweep, or when it sends first")
     }
     println("${ts()} fingerprint ${identity.fingerprint}")
+    println("${ts()} circle $circleId invite=$circleInvite — join with: flit-cli circle join --host 127.0.0.1:${
+        server.port
+    } --circle $circleId --invite $circleInvite")
 
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { discovery.stop(); server.close() }
@@ -484,5 +660,288 @@ private suspend fun info(args: ParsedArgs) {
             exitProcess(2)
         }
         println(WireJson.encode(peer.sansAnnounce()))
+    }
+}
+
+// ==== circle CLI: one-shot commands over the production Circle routes ========
+
+internal class CircleCliState(
+    var circleId: String = "",
+    var invite: String = "",
+    var key: String = "",
+    var host: String = "",
+    var members: MutableList<String> = mutableListOf(),
+    var events: MutableList<CircleEvent> = mutableListOf(),
+    var rekeyGen: Int = 0,
+)
+
+private fun circleStatePath(): Path = harnessHome().resolve("circle.state")
+
+private fun loadCircleState(): CircleCliState? {
+    val f = circleStatePath()
+    if (!Files.exists(f)) return null
+    val lines = Files.readAllLines(f)
+    if (lines.size < 7) return null
+    return runCatching {
+        CircleCliState(
+            circleId = lines[0],
+            invite = lines[1],
+            key = lines[2],
+            host = lines[3],
+            members = lines[4].split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList(),
+            events = WireJson.json.decodeFromString<List<CircleEvent>>(lines[5]).toMutableList(),
+            rekeyGen = lines[6].toIntOrNull() ?: 0,
+        )
+    }.getOrNull()
+}
+
+private fun saveCircleState(st: CircleCliState) {
+    val f = circleStatePath()
+    Files.createDirectories(f.parent)
+    val lines = listOf(
+        st.circleId, st.invite, st.key, st.host,
+        st.members.joinToString(","),
+        WireJson.encode(st.events),
+        st.rekeyGen.toString(),
+    )
+    Files.write(f, lines.joinToString("\n").toByteArray(Charsets.UTF_8))
+}
+
+private fun circleTarget(raw: String): SendTarget {
+    val (h, p) = splitHostPort(raw)
+    return SendTarget(h, p, tls = true)
+}
+
+private suspend fun circleExchange(
+    identity: TlsIdentity,
+    target: SendTarget,
+    st: CircleCliState,
+    events: List<CircleEvent>,
+): CircleResponse? = ProtocolClient(identity).use { cli ->
+    runCatching {
+        cli.circleSync(
+            target,
+            CircleRequest(
+                action = CircleRequest.ACTION_SYNC,
+                circleId = st.circleId,
+                memberFp = identity.fingerprint,
+                events = events,
+            ),
+        )
+    }.getOrNull()
+}
+
+private fun mergeCircleAnswer(st: CircleCliState, resp: CircleResponse) {
+    st.events = CircleCore.order(CircleCore.dedup(st.events + resp.events)).toMutableList()
+    if (resp.members.isNotEmpty()) st.members = resp.members.toMutableList()
+    if (resp.key.isNotBlank()) st.key = resp.key
+    st.rekeyGen = st.events.filter { it.type == CircleEvent.REKEY }.maxOfOrNull { e ->
+        circleBody(e.body)?.let { (it["gen"] as? JsonPrimitive)?.content?.toIntOrNull() } ?: 0
+    } ?: 0
+}
+
+private fun circleNextLamport(st: CircleCliState): Long =
+    (st.events.maxOfOrNull { it.lamport } ?: -1L) + 1
+
+private fun circleEvent(
+    st: CircleCliState,
+    identity: TlsIdentity,
+    type: String,
+    body: String,
+): CircleEvent = CircleCore.create(
+    circleId = st.circleId,
+    authorFp = identity.fingerprint,
+    identity = identity,
+    type = type,
+    body = body,
+    lamport = circleNextLamport(st),
+)
+
+private suspend fun circle(args: ParsedArgs) {
+    val sub = args.positional.drop(1).firstOrNull() ?: run { circleUsage(); return }
+    val identity = loadOrCreateIdentity()
+    val me = identity.fingerprint
+    var st = loadCircleState() ?: CircleCliState()
+
+    when (sub) {
+        "create" -> {
+            st = CircleCliState(
+                circleId = args.opt("--circle") ?: UUID.randomUUID().toString().replace("-", "").take(16),
+                invite = args.opt("--invite")
+                    ?: (UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")),
+                key = freshCircleKey(),
+                host = args.opt("--host") ?: "",
+                members = mutableListOf(me),
+            )
+            saveCircleState(st)
+            println("${ts()} circle ${st.circleId} invite=${st.invite}")
+            println("${ts()} host it: flit-cli serve --circle ${st.circleId} --invite ${st.invite}")
+        }
+        "join" -> {
+            val host = args.opt("--host") ?: st.host
+            if (host.isBlank()) { println("!! join needs --host ip[:port]"); return }
+            st.circleId = args.opt("--circle") ?: st.circleId
+            st.invite = args.opt("--invite") ?: st.invite
+            if (st.circleId.isBlank()) { println("!! join needs --circle ID"); return }
+            val resp = ProtocolClient(identity).use { cli ->
+                runCatching {
+                    cli.circleJoin(
+                        circleTarget(host),
+                        CircleRequest(
+                            action = CircleRequest.ACTION_JOIN,
+                            circleId = st.circleId,
+                            invite = st.invite,
+                            memberFp = me,
+                        ),
+                    )
+                }.getOrNull()
+            }
+            if (resp == null || !resp.ok) {
+                println("!! join refused: ${resp?.reason ?: "no answer from $host"}")
+                return
+            }
+            st.host = host
+            st.key = resp.key
+            st.members = resp.members.toMutableList()
+            st.events = CircleCore.order(CircleCore.dedup(st.events + resp.events)).toMutableList()
+            saveCircleState(st)
+            println("${ts()} joined ${st.circleId}: ${st.members.size} member(s), ${st.events.size} event(s), key=${st.key.take(8)}…")
+        }
+        "post" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            val file = args.opt("--file")
+            val body: String
+            val type: String
+            if (file != null) {
+                val p = Path.of(file)
+                if (!Files.isRegularFile(p)) { println("!! no file: $file"); return }
+                val bytes = Files.readAllBytes(p)
+                val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
+                    .joinToString("") { "%02x".format(it) }
+                val token = UUID.randomUUID().toString().replace("-", "").take(16)
+                body = buildJsonObject {
+                    put("name", JsonPrimitive(p.fileName.toString()))
+                    put("size", JsonPrimitive(bytes.size.toLong()))
+                    put("sha256", JsonPrimitive(sha))
+                    put("token", JsonPrimitive(token))
+                }.toString()
+                type = CircleEvent.FILE
+            } else {
+                val text = args.opt("--text") ?: run { println("!! post needs --text or --file"); return }
+                body = buildJsonObject { put("text", JsonPrimitive(text)) }.toString()
+                type = CircleEvent.MESSAGE
+            }
+            val ev = circleEvent(st, identity, type, body)
+            st.events.add(ev)
+            pushCircleEvent(st, identity, ev)
+        }
+        "poll" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            val q = args.opt("--text") ?: run { println("!! poll needs --text QUESTION"); return }
+            val opts = (args.opt("--option") ?: "").split(',')
+                .map { it.trim() }.filter { it.isNotEmpty() }
+            if (opts.isEmpty()) { println("!! poll needs --option A,B,C"); return }
+            val pollId = UUID.randomUUID().toString().replace("-", "").take(12)
+            val body = buildJsonObject {
+                put("pollId", JsonPrimitive(pollId))
+                put("question", JsonPrimitive(q))
+                put("options", buildJsonArray { opts.forEach { add(JsonPrimitive(it)) } })
+            }.toString()
+            val ev = circleEvent(st, identity, CircleEvent.POLL, body)
+            st.events.add(ev)
+            pushCircleEvent(st, identity, ev)
+            println("${ts()} poll $pollId: $q (${opts.size} options)")
+        }
+        "vote" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            val option = args.optInt("--option", -1)
+            if (option < 0) { println("!! vote needs --option N"); return }
+            val pollId = st.events.filter { it.type == CircleEvent.POLL }
+                .maxByOrNull { it.lamport }
+                ?.let { circleBody(it.body)?.let { o -> circleText(o, "pollId") } }
+                ?: run { println("!! no poll known — sync first"); return }
+            val body = buildJsonObject {
+                put("pollId", JsonPrimitive(pollId))
+                put("option", JsonPrimitive(option))
+            }.toString()
+            val ev = circleEvent(st, identity, CircleEvent.VOTE, body)
+            st.events.add(ev)
+            pushCircleEvent(st, identity, ev)
+            println("${ts()} vote on $pollId → option $option")
+        }
+        "kick" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            val target = args.opt("--target") ?: run { println("!! kick needs --target FP"); return }
+            val body = buildJsonObject {
+                put("kickId", JsonPrimitive(UUID.randomUUID().toString().replace("-", "").take(12)))
+                put("targetFp", JsonPrimitive(target.trim().uppercase()))
+                put("approve", JsonPrimitive(true))
+            }.toString()
+            val ev = circleEvent(st, identity, CircleEvent.KICK, body)
+            st.events.add(ev)
+            pushCircleEvent(st, identity, ev)
+        }
+        "leave" -> {
+            if (st.circleId.isBlank()) { println("!! no circle"); return }
+            val body = buildJsonObject { put("memberFp", JsonPrimitive(me)) }.toString()
+            val ev = circleEvent(st, identity, CircleEvent.LEAVE, body)
+            runCatching {
+                ProtocolClient(identity).use { cli ->
+                    cli.circleSync(
+                        circleTarget(st.host),
+                        CircleRequest(
+                            action = CircleRequest.ACTION_SYNC,
+                            circleId = st.circleId,
+                            memberFp = me,
+                            events = listOf(ev),
+                        ),
+                    )
+                }
+            }
+            Files.deleteIfExists(circleStatePath())
+            println("${ts()} left ${st.circleId} — local key discarded")
+        }
+        "sync" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            if (st.host.isBlank()) { println("!! no host — join with --host first"); return }
+            val resp = circleExchange(identity, circleTarget(st.host), st, emptyList())
+            if (resp == null || !resp.ok) {
+                println("!! sync refused: ${resp?.reason ?: "no answer"}")
+                return
+            }
+            mergeCircleAnswer(st, resp)
+            saveCircleState(st)
+            printCircleFeed(st)
+        }
+        else -> circleUsage()
+    }
+}
+
+private suspend fun pushCircleEvent(st: CircleCliState, identity: TlsIdentity, ev: CircleEvent) {
+    if (st.host.isBlank()) {
+        saveCircleState(st)
+        println("${ts()} ${ev.type} recorded locally (no host yet — sync after joining)")
+        return
+    }
+    val resp = circleExchange(identity, circleTarget(st.host), st, listOf(ev))
+    if (resp == null || !resp.ok) {
+        saveCircleState(st)
+        println("!! ${ev.type} not accepted by host: ${resp?.reason ?: "no answer"} (kept locally)")
+        return
+    }
+    mergeCircleAnswer(st, resp)
+    saveCircleState(st)
+    println("${ts()} ${ev.type} ${ev.id.take(8)} → ${st.events.size} event(s), ${st.members.size} member(s), gen=${st.rekeyGen}")
+}
+
+private fun printCircleFeed(st: CircleCliState) {
+    println("${ts()} circle ${st.circleId}: ${st.members.size} member(s), key=${st.key.take(8)}…, rekeyGen=${st.rekeyGen}")
+    for (e in CircleCore.order(st.events)) {
+        println("  ${e.authorFp.take(8)}  ${e.type.padEnd(7)}  ${e.body.take(100)}")
+    }
+    st.events.filter { it.type == CircleEvent.POLL }.maxByOrNull { it.lamport }?.let { poll ->
+        val pid = circleBody(poll.body)?.let { circleText(it, "pollId") } ?: return@let
+        val tally = CircleCore.tally(st.events, pid, st.members)
+        println("  tally $pid: ${tally.entries.sortedBy { it.key }}")
     }
 }

@@ -25,7 +25,14 @@ import java.net.URLEncoder
  * v1 carries only the address. v2 adds optional carrier hints — a Bluetooth
  * [mac], a [relay] ("host:port") and its [token] — and can be relay-only: a
  * code with no local address still tells the scanner how to reach its peer.
+ * v3 adds a circle invite: [circle] (the circle id) and [invite] (the invite
+ * token), alongside the host fingerprint and v2 route hints already present.
  * [v] is kept on the wire so a v1 code re-encodes byte-for-byte unchanged.
+ *
+ * A QR invite carries NO group key — only who to ask (host fingerprint),
+ * which circle, the invite token and how to reach the host. The key is
+ * exchanged over the pinned route after the invite is accepted. Emitting a
+ * key on a scannable surface would defeat the revocation/rekey contract.
  *
  * The scheme is deliberately ours (`flit://`): LocalSend peers never emit
  * it and Flit never emits anything resembling theirs.
@@ -42,6 +49,10 @@ data class QrAdd(
     val relay: String? = null,
     /** Optional relay credential, v2 only. */
     val token: String? = null,
+    /** Circle id, v3 invites only. Ignored by v1/v2 parsers. */
+    val circle: String? = null,
+    /** Invite token, v3 invites only. Never a group key. */
+    val invite: String? = null,
     val v: Int = 2,
 ) {
     fun uri(): String = buildString {
@@ -62,18 +73,24 @@ data class QrAdd(
         if (!mac.isNullOrBlank()) append("&mac=").append(URLEncoder.encode(mac, Charsets.UTF_8.name()))
         if (!relay.isNullOrBlank()) append("&relay=").append(URLEncoder.encode(relay, Charsets.UTF_8.name()))
         if (!token.isNullOrBlank()) append("&token=").append(URLEncoder.encode(token, Charsets.UTF_8.name()))
+        // v3 invite fields. Kept off the wire when blank so v1/v2 codes keep
+        // their exact historical byte shape. No key is ever emitted here.
+        if (!circle.isNullOrBlank()) append("&circle=").append(URLEncoder.encode(circle, Charsets.UTF_8.name()))
+        if (!invite.isNullOrBlank()) append("&invite=").append(URLEncoder.encode(invite, Charsets.UTF_8.name()))
     }
 }
 
 /**
  * Tolerant parser for what lands in the scanner / paste field. Accepts
- * `flit://add?...` codes of any parameter order, v1 and v2 alike. Anything
+ * `flit://add?...` codes of any parameter order, v1, v2 and v3 alike. Anything
  * else is not a pairing: `null` (plain `ip:port` strings belong to the Add
  * dialog's address path, which is pre-existing behavior).
  *
- * v1 must carry ip + a valid port, exactly as before. v2 may drop both when
- * it carries a well-formed relay; a port is only range-checked when an ip
- * is present. v1 codes ignore the v2-only hints.
+ * v1 must carry ip + a valid port, exactly as before. v2/v3 may drop both
+ * when they carry a well-formed relay; a port is only range-checked when an
+ * ip is present. v1 ignores every later hint. v3 must additionally carry a
+ * non-blank circle id and invite token — an invite code missing either is
+ * malformed and refused rather than silently downgraded to a pairing.
  */
 fun parseAddCode(text: String): QrAdd? {
     val t = text.trim()
@@ -91,23 +108,30 @@ fun parseAddCode(text: String): QrAdd? {
         if (k.isNotEmpty()) params[k] = v
     }
     val version = (params["v"] ?: "1").toIntOrNull() ?: return null
-    if (version !in 1..2) return null
+    if (version !in 1..3) return null
     val ip = params["ip"]?.trim().orEmpty()
     val port = (params["port"] ?: params["p"])?.toIntOrNull() ?: 0
     if (version == 1 && (ip.isEmpty() || port !in 1..65535)) return null
-    val relay = if (version == 2) params["relay"]?.trim()?.ifBlank { null } else null
+    val relay = if (version >= 2) params["relay"]?.trim()?.ifBlank { null } else null
     if (relay != null && FlitRoute.parseRelay(relay) == null) return null
-    if (version == 2 && ip.isEmpty() && relay == null) return null
-    if (version == 2 && ip.isNotEmpty() && port !in 1..65535) return null
+    if (version >= 2 && ip.isEmpty() && relay == null) return null
+    if (version >= 2 && ip.isNotEmpty() && port !in 1..65535) return null
+    val circle = if (version >= 3) params["circle"]?.trim()?.ifBlank { null } else null
+    val invite = if (version >= 3) params["invite"]?.trim()?.ifBlank { null } else null
+    // There is deliberately no key parameter on the wire: a code that tried
+    // to smuggle one cannot feed a group key into the store through here.
+    if (version >= 3 && (circle == null || invite == null)) return null
     return QrAdd(
         ip = ip,
         port = port,
         tls = (params["tls"] ?: "1") != "0",
         fingerprint = (params["fp"] ?: params["f"] ?: "").trim().uppercase().ifBlank { "" },
         alias = (params["alias"] ?: params["a"] ?: "").trim(),
-        mac = if (version == 2) params["mac"]?.trim()?.ifBlank { null } else null,
+        mac = if (version >= 2) params["mac"]?.trim()?.ifBlank { null } else null,
         relay = relay,
-        token = if (version == 2) params["token"]?.trim()?.ifBlank { null } else null,
+        token = if (version >= 2) params["token"]?.trim()?.ifBlank { null } else null,
+        circle = circle,
+        invite = invite,
         v = version,
     )
 }

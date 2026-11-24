@@ -85,19 +85,29 @@ fun QrCanvas(text: String, side: Dp, modifier: Modifier = Modifier) {
  * "My code": full screen, engine underneath. The QR shows our current Wi‑Fi
  * address + fingerprint; the other phone's stock camera or Flit's scanner
  * both work. Honest message when there is no usable local address (yet).
+ *
+ * Pass [invite] to show a v3 circle invite instead of a plain pairing code.
+ * When the code carries [QrAdd.circle]/[QrAdd.invite] the card says so and
+ * points the scanner at Circle → Join by QR, never at Add → Scan code — a
+ * circle invite is not a device pairing. No group key is displayed: it is
+ * exchanged over the pinned route only after the invite is accepted.
  */
 @Composable
-fun QrShowCard(onClose: () -> Unit) {
+fun QrShowCard(onClose: () -> Unit, invite: QrAdd? = null) {
     val cs = MaterialTheme.colorScheme
     BackHandler { onClose() }
     var self by remember { mutableStateOf<QrAdd?>(null) }
     LaunchedEffect(Unit) {
-        // The engine may still be booting (identity load is async); retry briefly.
+        // An explicit invite is already the payload to show; don't wait on the
+        // engine. Otherwise it may still be booting (identity load is async).
+        if (invite != null) return@LaunchedEffect
         while (self == null) {
             self = FlitEngine.selfQrAdd()
             if (self == null) delay(300)
         }
     }
+    val shown = invite ?: self
+    val hasInvite = shown?.let { !it.circle.isNullOrBlank() || !it.invite.isNullOrBlank() } ?: false
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -111,7 +121,7 @@ fun QrShowCard(onClose: () -> Unit) {
         ) {
             Surface(color = Color.White, shape = RoundedCornerShape(FlitCorner.extraLarge)) {
                 Box(modifier = Modifier.padding(18.dp)) {
-                    val c = self
+                    val c = shown
                     if (c != null) {
                         QrCanvas(text = c.uri(), side = 268.dp)
                     } else {
@@ -123,9 +133,12 @@ fun QrShowCard(onClose: () -> Unit) {
                 }
             }
             Spacer(Modifier.height(18.dp))
-            Text(self?.alias ?: "", style = MaterialTheme.typography.titleLarge)
             Text(
-                self?.let { code ->
+                if (hasInvite) "circle invite" else shown?.alias ?: "",
+                style = MaterialTheme.typography.titleLarge,
+            )
+            Text(
+                shown?.let { code ->
                     if (code.ip.isNotBlank()) "${code.ip}:${code.port}"
                     else code.relay ?: "?"
                 } ?: "?",
@@ -134,14 +147,33 @@ fun QrShowCard(onClose: () -> Unit) {
                 color = cs.onSurface.copy(alpha = 0.7f),
             )
             Text(
-                self?.fingerprint?.take(12)?.let { "fp $it…" } ?: "",
+                shown?.fingerprint?.take(12)?.let { if (hasInvite) "host fp $it…" else "fp $it…" } ?: "",
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
                 color = cs.onSurface.copy(alpha = 0.45f),
             )
+            if (hasInvite) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "circle ${shown?.circle.orEmpty()}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = FontFamily.Monospace,
+                    color = cs.onSurface.copy(alpha = 0.8f),
+                )
+                Text(
+                    "invite ${shown?.invite.orEmpty()}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = FontFamily.Monospace,
+                    color = cs.onSurface.copy(alpha = 0.8f),
+                )
+            }
             Spacer(Modifier.height(10.dp))
             Text(
-                "point the other phone's camera here — or open Flit → Add → Scan code on it",
+                if (hasInvite) {
+                    "scan with Flit → Circle → Join by QR to enter this circle"
+                } else {
+                    "point the other phone's camera here — or open Flit → Add → Scan code on it"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurface.copy(alpha = 0.6f),
             )
