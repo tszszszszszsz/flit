@@ -4,7 +4,9 @@ import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendTarget
+import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.discovery.UdpDiscovery
+import app.flit.share.protocol.relay.RelaySubscriber
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
@@ -52,7 +54,7 @@ internal class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout")
+        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout", "--relay")
     }
 }
 
@@ -110,6 +112,7 @@ private fun usage() {
         """flit-cli — the LocalSend v2.2 command line (same stack as the Flit app)
 
 serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--hidden] [--announce-to ip:port,...]
+      [--relay host:port --token T] -- serve only inside a blind pairer (milestone E)
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
@@ -224,6 +227,33 @@ private suspend fun serve(args: ParsedArgs) {
     )
     val delegate = ConsoleDelegate()
     val server = ProtocolServer(identity, delegate, config)
+
+    // Milestone E's operator door: serve ONLY inside the blind pairer, with
+    // no TCP listener and no announces. Direct routes go quiet so a peer's
+    // hunt falls through to its relay candidate; the protocol inside the
+    // pipe is the same core, with TLS inside it.
+    val relayAddr = args.opt("--relay")
+    if (relayAddr != null) {
+        val host = relayAddr.substringBeforeLast(':')
+        val port = relayAddr.substringAfterLast(':').toIntOrNull()
+        if (host.isBlank() || port == null || port !in 1..65535) {
+            System.err.println("!! bad --relay $relayAddr (expected host:port)")
+            exitProcess(2)
+        }
+        println("${ts()} relay subscription $host:$port dir=${config.destDir.toAbsolutePath()}")
+        println("${ts()} fingerprint ${identity.fingerprint}")
+        while (true) {
+            try {
+                val raw = RelaySubscriber.subscribe(host, port, identity.fingerprint, args.opt("--token"))
+                server.serve(TlsLink(raw, identity, clientMode = false))
+            } catch (t: Throwable) {
+                println("${ts()} relay: ${t.message ?: t.javaClass.simpleName} — retry in 2s")
+                Thread.sleep(2_000)
+            }
+        }
+        return
+    }
+
     server.start()
 
     val client = ProtocolClient(identity)

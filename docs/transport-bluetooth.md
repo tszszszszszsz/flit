@@ -347,8 +347,18 @@ involved. Same discipline as the look rewrite.
   relay-last hunt fallback, relay-aware dispatch, and an opt-in Options
   field (empty = E invisible). The harness end-to-end test now uses those
   same production endpoints with TLS inside the blind pipe. Rig green
-  (114 tests). The relay hardware walk (box relay ↔ phone, mid-body relay
-  kill) is owed.
+  (115 tests). **Hardware walk (2026-11-24):** the box ran `flit-cli relay`
+  and `flit-cli serve --relay 127.0.0.1:53317` (no direct listener, no
+  announces) while the phone typed that relay into Options. A 200 MiB camera
+  shot crossed the blind pairer: the phone logged `hunt: relay answered as
+  Flit (szszszs)`, the relay logged four opaque pairings, and the receiver
+  landed a hash-exact file. Then a 300 MiB shot was cut by `kill -9` on the
+  **relay** mid-transfer: the phone kept the row, both ends re-subscribed
+  with backoff, the next hunt re-paired through the restarted relay and
+  logged `recv-resume … from 31866880 bytes` — the exact killed prefix —
+  with a hash-exact landing and no leftover part. The mid-body
+  throw/keep/resume loop is proven through the relay on hardware, not only
+  in the harness.
 - Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
   measure-then-act only.
 
