@@ -36,8 +36,10 @@ a mid-transfer drop reconnects and continues, transport-independent.
    default, inert when left off). The rest of the rule holds: power-on stays a
    contextual system ask, once per device, in the system's own voice. Turning the
    option on opens an RFCOMM listener (connectable BLE advertising) and lets the
-   hunter dial a peer's Bluetooth address. Wi-Fi still wins whenever it answers:
-   Bluetooth is a fallback carrier, not a faster one.
+   hunter dial a peer's Bluetooth address. A permission or radio-power consent
+   answered after the toggle rebinds the carrier once, so a late grant still
+   brings the listener up. Wi-Fi still wins whenever it answers: Bluetooth is a
+   fallback carrier, not a faster one.
 3. **Permissions are contextual too.** BLUETOOTH_SCAN + BLUETOOTH_CONNECT (API 31+;
    the Redmi test device is API 36, dynamic color stock, so this is the primary path)
    are requested at the precise moment a no-AP transfer needs them, with a one-line

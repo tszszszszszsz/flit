@@ -132,17 +132,29 @@ internal class FlitBleRadio(
         advertisedConnectable = false
     }
 
+    /**
+     * A failed start leaves no advertisement on the air. Clear the whole cache
+     * — including [advertisedConnectable] — so the next apply (e.g. flipping
+     * the Bluetooth option) really rebuilds the record instead of believing
+     * the stale one is still running.
+     */
+    private fun advertiseFailed(why: String) {
+        Log.w(TAG, why)
+        advertising = false
+        advertised = null
+        advertisedConnectable = false
+    }
+
     private val legacyCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {}
         override fun onStartFailure(error: Int) {
-            Log.w(TAG, "legacy advertising start failed: $error")
-            advertising = false
+            advertiseFailed("legacy advertising start failed: $error")
         }
     }
 
     private val setCallback = object : AdvertisingSetCallback() {
         override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
-            if (status != ADVERTISE_SUCCESS) Log.w(TAG, "advertising set status $status")
+            if (status != ADVERTISE_SUCCESS) advertiseFailed("advertising set status $status")
         }
     }
 

@@ -2095,26 +2095,41 @@ class MainActivity : ComponentActivity() {
             interactionSource = interaction,
             modifier = Modifier.size(40.dp),
         ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clip(RoundedCornerShape(corner))
-                    .background(bg),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    icon,
-                    contentDescription = label,
-                    tint = if (selected) cs.onPrimary else cs.onSurfaceVariant,
-                    modifier = Modifier.size(24.dp),
-                )
+            // Unclipped wrapper: the background + icon are clipped to the
+            // pressed shape, but the badge is a sibling drawn on top so the
+            // circle clip can't shave it into a crescent.
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(RoundedCornerShape(corner))
+                        .background(bg),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        icon,
+                        contentDescription = label,
+                        tint = if (selected) cs.onPrimary else cs.onSurfaceVariant,
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
                 if (badge > 0) {
+                    // Surface-colored ring separates the dot from the icon/tint
+                    // so it reads as a deliberate notification mark, not a smudge.
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopEnd)
-                            .size(9.dp)
-                            .background(cs.error, CircleShape),
-                    )
+                            .padding(2.dp)
+                            .size(14.dp)
+                            .background(cs.surfaceContainerHighest, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .background(cs.error, CircleShape),
+                        )
+                    }
                 }
             }
         }

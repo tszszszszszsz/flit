@@ -527,6 +527,7 @@ val share: StateFlow<ShareIntake?> = _share
         relayJob = null
         relayParked.getAndSet(null)?.let { runCatching { it.close() } }
         relayRouteFor.clear()
+        FlitBluetooth.stopServer() // cancels a waiting retry loop too
         runCatching { btServerSocket?.close() }
         btServerSocket = null
         runCatching { btClient?.close() }
@@ -573,6 +574,14 @@ val share: StateFlow<ShareIntake?> = _share
             null -> return
         }
         if (_directAsk.value == kind) _directAsk.value = null
+        // The carrier is bound at engine start. If a grant/power consent
+        // arrived after the Bluetooth option was turned on, rebind once so
+        // the listener and connectable advertising actually come up.
+        if (prefs().getBoolean("bluetoothTransfer", false) &&
+            (btClient == null || btServerSocket == null)
+        ) {
+            bluetoothChanged()
+        }
     }
 
     private suspend fun run(seq: Int) {
