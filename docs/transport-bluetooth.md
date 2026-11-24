@@ -311,8 +311,8 @@ involved. Same discipline as the look rewrite.
   one media-read ask; walked on hardware end-to-end — a synthetic camera shot
   watched, queued, sent and landed hash-exact in ~200 ms, a restart re-sending
   nothing (dedup proven) (evidence below).
-- **A — carrier migration mid-transfer**: **code-complete, hardware walk
-  pending** — the route store, the respect-priority candidates, the hunter
+- **A — carrier migration mid-transfer** — **done, walked on hardware
+  (2026-11-24)**: the route store, the respect-priority candidates, the hunter
   (2 s tick, calm backoff, fingerprint-matched accept) and the death
   contract (a carrier death throws `TransferUnreachable`; a returned report
   means the receiver spoke; the flush drops its row only after a report)
@@ -323,10 +323,18 @@ involved. Same discipline as the look rewrite.
   prefix before the plain attach could use it (711 MB tail written as a
   fresh part). Both are pinned by `ResumeAndTurboTest` (5 tests: both
   range syntaxes, restart probe/attach, failed-chunk-then-resume, 409 for
-  a missing base, and a real `multi=true` hash-exact landing). The final
-  redo walk on the fixed build — SIGKILL mid-flush → `recv-resume` from
-  the killed prefix → hash-exact, no tail-only attempt — is owed on
-  hardware (no device attached at this commit).
+  a missing base, and a real `multi=true` hash-exact landing). **Final
+  walk (2026-11-24):** a fresh 300 MiB camera shot was mirrored to the
+  box; the box was `kill -9`d 0.8 s after `recv-start` with a 33,980,416 B
+  part on disk. The phone logged `ECONNREFUSED … — kept, sends when it
+  reappears`, the hunter re-probed on restart, and the very next offer
+  logged `recv-resume IMG_20261124_183000.jpg from 33980416 bytes` — the
+  exact killed prefix — then `recv-ok`: the landed file's sha256
+  `fbc4684a30afd…` matches the phone's byte-for-byte, with no part or
+  sidecar left. An earlier, late kill (~90% through an 800 MiB multi-socket
+  send) also landed hash-exact but took the clean full-resend path — a
+  sparse prefix near completion is not advertised as a resume base; that
+  limitation is listed, not hidden.
 - **B — Wi-Fi Aware fat pipe** — **parked, hardware absent**: the agreed
   gate `adb shell pm has-feature android.software.wifi.aware` answered
   `false` on the rig phone (2026-11-21). BLE stays discovery; no Aware
