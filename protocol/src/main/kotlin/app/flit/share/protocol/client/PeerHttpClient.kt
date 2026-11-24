@@ -53,8 +53,10 @@ class PeerHttpClient(
         contentLength: Long = 0,
         bodyProgress: ((Long) -> Unit)? = null,
         timeoutMs: Long = 10_000,
+        /** Milestone E: the fingerprint a relay route must pair with; direct routes pass null. */
+        relayFor: String? = null,
     ): Response = withContext(Dispatchers.IO) {
-        raw(method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength, bodyProgress, timeoutMs)
+        raw(method, host, port, tls, pathAndQuery, headers, bodyProvider, contentLength, bodyProgress, timeoutMs, relayFor)
     }
 
     private suspend fun raw(
@@ -68,8 +70,9 @@ class PeerHttpClient(
         contentLength: Long,
         bodyProgress: ((Long) -> Unit)?,
         timeoutMs: Long,
+        relayFor: String?,
     ): Response {
-        links.connect(host, port, tls, timeoutMs.toInt()).use { link ->
+        links.connect(host, port, tls, timeoutMs.toInt(), relayFor).use { link ->
             val out = link.output
             val head = StringBuilder().apply {
                 append(method).append(' ').append(pathAndQuery).append(" HTTP/1.1\r\n")

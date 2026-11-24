@@ -16,7 +16,10 @@ import app.flit.share.protocol.client.OutgoingFile
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
+import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.discovery.UdpDiscovery
+import app.flit.share.protocol.relay.RelayLinkProvider
+import app.flit.share.protocol.relay.RelaySubscriber
 import app.flit.share.protocol.server.IncomingSink
 import app.flit.share.protocol.model.FileInfo
 import app.flit.share.protocol.model.PeerInfo
@@ -36,7 +39,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -302,6 +307,16 @@ val share: StateFlow<ShareIntake?> = _share
     private var identity: TlsIdentity? = null
     private var server: ProtocolServer? = null
     private var client: ProtocolClient? = null
+
+    // Milestone E (opt-in, off by default): the subscription worker and the
+    // per-peer mark that the last fingerprint-matched answer came through a
+    // relay, so the flush dials the relay rather than the transport address
+    // the register carried. A later direct answer clears the mark.
+    private class RelayConfig(val host: String, val port: Int, val token: String?)
+    private var relayJob: Job? = null
+    private val relayParked = AtomicReference<Socket?>(null)
+    private val relayRouteFor = ConcurrentHashMap<String, RelayConfig>()
+
     private var discovery: UdpDiscovery? = null
     private var bleRadio: FlitBleRadio? = null
 
@@ -467,6 +482,15 @@ val share: StateFlow<ShareIntake?> = _share
         // Applies on the next start; the UI hints about toggling sharing to renew.
     }
 
+    /** Options changed E's address or token: rebind now (empty = invisible). */
+    fun relayChanged() {
+        if (!::appCtx.isInitialized) return
+        if (_state.value.running || _state.value.starting) {
+            stop()
+            start(appCtx)
+        }
+    }
+
     fun start(ctx: Context) {
         if (_state.value.running || _state.value.starting) return
         appCtx = ctx.applicationContext
@@ -484,6 +508,12 @@ val share: StateFlow<ShareIntake?> = _share
     fun stop() {
         startSeq++
         stopMirrorWatcher()
+        // E's parked read is blocking; close the socket so the worker wakes
+        // and sees the new sequence instead of lingering on a dead engine.
+        relayJob?.cancel()
+        relayJob = null
+        relayParked.getAndSet(null)?.let { runCatching { it.close() } }
+        relayRouteFor.clear()
         runCatching { discovery?.stop() }
         runCatching { server?.close() }
         runCatching { client?.close() }
@@ -562,7 +592,15 @@ val share: StateFlow<ShareIntake?> = _share
             )
             srv.start()
 
-            val cli = ProtocolClient(id)
+            // Milestone E is opt-in: with no typed relay the client is the
+            // unchanged TCP one; with one, the same client can dial the relay
+            // for a peer whose last answer came through it.
+            val relayCfg = relayConfig()
+            val cli = if (relayCfg != null) {
+                ProtocolClient(id, RelayLinkProvider(id, relayCfg.token))
+            } else {
+                ProtocolClient(id)
+            }
 
             // Android's kernel drops multicast frames unless we hold this lock.
             val wifi = appCtx.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -628,6 +666,10 @@ val share: StateFlow<ShareIntake?> = _share
                 fingerprintShort = id.fingerprint.take(12),
             )
             logLine("serving ${srv.scheme}://0.0.0.0:${srv.port} as \u201c$alias\u201d")
+            if (relayCfg != null) {
+                startRelayWorker(seq, id, relayCfg, srv)
+                logLine("relay: subscribed at ${relayCfg.host}:${relayCfg.port} as ${id.fingerprint.take(12)}")
+            }
             if (prefs().getBoolean("hiddenMode", false)) {
                 logLine("hidden mode: not announcing — others find this device by address, or when you send first")
             }
@@ -961,6 +1003,74 @@ val share: StateFlow<ShareIntake?> = _share
             touchPeer(route.host, answer)
             return
         }
+        // Milestone E: the relay is the last candidate, never the first.
+        // A direct answer above always won; only an owed peer nobody on the
+        // direct routes knows gets one register through the typed relay.
+        val relay = relayConfig() ?: return
+        val answered = probeRelay(cli, self, seq, fp, relay) ?: return
+        if (!FlitRoute.accepts(answered.fingerprint, fp)) return
+        logLine("hunt: relay answered as ${answered.alias.ifBlank { fp.take(12) }}")
+        huntAttempts.remove(fp)
+        huntNextAt.remove(fp)
+        huntLogged.remove(fp)
+        touchPeerViaRelay(relay.host, answered)
+    }
+
+    /** The one typed relay from Options; null means E is off and invisible. */
+    private fun relayConfig(): RelayConfig? {
+        val (host, port) = FlitRoute.parseRelay(prefs().getString("relayAddress", null)) ?: return null
+        val token = prefs().getString("relayToken", "")?.trim()?.ifEmpty { null }
+        return RelayConfig(host, port, token)
+    }
+
+    /**
+     * Receiver half of E: hold one subscription under our fingerprint, hand
+     * each paired pipe to the same server door TCP and Bluetooth ride (TLS
+     * runs inside the blind pipe), then re-subscribe — prepare and upload
+     * arrive on their own pipes. Backoff is the keeper's calm cadence; the
+     * parked socket is held so shutdown can unblock the blocking read.
+     */
+    private fun startRelayWorker(seq: Int, id: TlsIdentity, cfg: RelayConfig, srv: ProtocolServer) {
+        relayJob?.cancel()
+        relayParked.getAndSet(null)?.let { runCatching { it.close() } }
+        relayJob = scope.launch(Dispatchers.IO) {
+            var waitMs = 2_000L
+            while (isActive && seq == startSeq) {
+                try {
+                    RelaySubscriber.subscribe(
+                        cfg.host, cfg.port, id.fingerprint, cfg.token,
+                        parkTimeoutMs = 0, // a subscription's true lifetime
+                        onSocket = { relayParked.set(it) },
+                    ).let { raw -> srv.serve(TlsLink(raw, id, clientMode = false)) }
+                    waitMs = 2_000L
+                } catch (t: Throwable) {
+                    if (seq != startSeq || !isActive) break
+                    logLine("relay: ${t.message ?: t.javaClass.simpleName} — retry in ${waitMs / 1000}s")
+                    delay(waitMs)
+                    waitMs = minOf(waitMs * 2, 60_000L)
+                } finally {
+                    relayParked.set(null)
+                }
+            }
+        }
+    }
+
+    /** E's last candidate, after every direct route has had its say. */
+    private suspend fun probeRelay(
+        cli: ProtocolClient,
+        self: PeerInfo,
+        seq: Int,
+        fp: String,
+        cfg: RelayConfig,
+    ): PeerInfo? {
+        if (seq != startSeq) return null
+        return runCatching {
+            cli.register(
+                SendTarget(cfg.host, cfg.port, tls = true, relayFor = fp),
+                self,
+                timeoutMs = 5_000,
+            )
+        }.getOrNull()
     }
 
     /**
@@ -1099,8 +1209,19 @@ val share: StateFlow<ShareIntake?> = _share
         touchPeer(ip.hostAddress ?: return, info)
     }
 
-    private fun touchPeer(ip: String, info: PeerInfo) {
+    private fun touchPeer(ip: String, info: PeerInfo) = touchPeer(ip, info, markRelay = false)
+
+    /** A relay answer marks this peer's next flush as a relay dial, not a LAN one. */
+    private fun touchPeerViaRelay(host: String, info: PeerInfo) = touchPeer(host, info, markRelay = true)
+
+    private fun touchPeer(ip: String, info: PeerInfo, markRelay: Boolean) {
         if (info.fingerprint == identity?.fingerprint) return
+        if (markRelay) {
+            relayRouteFor[info.fingerprint] = relayConfig() ?: return
+        } else {
+            // A direct answer wins again: E is a last resort, never a sticky route.
+            relayRouteFor.remove(info.fingerprint)
+        }
         val now = System.currentTimeMillis()
         _peers.update { m ->
             val entry = m[info.fingerprint]?.copy(ip = ip, info = info, lastSeenMs = now)
@@ -1118,8 +1239,10 @@ val share: StateFlow<ShareIntake?> = _share
         // A): a register answer or an announce — both carry the peer's real
         // identity and its serving port. Address-less rows (direct radio,
         // port 0) remember nothing.
-        runCatching {
-            FlitRoster.rememberRoute(info.fingerprint, ip, info.port, info.protocol == "https")
+        if (!markRelay) {
+            runCatching {
+                FlitRoster.rememberRoute(info.fingerprint, ip, info.port, info.protocol == "https")
+            }
         }
         // A peer we owe files to just came back: dispatch its send-later batch
         // (guarded so an announce storm cannot double-send).
@@ -1322,36 +1445,51 @@ val share: StateFlow<ShareIntake?> = _share
      * Dispatches this peer's queued send-later batch, or no-ops quietly when
      * nothing is queued / a dispatch is already in flight. Also the entry
      * point for the queue's manual "retry now".
+     *
+     * The per-peer claim is taken HERE, before the batch is spooled — not
+     * deeper in [dispatchTo]. The hardware walk caught what the shallower
+     * claim allowed: a hunter answer every two seconds started five flushes
+     * for one 800 MB shot, each spooled its own full copy into cache, the
+     * near-full /data partition refused every copy, and the old empty-spool
+     * branch quietly dropped the row. One peer, one spool, one wire attempt;
+     * [dispatchTo] runs under this claim (`claimHeld`) and the release stays
+     * in the `finally` below.
      */
     private fun flushQueueFor(peer: PeerEntry) {
-        if (FlitRoster.queued().none { it.fingerprint == peer.info.fingerprint }) return
-        if (peer.info.fingerprint in dispatching) return
-        val batch = FlitRoster.queued().first { it.fingerprint == peer.info.fingerprint }
+        val fp = peer.info.fingerprint
+        if (FlitRoster.queued().none { it.fingerprint == fp }) return
+        if (!dispatching.add(fp)) return
+        val batch = FlitRoster.queued().first { it.fingerprint == fp }
         scope.launch(Dispatchers.IO) {
             try {
                 val spools = batch.uris.mapNotNull { spoolFileFor(it, "queue") }
                 if (spools.isEmpty()) {
-                    logLine("queue: nothing left for ${peer.displayName} — dropping")
-                    dropQueue(batch)
+                    // None of the row's items could be opened right now (a
+                    // full disk, a revoked grant, a mid-write camera file).
+                    // The row is a promise, not a cache: keep it, say why,
+                    // and leave "retry now" / cancel in the user's hands.
+                    logLine(
+                        "queue: none of ${batch.uris.size} item(s) for ${peer.displayName} " +
+                            "could be opened — kept, retry when the reason is gone",
+                    )
                 } else {
                     logLine("queue: ${spools.size} queued for ${peer.displayName} — sending now")
                     try {
-                        // Synchronous with the row's fate, and the claim is
-                        // dispatchTo's (see there): a returned report means
-                        // the far side SPOKE (sent, refused, declined) — the
-                        // story concluded, so the row's tokens leave now,
-                        // after the bytes, and the spooled copies with them.
-                        // A throw means the carrier died with no answer at
-                        // all: the row and its spools stay exactly as they
-                        // were — the hunt re-enters this flush and the
-                        // receiver's on-disk prefix carries the resume
+                        // Synchronous with the row's fate: a returned report
+                        // means the far side SPOKE (sent, refused, declined)
+                        // — the story concluded, so the row's tokens leave
+                        // now, after the bytes. A throw means the carrier
+                        // died with no answer at all: the row survives and
+                        // the receiver's on-disk prefix carries the resume
                         // (docs, milestones C and A).
-                        val report = dispatchTo(peer, SourceList(spools, emptyList()), null, fromQueue = true)
+                        val report = dispatchTo(
+                            peer, SourceList(spools, emptyList()), null,
+                            fromQueue = true, claimHeld = true,
+                        )
                         if (report == null) {
                             logLine("nothing concluded for ${peer.displayName} — kept")
                         } else {
                             dropSent(batch, spools)
-                            cleanSpools(spools)
                         }
                     } catch (e: Exception) {
                         // The row's keep IS the queue's promise: a send that
@@ -1361,9 +1499,15 @@ val share: StateFlow<ShareIntake?> = _share
                         // announce, hunt answer or "retry now" resumes.
                         val why = e.message ?: e.javaClass.simpleName
                         logLine("$why — kept, sends when it reappears")
+                    } finally {
+                        // The row keeps TOKENS, never spool paths: the next
+                        // flush re-spools from source. Reclaim the copies on
+                        // every outcome so a failed run cannot fill /data.
+                        cleanSpools(spools)
                     }
                 }
             } finally {
+                dispatching.remove(fp)
                 _queue.value = FlitRoster.queued()
             }
         }
@@ -1619,7 +1763,13 @@ val share: StateFlow<ShareIntake?> = _share
      * dispatches ([send], [sendShare]) run it fire-and-forget inside
      * [scope].
      */
-    private suspend fun dispatchTo(peer: PeerEntry, src: SourceList, text: String?, fromQueue: Boolean): SendReport? {
+    private suspend fun dispatchTo(
+        peer: PeerEntry,
+        src: SourceList,
+        text: String?,
+        fromQueue: Boolean,
+        claimHeld: Boolean = false,
+    ): SendReport? {
         val cli = client ?: run {
             if (fromQueue) throw NotServingYet()
             logLine("not sharing — start sharing first")
@@ -1632,8 +1782,9 @@ val share: StateFlow<ShareIntake?> = _share
         // One dispatch per peer at a time, fresh or queue-originated: the
         // owe row exists before bytes move, so an announce mid-fresh-send
         // would otherwise re-enter the flush and double-fly the batch. The
-        // hunter consults the same claim.
-        if (!dispatching.add(peer.info.fingerprint)) {
+        // hunter consults the same claim. A queue flush already took it
+        // before spooling (`claimHeld`) — it owns the release.
+        if (!claimHeld && !dispatching.add(peer.info.fingerprint)) {
             logLine("send to ${peer.displayName} already in flight — one at a time")
             return null
         }
@@ -1679,7 +1830,15 @@ val share: StateFlow<ShareIntake?> = _share
                     }
                 }
             }
-            val target = SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
+            // Milestone E: an owed peer whose last answer came through the
+            // relay is dialed there. `host:port` names the relay; the hint
+            // names the peer, so the blind pairer can match a subscription.
+            val relay = relayRouteFor[peer.info.fingerprint]
+            val target = if (relay != null) {
+                SendTarget(relay.host, relay.port, tls = true, relayFor = peer.info.fingerprint)
+            } else {
+                SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
+            }
             prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
             val report = cli.sendFiles(target, self, outgoing, multi = prefs().getBoolean("parallelStreams", true), progress = { name, soFar, _ ->
                 prog.tick(name, soFar)
@@ -1740,7 +1899,10 @@ val share: StateFlow<ShareIntake?> = _share
             if (fromQueue) throw e
             return null
         } finally {
-            dispatching.remove(peer.info.fingerprint)
+            // A queue flush took the claim before spooling and releases it
+            // after this returns (flushQueueFor's finally); fresh sends own
+            // their claim here.
+            if (!claimHeld) dispatching.remove(peer.info.fingerprint)
             crushedTmp.forEach { runCatching { it.delete() } }
         }
     }
@@ -1828,10 +1990,19 @@ val share: StateFlow<ShareIntake?> = _share
     private fun spoolFileFor(token: String, tag: String): SpooledFile? {
         val f = File(token)
         if (f.isFile) return SpooledFile(f, f.name, guessMime(f.name))
-        val uri = runCatching { Uri.parse(token) }.getOrNull() ?: return null
-        if (uri.scheme == "content" || uri.scheme == "file") {
-            return runCatching { spoolUri(uri, tag) }.getOrNull()
+        val uri = runCatching { Uri.parse(token) }.getOrNull() ?: run {
+            logLine("$tag: unreadable token — $token")
+            return null
         }
+        if (uri.scheme == "content" || uri.scheme == "file") {
+            // Never silent: a spool that fails is the moment a row's promise
+            // is at stake (the hardware walk's full disk), so the reason goes
+            // to the engine log instead of vanishing into a null.
+            return runCatching { spoolUri(uri, tag) }.onFailure { e ->
+                logLine("$tag: can't open $token — ${e.message ?: e.javaClass.simpleName}")
+            }.getOrNull()
+        }
+        logLine("$tag: unsupported token — $token")
         return null
     }
 
@@ -1915,9 +2086,17 @@ val share: StateFlow<ShareIntake?> = _share
         val stamp = System.currentTimeMillis()
         val safe = (displayName ?: "shared").replace(Regex("[\\/:*?\"<>|]"), "_").takeLast(80)
         val f = File(appCtx.cacheDir, "$tag-$stamp-${spoolSeq.incrementAndGet()}-$safe")
-        resolver.openInputStream(uri)?.use { input ->
-            f.outputStream().use { input.copyTo(it) }
-        } ?: throw IllegalStateException("no stream for $uri")
+        try {
+            resolver.openInputStream(uri)?.use { input ->
+                f.outputStream().use { input.copyTo(it) }
+            } ?: throw IllegalStateException("no stream for $uri")
+        } catch (t: Throwable) {
+            // A copy that died (ENOSPC on a full phone is the real one) must
+            // not leave a partial file behind — the next attempt needs that
+            // room, and nothing will ever read the fragment.
+            f.delete()
+            throw t
+        }
         return SpooledFile(f, safe, mime)
     }
     private val spoolSeq = java.util.concurrent.atomic.AtomicInteger(0)

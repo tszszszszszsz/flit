@@ -18,6 +18,19 @@ class FlitRouteTest {
         FlitRoute.Route(host, port, tls)
 
     @Test
+    fun `the typed relay is parsed once and off when empty or malformed`() {
+        assertEquals("box.example" to 53317, FlitRoute.parseRelay("box.example:53317"))
+        assertEquals("192.168.100.12" to 443, FlitRoute.parseRelay("  192.168.100.12:443  "))
+        assertEquals(null, FlitRoute.parseRelay(null))
+        assertEquals(null, FlitRoute.parseRelay("   "))
+        assertEquals(null, FlitRoute.parseRelay("box.example"))
+        assertEquals(null, FlitRoute.parseRelay("box.example:0"))
+        assertEquals(null, FlitRoute.parseRelay("box.example:65536"))
+        assertEquals(null, FlitRoute.parseRelay("box.example:port"))
+        assertEquals(null, FlitRoute.parseRelay(":53317"))
+    }
+
+    @Test
     fun `candidates come in priority order — live row, remembered route, typed addresses`() {
         val cands = FlitRoute.candidates(
             live = route("192.168.100.66"),

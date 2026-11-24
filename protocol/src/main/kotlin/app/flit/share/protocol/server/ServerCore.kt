@@ -332,6 +332,18 @@ class ServerCore(
         x.respondText(200, MIME_JSON, WireJson.encode(resp))
     }
 
+    /** Outcome of the upload-route claim, including the two honest refusals. */
+    private sealed class ClaimResult {
+        class Ok(
+            val pf: PendingFile,
+            val freshChunks: Boolean,
+            /** Prefix the ledger was seeded with when the chunk lane opened. */
+            val resumedBase: Long = 0,
+        ) : ClaimResult()
+        object Refused : ClaimResult()
+        object ResumeMismatch : ClaimResult()
+    }
+
     private suspend fun uploadRoute(x: HttpExchange) {
         val peerIp = x.origin
         val sessionId = x.query("sessionId")
@@ -349,17 +361,40 @@ class ServerCore(
             val s = session
             val f = if (s != null && s.id == sessionId && s.senderIp == peerIp) s.files[fileId] else null
             when {
-                f == null || f.token != token || f.settled -> null
+                f == null || f.token != token || f.settled -> ClaimResult.Refused
                 range != null -> {
                     // Multi-socket claims bypass the plain attempts cap: a
                     // healthy 4-stream upload must never be miscounted as
                     // three failed single-stream tries.
-                    if (!s!!.turbo) null
+                    if (!s!!.turbo) ClaimResult.Refused
                     else {
                         s.lastTouch = System.currentTimeMillis()
                         val fresh = f.tracker == null
-                        if (fresh) f.tracker = ChunkTracker(f.file.size)
-                        f to fresh
+                        var seededBase = 0L
+                        if (fresh) {
+                            // The turbo lane resumes too: the sender probes
+                            // first and starts its ranges at the base we
+                            // advertise, so the ledger is seeded with that
+                            // prefix. If the sender starts past our prefix a
+                            // hole would remain that no finalize could ever
+                            // hash — refuse the lane and let it re-probe on
+                            // the plain path.
+                            val held = resumableFor(token, f, peerIp)
+                            val claimedBase =
+                                x.header("X-Flit-Base")?.trim()?.toLongOrNull() ?: 0L
+                            if (held != null && held.from != f.temp) {
+                                return@withLock ClaimResult.ResumeMismatch
+                            }
+                            val base = held?.base ?: 0L
+                            if (claimedBase > base) {
+                                return@withLock ClaimResult.ResumeMismatch
+                            }
+                            seededBase = base
+                            f.tracker = ChunkTracker(f.file.size).also {
+                                if (base > 0) it.add(0, base)
+                            }
+                        }
+                        ClaimResult.Ok(f, fresh, seededBase)
                     }
                 }
 
@@ -367,61 +402,85 @@ class ServerCore(
                     if (f.attempts < MAX_ATTEMPTS) {
                         f.attempts++
                         s!!.lastTouch = System.currentTimeMillis()
-                        // A plain body now owns the whole file: multi-socket
-                        // piece state is obsolete. Trim the temp to the
-                        // confirmed contiguous prefix (from the live ledger or
-                        // a persisted sidecar from an earlier session) so a
-                        // resume appends behind real data, not behind a sparse
-                        // gap — the gap would be zero-filled garbage forever.
-                        f.tracker?.let { t ->
-                            truncateTo(f.temp, t.base())
-                            f.tracker = null
-                            deletePiecesSidecar(f.temp)
-                        } ?: clearPiecesSidecar(f.temp)
-                        f to false
-                    } else null
+                        // Never touch the temp or the chunk ledger here: this
+                        // very request may carry X-Flit-Resume, and the
+                        // attach below must see exactly the base the probe
+                        // advertised. A fresh body truncates on open; a
+                        // resumed one trims to its own confirmed base. (The
+                        // 2026-11-18 walk caught the old trim-to-tracker-base
+                        // deleting the kept part after a failed turbo claim.)
+                        ClaimResult.Ok(f, false)
+                    } else ClaimResult.Refused
                 }
             }
         }
-        if (claim == null) {
-            x.respondText(403, MIME_TEXT, "Invalid token or IP address")
-            return
+        val accepted = when (claim) {
+            is ClaimResult.Ok -> claim
+            ClaimResult.Refused -> {
+                x.respondText(403, MIME_TEXT, "Invalid token or IP address")
+                return
+            }
+            ClaimResult.ResumeMismatch -> {
+                x.respondText(409, MIME_TEXT, "Resume base changed — start over")
+                return
+            }
         }
-        val (pf, freshChunks) = claim
+        val pf = accepted.pf
         if (range != null) {
-            uploadChunkRoute(x, sessionId, fileId, pf, range, peerIp, freshChunks)
+            uploadChunkRoute(
+                x, sessionId, fileId, pf, range, peerIp,
+                accepted.freshChunks, accepted.resumedBase,
+            )
             return
         }
-
-        delegate.onUploadStart(sessionId, fileId, pf.file)
-        val md = MessageDigest.getInstance("SHA-256")
-        var bytes: Long = 0
-        var ok = false
 
         // Flit↔Flit resume: append the new body onto an interrupted prefix
         // (or a caller-provided stream straight through — those can't append,
-        // so resume always takes the file path).
+        // so resume always takes the file path). The probe and this attach
+        // share one base function, so the bytes the sender skipped are
+        // exactly the bytes on disk. A resume header whose base we no longer
+        // hold is refused: writing that tail as a fresh file would guarantee
+        // a checksum mismatch and leave a misaligned "prefix" behind (the
+        // walk's 711 MB tail did exactly that).
         val resumeToken = x.header("X-Flit-Resume")?.takeIf { config.resume && it.isNotBlank() }
-        var resumed = false
-        if (resumeToken != null) {
-            val e = parts.peek(resumeToken)
-            // Empty senderIp = a part repopulated from disk by an earlier run
-            // of this server. Safe to accept from any peer: the token binds
-            // content identity (name ∥ size ∥ sha256), so a tail appended
-            // under the same token matches the prefix by construction — and
-            // the final digest gate still rules. The re-put below re-binds
-            // the entry to the live peer's IP.
-            if (e != null && (e.senderIp == peerIp || e.senderIp.isEmpty())) {
-                if (e.path != pf.temp && Files.exists(e.path)) {
-                    Files.createDirectories(pf.temp.parent)
-                    Files.copy(e.path, pf.temp, StandardCopyOption.REPLACE_EXISTING)
-                }
-                resumed = runCatching {
-                    val have = Files.size(pf.temp)
-                    have > 0 && have < pf.file.size
-                }.getOrDefault(false)
-            }
+        val resume = resumeToken?.let { resumableFor(it, pf, peerIp) }
+            ?.takeIf { it.base in 1 until pf.file.size }
+        if (resumeToken != null && resume == null) {
+            forgetTracking(pf)
+            x.respondText(409, MIME_TEXT, "Resume base no longer held")
+            return
         }
+        delegate.onUploadStart(sessionId, fileId, pf.file)
+
+        val md = MessageDigest.getInstance("SHA-256")
+        var bytes: Long = 0
+        var ok = false
+        var resumed = false
+        if (resume != null) {
+            val usable = if (resume.from == pf.temp) true else runCatching {
+                Files.createDirectories(pf.temp.parent)
+                Files.copy(resume.from, pf.temp, StandardCopyOption.REPLACE_EXISTING)
+                true
+            }.getOrDefault(false)
+            if (!usable) {
+                forgetTracking(pf)
+                x.respondText(409, MIME_TEXT, "Resume base no longer held")
+                return
+            }
+            // The base is authoritative: a sparse part may be longer on disk
+            // than its contiguous prefix. Trim before appending, so the fold
+            // and the append meet at the same byte.
+            truncateTo(pf.temp, resume.base)
+            if (resume.from != pf.temp) {
+                runCatching { Files.deleteIfExists(resume.from) }
+                deletePiecesSidecar(resume.from)
+            }
+            resumed = true
+        }
+        // A plain body now owns the whole file: the chunk ledger and its
+        // sparse sidecars are history. This runs after the resume decision,
+        // never before it.
+        forgetTracking(pf)
         if (resumed) {
             // The prefix is already on disk; fold it into the digest so the
             // final hash covers the assembled whole.
@@ -446,12 +505,26 @@ class ServerCore(
         }
         try {
             val rawOut = when {
-                resumed -> Files.newOutputStream(
-                    pf.temp,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.APPEND,
-                )
-                else -> sink?.open ?: Files.newOutputStream(pf.temp)
+                resumed -> {
+                    // A second death during the resume must not lose the
+                    // sidecar either; it is idempotent.
+                    markPartDiscoverable(pf)
+                    Files.newOutputStream(
+                        pf.temp,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.APPEND,
+                    )
+                }
+                else -> sink?.open ?: run {
+                    // Milestone C's process-death case: the receiver can be
+                    // SIGKILLed before any catch block ever runs, so the
+                    // part's discoverability cannot wait for keepPart. The
+                    // sidecar lands BEFORE the first body byte; a restarting
+                    // server then answers the sender's /partial probe and
+                    // the resume appends into this same temp.
+                    markPartDiscoverable(pf)
+                    Files.newOutputStream(pf.temp)
+                }
             }
             rawOut.use { out ->
                 val buf = ByteArray(256 * 1024)
@@ -486,15 +559,22 @@ class ServerCore(
                 }
                 if (resumed) resumeToken?.let { parts.remove(it) }
             } else if (sink == null) {
-                if (resumed) {
-                    // keep the prefix — the sender (or a retry) can extend it
-                    keepPart(resumeToken!!, pf.temp, peerIp)
+                if (bytes < pf.file.size) {
+                    // A short body is a genuine prefix: the sender died (or
+                    // was cut) before shipping the rest, and sequential
+                    // writes mean every byte up to `bytes` is real. Keep it
+                    // for the next resume; the final sha still gates.
+                    keepPart(resumeToken ?: Protocol.resumeToken(pf.file), pf.temp, peerIp)
                 } else {
-                    // A truncated body (sender died) looks exactly like a
-                    // digest mismatch: as bytes they are an honest prefix of
-                    // what was shipped. Keep it; resume + final sha still
-                    // gate acceptance.
-                    keepPart(Protocol.resumeToken(pf.file), pf.temp, peerIp)
+                    // Full length but the digest failed: these bytes are not
+                    // a prefix of anything trustworthy. Keeping them would
+                    // let the next probe advertise a corrupt base, so drop
+                    // the part, its sidecar and its registry entry — the
+                    // sender starts clean.
+                    val t = resumeToken ?: Protocol.resumeToken(pf.file)
+                    runCatching { Files.deleteIfExists(pf.temp) }
+                    runCatching { Files.deleteIfExists(tokenSidecar(pf.temp)) }
+                    parts.remove(t)
                 }
             }
             sink?.done(ok)
@@ -549,6 +629,21 @@ class ServerCore(
         runCatching { Files.writeString(tokenSidecar(temp), token) }
     }
 
+    /**
+     * The part's token sidecar, written before the first body byte of a
+     * plain upload. [keepPart] only runs when a failure is actually caught;
+     * a SIGKILLed receiver (the case milestone C exists for) never gets
+     * there, and without the sidecar the restarted server cannot
+     * re-register the part — the sender's probe answers 404 and the walk
+     * restarts from zero (found on the 2026-11-18 hardware walk).
+     */
+    private fun markPartDiscoverable(pf: PendingFile) {
+        runCatching {
+            Files.createDirectories(pf.temp.parent)
+            Files.writeString(tokenSidecar(pf.temp), Protocol.resumeToken(pf.file))
+        }
+    }
+
     private fun keepPartAfterAbort(
         temp: Path,
         token: String,
@@ -582,6 +677,7 @@ class ServerCore(
         rangeStr: String,
         peerIp: String,
         fresh: Boolean,
+        resumedBase: Long,
     ) {
         val info = pf.file
         val total = info.size
@@ -590,7 +686,10 @@ class ServerCore(
             x.respondText(400, MIME_TEXT, "Bad Content-Range")
             return
         }
-        if (fresh) delegate.onUploadStart(sessionId, fileId, info)
+        if (fresh) {
+            delegate.onUploadStart(sessionId, fileId, info)
+            if (resumedBase > 0) delegate.onResumeStart(sessionId, fileId, info, resumedBase)
+        }
 
         val start = r.first
         val len = r.second - start + 1
@@ -620,13 +719,15 @@ class ServerCore(
                     }
                 }
             }
-            // The body is fully in — the chunk's bytes are confirmable.
-            tracker.add(start, len)
+            // Only bytes that actually landed may count as covered: a short
+            // body (the sender died) must never advance a resume base past
+            // real data. The old unconditional add(len) did exactly that.
+            tracker.add(start, sentInChunk)
             delegate.onUploadProgress(sessionId, fileId, info, minOf(total, tracker.bytesWritten), total)
-            if (tracker.complete()) {
-                finalizeChunk(x, sessionId, fileId, pf, tracker)
-            } else {
-                x.respondStatus(200)
+            when {
+                sentInChunk < len -> x.respondText(400, MIME_TEXT, "Short chunk body")
+                tracker.complete() -> finalizeChunk(x, sessionId, fileId, pf, tracker)
+                else -> x.respondStatus(200)
             }
         } catch (e: CancellationException) {
             // Sender went away mid-chunk. The bytes so far sit at a known
@@ -685,6 +786,7 @@ class ServerCore(
                 Files.createDirectories(pf.target.parent)
                 Files.move(pf.temp, pf.target, StandardCopyOption.REPLACE_EXISTING)
                 parts.remove(Protocol.resumeToken(pf.file))
+                runCatching { Files.deleteIfExists(tokenSidecar(pf.temp)) }
                 runCatching { deletePiecesSidecar(pf.temp) }
                 tracker.clear()
                 pf.tracker = null
@@ -693,12 +795,16 @@ class ServerCore(
                 markSessionEnded(sessionId, cancelled = false)
             } else {
                 // Assembled-but-wrong: the bytes are not salvageable as a
-                // prefix-suffix story. Count it as an attempt and let the
-                // sender's single-stream path redo the file from whatever it
-                // redefines (a fresh plain body truncates everything).
+                // prefix-suffix story. Leaving them would let the next probe
+                // advertise a corrupt base (the walk's 711 MB tail climbed
+                // exactly that way); drop the part, its sidecars and its
+                // registry entry so the sender starts clean.
                 pf.attempts++
                 if (pf.attempts >= MAX_ATTEMPTS) pf.settled = true
-                runCatching { deletePiecesSidecar(pf.temp) }
+                runCatching { Files.deleteIfExists(pf.temp) }
+                runCatching { Files.deleteIfExists(tokenSidecar(pf.temp)) }
+                deletePiecesSidecar(pf.temp)
+                parts.remove(Protocol.resumeToken(pf.file))
                 x.respondStatus(422)
                 delegate.onUploadFinish(sessionId, fileId, pf.file, UploadResult.Mismatch)
                 markSessionEnded(sessionId, cancelled = false)
@@ -734,19 +840,6 @@ class ServerCore(
         runCatching { Files.deleteIfExists(piecesSidecar(temp)) }
     }
 
-    private fun clearPiecesSidecar(temp: Path) {
-        // Sparse history without a live ledger (e.g. from an already-evicted
-        // session): the sidecar base still tells us exactly where real data
-        // ends. Trim to it so a plain resume never extends over a gap.
-        runCatching {
-            val f = piecesSidecar(temp)
-            if (!Files.exists(f)) return
-            val base = Files.readString(f).trim().toLongOrNull() ?: return
-            if (base in 1 until (Files.size(temp) + 1)) truncateTo(temp, base)
-            Files.deleteIfExists(f)
-        }
-    }
-
     /** Shrinks `p` to `len` bytes if it is currently longer. Never grows. */
     private fun truncateTo(p: Path, len: Long) {
         if (len <= 0) {
@@ -762,44 +855,67 @@ class ServerCore(
      * Flit extension: how many bytes of an interrupted file the receiver
      * still holds. Old peers never call this; a 404 just means "start over".
      *
-     * Multi-socket aware: the answer for a sparse ledger is the contiguous
-     * salvage base from zero, NOT the temp's on-disk length (its tail holds
-     * unorderable pieces). Only that base can be fold-resumed single-stream;
-     * the plain claim trims the temp to it.
+     * This and the resume attach below both call [resumableFor]: the sender
+     * skips exactly what this answer advertises, so the two must agree or
+     * the appended tail lands at the wrong offset. Multi-socket aware: the
+     * answer for a sparse ledger is the contiguous salvage base from zero,
+     * never the temp's on-disk length (its tail may hold unorderable pieces).
      */
     private suspend fun partialRoute(x: HttpExchange) {
         val token = x.query("token")
         val ip = x.origin
         if (!token.isNullOrBlank()) {
-            val tracked = mutex.withLock {
-                val s = session ?: return@withLock null
-                if (s.senderIp != ip && ip.isNotEmpty()) return@withLock null
-                s.files.values
-                    .filter { Protocol.resumeToken(it.file) == token && it.tracker != null }
-                    .mapNotNull { it.tracker?.base() }
-                    .firstOrNull()
+            val base = mutex.withLock {
+                val s = session?.takeIf { it.senderIp == ip || ip.isEmpty() }
+                val pf = s?.files?.values?.firstOrNull { Protocol.resumeToken(it.file) == token }
+                pf?.let { resumableFor(token, it, ip)?.base } ?: partsBase(token, ip)?.base
             }
-            if (tracked != null && tracked > 0) {
-                x.respondText(200, MIME_JSON, WireJson.encode(PartialInfo(tracked)))
-                return
-            }
-        }
-        val e = if (token.isNullOrBlank()) null else parts.peek(token)
-        if (e != null && (e.senderIp == ip || e.senderIp.isEmpty())) {
-            // Plain parts serve their byte length. A sparse part from a dead
-            // multi-socket session still carries its `.pieces` sidecar; only
-            // its contiguous base is resumable, so that's what we report.
-            val size = runCatching {
-                val sc = e.path.resolveSibling(e.path.fileName.toString() + ".pieces")
-                val base = runCatching { Files.readString(sc).trim().toLongOrNull() }.getOrNull()
-                if (base != null && base > 0) base else Files.size(e.path)
-            }.getOrDefault(0L)
-            if (size > 0) {
-                x.respondText(200, MIME_JSON, WireJson.encode(PartialInfo(size)))
+            if (base != null && base > 0) {
+                x.respondText(200, MIME_JSON, WireJson.encode(PartialInfo(base)))
                 return
             }
         }
         x.respondText(404, MIME_JSON, "{}")
+    }
+
+    /** Bytes held from zero for a resume, and the part that holds them. */
+    private class Resumable(val base: Long, val from: Path)
+
+    /**
+     * The one answer to "how much of this file can be resumed?" — shared by
+     * the probe and the attach. A live chunk ledger wins; otherwise the
+     * registry part's persisted contiguous base (its `.pieces` sidecar) or,
+     * for a plain part, its byte length.
+     */
+    private fun resumableFor(token: String, pf: PendingFile, peerIp: String): Resumable? {
+        pf.tracker?.base()?.takeIf { it > 0 }?.let { return Resumable(it, pf.temp) }
+        return partsBase(token, peerIp)
+    }
+
+    /** The registry's answer for [token], or null when it isn't ours. */
+    private fun partsBase(token: String, peerIp: String): Resumable? {
+        val e = parts.peek(token) ?: return null
+        // Empty senderIp = a part repopulated from disk by an earlier run of
+        // this server: safe from any peer (the token binds content identity,
+        // and the final digest still gates). The next keepPart re-binds it.
+        if (e.senderIp.isNotEmpty() && e.senderIp != peerIp) return null
+        val base = piecesBase(e.path) ?: runCatching { Files.size(e.path) }.getOrDefault(0L)
+        return if (base > 0) Resumable(base, e.path) else null
+    }
+
+    /** A sparse part's persisted contiguous base, if it has one. */
+    private fun piecesBase(part: Path): Long? {
+        val sc = part.resolveSibling(part.fileName.toString() + ".pieces")
+        return runCatching {
+            if (!Files.exists(sc)) null else Files.readString(sc).trim().toLongOrNull()
+        }.getOrNull()
+    }
+
+    /** The plain body owns the file now: chunk ledger + sparse sidecars go. */
+    private fun forgetTracking(pf: PendingFile) {
+        pf.tracker?.clear()
+        pf.tracker = null
+        deletePiecesSidecar(pf.temp)
     }
 
     /** Ends + notifies once every file is terminal. */
@@ -844,19 +960,33 @@ class ServerCore(
 }
 
 /**
- * `Content-Range: bytes=123-456/678` → (start, lastInclusive, total).
- * Only the concrete form is supported; suffix and unbounded forms are
- * nonsense for a fixed-size file and are rejected.
+ * `Content-Range: bytes 123-456/678` (RFC 7233) or the common
+ * `bytes=123-456/678` → (start, lastInclusive, total). Accepting only the
+ * equals form rejected every turbo chunk the client sent — the lane
+ * silently fell back to single-stream on the 2026-11-18 hardware walk.
+ * Suffix and unbounded forms are nonsense for a fixed-size file.
  */
 internal fun parseContentRange(value: String): Triple<Long, Long, Long>? {
     val head = value.trim()
-    if (!head.startsWith("bytes=", ignoreCase = true)) return null
-    val slash = head.indexOf('/')
-    if (slash <= "bytes=".length) return null
+    if (!head.regionMatches(0, "bytes", 0, 5, ignoreCase = true)) return null
+    var i = 5
+    if (i < head.length && head[i] == '=') {
+        i++
+    } else if (i < head.length && head[i].isWhitespace()) {
+        while (i < head.length && head[i].isWhitespace()) i++
+        if (i < head.length && head[i] == '=') {
+            i++
+            while (i < head.length && head[i].isWhitespace()) i++
+        }
+    } else {
+        return null
+    }
+    val slash = head.indexOf('/', i)
+    if (slash <= i) return null
     val total = head.substring(slash + 1).trim().toLongOrNull() ?: return null
-    val dash = head.indexOf('-')
-    if (dash < "bytes=".length) return null
-    val start = head.substring("bytes=".length, dash).trim().toLongOrNull() ?: return null
+    val dash = head.indexOf('-', i)
+    if (dash <= i || dash > slash) return null
+    val start = head.substring(i, dash).trim().toLongOrNull() ?: return null
     val last = head.substring(dash + 1, slash).trim().toLongOrNull() ?: return null
     if (start < 0 || last < start) return null
     return Triple(start, last, total)

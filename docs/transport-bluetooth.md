@@ -316,19 +316,31 @@ involved. Same discipline as the look rewrite.
   (2 s tick, calm backoff, fingerprint-matched accept) and the death
   contract (a carrier death throws `TransferUnreachable`; a returned report
   means the receiver spoke; the flush drops its row only after a report)
-  are in, sim-proven, rig green (91 tests). The first walk caught a C-era
-  defect on the flush path and the fix landed with it (evidence below);
-  the redo walk — SIGKILL mid-flush → row survives → hunt re-attach →
-  resume hash-exact — is owed on hardware (no device attached at commit
-  time).
-- **B — Wi-Fi Aware fat pipe** (hardware-gated: check `pm has-feature` on the rig
-  before committing; BLE stays discovery, Aware becomes the data road).
-- **E — self-hosted relay**: parked last as agreed; the design is written
-  (end of this file), the pure core has landed (`RelayHello` +
-  `RelayCore`, 11 tests) and the harness surface runs — `flit-cli relay`
-  with 4 end-to-end tests (a real protocol send lands hash-exact through
-  the pairer); the app dialer/subscription workers and the engine
-  surface still wait behind B, opt-in only.
+  are in, sim-proven, rig green. The first walk caught a C-era defect on
+  the flush path; the second walk (2026-11-18) caught a two-layer resume
+  defect — the receiver parsed only `bytes=` while the wire sends RFC
+  `bytes …` (turbo never ran), and a failed chunk claim deleted the kept
+  prefix before the plain attach could use it (711 MB tail written as a
+  fresh part). Both are pinned by `ResumeAndTurboTest` (5 tests: both
+  range syntaxes, restart probe/attach, failed-chunk-then-resume, 409 for
+  a missing base, and a real `multi=true` hash-exact landing). The final
+  redo walk on the fixed build — SIGKILL mid-flush → `recv-resume` from
+  the killed prefix → hash-exact, no tail-only attempt — is owed on
+  hardware (no device attached at this commit).
+- **B — Wi-Fi Aware fat pipe** — **parked, hardware absent**: the agreed
+  gate `adb shell pm has-feature android.software.wifi.aware` answered
+  `false` on the rig phone (2026-11-21). BLE stays discovery; no Aware
+  carrier was built for a device that does not have the feature. This is
+  a hardware limit, not a silent cut.
+- **E — self-hosted relay**: pure core (`RelayHello` + `RelayCore`),
+  `flit-cli relay`, and — as of 2026-11-24 — the full app surface landed:
+  production relay dial/subscribe endpoints in the protocol module, an
+  engine subscription worker riding `ProtocolServer.serve` (the B door),
+  relay-last hunt fallback, relay-aware dispatch, and an opt-in Options
+  field (empty = E invisible). The harness end-to-end test now uses those
+  same production endpoints with TLS inside the blind pipe. Rig green
+  (114 tests). The relay hardware walk (box relay ↔ phone, mid-body relay
+  kill) is owed.
 - Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
   measure-then-act only.
 
@@ -820,6 +832,20 @@ relay, and a mid-body relay kill exercises the throw/keep/resume loop.
 selection or failover, no relay directory/discovery, no per-peer relay
 routing (one relay per device), no auth beyond the optional shared
 token. Each is a later ladder item only if a real use demands it.
+
+**Status (2026-11-24):** the app surface is in. `RelayLinkProvider`
+(the sender's dial: preamble, then TLS inside the pipe) and
+`RelaySubscriber` (the receiver's parked subscription; its socket hook
+lets engine shutdown unblock a blocking read) live in the JVM-pure
+protocol module alongside the core. `LinkProvider.connect` gained an
+optional target hint, threaded through `SendTarget`, `PeerHttpClient`
+and every `ProtocolClient` exchange — direct transports ignore it. The
+engine dials through the relay only for peers whose last answer came
+through one, starts/stops the subscription with the engine, and tries a
+relay register only after every direct hunt candidate has failed. The
+Options field is empty by default, so E stays invisible until a user
+types an address. The harness end-to-end test now runs those production
+endpoints with TLS inside the pipe, hash-exact.
 
 **Status (2026-11-18):** the pure core landed exactly as specified —
 `RelayHello` (the one-line preamble, strict parse, bounded reads) and

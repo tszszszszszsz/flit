@@ -36,6 +36,20 @@ object FlitRoute {
         listOf(2_000L, 5_000L, 15_000L, 30_000L).getOrElse(attempt) { 60_000L }
 
     /**
+     * Milestone E: parse the one typed relay address ("host:port", off when
+     * empty). A malformed value is invisible rather than a crash — E is an
+     * opt-in last resort, never a route the user did not deliberately type.
+     */
+    fun parseRelay(raw: String?): Pair<String, Int>? {
+        val value = raw?.trim().orEmpty()
+        if (value.isEmpty()) return null
+        val host = value.substringBeforeLast(':')
+        val port = value.substringAfterLast(':').toIntOrNull() ?: return null
+        if (host.isEmpty() || port !in 1..65535) return null
+        return host to port
+    }
+
+    /**
      * Whether a probe answer belongs to the fingerprint being hunted. A
      * register answer carries the peer's full identity, so the fingerprint
      * is the whole rule: a reassigned address can never hand the batch to a

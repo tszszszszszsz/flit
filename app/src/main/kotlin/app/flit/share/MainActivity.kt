@@ -355,6 +355,7 @@ class MainActivity : ComponentActivity() {
         var showRenameDialog by remember { mutableStateOf(false) }
         var showThemeDialog by remember { mutableStateOf(false) }
         var showBatteryDialog by remember { mutableStateOf(false) }
+        var showRelayDialog by remember { mutableStateOf(false) }
         var theme by remember { mutableStateOf(prefs().getString("theme", "auto") ?: "auto") }
         var keepOn by remember { mutableStateOf(prefs().getBoolean("keepScreenOn", true)) }
         val transferActive by FlitEngine.transferActive.collectAsState()
@@ -963,6 +964,7 @@ class MainActivity : ComponentActivity() {
                                 showRename = { showRenameDialog = true },
                                 showTheme = { showThemeDialog = true },
                                 showBattery = { showBatteryDialog = true },
+                                showRelay = { showRelayDialog = true },
                                 keepOn = keepOn,
                                 setKeepOn = { v ->
                                     keepOn = v
@@ -1185,6 +1187,52 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        if (showRelayDialog) {
+            var relayAddressText by remember { mutableStateOf(prefs().getString("relayAddress", "") ?: "") }
+            var relayTokenText by remember { mutableStateOf(prefs().getString("relayToken", "") ?: "") }
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
+                    onDismissRequest = { showRelayDialog = false },
+                    title = { Text("Relay (optional)") },
+                    text = {
+                        Column {
+                            Text(
+                                "A relay you run is a last resort for peers direct routes cannot reach. It pairs devices and shuttles bytes only — files, names and identities stay end-to-end. Leave the address empty to turn it off.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            OutlinedTextField(
+                                value = relayAddressText,
+                                onValueChange = { relayAddressText = it.take(256) },
+                                label = { Text("Address (host:port)") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            )
+                            OutlinedTextField(
+                                value = relayTokenText,
+                                onValueChange = { relayTokenText = it.take(128) },
+                                label = { Text("Shared token (optional)") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            showRelayDialog = false
+                            prefs().edit()
+                                .putString("relayAddress", relayAddressText.trim())
+                                .putString("relayToken", relayTokenText.trim())
+                                .apply()
+                            FlitEngine.relayChanged()
+                        }) { Text("Save") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showRelayDialog = false }) { Text("Cancel") }
+                    },
+                )
+            }
+        }
+
         if (showThemeDialog) {
             MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
             AlertDialog(
@@ -1291,6 +1339,7 @@ class MainActivity : ComponentActivity() {
         showRename: () -> Unit,
         showTheme: () -> Unit,
         showBattery: () -> Unit,
+        showRelay: () -> Unit,
         keepOn: Boolean,
         setKeepOn: (Boolean) -> Unit,
         globalTreeSet: Boolean,
@@ -1416,6 +1465,17 @@ class MainActivity : ComponentActivity() {
                     ) { on ->
                         prefs().edit().putBoolean("parallelStreams", on).apply()
                     }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    val relayAddress = prefs().getString("relayAddress", "") ?: ""
+                    OptionRow(
+                        title = "Relay (optional)",
+                        subtitle = if (relayAddress.isBlank()) {
+                            "off — leave empty to never use one; set a host:port you trust to reach peers that cannot answer directly"
+                        } else {
+                            "$relayAddress — tried last, only for files waiting on a peer direct routes cannot find"
+                        },
+                        onClick = showRelay,
+                    )
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     if (Build.VERSION.SDK_INT >= 29) {
                         var showMirrorPicker by remember { mutableStateOf(false) }

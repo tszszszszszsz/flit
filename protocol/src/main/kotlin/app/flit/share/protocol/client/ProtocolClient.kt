@@ -21,7 +21,18 @@ import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.UUID
 
-data class SendTarget(val ip: String, val port: Int, val tls: Boolean) {
+/**
+ * A route to a peer. [relayFor] is milestone E's one extra field: when set,
+ * `host:port` names a self-hosted relay instead of the peer and the hint
+ * names the fingerprint to pair with. Direct routes leave it null and are
+ * byte-for-byte unchanged.
+ */
+data class SendTarget(
+    val ip: String,
+    val port: Int,
+    val tls: Boolean,
+    val relayFor: String? = null,
+) {
     fun baseUrl(): String = "${if (tls) "https" else "http"}://$ip:$port"
 }
 
@@ -58,6 +69,7 @@ class ProtocolClient(
                 json<PeerInfo>(
                     http.exchange(
                         method = "GET", host = target.ip, port = target.port, tls = target.tls,
+                        relayFor = target.relayFor,
                         pathAndQuery = Protocol.PATH_INFO, timeoutMs = timeoutMs,
                     ),
                 )
@@ -82,6 +94,7 @@ class ProtocolClient(
             runCatching {
                 http.exchange(
                     method = "POST", host = target.ip, port = target.port, tls = target.tls,
+                    relayFor = target.relayFor,
                     pathAndQuery = "${Protocol.PATH_CANCEL}?sessionId=${enc(sessionId)}",
                     timeoutMs = 2000,
                 )
@@ -158,10 +171,19 @@ class ProtocolClient(
                         try {
                             // Turbo lane: split large files across concurrent
                             // sockets when the receiver signed up for it.
+                            // Resume-aware: probe first and start the ranges
+                            // at the base the receiver advertises, so a retry
+                            // after a death extends the kept prefix instead
+                            // of re-sending the whole file.
                             var carried = 0L
                             if (multi && chunkBytes > 0 && info.size >= TURBO_MIN_BYTES) {
+                                carried = runCatching {
+                                    queryPartial(target, Protocol.resumeToken(info))
+                                }.getOrNull() ?: 0L
+                                if (carried !in 1 until source.size) carried = 0
                                 val turboErr = turboUpload(
-                                    target, prepared.sessionId, fileId, token, info, source, progress,
+                                    target, prepared.sessionId, fileId, token, info, source,
+                                    from = carried, progress = progress,
                                 )
                                 if (turboErr == null) return@withPermit fileId to null
                                 // Turbo was cut short: whatever covered bytes
@@ -258,6 +280,7 @@ class ProtocolClient(
             val resp: PeerHttpClient.Response? = try {
                 http.exchange(
                     method = "POST", host = target.ip, port = target.port, tls = target.tls,
+                    relayFor = target.relayFor,
                     pathAndQuery = uploadPath,
                     headers = buildMap {
                         put("Content-Type", "application/octet-stream")
@@ -340,12 +363,17 @@ class ProtocolClient(
     }
 
     /**
-     * Multi-socket (Flit↔Flit) upload: split the file into contiguous ranges
-     * and push each on its own connection to the normal upload route with
-     * `Content-Range`. Ranges are disjoint, so the receiver pieces them into
-     * its temp with no coordination on our side. One failed stream cancels
-     * the others and surfaces the failure; the caller falls back to a plain
-     * single-stream resume of the receiver's salvage base.
+     * Multi-socket (Flit↔Flit) upload: split the bytes from [from] to the
+     * end into contiguous ranges and push each on its own connection to the
+     * normal upload route with `Content-Range`. Ranges are disjoint, so the
+     * receiver pieces them into its temp with no coordination on our side.
+     * One failed stream cancels the others and surfaces the failure; the
+     * caller falls back to a plain single-stream resume of the receiver's
+     * salvage base.
+     *
+     * [from] is the receiver's advertised prefix: ranges begin there and
+     * every request declares it in `X-Flit-Base`, so the receiver can seed
+     * its coverage ledger with the same bytes and refuse a disagreeing view.
      *
      * @return null when every stream confirmed its range; an error message
      *   otherwise (sender then continues on the single-stream path).
@@ -357,21 +385,24 @@ class ProtocolClient(
         token: String,
         info: FileInfo,
         source: OutgoingFile,
+        from: Long,
         progress: ((fileName: String, bytesSent: Long, totalBytes: Long) -> Unit)?,
     ): String? {
         val total = source.size
+        if (from < 0 || from >= total) return "multi-stream: nothing to resume"
+        val span = total - from
         val streamCount = minOf(
             TURBO_MAX_STREAMS,
-            maxOf(1, ((total + SPLIT_TARGET_BYTES - 1) / SPLIT_TARGET_BYTES).toInt()),
+            maxOf(1, ((span + SPLIT_TARGET_BYTES - 1) / SPLIT_TARGET_BYTES).toInt()),
         )
-        if (streamCount < 2) return "multi-stream: file not worth splitting"
+        if (streamCount < 2) return "multi-stream: remainder not worth splitting"
         val uploadPath =
             "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}"
         return try {
             coroutineScope {
                 (0 until streamCount).map { i ->
-                    val start = total * i / streamCount
-                    val endExcl = total * (i + 1) / streamCount
+                    val start = from + span * i / streamCount
+                    val endExcl = from + span * (i + 1) / streamCount
                     val len = endExcl - start
                     val last = endExcl - 1
                     async {
@@ -381,11 +412,13 @@ class ProtocolClient(
                             val resp = try {
                                 http.exchange(
                                     method = "POST", host = target.ip, port = target.port, tls = target.tls,
+                                    relayFor = target.relayFor,
                                     pathAndQuery = uploadPath,
                                     headers = buildMap {
                                         put("Content-Type", "application/octet-stream")
                                         // The receiver's coverage ledger reads exactly this.
                                         put("Content-Range", "bytes $start-$last/$total")
+                                        put("X-Flit-Base", from.toString())
                                     },
                                     bodyProvider = {
                                         val st = source.openStream()
@@ -451,6 +484,7 @@ class ProtocolClient(
         return runCatching {
             val resp = http.exchange(
                 method = "GET", host = target.ip, port = target.port, tls = target.tls,
+                relayFor = target.relayFor,
                 pathAndQuery = "${Protocol.PATH_PARTIAL}?token=${enc(contentToken)}",
                 timeoutMs = 2_000,
             )
@@ -466,6 +500,7 @@ class ProtocolClient(
         extraHeaders: Map<String, String> = emptyMap(),
     ) = http.exchange(
         method = "POST", host = target.ip, port = target.port, tls = target.tls,
+        relayFor = target.relayFor,
         pathAndQuery = pathAndQuery,
         headers = buildMap {
             put("Content-Type", "application/json")

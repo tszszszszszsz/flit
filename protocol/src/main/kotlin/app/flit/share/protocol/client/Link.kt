@@ -33,6 +33,15 @@ interface Link : AutoCloseable {
 /** Fresh link per exchange — we always send `Connection: close`. */
 fun interface LinkProvider {
     suspend fun connect(host: String, port: Int, tls: Boolean, timeoutMs: Int): Link
+
+    /**
+     * Milestone E: an optional target hint for transports that need to know
+     * *which peer* a dial is for before any protocol byte is spoken (a relay
+     * pairs by fingerprint). Direct carriers — TCP, Bluetooth, the sim —
+     * ignore it through this default, so their wiring is unchanged.
+     */
+    suspend fun connect(host: String, port: Int, tls: Boolean, timeoutMs: Int, relayFor: String?) =
+        connect(host, port, tls, timeoutMs)
 }
 
 /**
@@ -64,7 +73,7 @@ class TcpLinkProvider(identity: TlsIdentity) : LinkProvider {
     }
 }
 
-private class SocketLink(private val socket: Socket) : Link {
+internal class SocketLink(private val socket: Socket) : Link {
     override val input: InputStream get() = socket.getInputStream()
     override val output: OutputStream get() = socket.getOutputStream()
 
