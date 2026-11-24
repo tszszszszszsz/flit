@@ -15,6 +15,9 @@ That contract was deliberately revised on 2026-11-24: an explicit opt-in
 - [QR-only mode, known devices and panic](qr-only-and-panic.md) —
   the free-will base: QR v2 pairing, per-device route policy, signed alerts,
   and the safety rule that nothing ever auto-acts on a recipient's device.
+- [Circle — accountless group coordination](circle.md) — **design only**:
+  QR-founded groups with an encrypted local event log, file drops and
+  re-votable polls; threat model, scope cuts and test story.
 - [Milestone C — process-death checkpoints](milestone-c.md) —
   queue rows before bytes, receiver sidecars, and the hardware walk.
 - [Milestone D — album mirror](milestone-d.md) —
