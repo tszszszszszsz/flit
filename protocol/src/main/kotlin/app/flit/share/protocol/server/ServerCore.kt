@@ -2,12 +2,17 @@ package app.flit.share.protocol.server
 
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.model.FileInfo
+import app.flit.share.protocol.model.PanicAlert
 import app.flit.share.protocol.model.PartialInfo
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.model.PrepareUploadResponse
 import app.flit.share.protocol.model.WireJson
+import app.flit.share.protocol.panic.PanicCore
 import app.flit.share.protocol.tls.TlsIdentity
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.util.Base64
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -49,6 +54,16 @@ interface ServerDelegate {
     fun onUploadProgress(sessionId: String, fileId: String, file: FileInfo, bytes: Long, totalBytes: Long) {}
     fun onUploadFinish(sessionId: String, fileId: String, file: FileInfo, result: UploadResult) {}
     fun onSessionEnd(sessionId: String, cancelled: Boolean) {}
+
+    /**
+     * Flit-only panic alert, delivered only after the signature, replay
+     * window, dedup and hop checks pass. Default no-op keeps every existing
+     * delegate (harnesses included) source-compatible.
+     *
+     * Receiving this NEVER acts on this device — the app decides what a
+     * human sees, and any forwarding is an explicit user action.
+     */
+    fun onPanic(alert: PanicAlert, ip: String) {}
 }
 
 data class ServerConfig(
@@ -239,6 +254,7 @@ class ServerCore(
             x.method == "POST" && x.path == Protocol.PATH_UPLOAD -> uploadRoute(x)
             x.method == "POST" && x.path == Protocol.PATH_CANCEL -> cancelRoute(x)
             x.method == "GET" && x.path == Protocol.PATH_PARTIAL -> partialRoute(x)
+            x.method == "POST" && x.path == Protocol.PATH_PANIC -> panicRoute(x)
             else -> x.respondStatus(404)
         }
     }
@@ -849,6 +865,51 @@ class ServerCore(
         runCatching {
             java.io.RandomAccessFile(p.toFile(), "rw").use { if (it.length() > len) it.setLength(len) }
         }
+    }
+
+    /**
+     * Flit-only panic route. The sender's self-signed cert travels in a
+     * header and is pinned under its own SHA-256 DER: a claimed senderFp is
+     * trusted only if the cert's real fingerprint matches it and the
+     * signature verifies over the canonical bytes. Bad wire → 400; bad
+     * identity → 403; anything valid (including a duplicate/stale relay)
+     * gets a quiet 200 so senders never retry a delivered alert forever.
+     */
+    private suspend fun panicRoute(x: HttpExchange) {
+        val raw = x.readBodyText()
+        val alert = runCatching { WireJson.decode<PanicAlert>(raw) }.getOrNull()
+        if (alert == null || alert.id.isBlank() || alert.senderFp.isBlank() ||
+            alert.sig.isBlank() || alert.hops < 0
+        ) {
+            x.respondText(400, MIME_TEXT, "Invalid panic alert")
+            return
+        }
+
+        val encodedCert = x.header(Protocol.HEADER_PANIC_CERT)?.trim()
+        if (encodedCert.isNullOrBlank()) {
+            x.respondText(403, MIME_TEXT, "Missing sender certificate")
+            return
+        }
+        val der = runCatching { Base64.getDecoder().decode(encodedCert) }.getOrNull()
+        val cert = der?.let {
+            runCatching {
+                CertificateFactory.getInstance("X.509").generateCertificate(it.inputStream()) as X509Certificate
+            }.getOrNull()
+        }
+        if (cert == null) {
+            x.respondText(403, MIME_TEXT, "Malformed sender certificate")
+            return
+        }
+        val pinnedFp = TlsIdentity.pin(cert)
+        if (!pinnedFp.equals(alert.senderFp.trim(), ignoreCase = true) || !PanicCore.verify(alert)) {
+            x.respondText(403, MIME_TEXT, "Forged panic alert")
+            return
+        }
+
+        if (PanicCore.accept(alert) == PanicCore.Decision.Accept) {
+            delegate.onPanic(alert, x.origin)
+        }
+        x.respondStatus(200)
     }
 
     /**

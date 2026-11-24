@@ -22,7 +22,9 @@ import app.flit.share.protocol.relay.RelayLinkProvider
 import app.flit.share.protocol.relay.RelaySubscriber
 import app.flit.share.protocol.server.IncomingSink
 import app.flit.share.protocol.model.FileInfo
+import app.flit.share.protocol.model.PanicAlert
 import app.flit.share.protocol.model.PeerInfo
+import app.flit.share.protocol.panic.PanicCore
 import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.server.PrepareDecision
 import app.flit.share.protocol.server.ProtocolServer
@@ -270,6 +272,104 @@ val share: StateFlow<ShareIntake?> = _share
     val transfer: StateFlow<TransferTelemetry?> = _transfer
     internal fun pushTelemetry(t: TransferTelemetry?) { _transfer.value = t }
 
+    /** QR-paired devices: the social graph lives on this device, not in a directory. */
+    private val _knownDevices = MutableStateFlow<List<FlitKnown.Device>>(emptyList())
+    val knownDevices: StateFlow<List<FlitKnown.Device>> = _knownDevices
+
+    /** Panic alerts are notifications only — recipients decide what to do. */
+    data class PanicEvent(
+        val id: String,
+        val senderFp: String,
+        val alias: String?,
+        val text: String,
+        val atMs: Long,
+        val hops: Int,
+    )
+
+    private val _panicEvents = MutableStateFlow<List<PanicEvent>>(emptyList())
+    val panicEvents: StateFlow<List<PanicEvent>> = _panicEvents
+
+    /** Incoming alert: signed, from a QR-known device, deduped, never auto-acting. */
+    internal fun onPanicReceived(alert: PanicAlert, ip: String) {
+        if (!PanicCore.verify(alert) || !knownFingerprint(alert.senderFp)) {
+            logLine("panic: ignored unverified or QR-unknown sender ${alert.senderFp.take(12)}")
+            return
+        }
+        if (_panicEvents.value.any { it.id == alert.id }) return
+        val who = _knownDevices.value.firstOrNull { it.fingerprint.equals(alert.senderFp, true) }
+        val event = PanicEvent(
+            id = alert.id, senderFp = alert.senderFp,
+            alias = who?.alias?.ifBlank { null } ?: who?.label?.ifBlank { null },
+            text = alert.text, atMs = alert.sentMs, hops = alert.hops,
+        )
+        _panicEvents.value = (listOf(event) + _panicEvents.value).take(20)
+        logLine("panic: ${alert.senderFp.take(12)} — ${alert.text.take(80)}")
+        FlitProgress.panic(appCtx, event)
+    }
+
+    fun acknowledgePanic(id: String) {
+        _panicEvents.value = _panicEvents.value.filterNot { it.id == id }
+        logLine("panic acknowledged")
+    }
+
+    fun dismissPanic(id: String) {
+        _panicEvents.value = _panicEvents.value.filterNot { it.id == id }
+    }
+
+    /** Explicit forward only: a new signed alert with a hop count, never a remote action. */
+    fun forwardPanic(id: String) {
+        val e = _panicEvents.value.firstOrNull { it.id == id } ?: return
+        val idf = identity ?: return
+        val note = "↻ ${e.senderFp.take(12)}: ${e.text}".take(240)
+        val out = PanicCore.create(idf.fingerprint, note, idf, e.hops + 1)
+        scope.launch(Dispatchers.IO) { fanOutPanic(out) }
+        dismissPanic(id)
+    }
+
+    /** Fan out to QR-known devices over each device's allowed carrier. */
+    fun sendPanic(text: String) {
+        val idf = identity ?: run { toast("sharing is not ready yet"); return }
+        val alert = PanicCore.create(idf.fingerprint, text.trim().take(240), idf)
+        scope.launch(Dispatchers.IO) { fanOutPanic(alert) }
+        logLine("panic: alert sent to ${_knownDevices.value.size} known device(s)")
+    }
+
+    private suspend fun fanOutPanic(alert: PanicAlert) {
+        val self = server?.selfInfo() ?: return
+        for (d in _knownDevices.value) {
+            val policy = d.routePolicy
+            var sent = false
+            if (policy != FlitKnown.RoutePolicy.WIFI_ONLY && !d.mac.isNullOrBlank() && btClient != null) {
+                sent = runCatching {
+                    btClient!!.sendPanic(SendTarget(d.mac, 0, tls = true), alert)
+                }.isSuccess
+            }
+            if (!sent && policy != FlitKnown.RoutePolicy.BLUETOOTH_ONLY && !d.relay.isNullOrBlank()) {
+                val host = d.relay.substringBeforeLast(':')
+                val port = d.relay.substringAfterLast(':').toIntOrNull()
+                if (port != null && port in 1..65535) {
+                    val cfg = relayConfig()
+                    if (cfg != null) {
+                        val target = SendTarget(
+                            cfg.host, cfg.port, tls = true,
+                            relayFor = d.fingerprint,
+                        )
+                        sent = runCatching { client?.sendPanic(target, alert) }.isSuccess
+                    }
+                }
+            }
+            if (!sent && policy != FlitKnown.RoutePolicy.BLUETOOTH_ONLY && policy != FlitKnown.RoutePolicy.RELAY_ONLY) {
+                val r = runCatching { FlitRoster.routeFor(d.fingerprint) }.getOrNull()
+                if (r != null && !r.isBluetooth && r.port in 1..65535) {
+                    sent = runCatching {
+                        client?.sendPanic(SendTarget(r.host, r.port, r.tls), alert)
+                    }.isSuccess
+                }
+            }
+            if (!sent) logLine("panic: no live route to ${d.alias.ifBlank { d.fingerprint.take(12) }}")
+        }
+    }
+
     /** The last successfully-served peer (fingerprint, alias) for "send again". */
     fun lastPeer(): Pair<String, String>? {
         val fp = prefs().getString("lastPeerFp", null) ?: return null
@@ -352,7 +452,17 @@ val share: StateFlow<ShareIntake?> = _share
             FlitEngine.touchPeer(ip, info)
         }
 
+        override fun onPanic(alert: PanicAlert, ip: String) {
+            FlitEngine.onPanicReceived(alert, ip)
+        }
+
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
+            // QR-only is a carrier gate, not just a discoverability setting:
+            // a device that never entered the graph by QR never gets a send.
+            if (qrOnly() && !knownFingerprint(request.info.fingerprint)) {
+                logLine("declined QR-unknown device ${request.info.alias} (${request.info.fingerprint.take(12)})")
+                return PrepareDecision.Decline
+            }
             // Trust gate (Options): an untrusted offer is declined outright —
             // the sender's UI shows it the way people expect a refusal to
             // show. Only the sender's fingerprint decides, never its IP.
@@ -654,10 +764,10 @@ val share: StateFlow<ShareIntake?> = _share
                         logLine("register to $ip:$port: ${e.message ?: e.javaClass.simpleName}")
                     }
                 },
-                // Hidden mode: stay off other devices' rosters entirely.
-                announce = !prefs().getBoolean("hiddenMode", false),
+                // Hidden or QR-only: stay off other devices' rosters entirely.
+                announce = !qrOnly() && !prefs().getBoolean("hiddenMode", false),
             )
-            disc.create()
+            if (!qrOnly()) disc.create()
 
             val cm = appCtx.getSystemService(android.net.ConnectivityManager::class.java)
             val wifiNet = wifiNetwork(cm)
@@ -671,7 +781,7 @@ val share: StateFlow<ShareIntake?> = _share
                 else -> logLine("no Wi\u2011Fi network; using default network")
             }
 
-            disc.start()
+            if (!qrOnly()) disc.start() else logLine("qr-only: no ambient discovery")
 
             // Direct-peer radio: dormant while the roster is Wi-Fi's (the
             // flipper decides from real facts each tick); the radio itself is
@@ -712,10 +822,16 @@ val share: StateFlow<ShareIntake?> = _share
                 logLine("hidden mode: not announcing — others find this device by address, or when you send first")
             }
 
+            refreshKnown()
             startPruner(seq)
-            startManualProber(seq)
-            startBleFlipper(seq)
-            startSweeper(seq)
+            if (!qrOnly()) {
+                startManualProber(seq)
+                startBleFlipper(seq)
+                startSweeper(seq)
+            } else {
+                runCatching { radio.stopAll() }
+                bleAdvertised = false
+            }
             startHunter(seq)
             startMirrorWatcher(seq)
             _lastPeer.value = lastPeerEntry()
@@ -1598,6 +1714,57 @@ val share: StateFlow<ShareIntake?> = _share
      * ethernet on the sort order), the real serving port, our fingerprint
      * for the trust badge.
      */
+    private fun refreshKnown() {
+        if (::appCtx.isInitialized) _knownDevices.value = FlitKnown.all(appCtx)
+    }
+
+    internal fun knownFingerprint(fp: String): Boolean =
+        _knownDevices.value.any { it.fingerprint.equals(fp, ignoreCase = true) }
+
+    /** QR-only: no ambient announce, no scan, no sweep — QR-paired devices only. */
+    fun qrOnly(): Boolean = if (::appCtx.isInitialized) FlitKnown.qrOnly(appCtx) else false
+
+    fun setQrOnly(on: Boolean) {
+        if (!::appCtx.isInitialized) return
+        prefs().edit().putBoolean("qrOnly", on).apply()
+        FlitKnown.setQrOnly(appCtx, on)
+        refreshKnown()
+        if (_state.value.running || _state.value.starting) {
+            stop()
+            start(appCtx)
+        }
+    }
+
+    fun forgetKnown(fp: String) {
+        if (!::appCtx.isInitialized) return
+        FlitKnown.forget(appCtx, fp)
+        refreshKnown()
+        FlitRoster.forgetRoute(fp)
+        logLine("known device forgotten: ${fp.take(12)}")
+    }
+
+    fun setKnownAlias(fp: String, alias: String) {
+        if (!::appCtx.isInitialized) return
+        val d = FlitKnown.all(appCtx).firstOrNull { it.fingerprint == fp } ?: return
+        FlitKnown.put(appCtx, d.copy(alias = alias.trim().ifBlank { d.alias }))
+        refreshKnown()
+    }
+
+    fun setRoutePolicy(fp: String, policy: FlitKnown.RoutePolicy) {
+        if (!::appCtx.isInitialized) return
+        val d = FlitKnown.all(appCtx).firstOrNull { it.fingerprint == fp } ?: return
+        FlitKnown.put(appCtx, d.copy(routePolicy = policy))
+        refreshKnown()
+        logLine("route for ${d.alias.ifBlank { fp.take(12) }}: ${policy.name}")
+    }
+
+    fun setRelayFor(fp: String, on: Boolean) {
+        if (!::appCtx.isInitialized) return
+        val d = FlitKnown.all(appCtx).firstOrNull { it.fingerprint == fp } ?: return
+        FlitKnown.put(appCtx, d.copy(relayFor = on))
+        refreshKnown()
+    }
+
     fun selfQrCode(): String? = selfQrAdd()?.uri()
 
     /**
@@ -1608,13 +1775,29 @@ val share: StateFlow<ShareIntake?> = _share
      */
     fun selfQrAdd(): QrAdd? {
         if (identity == null) return null
-        val ip = pickAnnounceAddress() ?: return null
+        val ip = pickAnnounceAddress()
+        if (ip == null) {
+            // A relay-only code is still a usable pairing when local Wi-Fi is
+            // down or deliberately dark (QR-only mode, jamming).
+            val relay = relayConfig() ?: return null
+            return QrAdd(
+                ip = "", port = 0, tls = true,
+                fingerprint = identity?.fingerprint ?: "",
+                alias = currentAlias(),
+                mac = bluetoothAddress(),
+                relay = "${relay.host}:${relay.port}",
+                token = relay.token,
+            )
+        }
         return QrAdd(
             ip = ip,
             port = server?.port ?: Protocol.DEFAULT_PORT,
             tls = true,
             fingerprint = identity?.fingerprint ?: "",
             alias = currentAlias(),
+            mac = bluetoothAddress(),
+            relay = relayConfig()?.let { "${it.host}:${it.port}" },
+            token = relayConfig()?.token,
         )
     }
 
@@ -1630,6 +1813,11 @@ val share: StateFlow<ShareIntake?> = _share
         return cands.firstOrNull()?.host
     }
 
+    /** Our Bluetooth controller address, when the platform still tells us. */
+    private fun bluetoothAddress(): String? =
+        runCatching { android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.address }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+
     /**
      * Entry from the QR scanner / paste field. A scanned pairing code is
      * human-eyeball verified: the address is inserted like any manual peer,
@@ -1643,6 +1831,36 @@ val share: StateFlow<ShareIntake?> = _share
         if (code == null) {
             logLine("scan: not a Flit pairing code")
             toast("that does not look like a Flit code")
+            return
+        }
+        addFromScan(code)
+    }
+
+    /** A scanned QR is the only way a device enters the known-devices graph. */
+    fun addFromScan(code: QrAdd) {
+        val fp = code.fingerprint.trim().uppercase()
+        if (fp.isBlank()) {
+            logLine("scan: code carries no fingerprint — not a pairing")
+            toast("that code has no device identity")
+            return
+        }
+        val known = FlitKnown.Device(
+            fingerprint = fp,
+            alias = code.alias.trim(),
+            mac = code.mac?.trim()?.ifBlank { null },
+            relay = code.relay?.trim()?.ifBlank { null },
+            token = code.token?.trim()?.ifBlank { null },
+            scannedMs = System.currentTimeMillis(),
+        )
+        // Relay-only / MAC-only codes have no address to probe: the QR itself
+        // is the human-eyeball verification, so the fingerprint pins directly.
+        if (code.ip.isBlank()) {
+            if (!::appCtx.isInitialized) return
+            FlitKnown.put(appCtx, known)
+            refreshKnown()
+            FlitRoster.pin(fp, known.alias)
+            logLine("scan: known ${fp.take(12)} via ${if (known.relay != null) "relay" else "bluetooth"} (QR verified)")
+            toast("device added from code")
             return
         }
         val cli = client ?: run { logLine("not sharing \u2014 start sharing first"); return }
@@ -1670,6 +1888,13 @@ val share: StateFlow<ShareIntake?> = _share
             if (code.fingerprint.isNotBlank()) {
                 FlitRoster.pin(real.fingerprint, real.alias)
                 FlitRoster.markScanned(real.fingerprint)
+                if (::appCtx.isInitialized) {
+                    FlitKnown.put(
+                        appCtx,
+                        known.copy(fingerprint = real.fingerprint, alias = real.alias),
+                    )
+                    refreshKnown()
+                }
                 logLine("scan: pinned ${real.alias} (code verified)")
             }
         }
@@ -1900,15 +2125,20 @@ val share: StateFlow<ShareIntake?> = _share
             // relay is dialed there. `host:port` names the relay; the hint
             // names the peer, so the blind pairer can match a subscription.
             val relay = relayRouteFor[peer.info.fingerprint]
+            val policy = if (::appCtx.isInitialized) {
+                FlitKnown.policy(appCtx, peer.info.fingerprint)
+            } else FlitKnown.RoutePolicy.AUTO
             val dialer: ProtocolClient
             val target = when {
-                peer.kind == FlitRoute.Kind.BLUETOOTH -> {
+                policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY ||
+                    (peer.kind == FlitRoute.Kind.BLUETOOTH && policy != FlitKnown.RoutePolicy.WIFI_ONLY) -> {
                     dialer = btClient ?: throw IOException("Bluetooth link is off")
                     SendTarget(peer.ip, 0, tls = true)
                 }
-                relay != null -> {
+                relay != null || policy == FlitKnown.RoutePolicy.RELAY_ONLY -> {
                     dialer = cli
-                    SendTarget(relay.host, relay.port, tls = true, relayFor = peer.info.fingerprint)
+                    val r = relay ?: relayConfig() ?: throw IOException("relay is not configured")
+                    SendTarget(r.host, r.port, tls = true, relayFor = peer.info.fingerprint)
                 }
                 else -> {
                     dialer = cli

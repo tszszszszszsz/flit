@@ -125,7 +125,10 @@ fun QrShowCard(onClose: () -> Unit) {
             Spacer(Modifier.height(18.dp))
             Text(self?.alias ?: "", style = MaterialTheme.typography.titleLarge)
             Text(
-                "${self?.ip ?: "?"}:${self?.port ?: "?"}",
+                self?.let { code ->
+                    if (code.ip.isNotBlank()) "${code.ip}:${code.port}"
+                    else code.relay ?: "?"
+                } ?: "?",
                 style = MaterialTheme.typography.bodyLarge,
                 fontFamily = FontFamily.Monospace,
                 color = cs.onSurface.copy(alpha = 0.7f),
@@ -191,7 +194,7 @@ fun QrScanCard(onCode: (String) -> Unit, onClose: () -> Unit) {
                     value = manual,
                     onValueChange = { manual = it },
                     singleLine = true,
-                    placeholder = { Text("flit://add?v=1&…") },
+                    placeholder = { Text("flit://add?v=2&…") },
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                 )
                 Row(

@@ -130,6 +130,7 @@ class ProtocolServer(
                 post(Protocol.PATH_UPLOAD) { core.handle(KtorExchange(call)) }
                 post(Protocol.PATH_CANCEL) { core.handle(KtorExchange(call)) }
                 get(Protocol.PATH_PARTIAL) { core.handle(KtorExchange(call)) }
+                post(Protocol.PATH_PANIC) { core.handle(KtorExchange(call)) }
             }
         }
 

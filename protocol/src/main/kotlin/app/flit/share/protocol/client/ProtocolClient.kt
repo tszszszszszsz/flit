@@ -2,11 +2,13 @@ package app.flit.share.protocol.client
 
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.model.FileInfo
+import app.flit.share.protocol.model.PanicAlert
 import app.flit.share.protocol.model.PartialInfo
 import app.flit.share.protocol.model.PeerInfo
 import app.flit.share.protocol.model.PrepareUploadRequest
 import app.flit.share.protocol.model.PrepareUploadResponse
 import app.flit.share.protocol.model.WireJson
+import app.flit.share.protocol.panic.PanicCore
 import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -19,6 +21,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.URLEncoder
 import java.security.MessageDigest
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLongArray
 
@@ -89,6 +92,35 @@ class ProtocolClient(
                 ),
             )
         }
+
+    /**
+     * Flit-only panic route. A blank [PanicAlert.sig] is signed here with our
+     * identity; an already-signed alert is forwarded as-is. The sender cert
+     * rides in a header and is fingerprint-pinned by the receiver, so the
+     * same relay-aware [target] (including [SendTarget.relayFor]) works over
+     * TCP, Bluetooth or a relay without touching any v2.2 route.
+     *
+     * @return true only when the receiver answered 200 after verifying it.
+     */
+    suspend fun sendPanic(
+        target: SendTarget,
+        alert: PanicAlert,
+        timeoutMs: Long = 5_000,
+    ): Boolean {
+        TlsIdentity.pin(identity.certificate)
+        val signed = if (alert.sig.isBlank()) {
+            alert.copy(sig = identity.signPanic(PanicCore.canonical(alert)))
+        } else alert
+        val certDer = Base64.getEncoder().encodeToString(identity.certificate.encoded)
+        val response = postJson(
+            target,
+            Protocol.PATH_PANIC,
+            WireJson.encode(signed),
+            timeoutMs,
+            extraHeaders = mapOf(Protocol.HEADER_PANIC_CERT to certDer),
+        )
+        return response.status == 200
+    }
 
     suspend fun cancelTransfer(target: SendTarget, sessionId: String) {
         withTimeoutOrNull(2000) {

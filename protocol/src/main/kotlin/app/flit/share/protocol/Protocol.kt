@@ -35,6 +35,17 @@ object Protocol {
     const val FLIT_ROOT: String = "/api/flit/v1"
     const val PATH_PARTIAL: String = "$FLIT_ROOT/partial"
 
+    /** Flit-only panic route: never registered under the v2.2 API root. */
+    const val PATH_PANIC: String = "$FLIT_ROOT/panic"
+
+    /**
+     * Base64 DER of the sender's self-signed cert. The receiver pins it under
+     * the SHA-256 of its DER (the same value as the announced fingerprint)
+     * before trusting the signature, so the QR-paired fingerprint is the
+     * anchor — not the TLS transport.
+     */
+    const val HEADER_PANIC_CERT: String = "X-Flit-Panic-Cert"
+
     /**
      * Identity of a resumable file across sessions: name + size + content
      * hash. Nobody ever uploads against a token they didn't first offer to

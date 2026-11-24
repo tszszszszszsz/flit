@@ -13,40 +13,67 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 
 /**
- * Flit's pairing code, v1.
+ * Flit's pairing code.
  *
  * A device shows a QR of this URI on its "My code" screen; the other phone
- * scans it, `parseAddCode` reads the payload, and `addManualPeer` gets an
- * address that is guaranteed typed correctly. The fingerprint rides along
+ * scans it, `parseAddCode` reads the payload, and `addFromScan` gets a code
+ * that is guaranteed typed correctly. The fingerprint rides along
  * out-of-band: the scanner marks the peer's code `scanned` (a "✓ code"
  * badge in the peer card) and pins it — the receiver trust gate (Options
  * "only trusted") is satisfied by human-eyeball verification.
+ *
+ * v1 carries only the address. v2 adds optional carrier hints — a Bluetooth
+ * [mac], a [relay] ("host:port") and its [token] — and can be relay-only: a
+ * code with no local address still tells the scanner how to reach its peer.
+ * [v] is kept on the wire so a v1 code re-encodes byte-for-byte unchanged.
  *
  * The scheme is deliberately ours (`flit://`): LocalSend peers never emit
  * it and Flit never emits anything resembling theirs.
  */
 data class QrAdd(
-    val ip: String,
-    val port: Int,
+    val ip: String = "",
+    val port: Int = 0,
     val tls: Boolean = true,
     val fingerprint: String = "",
     val alias: String = "",
+    /** Bluetooth carrier address, v2 only. */
+    val mac: String? = null,
+    /** Relay "host:port", v2 only; may be the code's only route. */
+    val relay: String? = null,
+    /** Optional relay credential, v2 only. */
+    val token: String? = null,
+    val v: Int = 2,
 ) {
     fun uri(): String = buildString {
-        append("flit://add?v=1")
-        append("&ip=").append(URLEncoder.encode(ip, Charsets.UTF_8.name()))
-        append("&port=").append(port)
-        if (tls) append("&tls=1")
+        append("flit://add?v=").append(v)
+        if (ip.isNotBlank()) {
+            append("&ip=").append(URLEncoder.encode(ip, Charsets.UTF_8.name()))
+            append("&port=").append(port)
+        } else if (port > 0) {
+            // Relay-only codes have no ip; keep an explicitly given port.
+            append("&port=").append(port)
+        }
+        // v1 wrote tls only when true — keep that literal shape for deployed
+        // codes. v2 writes it always so tls=false survives a roundtrip.
+        if (v >= 2) append("&tls=").append(if (tls) '1' else '0')
+        else if (tls) append("&tls=1")
         if (fingerprint.isNotBlank()) append("&fp=").append(fingerprint.uppercase())
         if (alias.isNotBlank()) append("&alias=").append(URLEncoder.encode(alias, Charsets.UTF_8.name()))
+        if (!mac.isNullOrBlank()) append("&mac=").append(URLEncoder.encode(mac, Charsets.UTF_8.name()))
+        if (!relay.isNullOrBlank()) append("&relay=").append(URLEncoder.encode(relay, Charsets.UTF_8.name()))
+        if (!token.isNullOrBlank()) append("&token=").append(URLEncoder.encode(token, Charsets.UTF_8.name()))
     }
 }
 
 /**
  * Tolerant parser for what lands in the scanner / paste field. Accepts
- * `flit://add?...` codes of any parameter order. Anything else is not a
- * pairing: `null` (plain `ip:port` strings belong to the Add dialog's
- * address path, which is pre-existing behavior).
+ * `flit://add?...` codes of any parameter order, v1 and v2 alike. Anything
+ * else is not a pairing: `null` (plain `ip:port` strings belong to the Add
+ * dialog's address path, which is pre-existing behavior).
+ *
+ * v1 must carry ip + a valid port, exactly as before. v2 may drop both when
+ * it carries a well-formed relay; a port is only range-checked when an ip
+ * is present. v1 codes ignore the v2-only hints.
  */
 fun parseAddCode(text: String): QrAdd? {
     val t = text.trim()
@@ -63,16 +90,25 @@ fun parseAddCode(text: String): QrAdd? {
         }.getOrDefault("")
         if (k.isNotEmpty()) params[k] = v
     }
-    if ((params["v"] ?: "1").toIntOrNull() != 1) return null
-    val ip = params["ip"]?.trim() ?: return null
-    if (ip.isEmpty()) return null
-    val port = (params["port"] ?: params["p"])?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+    val version = (params["v"] ?: "1").toIntOrNull() ?: return null
+    if (version !in 1..2) return null
+    val ip = params["ip"]?.trim().orEmpty()
+    val port = (params["port"] ?: params["p"])?.toIntOrNull() ?: 0
+    if (version == 1 && (ip.isEmpty() || port !in 1..65535)) return null
+    val relay = if (version == 2) params["relay"]?.trim()?.ifBlank { null } else null
+    if (relay != null && FlitRoute.parseRelay(relay) == null) return null
+    if (version == 2 && ip.isEmpty() && relay == null) return null
+    if (version == 2 && ip.isNotEmpty() && port !in 1..65535) return null
     return QrAdd(
         ip = ip,
         port = port,
         tls = (params["tls"] ?: "1") != "0",
         fingerprint = (params["fp"] ?: params["f"] ?: "").trim().uppercase().ifBlank { "" },
         alias = (params["alias"] ?: params["a"] ?: "").trim(),
+        mac = if (version == 2) params["mac"]?.trim()?.ifBlank { null } else null,
+        relay = relay,
+        token = if (version == 2) params["token"]?.trim()?.ifBlank { null } else null,
+        v = version,
     )
 }
 

@@ -54,7 +54,7 @@ internal class ParsedArgs(argv: Array<String>) {
     fun has(k: String): Boolean = flags.containsKey(k)
 
     companion object {
-        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout", "--relay")
+        val VALUE_FLAGS = setOf("--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin", "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout", "--relay", "--text")
     }
 }
 
@@ -97,6 +97,7 @@ fun main(argv: Array<String>) {
             "info" -> kotlinx.coroutines.runBlocking { info(args) }
             "bt-sim" -> kotlinx.coroutines.runBlocking { btSim(args) }
             "relay" -> relay(args)
+            "panic" -> kotlinx.coroutines.runBlocking { panicCmd(args) }
             "parse-qr" -> parseQr(args)
             else -> usage()
         }
@@ -118,6 +119,7 @@ send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
 bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
+panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
 """
     )
@@ -162,6 +164,20 @@ private fun parseQr(args: ParsedArgs) {
     }
 }
 
+/** Send a signed panic alert from the CLI (used to walk the recipient banner). */
+private suspend fun panicCmd(args: ParsedArgs) {
+    val raw = args.positional.drop(1).firstOrNull() ?: run { println("!! panic needs ip[:port]"); return }
+    val host = raw.substringBeforeLast(':')
+    val port = raw.substringAfterLast(':').toIntOrNull() ?: Protocol.DEFAULT_PORT
+    val identity = loadOrCreateIdentity()
+    val text = args.opt("--text") ?: "check in when you can"
+    val alert = app.flit.share.protocol.panic.PanicCore.create(identity.fingerprint, text, identity)
+    ProtocolClient(identity).use { cli ->
+        val ok = cli.sendPanic(SendTarget(host, port, tls = true), alert)
+        println("${ts()} panic to $host:$port ${if (ok) "sent" else "refused"}")
+    }
+}
+
 // ==== shared "console delegate" receiving protocol callbacks ==================
 
 /** Registers collect into `seen` (dedup by fingerprint, both UDP announce + HTTP register). */
@@ -178,6 +194,10 @@ internal class ConsoleDelegate : ServerDelegate {
         if (seen.containsKey(info.fingerprint)) return
         seen[info.fingerprint] = (ip.hostAddress ?: "?") to info
         println("${ts()} seen ${info.alias} (multi from $ip) type=${info.deviceType ?: "?"} proto=${info.protocol} port=${info.port} v=${info.version}")
+    }
+
+    override fun onPanic(alert: app.flit.share.protocol.model.PanicAlert, ip: String) {
+        println("${ts()} panic from ${alert.senderFp.take(12)} ($ip): ${alert.text} [hops=${alert.hops}]")
     }
 
     override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {

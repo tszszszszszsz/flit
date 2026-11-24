@@ -6,6 +6,8 @@ import androidx.core.app.NotificationCompat
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 
+private const val PANIC_ID = 91
+
 /**
  * Transfer progress, rendered as live notifications (one per direction+session).
  * Tracks its own per-file ledger so parallel/multi-file transfers aggregate
@@ -22,8 +24,24 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
     private var title = ""
 
     /** Counts FlitProgress instances across ALL sessions; zero ⇒ telemetry idle. */
-    private companion object {
+    companion object {
         val activeSessions = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /** A panic alert is informational: no auto-action on the recipient's device. */
+        fun panic(ctx: Context, e: FlitEngine.PanicEvent) {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(
+                PANIC_ID,
+                NotificationCompat.Builder(ctx, CHANNEL_TRANSFERS)
+                    .setSmallIcon(android.R.drawable.stat_notify_error)
+                    .setContentTitle("Panic alert · ${e.alias ?: e.senderFp.take(12)}")
+                    .setContentText(e.text.ifBlank { "check in when you can" })
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(e.text))
+                    .setContentIntent(FlitEngine.openAppIntent())
+                    .setAutoCancel(true)
+                    .build(),
+            )
+        }
     }
 
     private var kind: Kind? = null

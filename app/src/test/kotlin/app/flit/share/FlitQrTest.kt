@@ -42,7 +42,7 @@ class FlitQrTest {
         assertNull(parseAddCode(""))
         assertNull(parseAddCode("192.168.1.42:53317"))      // address path, not a code
         assertNull(parseAddCode("flit://add"))               // no query
-        assertNull(parseAddCode("flit://add?v=2&ip=1.2.3.4&port=1")) // unknown version
+        assertNull(parseAddCode("flit://add?v=3&ip=1.2.3.4&port=1")) // unknown version
         assertNull(parseAddCode("flit://add?ip=&port=53317"))  // empty ip
         assertNull(parseAddCode("flit://add?ip=x&port=0"))     // port out of range
         assertNull(parseAddCode("flit://add?ip=x&port=99999"))
@@ -75,6 +75,75 @@ class FlitQrTest {
     fun `tls=0 is honored`() {
         val zeroed = "flit://add?v=1&ip=192.168.1.42&port=53317&tls=0&fp=ABC"
         assertEquals(false, parseAddCode(zeroed)?.tls)
+    }
+
+    @Test
+    fun `v2 roundtrip carries mac relay and token`() {
+        val v2 = QrAdd(
+            ip = "192.168.100.80",
+            port = 53317,
+            fingerprint = "B68ABD124F40",
+            alias = "Bridge",
+            mac = "AA:BB:CC:DD:EE:FF",
+            relay = "relay.example.org:443",
+            token = "long-shared-secret",
+        )
+        val uri = v2.uri()
+        assertTrue(uri.startsWith("flit://add?v=2&ip=192.168.100.80&port=53317&"))
+        assertTrue("mac must be url-encoded: $uri".let { uri.contains("mac=AA%3ABB%3ACC") })
+        assertEquals(v2, parseAddCode(uri))
+        assertEquals(2, parseAddCode(uri)?.v)
+    }
+
+    @Test
+    fun `relay-only v2 code needs no ip or port`() {
+        val relayOnly = QrAdd(
+            fingerprint = "B68ABD124F40",
+            alias = "Relay peer",
+            relay = "relay.example.org:443",
+            token = "secret",
+        )
+        val uri = relayOnly.uri()
+        assertTrue("no ip on relay-only codes: $uri".let { !uri.contains("&ip=") })
+        assertEquals(relayOnly, parseAddCode(uri))
+        assertEquals("relay.example.org:443", parseAddCode(uri)?.relay)
+        // A legacy-style port (or none at all) is tolerated when there is no ip.
+        assertEquals(
+            "relay.example.org:443",
+            parseAddCode("flit://add?v=2&port=53317&relay=relay.example.org:443")?.relay,
+        )
+    }
+
+    @Test
+    fun `v2 tls=false survives a roundtrip`() {
+        val off = QrAdd(ip = "10.0.0.7", port = 53317, tls = false)
+        val uri = off.uri()
+        assertTrue(uri.contains("&tls=0"))
+        assertEquals(off, parseAddCode(uri))
+    }
+
+    @Test
+    fun `malformed v2 is refused`() {
+        assertNull(parseAddCode("flit://add?v=2"))                       // no route at all
+        assertNull(parseAddCode("flit://add?v=2&ip=1.2.3.4&port=0"))     // ip needs a valid port
+        assertNull(parseAddCode("flit://add?v=2&ip=1.2.3.4&port=99999"))
+        assertNull(parseAddCode("flit://add?v=2&relay=host"))             // relay needs host:port
+        assertNull(parseAddCode("flit://add?v=2&relay=host:0"))
+        assertNull(parseAddCode("flit://add?v=2&relay=host:70000"))
+        assertNull(parseAddCode("flit://add?v=2&ip=1.2.3.4&port=1&relay=host:port"))
+        assertNull(parseAddCode("flit://add?v=nope&relay=host:443"))
+    }
+
+    @Test
+    fun `v2 payload still decodes off a rendered code`() {
+        val v2 = QrAdd(
+            ip = "192.168.100.80", port = 53317, fingerprint = "B68ABD124F40",
+            alias = "Bridge", mac = "AA:BB:CC:DD:EE:FF",
+            relay = "relay.example.org:443", token = "long-shared-secret",
+        )
+        val uri = v2.uri()
+        val size = 200
+        assertEquals(uri, Qr.decodeGray(Qr.gray(Qr.encode(uri, size)), size, size))
     }
 
     @Test

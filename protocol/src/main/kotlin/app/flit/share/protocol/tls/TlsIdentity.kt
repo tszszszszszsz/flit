@@ -20,10 +20,12 @@ import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.Principal
 import java.security.PrivateKey
-import java.security.SecureRandom
+import java.security.Signature
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.util.Base64
 import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.KeyManager
 import javax.net.ssl.KeyManagerFactory
@@ -49,12 +51,23 @@ class TlsIdentity private constructor(
 ) {
     val certificate: X509Certificate get() = keyStore.getCertificate(alias) as X509Certificate
 
-    /** Uppercase-hex SHA-256 of the certificate, announded as `fingerprint` on the wire. */
-    val fingerprint: String by lazy {
-        MessageDigest.getInstance("SHA-256")
-            .digest(certificate.encoded)
-            .joinToString("") { "%02X".format(it) }
+    /** A fresh handle each time: the store owns the key, never a cached array. */
+    private val privateKey: PrivateKey get() = keyStore.getKey(alias, secretChars()) as PrivateKey
+
+    /** Uppercase-hex SHA-256 of the certificate, announced as `fingerprint` on the wire. */
+    val fingerprint: String by lazy { certificateFingerprint(certificate) }
+
+    /** Signs caller-supplied canonical bytes with this device's private key. */
+    fun signPanic(canonical: ByteArray): String {
+        val signer = Signature.getInstance(signatureAlgorithm(privateKey.algorithm))
+        signer.initSign(privateKey)
+        signer.update(canonical)
+        return Base64.getEncoder().encodeToString(signer.sign())
     }
+
+    /** Instance form of the fingerprint-pinned signature check (see companion). */
+    fun verifyPanic(senderFp: String, canonical: ByteArray, sig: String): Boolean =
+        verifyPanicSignature(senderFp, canonical, sig)
 
     /** Fresh mutable copy per call — consumers may zero it after use. */
     fun secretChars(): CharArray = secret.toCharArray()
@@ -138,6 +151,34 @@ class TlsIdentity private constructor(
         const val DEFAULT_ALIAS = "flit-device"
         const val DEFAULT_PASSWORD = "flit"
 
+        /**
+         * Certificates trusted for panic signatures, keyed by the SHA-256 of
+         * their DER — the very same value announced as a device fingerprint.
+         * Pinning by the certificate's OWN digest (never a caller-supplied
+         * label) is what makes a claimed senderFp unforgeable: an attacker's
+         * cert lands under the attacker's fingerprint, not the victim's.
+         */
+        private val panicPins = ConcurrentHashMap<String, X509Certificate>()
+
+        /** Pins [cert] under its own fingerprint; returns that fingerprint. */
+        fun pin(cert: X509Certificate): String {
+            val fp = certificateFingerprint(cert)
+            panicPins[fp] = cert
+            return fp
+        }
+
+        fun pinned(fingerprint: String): X509Certificate? = panicPins[fingerprint.trim().uppercase()]
+
+        fun forgetPin(fingerprint: String) {
+            panicPins.remove(fingerprint.trim().uppercase())
+        }
+
+        fun fingerprintOf(cert: X509Certificate): String = certificateFingerprint(cert)
+
+        /** Static form of the pinned signature check, usable by PanicCore.verify. */
+        fun verifyPanic(senderFp: String, canonical: ByteArray, sig: String): Boolean =
+            verifyPanicSignature(senderFp, canonical, sig)
+
         fun generate(alias: String = DEFAULT_ALIAS): TlsIdentity {
             val password = DEFAULT_PASSWORD.toCharArray()
             val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
@@ -190,6 +231,31 @@ class TlsIdentity private constructor(
             }
             return TlsIdentity(alias, ks, DEFAULT_PASSWORD)
         }
+    }
+}
+
+/** Uppercase-hex SHA-256 of a certificate's DER encoding — the wire fingerprint. */
+private fun certificateFingerprint(cert: X509Certificate): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(cert.encoded)
+        .joinToString("") { "%02X".format(it) }
+
+/** RSA identities are what generate() mints; loaded EC keys stay usable too. */
+private fun signatureAlgorithm(keyAlgorithm: String): String =
+    if (keyAlgorithm.equals("EC", ignoreCase = true)) "SHA256withECDSA" else "SHA256withRSA"
+
+/** Shared by the instance and companion verifyPanic entry points. */
+private fun verifyPanicSignature(senderFp: String, canonical: ByteArray, sig: String): Boolean {
+    val fp = senderFp.trim().uppercase()
+    val cert = TlsIdentity.pinned(fp) ?: return false
+    if (TlsIdentity.fingerprintOf(cert) != fp) return false
+    return try {
+        val verifier = Signature.getInstance(signatureAlgorithm(cert.publicKey.algorithm))
+        verifier.initVerify(cert.publicKey)
+        verifier.update(canonical)
+        verifier.verify(Base64.getDecoder().decode(sig.trim()))
+    } catch (_: Exception) {
+        false // malformed base64, wrong algorithm, or plain forgery
     }
 }
 

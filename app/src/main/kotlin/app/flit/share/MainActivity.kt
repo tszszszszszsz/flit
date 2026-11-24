@@ -346,11 +346,15 @@ class MainActivity : ComponentActivity() {
         val queue by FlitEngine.queue.collectAsState()
         val lastPeer by FlitEngine.lastPeerFlow.collectAsState()
         val transfer by FlitEngine.transfer.collectAsState()
+        val knownDevices by FlitEngine.knownDevices.collectAsState()
+        val panicEvents by FlitEngine.panicEvents.collectAsState()
         var screen by remember { mutableStateOf(Screen.Home) }
         var showAddDialog by remember { mutableStateOf(false) }
         var showNoteDialog by remember { mutableStateOf(false) }
         var showQrDialog by remember { mutableStateOf(false) }
         var showScanDialog by remember { mutableStateOf(false) }
+        var showKnownDialog by remember { mutableStateOf(false) }
+        var showPanicDialog by remember { mutableStateOf(false) }
         var peerMenuFor by remember { mutableStateOf<FlitEngine.PeerEntry?>(null) }
         var showRenameDialog by remember { mutableStateOf(false) }
         var showThemeDialog by remember { mutableStateOf(false) }
@@ -644,6 +648,15 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
 
+                                    // ---- panic alerts -----------------------------------------
+                                    // Received alerts only show here. Nothing is acted on
+                                    // automatically: every action below is a deliberate tap.
+                                    AnimatedVisibility(visible = panicEvents.isNotEmpty()) {
+                                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            for (event in panicEvents) PanicBanner(event)
+                                        }
+                                    }
+
                                     // ---- staged share banner -----------------------------------
                                     share?.let { s ->
                                         val n = s.files.size + s.uris.size
@@ -835,6 +848,13 @@ class MainActivity : ComponentActivity() {
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             )
                                         }
+                                        Spacer(Modifier.width(8.dp))
+                                        OutlinedButton(
+                                            onClick = { showPanicDialog = true },
+                                            shape = CircleShape,
+                                            contentPadding = PaddingValues(horizontal = 14.dp),
+                                            modifier = Modifier.height(36.dp),
+                                        ) { Text("Panic", style = MaterialTheme.typography.labelLarge) }
                                     }
                                     if (peers.isEmpty()) {
                                         Surface(
@@ -962,6 +982,8 @@ class MainActivity : ComponentActivity() {
                                 theme = theme,
                                 onTheme = { theme = it },
                                 showRename = { showRenameDialog = true },
+                                onShowKnown = { showKnownDialog = true },
+                                knownCount = knownDevices.size,
                                 showTheme = { showThemeDialog = true },
                                 showBattery = { showBatteryDialog = true },
                                 showRelay = { showRelayDialog = true },
@@ -1108,6 +1130,46 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(onClick = { showAddDialog = false }) { Text("Cancel") }
                 },
             )
+            }
+        }
+
+        if (showKnownDialog) {
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                KnownDevicesSheet(devices = knownDevices, onClose = { showKnownDialog = false })
+            }
+        }
+
+        if (showPanicDialog) {
+            var note by remember { mutableStateOf("") }
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                AlertDialog(
+                    onDismissRequest = { showPanicDialog = false },
+                    title = { Text("Panic alert") },
+                    text = {
+                        Column {
+                            Text(
+                                "Sends a short alert to your known devices. Nothing happens to this device automatically — recipients decide what to do; no files open and no settings change.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            OutlinedTextField(
+                                value = note,
+                                onValueChange = { note = it.take(280) },
+                                label = { Text("Note (optional)") },
+                                minLines = 2,
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            showPanicDialog = false
+                            FlitEngine.sendPanic(note)
+                        }) { Text("Send alert") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showPanicDialog = false }) { Text("Cancel") }
+                    },
+                )
             }
         }
 
@@ -1337,6 +1399,8 @@ class MainActivity : ComponentActivity() {
         theme: String,
         onTheme: (String) -> Unit,
         showRename: () -> Unit,
+        onShowKnown: () -> Unit,
+        knownCount: Int,
         showTheme: () -> Unit,
         showBattery: () -> Unit,
         showRelay: () -> Unit,
@@ -1374,6 +1438,16 @@ class MainActivity : ComponentActivity() {
                     )
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     OptionRow(
+                        title = "Known devices",
+                        subtitle = if (knownCount == 0) {
+                            "no paired devices yet — add one by QR code"
+                        } else {
+                            "$knownCount paired — choose how each one is reached"
+                        },
+                        onClick = onShowKnown,
+                    )
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    OptionRow(
                         title = "Theme",
                         subtitle = when (theme) {
                             "dark" -> "dark"
@@ -1406,6 +1480,12 @@ class MainActivity : ComponentActivity() {
                             }, 700)
                         }
                     }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    SwitchOption(
+                        title = "QR-only mode",
+                        subtitle = "only QR-paired devices can connect — no announcing or scanning",
+                        initial = FlitEngine.qrOnly(),
+                    ) { on -> FlitEngine.setQrOnly(on) }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     Row(
                         modifier = Modifier
@@ -1738,6 +1818,190 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.width(12.dp))
             Switch(checked = on, onCheckedChange = { v -> on = v; onChange(v) })
         }
+    }
+
+    /** One incoming alert. Every action is an explicit tap — no auto-response. */
+    @Composable
+    private fun PanicBanner(event: FlitEngine.PanicEvent) {
+        val cs = MaterialTheme.colorScheme
+        val from = event.alias?.takeIf { it.isNotBlank() } ?: event.senderFp.take(12)
+        Surface(
+            shape = RoundedCornerShape(FlitCorner.large),
+            color = cs.errorContainer,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "Panic alert from $from · ${ts(event.atMs)}",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = cs.onErrorContainer,
+                )
+                if (event.text.isNotBlank()) {
+                    Text(
+                        event.text.take(280),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onErrorContainer,
+                    )
+                }
+                Text(
+                    "Nothing happens to this device automatically. Forward sends the alert to your known devices only when you tap it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onErrorContainer.copy(alpha = 0.8f),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = { FlitEngine.acknowledgePanic(event.id) }) {
+                        Text("Acknowledge", style = MaterialTheme.typography.labelLarge)
+                    }
+                    TextButton(onClick = { FlitEngine.dismissPanic(event.id) }) {
+                        Text("Dismiss", style = MaterialTheme.typography.labelLarge)
+                    }
+                    TextButton(onClick = { FlitEngine.forwardPanic(event.id) }) {
+                        Text("Forward", style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+            }
+        }
+    }
+
+    /** QR-paired devices and the route chosen for each one. */
+    @Composable
+    private fun KnownDevicesSheet(
+        devices: List<FlitKnown.Device>,
+        onClose: () -> Unit,
+    ) {
+        var policyFor by remember { mutableStateOf<String?>(null) }
+        AlertDialog(
+            onDismissRequest = onClose,
+            title = { Text("Known devices") },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    if (devices.isEmpty()) {
+                        Text(
+                            "No known devices yet — add one by QR code.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    for (device in devices) {
+                        val fp = device.fingerprint
+                        Surface(
+                            shape = RoundedCornerShape(FlitCorner.medium),
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            device.alias.ifBlank { fp.take(12) },
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                        )
+                                        Text(
+                                            "fp ${fp.take(12)}…",
+                                            style = MaterialTheme.typography.bodySmall
+                                                .copy(fontFamily = FontFamily.Monospace),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    TextButton(onClick = { FlitEngine.forgetKnown(fp) }) {
+                                        Text("Forget", style = MaterialTheme.typography.labelLarge)
+                                    }
+                                }
+                                OptionRow(
+                                    title = "Route",
+                                    subtitle = routeLabel(device.routePolicy),
+                                    onClick = { policyFor = fp },
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Relay for this device", style = MaterialTheme.typography.bodyLarge)
+                                        Text(
+                                            "use a relay as a last resort for this device",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    Spacer(Modifier.width(12.dp))
+                                    Switch(
+                                        checked = device.relayFor,
+                                        onCheckedChange = { on -> FlitEngine.setRelayFor(fp, on) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { Button(onClick = onClose) { Text("Done") } },
+        )
+        policyFor?.let { fp ->
+            val current = devices.firstOrNull { it.fingerprint == fp }?.routePolicy
+                ?: FlitKnown.RoutePolicy.AUTO
+            AlertDialog(
+                onDismissRequest = { policyFor = null },
+                title = { Text("Route to device") },
+                text = {
+                    Column {
+                        for (policy in FlitKnown.RoutePolicy.values()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .selectable(
+                                        selected = policy == current,
+                                        role = Role.RadioButton,
+                                        onClick = {
+                                            FlitEngine.setRoutePolicy(fp, policy)
+                                            policyFor = null
+                                        },
+                                    )
+                                    .padding(vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(selected = policy == current, onClick = null)
+                                Spacer(Modifier.width(12.dp))
+                                Text(
+                                    routeLabel(policy),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = if (policy == current) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    },
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    TextButton(onClick = { policyFor = null }) { Text("Cancel") }
+                },
+            )
+        }
+    }
+
+    private fun routeLabel(policy: FlitKnown.RoutePolicy): String = when (policy) {
+        FlitKnown.RoutePolicy.AUTO -> "automatic"
+        FlitKnown.RoutePolicy.WIFI_ONLY -> "Wi‑Fi only"
+        FlitKnown.RoutePolicy.BLUETOOTH_ONLY -> "Bluetooth only"
+        FlitKnown.RoutePolicy.RELAY_ONLY -> "relay only"
     }
 
     @Composable
