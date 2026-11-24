@@ -151,3 +151,10 @@ log line in this walk even though the event landed locally and the harness
 two-node test proves fan-out. Inbound sync, join, leave and the governance
 logic are device-evidenced; that one direction is test-evidenced only and is
 listed rather than hidden.
+
+**Tap-to-join (later the same day):** `flit://add?v=3&…&circle=…&invite=…`
+now opens the app via a `VIEW` intent filter, starts sharing and joins the
+Circle without pasting. Device evidence: `invite link parsed=true`,
+`circle sync armed for 4 member(s)`, and a feed showing the box's poll with
+changeable votes and two bot messages. Invite text/HTML were also pushed to
+the phone's Downloads for manual opening.

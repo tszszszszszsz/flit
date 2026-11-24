@@ -132,6 +132,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.lifecycleScope
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -293,6 +294,30 @@ class MainActivity : ComponentActivity() {
                 FlitEngine.handleShareIntent(intent, referrerHost = referrer?.host)
                 // The engine may not be running yet; share flows auto-start silently.
                 if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
+            }
+            Intent.ACTION_VIEW -> {
+                val link = intent.data?.toString() ?: return
+                val code = parseAddCode(link)
+                android.util.Log.i("FlitSend", "invite link parsed=${code != null} circle=${code?.circle} invite=${code?.invite?.take(8)}")
+                if (code == null) {
+                    FlitEngine.toast("that is not a Flit invite")
+                    return
+                }
+                if (code.circle.isNullOrBlank() || code.invite.isNullOrBlank()) {
+                    FlitEngine.addFromScan(code)
+                    return
+                }
+                // A Circle invite needs a live dialer; start sharing first,
+                // then join as soon as the engine reports its identity.
+                if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
+                lifecycleScope.launch {
+                    var waited = 0
+                    while (!FlitEngine.state.value.running && waited < 100) {
+                        delay(200)
+                        waited++
+                    }
+                    FlitEngine.joinCircle(code)
+                }
             }
         }
     }

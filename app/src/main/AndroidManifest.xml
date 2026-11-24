@@ -69,6 +69,13 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="*/*" />
             </intent-filter>
+            <!-- flit:// pair and Circle-invite links: tap a saved invite, no pasting. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="flit" android:host="add" />
+            </intent-filter>
             <!-- Direct-share targets: pinned peers appear inside the system sheet. -->
             <meta-data
                 android:name="android.app.shortcuts"
