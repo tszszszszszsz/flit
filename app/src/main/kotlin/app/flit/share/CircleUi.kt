@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -47,6 +48,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -161,7 +163,20 @@ fun CircleScreen(
         HorizontalDivider(color = cs.outlineVariant)
 
         // ---- chronological feed: mine to the end, theirs to the start ----
+        val feedState = rememberLazyListState()
+        LaunchedEffect(events.size, events.lastOrNull()?.id) {
+            val last = events.lastOrNull() ?: return@LaunchedEffect
+            val nearBottom = feedState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
+                ?.let { it >= events.lastIndex - 2 } == true
+            // Always follow our own send; follow others only when the reader
+            // is already at the bottom, so scrolling back through history
+            // is never yanked away by an incoming message.
+            if (last.authorFp == meFp || nearBottom) {
+                feedState.animateScrollToItem(events.lastIndex)
+            }
+        }
         LazyColumn(
+            state = feedState,
             modifier = Modifier.weight(1f),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
