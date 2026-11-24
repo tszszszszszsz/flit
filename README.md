@@ -25,13 +25,15 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
 
 - **No Wi‑Fi network? The roster keeps working.** The engine flips Bluetooth LE
   discovery on at the exact no-AP moment (mobile data only, dead access point) and the
-  same v2.2 exchange rides the Bluetooth pipe; peers arrive in the same list. The surface
-  never learns the radio exists — the only prompts are the OS's own dialogs, each asked
-  once per device, at the moment they matter. Direct transport is exercised end to end in
-  the harness (`bt-sim`) against the production server and client, and the arbiter's
-  no-AP / hotspot / radio-off states are walked on hardware (see
-  `docs/transport-bluetooth.md`); a two-phone transfer over the radio remains the listed
-  pending item there.
+  same v2.2 exchange rides the Bluetooth pipe; peers arrive in the same list. The radio
+  stays silent until the user opts in with **Transfer over Bluetooth**; the only prompts
+  are the OS's own dialogs, each asked once per device. Direct transport is exercised end
+  to end in the harness (`bt-sim`) against the production server and client, and the
+  arbiter's no-AP / hotspot / radio-off states are walked on hardware. Design, walks and
+  limitations live in [the ladder and design index](docs/transport-bluetooth.md),
+  [the Bluetooth carrier](docs/bluetooth-carrier.md) and
+  [QR-only / panic](docs/qr-only-and-panic.md); a two-phone radio transfer remains the
+  listed pending item.
 - Share-sheet send: streams are spooled into app cache the moment the intent lands, so grants can
   never expire and every shared file can queue for later (`Send later` row; auto-dispatches when
   the peer reappears). The queue's promise is kept: a second intake joins the waiting batch
