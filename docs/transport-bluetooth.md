@@ -30,9 +30,14 @@ a mid-transfer drop reconnects and continues, transport-independent.
 1. **Zero new strings on the happy path.** The roster row, transfer strip, snackbars:
    unchanged. If the engine ever must explain itself, it borrows the existing voice
    ("no Wi‑Fi between us — trying the direct way"), never the word Bluetooth.
-2. **Zero new settings.** No "enable Bluetooth transfers" checkbox, ever. Power on the
-   radio is a *contextual* system ask: on the first no-AP start with the radio off,
-   one system prompt / one sheet, once per device. After that, silence.
+2. **Zero new settings — deliberately revised 2026-11-24.** The original contract had
+   no Bluetooth setting at all; the user explicitly asked for an option to transfer
+   over Bluetooth, so Options now carries **Transfer over Bluetooth** (off by
+   default, inert when left off). The rest of the rule holds: power-on stays a
+   contextual system ask, once per device, in the system's own voice. Turning the
+   option on opens an RFCOMM listener (connectable BLE advertising) and lets the
+   hunter dial a peer's Bluetooth address. Wi-Fi still wins whenever it answers:
+   Bluetooth is a fallback carrier, not a faster one.
 3. **Permissions are contextual too.** BLUETOOTH_SCAN + BLUETOOTH_CONNECT (API 31+;
    the Redmi test device is API 36, dynamic color stock, so this is the primary path)
    are requested at the precise moment a no-AP transfer needs them, with a one-line
@@ -204,9 +209,28 @@ remaining visible to multicast and manual address.
   protocol client — discovering the phone and delivering a file (`from-box.bin`) that
   landed in `Downloads/Flit/` with ledger row "_received_ from Flit-sender". Reference
   CLI, our engine, real radio.
-- **Still parked, still listed**: the two-phone *Bluetooth* end-to-end — today's box
-  contacts prove the protocol and queue on the Wi-Fi carrier; the BLE carrier's full
-  phone-to-phone transfer needs an actual second phone with the app.
+- **Bluetooth data carrier landed (2026-11-24)**: BLE was discovery-only until
+  now. `FlitBluetooth` adds the real RFCOMM dialer and accept loop on the
+  existing `Link`/`LinkProvider` + `LinkServer` + `TlsLink` seams: TLS and the
+  whole v2.2 protocol run inside the socket, so trust, resume and the death
+  contract are unchanged. BLE advertising becomes connectable only while the
+  carrier is on. A new **Transfer over Bluetooth** option (off by default)
+  binds it; the hunter carries a route `kind` (TCP/Bluetooth) so a MAC never
+  gets dialed as an IP. On-device smoke: toggling the option restarted the
+  engine and logged `bluetooth link: listening for direct transfers` with no
+  crash. **Not verified:** a real phone-to-phone RFCOMM transfer — there is no
+  second phone, and the bench box has no Bluetooth adapter (`bluetoothctl
+  list` is empty), so the real socket path cannot be exercised here. Listed,
+  not hidden.
+- **Speed, measured 2026-11-24**: a 512 MiB file from the reference CLI to the
+  phone completed in 15.9 s both single-stream and multi-socket — **32.1 MiB/s
+  (~270 Mbps)**. The ceiling is this Wi-Fi link and the phone's storage, not
+  Flit's framing; turbo is resume-aware but cannot outrun the radio. Bluetooth
+  is a reachability fallback, never a speed upgrade. The in-app readout was
+  fixed in the same pass: `FlitSpeed` samples independently of the 350 ms
+  notification paint, and multi-socket progress is summed across streams
+  instead of four absolute offsets overwriting one ledger slot — the old
+  "KB/s then gigabits then done" spike is pinned by `FlitSpeedTest`.
 - **Rescue sweep on hardware (2026-11-14, milestone 1)**: fresh release install
   (0.2.0 + sweep; the rig's release key proved stable across rebuilds — one earlier
   debug-signed device build needed a single uninstall before the signed update took,

@@ -11,9 +11,23 @@ import kotlinx.serialization.Serializable
  */
 object FlitRoute {
 
+    /** The carrier a route rides. TCP is the default so old prefs stay valid. */
+    @Serializable
+    enum class Kind { TCP, BLUETOOTH }
+
     /** One way a peer was reachable: a host, a serving port, a scheme. */
     @Serializable
-    data class Route(val host: String, val port: Int, val tls: Boolean)
+    data class Route(
+        val host: String,
+        val port: Int,
+        val tls: Boolean,
+        val kind: Kind = Kind.TCP,
+    ) {
+        val isBluetooth: Boolean get() = kind == Kind.BLUETOOTH
+    }
+
+    /** Bluetooth route keys are MACs, not IPs; their port is always zero. */
+    fun bluetooth(host: String) = Route(host, 0, tls = true, kind = Kind.BLUETOOTH)
 
     /**
      * Candidates for an owed fingerprint, in priority order: the live row's

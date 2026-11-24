@@ -42,6 +42,7 @@ internal class FlitBleRadio(
 
     private var advertising = false
     private var advertised: ByteArray? = null
+    private var advertisedConnectable = false
     private var scanning = false
     private var scanningDump = false
     private val seenDump = HashMap<String, String>()
@@ -54,10 +55,17 @@ internal class FlitBleRadio(
     fun radioOn(): Boolean = runCatching { adapter()?.isEnabled == true }.getOrDefault(false)
 
     /** Applies a stance; returns true when the radio state actually changed. */
-    fun apply(stance: FlitBle.Stance, alias: String, fingerprint: String, dump: Boolean): Boolean {
+    fun apply(
+        stance: FlitBle.Stance,
+        alias: String,
+        fingerprint: String,
+        dump: Boolean,
+        /** RFCOMM needs connectable advertising; discovery-only stays non-connectable. */
+        connectable: Boolean = false,
+    ): Boolean {
         val advBefore = advertising
         val scanBefore = scanning
-        if (stance.advertise) startAdvertising(alias, fingerprint) else stopAdvertising()
+        if (stance.advertise) startAdvertising(alias, fingerprint, connectable) else stopAdvertising()
         if (stance.scan) startScan(dump) else stopScan()
         return advBefore != advertising || scanBefore != scanning
     }
@@ -70,11 +78,11 @@ internal class FlitBleRadio(
 
     // ---- advertising -------------------------------------------------------
 
-    private fun startAdvertising(alias: String, fingerprint: String) {
+    private fun startAdvertising(alias: String, fingerprint: String, connectable: Boolean = false) {
         val adv = advertiser() ?: return
         val extended = extendedSupported()
         val payload = FlitBle.buildPayload(alias, fingerprint, legacy = !extended) ?: return
-        if (advertising && advertised?.contentEquals(payload) == true) return
+        if (advertising && advertisedConnectable == connectable && advertised?.contentEquals(payload) == true) return
         stopAdvertising() // rebuild the record from a clean slate (e.g. rename)
         val data = AdvertiseData.Builder()
             .addServiceData(ParcelUuid(FlitBle.SERVICE_UUID), payload)
@@ -83,7 +91,7 @@ internal class FlitBleRadio(
         if (extended) {
             val params = AdvertisingSetParameters.Builder()
                 .setLegacyMode(false)
-                .setConnectable(false)
+                .setConnectable(connectable)
                 .setScannable(false)
                 .setIncludeTxPower(false)
                 .setInterval(AdvertisingSetParameters.INTERVAL_MEDIUM)
@@ -95,7 +103,7 @@ internal class FlitBleRadio(
         } else {
             val settings = AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-                .setConnectable(false)
+                .setConnectable(connectable)
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
                 .build()
             runCatching { adv.startAdvertising(settings, data, legacyCallback) }
@@ -103,6 +111,7 @@ internal class FlitBleRadio(
         }
         advertising = true
         advertised = payload
+        advertisedConnectable = connectable
     }
 
     /**
@@ -120,6 +129,7 @@ internal class FlitBleRadio(
         runCatching { adv?.stopAdvertising(legacyCallback) }
         advertising = false
         advertised = null
+        advertisedConnectable = false
     }
 
     private val legacyCallback = object : AdvertiseCallback() {

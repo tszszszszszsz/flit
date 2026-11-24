@@ -96,6 +96,7 @@ object FlitEngine {
         val ip: String,
         val info: PeerInfo,
         val lastSeenMs: Long,
+        val kind: FlitRoute.Kind = FlitRoute.Kind.TCP,
     ) {
         // Trust wins over the wire: a locally pinned/renamed alias shadows
         // whatever the announce carries; a device we know nothing about still
@@ -307,6 +308,9 @@ val share: StateFlow<ShareIntake?> = _share
     private var identity: TlsIdentity? = null
     private var server: ProtocolServer? = null
     private var client: ProtocolClient? = null
+    /** Bluetooth data carrier, built only when the option is on. */
+    private var btClient: ProtocolClient? = null
+    private var btServerSocket: android.bluetooth.BluetoothServerSocket? = null
 
     // Milestone E (opt-in, off by default): the subscription worker and the
     // per-peer mark that the last fingerprint-matched answer came through a
@@ -482,6 +486,15 @@ val share: StateFlow<ShareIntake?> = _share
         // Applies on the next start; the UI hints about toggling sharing to renew.
     }
 
+    /** Options changed the Bluetooth link: rebind the carrier now. */
+    fun bluetoothChanged() {
+        if (!::appCtx.isInitialized) return
+        if (_state.value.running || _state.value.starting) {
+            stop()
+            start(appCtx)
+        }
+    }
+
     /** Options changed E's address or token: rebind now (empty = invisible). */
     fun relayChanged() {
         if (!::appCtx.isInitialized) return
@@ -514,6 +527,10 @@ val share: StateFlow<ShareIntake?> = _share
         relayJob = null
         relayParked.getAndSet(null)?.let { runCatching { it.close() } }
         relayRouteFor.clear()
+        runCatching { btServerSocket?.close() }
+        btServerSocket = null
+        runCatching { btClient?.close() }
+        btClient = null
         runCatching { discovery?.stop() }
         runCatching { server?.close() }
         runCatching { client?.close() }
@@ -601,6 +618,13 @@ val share: StateFlow<ShareIntake?> = _share
             } else {
                 ProtocolClient(id)
             }
+            // Bluetooth is a separate carrier with its own dialer: a target's
+            // port is 0 and its host is a MAC, so it must never ride the TCP
+            // provider by accident. Both clients share one identity/brain.
+            val btOn = prefs().getBoolean("bluetoothTransfer", false)
+            val bluetoothClient = if (btOn && FlitBluetooth.hasPermission(appCtx)) {
+                ProtocolClient(id, FlitBluetooth.LinkProvider(appCtx, id))
+            } else null
 
             // Android's kernel drops multicast frames unless we hold this lock.
             val wifi = appCtx.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -669,6 +693,11 @@ val share: StateFlow<ShareIntake?> = _share
             if (relayCfg != null) {
                 startRelayWorker(seq, id, relayCfg, srv)
                 logLine("relay: subscribed at ${relayCfg.host}:${relayCfg.port} as ${id.fingerprint.take(12)}")
+            }
+            btClient = bluetoothClient
+            if (bluetoothClient != null) {
+                FlitBluetooth.startServer(appCtx, id, srv, scope, ::logLine) { btServerSocket = it }
+                logLine("bluetooth link: listening for direct transfers")
             }
             if (prefs().getBoolean("hiddenMode", false)) {
                 logLine("hidden mode: not announcing — others find this device by address, or when you send first")
@@ -897,6 +926,12 @@ val share: StateFlow<ShareIntake?> = _share
         route: FlitRoute.Route,
     ): PeerInfo? {
         if (seq != startSeq) return null
+        if (route.isBluetooth) {
+            val dialer = btClient ?: return null
+            return runCatching {
+                dialer.register(SendTarget(route.host, 0, tls = true), self, timeoutMs = 4_000)
+            }.getOrNull()
+        }
         if (!tcpOpen(route.host, route.port)) return null
         for (tls in if (route.tls) booleanArrayOf(true, false) else booleanArrayOf(false, true)) {
             try {
@@ -968,8 +1003,10 @@ val share: StateFlow<ShareIntake?> = _share
         huntAttempts[fp] = attempt + 1
         huntNextAt[fp] = System.currentTimeMillis() + FlitRoute.huntDelayMs(attempt)
         val live = _peers.value[fp]?.let {
-            FlitRoute.Route(it.ip, it.info.port, it.info.protocol == "https")
-        }?.takeIf { it.port in 1..65535 }
+            FlitRoute.Route(
+                it.ip, it.info.port, it.info.protocol == "https", it.kind,
+            )
+        }?.takeIf { it.isBluetooth || it.port in 1..65535 }
         val remembered = runCatching { FlitRoster.routeFor(fp) }.getOrNull()
         val manual = FlitRoster.manual().map { addr ->
             FlitRoute.Route(
@@ -993,14 +1030,18 @@ val share: StateFlow<ShareIntake?> = _share
             // The fingerprint is the whole accept rule: a reassigned address
             // that serves a stranger is simply not this peer's route.
             if (!FlitRoute.accepts(answer.fingerprint, fp)) continue
-            logLine("hunt: ${route.host}:${route.port} answered as ${answer.alias.ifBlank { fp.take(12) }}")
+            logLine(
+                if (route.isBluetooth) "hunt: bluetooth ${route.host} answered as ${answer.alias.ifBlank { fp.take(12) }}"
+                else "hunt: ${route.host}:${route.port} answered as ${answer.alias.ifBlank { fp.take(12) }}",
+            )
             huntAttempts.remove(fp)
             huntNextAt.remove(fp)
             huntLogged.remove(fp)
             // The ordinary door does the rest: the row's queued-check
             // flushes the owed batch, and the flush's first-attempt probe
             // resumes from the receiver's own disk.
-            touchPeer(route.host, answer)
+            if (route.isBluetooth) touchPeerBluetooth(route.host, answer)
+            else touchPeer(route.host, answer)
             return
         }
         // Milestone E: the relay is the last candidate, never the first.
@@ -1103,7 +1144,12 @@ val share: StateFlow<ShareIntake?> = _share
                     radioOn = radioOn,
                     hidden = prefs().getBoolean("hiddenMode", false),
                 )
-                runCatching { radio.apply(stance, info.alias, info.fingerprint, dump) }
+                runCatching {
+                    radio.apply(
+                        stance, info.alias, info.fingerprint, dump,
+                        connectable = btClient != null,
+                    )
+                }
                 if (stance.advertise != bleAdvertised) {
                     bleAdvertised = stance.advertise
                     when {
@@ -1160,7 +1206,7 @@ val share: StateFlow<ShareIntake?> = _share
             // stays the radio address (port would be a lie).
             port = 0,
         )
-        touchPeer(addr, info)
+        touchPeerBluetooth(addr, info)
     }
 
     /**
@@ -1214,7 +1260,14 @@ val share: StateFlow<ShareIntake?> = _share
     /** A relay answer marks this peer's next flush as a relay dial, not a LAN one. */
     private fun touchPeerViaRelay(host: String, info: PeerInfo) = touchPeer(host, info, markRelay = true)
 
-    private fun touchPeer(ip: String, info: PeerInfo, markRelay: Boolean) {
+    /** A BLE announce carries a MAC as the row address — a Bluetooth route. */
+    private fun touchPeerBluetooth(host: String, info: PeerInfo) =
+        touchPeer(host, info, markRelay = false, kind = FlitRoute.Kind.BLUETOOTH)
+
+    private fun touchPeer(ip: String, info: PeerInfo, markRelay: Boolean) =
+        touchPeer(ip, info, markRelay, FlitRoute.Kind.TCP)
+
+    private fun touchPeer(ip: String, info: PeerInfo, markRelay: Boolean, kind: FlitRoute.Kind) {
         if (info.fingerprint == identity?.fingerprint) return
         if (markRelay) {
             relayRouteFor[info.fingerprint] = relayConfig() ?: return
@@ -1224,8 +1277,8 @@ val share: StateFlow<ShareIntake?> = _share
         }
         val now = System.currentTimeMillis()
         _peers.update { m ->
-            val entry = m[info.fingerprint]?.copy(ip = ip, info = info, lastSeenMs = now)
-                ?: PeerEntry(ip, info, now)
+            val entry = m[info.fingerprint]?.copy(ip = ip, info = info, lastSeenMs = now, kind = kind)
+                ?: PeerEntry(ip, info, now, kind)
             m + (info.fingerprint to entry)
         }
         // A trusted peer that renamed itself: roster + direct-share shortcuts
@@ -1241,13 +1294,17 @@ val share: StateFlow<ShareIntake?> = _share
         // port 0) remember nothing.
         if (!markRelay) {
             runCatching {
-                FlitRoster.rememberRoute(info.fingerprint, ip, info.port, info.protocol == "https")
+                if (kind == FlitRoute.Kind.BLUETOOTH) {
+                    FlitRoster.rememberRoute(info.fingerprint, ip, 0, true, kind)
+                } else {
+                    FlitRoster.rememberRoute(info.fingerprint, ip, info.port, info.protocol == "https")
+                }
             }
         }
         // A peer we owe files to just came back: dispatch its send-later batch
         // (guarded so an announce storm cannot double-send).
         if (FlitRoster.queued().any { it.fingerprint == info.fingerprint }) {
-            flushQueueFor(PeerEntry(ip, info, now))
+            flushQueueFor(PeerEntry(ip, info, now, kind))
         }
     }
 
@@ -1834,13 +1891,23 @@ val share: StateFlow<ShareIntake?> = _share
             // relay is dialed there. `host:port` names the relay; the hint
             // names the peer, so the blind pairer can match a subscription.
             val relay = relayRouteFor[peer.info.fingerprint]
-            val target = if (relay != null) {
-                SendTarget(relay.host, relay.port, tls = true, relayFor = peer.info.fingerprint)
-            } else {
-                SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
+            val dialer: ProtocolClient
+            val target = when {
+                peer.kind == FlitRoute.Kind.BLUETOOTH -> {
+                    dialer = btClient ?: throw IOException("Bluetooth link is off")
+                    SendTarget(peer.ip, 0, tls = true)
+                }
+                relay != null -> {
+                    dialer = cli
+                    SendTarget(relay.host, relay.port, tls = true, relayFor = peer.info.fingerprint)
+                }
+                else -> {
+                    dialer = cli
+                    SendTarget(peer.ip, peer.info.port, peer.info.protocol == "https")
+                }
             }
             prog.begin(FlitProgress.Kind.SEND, outgoing.associate { it.wireName to it.size })
-            val report = cli.sendFiles(target, self, outgoing, multi = prefs().getBoolean("parallelStreams", true), progress = { name, soFar, _ ->
+            val report = dialer.sendFiles(target, self, outgoing, multi = prefs().getBoolean("parallelStreams", true), progress = { name, soFar, _ ->
                 prog.tick(name, soFar)
             })
             val sent = report.sent.size

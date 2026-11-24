@@ -18,8 +18,7 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
     private val ledger = ConcurrentHashMap<String, Long>() // fileName -> bytes done
     private var sessionTotal = 0L
     private var lastPaintMs = 0L
-    private var lastPaintBytes = 0L
-    private var speedBytesPerSec = 0.0
+    private val speed = FlitSpeed()
     private var title = ""
 
     /** Counts FlitProgress instances across ALL sessions; zero ⇒ telemetry idle. */
@@ -35,8 +34,7 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
         ledger.clear()
         files.forEach { (n, _) -> ledger[n] = 0L }
         sessionTotal = max(0L, files.values.sum())
-        speedBytesPerSec = 0.0
-        lastPaintBytes = 0
+        speed.reset()
         lastPaintMs = 0
         title = if (kind == Kind.SEND) "Sending…" else "Receiving…"
         FlitEngine.setTransferActive(true)
@@ -44,7 +42,10 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
     }
 
     fun tick(fileName: String, bytes: Long) {
-        ledger[fileName] = bytes
+        // Multi-stream senders report an aggregate for the file; keep the
+        // ledger monotonic so a late/out-of-order callback can never drag the
+        // done count (and the rate derived from it) backwards.
+        ledger.merge(fileName, bytes) { a, b -> maxOf(a, b) }
         paint(timeBudgetMs = 350)
     }
 
@@ -59,24 +60,15 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
 
     fun doneBytes(): Long = ledger.values.sum()
 
-    private fun speed(): Long {
-        val now = System.currentTimeMillis()
-        val dt = now - lastPaintMs
-        if (dt > 0) {
-            val inst = (doneBytes() - lastPaintBytes) * 1000.0 / dt
-            speedBytesPerSec = if (speedBytesPerSec == 0.0) inst else speedBytesPerSec * 0.7 + inst * 0.3
-        }
-        return speedBytesPerSec.toLong()
-    }
-
     /**
      * Repaints the notification. Rate-limited to `timeBudgetMs` between paints
-     * (0 = always). Speed is sampled on every call, paints carry the latest.
+     * (0 = always). Speed sampling is independent of that budget now: the
+     * in-app readout and the notification show the same honest rate.
      */
     private fun paint(timeBudgetMs: Long = 0) {
         val now = System.currentTimeMillis()
-        val sp = speed()
         val doneNow = doneBytes()
+        val sp = speed.sample(now, doneNow)
         // In-app readout (hero card / dock ring) refreshes every call, faster
         // than the notification budget — it's just a StateFlow assignment.
         kind?.let { k ->
@@ -91,7 +83,6 @@ class FlitProgress(private val ctx: Context, private val notifId: Int) {
         }
         if (timeBudgetMs > 0 && now - lastPaintMs < timeBudgetMs) return
         lastPaintMs = now
-        lastPaintBytes = doneNow
 
         val done = doneNow
         // 10,000-step scale: immune to setProgress Int overflow, plenty smooth.

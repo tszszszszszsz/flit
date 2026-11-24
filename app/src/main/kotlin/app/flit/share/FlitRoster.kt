@@ -140,9 +140,16 @@ object FlitRoster {
             }.getOrNull()
         }
 
-    fun rememberRoute(fingerprint: String, host: String, port: Int, tls: Boolean) {
-        if (port !in 1..65535) return // a row without an address-bearing socket remembers nothing
-        val fresh = FlitRoute.Route(host, port, tls)
+    fun rememberRoute(
+        fingerprint: String,
+        host: String,
+        port: Int,
+        tls: Boolean,
+        kind: FlitRoute.Kind = FlitRoute.Kind.TCP,
+    ) {
+        // A Bluetooth route carries a MAC and no port; TCP still needs both.
+        if (kind == FlitRoute.Kind.TCP && port !in 1..65535) return
+        val fresh = FlitRoute.Route(host, port, tls, kind)
         val cur = runCatching { routeFor(fingerprint) }.getOrNull()
         if (cur == fresh) return
         val routes = prefs().getString(KEY_ROUTES, null)?.let {

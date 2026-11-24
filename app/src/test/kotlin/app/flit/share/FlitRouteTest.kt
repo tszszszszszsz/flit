@@ -18,6 +18,29 @@ class FlitRouteTest {
         FlitRoute.Route(host, port, tls)
 
     @Test
+    fun `a bluetooth route is a MAC with no port and stays distinct from its TCP twin`() {
+        val bt = FlitRoute.bluetooth("AA:BB:CC:DD:EE:FF")
+        assertEquals(FlitRoute.Kind.BLUETOOTH, bt.kind)
+        assertTrue(bt.isBluetooth)
+        assertEquals(0, bt.port)
+
+        val tcp = route("AA:BB:CC:DD:EE:FF")
+        val cands = FlitRoute.candidates(bt, tcp, emptyList())
+        assertEquals(2, cands.size, "the two carriers must not collapse into one dial")
+    }
+
+    @Test
+    fun `a remembered route from before bluetooth still decodes as TCP`() {
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val old = json.decodeFromString<FlitRoute.Route>("""{"host":"192.168.100.12","port":53317,"tls":true}""")
+        assertEquals(FlitRoute.Kind.TCP, old.kind)
+        val new = FlitRoute.bluetooth("AA:BB:CC:DD:EE:FF")
+        val round = json.decodeFromString<FlitRoute.Route>(json.encodeToString(FlitRoute.Route.serializer(), new))
+        assertEquals(FlitRoute.Kind.BLUETOOTH, round.kind)
+        assertEquals(0, round.port)
+    }
+
+    @Test
     fun `the typed relay is parsed once and off when empty or malformed`() {
         assertEquals("box.example" to 53317, FlitRoute.parseRelay("box.example:53317"))
         assertEquals("192.168.100.12" to 443, FlitRoute.parseRelay("  192.168.100.12:443  "))

@@ -20,6 +20,7 @@ import java.io.InputStream
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLongArray
 
 /**
  * A route to a peer. [relayFor] is milestone E's one extra field: when set,
@@ -396,6 +397,11 @@ class ProtocolClient(
             maxOf(1, ((span + SPLIT_TARGET_BYTES - 1) / SPLIT_TARGET_BYTES).toInt()),
         )
         if (streamCount < 2) return "multi-stream: remainder not worth splitting"
+        // ONE progress number for the file, not four absolute stream offsets
+        // fighting over a single ledger slot. Each stream records how many of
+        // its own bytes landed; the sum is what the receiver has covered.
+        val streamSent = AtomicLongArray(streamCount)
+        val progressLock = Any()
         val uploadPath =
             "${Protocol.PATH_UPLOAD}?sessionId=${enc(sessionId)}&fileId=${enc(fileId)}&token=${enc(token)}"
         return try {
@@ -431,7 +437,12 @@ class ProtocolClient(
                                         { sent: Long ->
                                             if (sent - lastReport >= PROGRESS_STEP) {
                                                 lastReport = sent
-                                                cb(info.fileName, start + sent, total)
+                                                synchronized(progressLock) {
+                                                    streamSent.set(i, sent)
+                                                    var covered = 0L
+                                                    for (j in 0 until streamCount) covered += streamSent.get(j)
+                                                    cb(info.fileName, from + covered, total)
+                                                }
                                             }
                                         }
                                     },

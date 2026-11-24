@@ -96,7 +96,13 @@ class FlitService : Service() {
             st.alias.ifEmpty { FlitEngine.currentAlias() },
             st.port,
         )
-        if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            // The Bluetooth link listens on RFCOMM in the background; Android
+            // requires the connected-device type alongside dataSync for it.
+            val flags = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            startForeground(NOTIFICATION_ID, notification, flags)
+        } else if (Build.VERSION.SDK_INT >= 29) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIFICATION_ID, notification)

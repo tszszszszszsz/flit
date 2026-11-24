@@ -1466,6 +1466,15 @@ class MainActivity : ComponentActivity() {
                         prefs().edit().putBoolean("parallelStreams", on).apply()
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    SwitchOption(
+                        title = "Transfer over Bluetooth",
+                        subtitle = "direct link when devices are close — slower than Wi-Fi; both devices need sharing on, this option enabled, and a one-time pairing consent",
+                        initial = prefs().getBoolean("bluetoothTransfer", false),
+                    ) { on ->
+                        prefs().edit().putBoolean("bluetoothTransfer", on).apply()
+                        FlitEngine.bluetoothChanged()
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     val relayAddress = prefs().getString("relayAddress", "") ?: ""
                     OptionRow(
                         title = "Relay (optional)",
