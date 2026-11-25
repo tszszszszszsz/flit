@@ -1,0 +1,44 @@
+# Commit schedule
+
+One layer per working day, one commit per day, no weekend commits. A commit
+contains a complete layer: code, tests, a completion note under
+`docs/completions/`, and docs updates. Nothing is committed halfway through a
+layer.
+
+## Dates
+
+| Date | Layer | Commit scope |
+|---|---|---|
+| 2026-11-25 | Planning | This document set and the 16 specifications |
+| 2026-11-26 | Device | Three-node baseline walk and evidence note |
+| 2026-11-27 | Protocol | Courier envelope and carry core, pure JVM, tests |
+| 2026-11-30 | CLI | Courier carrier, tests |
+| 2026-12-01 | App | Courier sync and file-card states, tests |
+| 2026-12-02 | Device | Courier three-node walk and evidence note |
+| 2026-12-03 | Protocol | QR parcel frame codec, pure JVM, tests |
+| 2026-12-04 | CLI | Parcel encode and decode, tests |
+| 2026-12-07 | App | Parcel display and camera decode, tests |
+| 2026-12-08 | Device | Air-gap walk and evidence note |
+| 2026-12-09 | Protocol | Per-drop content keys, pure JVM, tests |
+| 2026-12-10 | Integration | Per-drop keys in app and CLI, tests |
+| 2026-12-11 | Protocol | Delivery receipts, pure JVM, tests |
+| 2026-12-14 | Integration | Receipts in app and CLI, device walk, note |
+| 2026-12-15 | Protocol | Circle pad CRDT core, pure JVM, tests |
+| 2026-12-16 | Integration | Circle pad in app and CLI, tests (specified in `circle-pad.md`) |
+| 2026-12-17 | Device | Full feature walk and evidence note |
+| 2026-12-18 | Release | Final rig, docs consolidation, v0.3.0 |
+
+## Rules for a day
+
+- The layer is finished by every agent assigned to it before integration.
+- Integration runs the full rig once. A green rig is required for the commit.
+- A device layer also needs the log and observation recorded in a new file
+  under `docs/completions/` named `<date>-<topic>.md`.
+- A commit message names the layer and the evidence. No day carries work from
+  a later date.
+- If a day cannot be completed, the date moves; no placeholder commit is made.
+
+## Historical record
+
+Actual commit hashes and dates are added to the bottom of this file as each day
+lands. Planned dates above are targets, not claims of completed work.

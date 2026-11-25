@@ -98,6 +98,7 @@ Milestone status is in the [design index](docs/transport-bluetooth.md). Engineer
 - [Testing](docs/TESTING.md) — rig command, evidence levels, device walks, reproduction recipes.
 - [Operations](docs/OPERATIONS.md) — CLI reference, box/phone setup, MIUI notes, logs, troubleshooting.
 - [Product decisions](docs/PRODUCT-DECISIONS.md) — non-profit constraint, surface contract revision, scope cuts, postmortems.
+- [Build roadmap](docs/roadmap/00-plan.md) — dated plan, agent waves and quality gates for the next features.
 - Focused designs: [Circle](docs/circle.md), [Bluetooth carrier](docs/bluetooth-carrier.md), [QR-only & panic](docs/qr-only-and-panic.md), [Open file & sharing restore](docs/open-file-and-sharing-restore.md), milestones [A](docs/milestone-a.md), [C](docs/milestone-c.md), [D](docs/milestone-d.md), [E](docs/milestone-e.md), and [store listing copy](docs/play-listing.md).
 
 ## Repo layout
