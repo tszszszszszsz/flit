@@ -2,6 +2,7 @@ package app.flit.share
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -80,5 +81,61 @@ class FlitRosterTest {
         val left = joined.without(listOf("/s/a"), listOf("a.jpg"))!!
         assertTrue(left.mirror, "the duty survives the manual half leaving")
         assertEquals(listOf("content://media/1"), left.uris)
+    }
+
+    // ==== sharing-desired codec / reducers =====================================
+
+    @Test
+    fun `sharing desired survives an encode-decode round trip`() {
+        val row = SharingDesired(desired = true, updatedMs = 1234L)
+        val back = SharingDesired.decode(SharingDesired.encode(row))
+        assertTrue(back.desired)
+        assertEquals(1234L, back.updatedMs)
+        assertFalse(SharingDesired.decode(SharingDesired.encode(SharingDesired())).desired)
+    }
+
+    @Test
+    fun `an absent or old sharing-desired row decodes safely — default is OFF`() {
+        assertFalse(SharingDesired.decode(null).desired, "never written = not desired")
+        assertFalse(SharingDesired.decode("").desired)
+        assertFalse(SharingDesired.decode("   ").desired)
+        // Old rows: a bare boolean/number word written before the JSON envelope.
+        assertTrue(SharingDesired.decode("true").desired)
+        assertTrue(SharingDesired.decode("TRUE").desired)
+        assertTrue(SharingDesired.decode("1").desired)
+        assertTrue(SharingDesired.decode("yes").desired)
+        assertFalse(SharingDesired.decode("false").desired)
+        assertFalse(SharingDesired.decode("0").desired)
+        assertFalse(SharingDesired.decode("no").desired)
+    }
+
+    @Test
+    fun `a corrupt or forward-newer sharing-desired row never throws`() {
+        assertFalse(SharingDesired.decode("garbage").desired)
+        assertFalse(SharingDesired.decode("{\"desired\": \"not-a-bool\"}").desired)
+        // Unknown keys ignored; a missing 'desired' falls back to OFF.
+        assertTrue(SharingDesired.decode("{\"desired\":true,\"future\":42}").desired)
+        assertFalse(SharingDesired.decode("{\"updatedMs\":99}").desired)
+        assertFalse(SharingDesired.decode("{}").desired)
+    }
+
+    @Test
+    fun `the sharing-desired reducer applies a new intent without losing the stamp`() {
+        val off = SharingDesired()
+        val on = off.with(true, atMs = 500L)
+        assertTrue(on.desired)
+        assertEquals(500L, on.updatedMs)
+        val offAgain = on.with(false, 700L)
+        assertFalse(offAgain.desired)
+        assertEquals(700L, offAgain.updatedMs)
+    }
+
+    @Test
+    fun `restore only when desired and neither running nor already starting`() {
+        val desired = SharingDesired(true)
+        assertTrue(SharingDesired.shouldRestore(desired, running = false, starting = false))
+        assertFalse(SharingDesired.shouldRestore(desired, running = true, starting = false))
+        assertFalse(SharingDesired.shouldRestore(desired, running = false, starting = true))
+        assertFalse(SharingDesired.shouldRestore(SharingDesired(false), false, false))
     }
 }

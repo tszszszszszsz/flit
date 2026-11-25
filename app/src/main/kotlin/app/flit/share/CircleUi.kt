@@ -33,6 +33,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Share
@@ -113,6 +114,17 @@ fun CircleScreen(
     onLeave: () -> Unit,
     onQr: () -> Unit,
     onBack: () -> Unit,
+    // ---- additive open-file robustness params (defaults keep old callers) ----
+    /**
+     * sha256 values that have a local, openable copy on THIS device ("landed
+     * here"): received files plus any still-present sender spool. Cards whose
+     * sha is not in this set are announcement-only and get no Open action —
+     * an Open button there can only dead-end in a toast. Defaults to empty so
+     * the UI never offers a dead action until the caller supplies the truth.
+     */
+    landedSha256: Set<String> = emptySet(),
+    /** sha256 currently being resolved/opened; drives the disabled/loading card state. */
+    openingSha256: String? = null,
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
@@ -133,6 +145,15 @@ fun CircleScreen(
     // Delivery status is device-local and never gossiped. File cards read the
     // local record by sha; an announcement without one says so explicitly.
     val deliveries = state?.deliveries.orEmpty()
+    // Hashes on the wire may be upper- or lower-case hex; normalise once here
+    // so membership checks are exact and case-insensitive, matching the
+    // engine's own sha comparison. The sets are tiny (received ledger + spools).
+    val landedHashes = remember(landedSha256) {
+        landedSha256.mapTo(HashSet(landedSha256.size)) { it.trim().lowercase(Locale.ROOT) }
+    }
+    val openingHash = remember(openingSha256) {
+        openingSha256?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
+    }
     // Every poll and kick card used to walk the whole log once per member and
     // re-parse each vote body on the main thread. Do the work once here for the
     // whole screen: one JSON parse per event body, then derive every tally from
@@ -246,15 +267,23 @@ fun CircleScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 itemsIndexed(events, key = { _, event -> event.id }) { index, event ->
+                    val body = feedData.parsed[index].body
                     FeedRow(
                         event = event,
-                        body = feedData.parsed[index].body,
+                        body = body,
                         mine = event.authorFp == selfFp && selfFp.isNotBlank(),
                         author = members.firstOrNull { it.fp == event.authorFp }?.alias
                             ?: event.authorFp.take(8),
                         members = members,
                         tallies = feedData.tallies,
                         deliveries = deliveries,
+                        // Resolve per card from one normalised set: only a
+                        // landed sha gets an actionable Open; a resolving sha
+                        // gets the disabled/loading state while it opens.
+                        landed = body.sha256.isNotBlank() &&
+                            body.sha256.trim().lowercase(Locale.ROOT) in landedHashes,
+                        opening = body.sha256.isNotBlank() &&
+                            body.sha256.trim().lowercase(Locale.ROOT) == openingHash,
                         onVote = onVote,
                         onVoteKick = onVoteKick,
                         onOpenFile = onOpenFile,
@@ -441,6 +470,8 @@ private fun FeedRow(
     members: List<FlitCircleStore.Member>,
     tallies: CircleTallies,
     deliveries: Map<String, FlitCircleStore.CircleDelivery>,
+    landed: Boolean,
+    opening: Boolean,
     onVote: (String, Int) -> Unit,
     onVoteKick: (String, Boolean) -> Unit,
     onOpenFile: (String) -> Unit,
@@ -468,6 +499,8 @@ private fun FeedRow(
                     size = body.size,
                     sha256 = body.sha256,
                     delivery = body.sha256.takeIf { it.isNotBlank() }?.let { deliveries[it] },
+                    landed = landed,
+                    opening = opening,
                     onOpenFile = onOpenFile,
                 )
                 CircleCard.POLL -> PollCard(
@@ -514,6 +547,10 @@ private fun FileCard(
     size: Long,
     sha256: String,
     delivery: FlitCircleStore.CircleDelivery?,
+    /** True only when this device actually holds an openable copy of the file. */
+    landed: Boolean,
+    /** True while the caller is resolving/opening this sha; suppresses the action. */
+    opening: Boolean,
     onOpenFile: (String) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -582,16 +619,72 @@ private fun FileCard(
                     maxLines = 2,
                 )
             }
-            // The callback resolves sha256 to a landed local copy; when none
-            // exists it reports that honestly. Status text above is the truth.
+            // Open affordance — three honest states, no dead button:
+            //  - resolving: disabled button + spinner, so a second tap cannot
+            //    launch a second chooser while the first is being prepared;
+            //  - landed: the only state that actually offers Open;
+            //  - otherwise: a plain status line, because an Open here could
+            //    only dead-end in a toast ("hasn't landed here yet").
             if (sha256.isNotBlank()) {
-                TextButton(
-                    onClick = { onOpenFile(sha256) },
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .semantics { contentDescription = "Open $name" },
-                ) {
-                    Text("Open file", style = typ.labelMedium, fontWeight = FontWeight.Bold)
+                when {
+                    opening -> TextButton(
+                        enabled = false,
+                        onClick = { /* disabled: nothing to do until it resolves */ },
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .semantics(mergeDescendants = true) {
+                                contentDescription = "Opening $name, please wait"
+                            },
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            // Decorative here: the merged button labels it for TalkBack.
+                            CircularProgressIndicator(
+                                color = cs.primary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text("Opening…", style = typ.labelMedium)
+                        }
+                    }
+                    landed -> {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.semantics(mergeDescendants = true) {
+                                contentDescription = "$name landed on this device and is ready to open"
+                            },
+                        ) {
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null, // the row carries the label
+                                tint = cs.primary,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Text(
+                                text = "Landed here",
+                                style = typ.labelSmall,
+                                color = cs.primary,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        TextButton(
+                            onClick = { onOpenFile(sha256) },
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .semantics(mergeDescendants = true) {
+                                    contentDescription = "Open $name, landed on this device"
+                                },
+                        ) {
+                            Text("Open file", style = typ.labelMedium, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    else -> Text(
+                        text = "Not here yet · no local copy to open",
+                        style = typ.labelSmall,
+                        color = cs.onSurfaceVariant,
+                    )
                 }
             }
         }

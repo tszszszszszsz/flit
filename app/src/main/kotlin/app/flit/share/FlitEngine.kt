@@ -209,14 +209,21 @@ val share: StateFlow<ShareIntake?> = _share
     val received: StateFlow<List<ReceivedFile>> = _received
     /** Digest of a landed file by its ledger key, computed once at receive time. */
     private val receivedDigests = ConcurrentHashMap<String, String>()
+    /** shas with a local, openable copy — drives the Circle file card's Open action. */
+    private val _circleLandedShas = MutableStateFlow<Set<String>>(emptySet())
+    val circleLandedShas: StateFlow<Set<String>> = _circleLandedShas
+
+    private fun refreshLandedShas() {
+        _circleLandedShas.value = receivedDigests.values.map { it.lowercase() }.toSet()
+    }
 
     private fun receivedKey(r: ReceivedFile): String = r.path?.absolutePath ?: r.uri.orEmpty()
 
-    private fun digestOf(r: ReceivedFile): String? {
-        val stream = r.path?.inputStream() ?: runCatching {
-            r.uri?.let { appCtx.contentResolver.openInputStream(Uri.parse(it)) }
-        }.getOrNull() ?: return null
-        return stream.use { input ->
+    private fun digestOf(r: ReceivedFile): String? = runCatching {
+        val stream = r.uri?.let { appCtx.contentResolver.openInputStream(Uri.parse(it)) }
+            ?: r.path?.inputStream()
+            ?: return@runCatching null
+        stream.use { input ->
             val md = MessageDigest.getInstance("SHA-256")
             val buf = ByteArray(64 * 1024)
             while (true) {
@@ -226,7 +233,7 @@ val share: StateFlow<ShareIntake?> = _share
             }
             md.digest().joinToString("") { "%02x".format(it) }
         }
-    }
+    }.getOrNull() // a stale ledger path must never crash the caller
 
     // ==== received history ======================================================
 
@@ -268,7 +275,20 @@ val share: StateFlow<ShareIntake?> = _share
         // Compute once off the UI thread so "Open file" in Circle is O(1).
         scope.launch(Dispatchers.IO) {
             digestOf(r)?.let { receivedDigests[receivedKey(r)] = it }
+            refreshLandedShas()
         }
+    }
+
+    /** After a copy to SAF/Downloads, point the ledger at the surviving artifact. */
+    private fun relocateReceived(old: ReceivedFile, uri: String) {
+        val updated = old.copy(path = null, uri = uri)
+        _received.update { rows ->
+            rows.map { if (it.name == old.name && it.whenMs == old.whenMs) updated else it }
+        }
+        persistReceived()
+        val digest = receivedDigests.remove(receivedKey(old)) ?: digestOf(updated)
+        if (digest != null) receivedDigests[uri] = digest
+        refreshLandedShas()
     }
 
     /** Loaded at app boot: history is visible before the engine ever starts. */
@@ -278,6 +298,14 @@ val share: StateFlow<ShareIntake?> = _share
         runCatching {
             val f = boot.filesDir.resolve(RECEIVED_HISTORY_FILE)
             _received.value = decodeReceived(f.takeIf { it.length() > 0 }?.readText() ?: "").takeLast(20)
+        }
+        // A fresh process has no digest cache; rebuild it off the UI thread so
+        // the first "Open file" tap knows which shas are actually landed.
+        scope.launch(Dispatchers.IO) {
+            for (r in _received.value) {
+                digestOf(r)?.let { receivedDigests[receivedKey(r)] = it }
+            }
+            refreshLandedShas()
         }
     }
 
@@ -681,8 +709,10 @@ val share: StateFlow<ShareIntake?> = _share
         val target = sha.trim().lowercase()
         if (target.isBlank()) return@withContext null
         for (r in _received.value) {
-            val cached = receivedDigests[receivedKey(r)]
-            val match = cached?.equals(target, ignoreCase = true) ?: digestOf(r)?.equals(target, ignoreCase = true)
+            val match = runCatching {
+                val cached = receivedDigests[receivedKey(r)]
+                cached?.equals(target, ignoreCase = true) ?: digestOf(r)?.equals(target, ignoreCase = true)
+            }.getOrNull()
             if (match == true) return@withContext r
         }
         return@withContext null
@@ -1320,11 +1350,14 @@ val share: StateFlow<ShareIntake?> = _share
             startMirrorWatcher(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
-            _state.value = _state.value.copy(running = false, starting = false, error = t.message ?: t.javaClass.simpleName)
-            logLine("start failed: ${t.message ?: t.javaClass.simpleName}")
+            val reason = t.message ?: t.javaClass.simpleName
+            // A partial start must not leave a port bound, discovery running
+            // or seq-guarded workers alive while the UI reports "off".
+            runCatching { stop() }
+            _state.value = _state.value.copy(error = reason)
+            logLine("start failed: $reason")
             // Full stack goes to logcat (obfuscated in release; use mapping.txt to deobfuscate).
             android.util.Log.e("FlitEngine", "engine start failed", t)
-            runCatching { bleRadio?.stopAll() }
         }
     }
 
@@ -3041,18 +3074,21 @@ val share: StateFlow<ShareIntake?> = _share
                     logLine("could not unpack ${file.name} — keeping the gzip (${it.message ?: it.javaClass.simpleName})")
                 }
         }
-        addReceived(ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file))
+        val row = ReceivedFile(file.name, file.length(), System.currentTimeMillis(), file)
+        addReceived(row)
         // A per-peer folder, else the global default, else the Downloads/Flit bucket.
         val tree = receiveTreeFor(senderFp)
         if (tree != null) {
             scope.launch(Dispatchers.IO) {
                 runCatching { copyToTree(file, tree) }
-                    .onSuccess {
+                    .onSuccess { uri ->
+                        if (uri != null) runCatching { relocateReceived(row, uri) }
                         runCatching { file.delete() }
-                        logLine("\u2192 ${it ?: file.name}")
+                        logLine("\u2192 ${uri ?: file.name}")
                     }
                     .onFailure {
                         runCatching { copyToDownloadsBucket(file) }
+                            .onSuccess { uri -> runCatching { relocateReceived(row, uri.toString()) } }
                         logLine("\u2192 Downloads/Flit/${file.name} (folder unreachable)")
                     }
             }
@@ -3061,7 +3097,8 @@ val share: StateFlow<ShareIntake?> = _share
         if (Build.VERSION.SDK_INT >= 29) {
             scope.launch(Dispatchers.IO) {
                 runCatching { copyToDownloadsBucket(file) }
-                    .onSuccess {
+                    .onSuccess { uri ->
+                        runCatching { relocateReceived(row, uri.toString()) }
                         runCatching { file.delete() }
                         logLine("→ Downloads/Flit/${file.name}")
                     }
@@ -3083,7 +3120,7 @@ val share: StateFlow<ShareIntake?> = _share
         resolver.openOutputStream(docUri)?.use { out ->
             file.inputStream().use { it.copyTo(out) }
         } ?: throw IllegalStateException("cannot write to tree")
-        return name
+        return docUri.toString() // the surviving artifact, not just its name
     }
 
     /** SAF providers do not dedupe consistently; do it ourselves. */

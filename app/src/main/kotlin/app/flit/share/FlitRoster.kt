@@ -63,6 +63,60 @@ data class QueuedSend(
 }
 
 /**
+ * Persisted user intent: "sharing should be ON". This is deliberately NOT the
+ * live engine state — a killed process forgets `running` but not this row. It is
+ * written when sharing is deliberately started, cleared only on an explicit
+ * stop, and read on relaunch so a detour through an external viewer cannot
+ * leave sharing quietly off.
+ *
+ * Stored in SharedPreferences as a string via [encode], so the envelope can
+ * grow without breaking old installs. [decode] tolerates every row shape an
+ * older build could have produced (bare boolean/number words, absent, corrupt)
+ * and never throws — an unreadable row simply means "not desired".
+ */
+@Serializable
+data class SharingDesired(
+    val desired: Boolean = false,
+    val updatedMs: Long = 0L,
+) {
+    /** Pure reducer: apply a fresh user intent to this row. */
+    fun with(desired: Boolean, atMs: Long = updatedMs): SharingDesired =
+        copy(desired = desired, updatedMs = atMs)
+
+    companion object {
+        const val KEY = "sharingDesired"
+
+        private val codec = Json { ignoreUnknownKeys = true }
+
+        /** Pure: a row → the string we persist. */
+        fun encode(row: SharingDesired): String =
+            codec.encodeToString(SharingDesired.serializer(), row)
+
+        /** Pure: any persisted string (including old rows) → a row. Never throws. */
+        fun decode(raw: String?): SharingDesired {
+            if (raw.isNullOrBlank()) return SharingDesired()
+            val v = raw.trim()
+            // Old rows predate the JSON envelope: a bare boolean/number word.
+            when (v.lowercase()) {
+                "true", "1", "yes" -> return SharingDesired(desired = true)
+                "false", "0", "no" -> return SharingDesired()
+            }
+            return runCatching { codec.decodeFromString(SharingDesired.serializer(), v) }
+                .getOrDefault(SharingDesired())
+        }
+
+        /**
+         * Pure restore decision: persisted intent + live engine facts → should
+         * sharing be (re)started? After process death [running] is false even
+         * though the user never stopped sharing; that is exactly the gap this
+         * closes. A session already up or coming up is never restarted.
+         */
+        fun shouldRestore(row: SharingDesired, running: Boolean, starting: Boolean): Boolean =
+            row.desired && !running && !starting
+    }
+}
+
+/**
  * Everything F-Droid reviewers like to see: tiny, local, and inspectable.
  * Persisted in the app's own SharedPreferences as JSON — no account, no cloud.
  */
@@ -80,6 +134,40 @@ object FlitRoster {
     }
 
     private fun prefs() = ctx.getSharedPreferences("flit", Context.MODE_PRIVATE)
+
+    // ==== sharing desired (survives process death) ================================
+
+    /**
+     * True iff the user last asked for sharing to be ON. Distinct from the
+     * engine's live `running` flag: a killed process resets that without the
+     * user ever turning sharing off. Call on relaunch to decide whether to
+     * restore; pair with [shouldRestore] for the pure decision.
+     */
+    fun sharingDesired(): Boolean = runCatching {
+        SharingDesired.decode(prefs().getString(SharingDesired.KEY, null)).desired
+    }.getOrDefault(false)
+
+    /**
+     * Persist the user's sharing intent. Write on a deliberate start; clear
+     * ONLY on an explicit "turn sharing off" action — internal stop/start
+     * transitions (carrier or alias rebind) must not clear it.
+     */
+    fun setSharingDesired(desired: Boolean) {
+        if (sharingDesired() == desired) return // avoid prefs churn on idempotent writes
+        prefs().edit()
+            .putString(
+                SharingDesired.KEY,
+                SharingDesired.encode(SharingDesired(desired, System.currentTimeMillis())),
+            )
+            .apply()
+    }
+
+    fun shouldRestoreSharing(running: Boolean, starting: Boolean): Boolean =
+        SharingDesired.shouldRestore(
+            runCatching { SharingDesired.decode(prefs().getString(SharingDesired.KEY, null)) }
+                .getOrDefault(SharingDesired()),
+            running, starting,
+        )
 
     // ==== trusted peers =========================================================
 

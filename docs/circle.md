@@ -208,6 +208,16 @@ the announcement by itself proves nothing was delivered.
 > never the delivery path. The event is `{name,size,sha256}` only, and bytes go
 > by a direct per-member `sendFiles` call from the sender's spool.
 
+**Open file action (2026-11-25 fix).** The card's Open affordance now has three
+honest states: a disabled "Opening…" button while the hash is resolving, "Landed
+here" + "Open file" only when a local copy with that SHA-256 exists, and no
+button at all otherwise ("Not here yet · no local copy to open"). The open uses
+a FileProvider URI valid for `Download/Flit` as well as the spool/cache roots,
+and the external chooser is launched as a lifecycle-bound detour so returning
+from a viewer neither closes Flit nor stops sharing. Full root cause, per-layer
+fix and MIUI limitations:
+[Open file, sharing restoration and the MIUI limit](open-file-and-sharing-restore.md).
+
 ## Transport and battery
 
 Events ride the already-existing route policy: **Wi‑Fi and Bluetooth are both

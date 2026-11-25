@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- What the ledger may hand to viewers/share targets:
-     received/ = classic receive staging dir; cache roots cover spooled files. -->
+     received/ = classic receive staging dir; cache roots cover spooled files
+     (including cache/circle for Circle attachments); Download/Flit is the
+     public receive bucket — legacy ledger rows can still point here, and a
+     FileProvider root must exist or getUriForFile() throws on "Open file". -->
 <paths>
+    <external-path name="downloads_flit" path="Download/Flit/" />
     <external-files-path name="received" path="received/" />
     <files-path name="files" path="." />
     <cache-path name="cache" path="." />

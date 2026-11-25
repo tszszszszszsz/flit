@@ -75,6 +75,14 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   Two-node join/post/leave were walked on device; the multi-member mesh and
   phone→host fan-out remain honestly listed as limitations — see
   [the Circle design and evidence](docs/circle.md).
+- **"Open file" is a detour, not an exit:** a Circle file card offers Open only
+  when a local copy with that SHA-256 is present; the chooser carries a valid
+  FileProvider grant, and returning from an external viewer leaves the feed and
+  sharing intact. Sharing "desired" is persisted locally, so a cold launch
+  restores it silently; only an explicit Stop turns it off. MIUI can still kill
+  the process — restoration happens on the next open, not by MIUI restarting
+  us. Root cause, per-layer fix, and honest verification status live in
+  [Open file, sharing restoration and the MIUI limit](docs/open-file-and-sharing-restore.md).
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 

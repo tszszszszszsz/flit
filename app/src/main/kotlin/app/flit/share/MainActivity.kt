@@ -111,6 +111,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -142,10 +144,24 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+/** Must stay identical to android:authorities on the provider in AndroidManifest.xml. */
+private const val FILE_PROVIDER_AUTHORITY = "app.flit.share.fileprovider"
+
+/** Saved-instance key: the share-sheet SEND was already consumed by this task. */
+private const val KEY_SHARE_CONSUMED = "shareIntentConsumed"
+
+/** QrAdd is not Parcelable; its own URI is the canonical, round-trippable form.
+ *  Compose's MutableState overload wants Saver<T, …> where T is the VALUE type. */
+private val QrAddStateSaver = Saver<QrAdd?, String>(
+    save = { it?.uri().orEmpty() },
+    restore = { raw -> if (raw.isBlank()) null else parseAddCode(raw) },
+)
 
 /**
  * Launches as the main screen AND as a system share target (SEND / SEND_MULTIPLE).
@@ -156,6 +172,28 @@ class MainActivity : ComponentActivity() {
 
     private var pendingPeer: FlitEngine.PeerEntry? = null
     private var shareMode = false
+
+    /** The share-sheet SEND is dispatched once; a re-create must not re-ingest it. */
+    private var shareIntentConsumed = false
+
+    /** finish() is the one-shot conclusion of share-sheet mode. */
+    private var shareFinishDone = false
+
+    /**
+     * External viewer/chooser launches leave and re-enter through the activity's
+     * result registry. Registered at construction so the call is lifecycle-bound;
+     * the result is deliberately ignored — a viewer can never finish Flit or
+     * change the sharing/Circle state on the way back.
+     */
+    private val openExternal = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { /* returning from a viewer is a no-op: no finish, no state teardown */ }
+
+    /** A failed open must never escape to the default handler and kill the process. */
+    private val openGuard = CoroutineExceptionHandler { _, t ->
+        android.util.Log.w("FlitOpen", "open-file path failed", t)
+        FlitEngine.toast("could not open that file")
+    }
 
     /** The latest ACTION_VIEW invite; a new link supersedes an in-flight join. */
     private var pendingCircleJoin: Job? = null
@@ -277,8 +315,33 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         FlitEngine.channels(this)
         globalTree.value = prefs().getString("destTreeGlobal", null)
-        ingestIntent(intent)
+        if (savedInstanceState?.getBoolean(KEY_SHARE_CONSUMED) == true) {
+            // A config-change recreate must not re-ingest the SEND that the
+            // previous instance already dispatched — that stale intake was
+            // the "app closes fully" path.
+            shareIntentConsumed = true
+            setIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER))
+        } else {
+            ingestIntent(intent)
+        }
+        // Cold start after a killed process/engine: the user never stopped
+        // sharing, so bring it back SILENTLY — never re-prompt on a cold start.
+        restoreSharingIfDesired()
         setContent { FlitUi() }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // A detour through an external chooser can outlive the engine; on the
+        // way back, honour the intent the user last expressed.
+        restoreSharingIfDesired()
+    }
+
+    /** Idempotent, silent restore — only when nothing is already up. */
+    private fun restoreSharingIfDesired() {
+        val s = FlitEngine.state.value
+        if (s.running || s.starting) return
+        if (FlitRoster.shouldRestoreSharing(s.running, s.starting)) startSharing()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -289,12 +352,21 @@ class MainActivity : ComponentActivity() {
         ingestIntent(intent)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_SHARE_CONSUMED, shareIntentConsumed)
+    }
+
     private fun ingestIntent(intent: Intent?) {
         android.util.Log.i("FlitSend", "ingest action=${intent?.action} onNew=${intent?.let { it.flags and 0x10000000 != 0 }}")
         if (intent == null) return
         when (intent.action) {
             Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE -> {
                 shareMode = true
+                // Consume the intake now: neither a config-change recreate nor
+                // a later re-entry may dispatch this same SEND a second time.
+                shareIntentConsumed = true
+                setIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER))
                 // The fp rides in our own extra; on some OEM sheets (MIUI)
                 // only the standard shortcut id survives — the id IS the
                 // fingerprint by contract, so both roads end at the truth.
@@ -304,8 +376,9 @@ class MainActivity : ComponentActivity() {
                 if (fp != null) android.util.Log.i("FlitSend", "share-in: direct target ${FlitRoster.alias(fp) ?: fp.take(8)}")
                 autoPeerFp.value = fp
                 FlitEngine.handleShareIntent(intent, referrerHost = referrer?.host)
-                // The engine may not be running yet; share flows auto-start silently.
-                if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
+                // Funnel every Activity-originated start through the one
+                // POST_NOTIFICATIONS-aware gate before the FGS is launched.
+                if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) askThenStart()
             }
             Intent.ACTION_VIEW -> {
                 // An invite replaces any share-sheet context: no stale
@@ -335,10 +408,10 @@ class MainActivity : ComponentActivity() {
                     FlitEngine.addFromScan(code)
                     return
                 }
-                // A Circle invite needs a live dialer; start sharing first,
-                // then join as soon as the engine reports its identity.
-                if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
-                pendingCircleJoin = lifecycleScope.launch {
+                // A Circle invite needs a live dialer; start through the same
+                // permission-aware gate, then join when identity is ready.
+                if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) askThenStart()
+                pendingCircleJoin = lifecycleScope.launch(openGuard) {
                     var waited = 0
                     while (isActive && !FlitEngine.state.value.running &&
                         FlitEngine.state.value.error == null && waited < 100
@@ -360,12 +433,21 @@ class MainActivity : ComponentActivity() {
                     FlitEngine.joinCircle(code)
                     pendingCircleJoin = null
                 }
+                // Clear the handle on every conclusion, including cancellation
+                // by a config change, without clobbering a newer invite.
+                pendingCircleJoin?.let { job ->
+                    job.invokeOnCompletion { if (pendingCircleJoin === job) pendingCircleJoin = null }
+                }
             }
         }
     }
 
     private fun startSharing() {
-        if (!FlitService.launch(this)) {
+        // Every deliberate start records the user's intent — share-sheet,
+        // invite and silent restore alike — so a killed FGS can be revived.
+        FlitRoster.setSharingDesired(true)
+        // An FGS start outlives this activity: no activity context is held.
+        if (!FlitService.launch(applicationContext)) {
             // System rationed background FGS (dataSync budget): engine still
             // runs while the app is in the foreground.
             FlitEngine.start(applicationContext)
@@ -373,10 +455,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Explicit user Stop only. A live FGS clears its own persisted intent in
+     * onDestroy; we cover the engine-only / refused-FGS case where no service
+     * teardown will do it. Rebinds use [stopForRebind] and never clear it.
+     */
     private fun stopSharing() {
-        stopService(Intent(this, FlitService::class.java))
+        val serviceWasRunning = stopService(Intent(applicationContext, FlitService::class.java))
+        if (!serviceWasRunning || !FlitEngine.state.value.running) {
+            FlitEngine.stop()
+            FlitRoster.setSharingDesired(false) // idempotent; no write when already false
+        }
     }
 
+    /** Internal rebind (alias, hidden, carrier, relay): never clear user intent. */
+    private fun stopForRebind() {
+        stopService(Intent(applicationContext, FlitService::class.java))
+    }
+
+    /**
+     * Single POST_NOTIFICATIONS-aware gate for every user/Activity-originated
+     * sharing start (hero, dock, share sheet, invite). Cold-start restore and
+     * internal rebinds call [startSharing] directly and stay silent.
+     */
     private fun askThenStart() {
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -395,8 +496,9 @@ class MainActivity : ComponentActivity() {
     private fun applyAlias(name: String) {
         FlitEngine.setAlias(name)
         if (FlitEngine.state.value.running || FlitEngine.state.value.starting) {
-            stopSharing()
+            stopForRebind() // internal rebind — desired stays true
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (isDestroyed) return@postDelayed // never start from a dead activity
                 startSharing()
                 FlitEngine.toast("renamed — sharing restarted")
             }, 700)
@@ -422,31 +524,43 @@ class MainActivity : ComponentActivity() {
         val panicEvents by FlitEngine.panicEvents.collectAsState()
         val circleState by FlitEngine.circleState.collectAsState()
         val circleEvents by FlitEngine.circleEvents.collectAsState()
+        // Only shas with a copy actually openable on THIS device get an Open action.
+        val landedShas by FlitEngine.circleLandedShas.collectAsState()
         // Full fingerprint (not the short hero form) is what event authors are
         // compared against in the feed; identity loads async, so track it.
         val meFp by remember(circleState) {
             mutableStateOf(FlitEngine.selfQrAdd()?.fingerprint.orEmpty())
         }
-        var screen by remember { mutableStateOf(Screen.Home) }
-        var showAddDialog by remember { mutableStateOf(false) }
-        var showNoteDialog by remember { mutableStateOf(false) }
-        var showQrDialog by remember { mutableStateOf(false) }
-        var showScanDialog by remember { mutableStateOf(false) }
-        var showKnownDialog by remember { mutableStateOf(false) }
-        var showPanicDialog by remember { mutableStateOf(false) }
+        // Transient UI state is saved: a config change (or returning from an
+        // external viewer that recreated us) must not silently drop the modal
+        // that was up, or leave a half-resolved Circle invite behind.
+        var screen by rememberSaveable { mutableStateOf(Screen.Home) }
+        var showAddDialog by rememberSaveable { mutableStateOf(false) }
+        var showNoteDialog by rememberSaveable { mutableStateOf(false) }
+        var showQrDialog by rememberSaveable { mutableStateOf(false) }
+        var showScanDialog by rememberSaveable { mutableStateOf(false) }
+        var showKnownDialog by rememberSaveable { mutableStateOf(false) }
+        var showPanicDialog by rememberSaveable { mutableStateOf(false) }
+        // PeerEntry has no saveable contract; this menu simply closes on a re-create.
         var peerMenuFor by remember { mutableStateOf<FlitEngine.PeerEntry?>(null) }
-        var showRenameDialog by remember { mutableStateOf(false) }
-        var showThemeDialog by remember { mutableStateOf(false) }
-        var showBatteryDialog by remember { mutableStateOf(false) }
-        var showRelayDialog by remember { mutableStateOf(false) }
+        var showRenameDialog by rememberSaveable { mutableStateOf(false) }
+        var showThemeDialog by rememberSaveable { mutableStateOf(false) }
+        var showBatteryDialog by rememberSaveable { mutableStateOf(false) }
+        var showRelayDialog by rememberSaveable { mutableStateOf(false) }
         // Circle is a Home action + a full-screen feed, never a dock tab.
-        var showCircle by remember { mutableStateOf(false) }
-        var showCircleStart by remember { mutableStateOf(false) }
-        var showCircleJoin by remember { mutableStateOf(false) }
-        var showCircleScan by remember { mutableStateOf(false) }
-        var showCircleInvite by remember { mutableStateOf(false) }
-        var circleInvite by remember { mutableStateOf<QrAdd?>(null) }
-        var pendingCircleOpen by remember { mutableStateOf(false) }
+        var showCircle by rememberSaveable { mutableStateOf(false) }
+        var showCircleStart by rememberSaveable { mutableStateOf(false) }
+        var showCircleJoin by rememberSaveable { mutableStateOf(false) }
+        var showCircleScan by rememberSaveable { mutableStateOf(false) }
+        var showCircleInvite by rememberSaveable { mutableStateOf(false) }
+        var circleInvite by rememberSaveable(stateSaver = QrAddStateSaver) {
+            mutableStateOf<QrAdd?>(null)
+        }
+        var pendingCircleOpen by rememberSaveable { mutableStateOf(false) }
+        // Resolving an Open action: disables the file card while we look it up
+        // and launch. Plain remember — a recreate cancels the coroutine and
+        // must not leave the card stuck in "opening".
+        var openingSha256 by remember { mutableStateOf<String?>(null) }
         LaunchedEffect(circleState) {
             if (circleState != null && pendingCircleOpen) {
                 showCircle = true
@@ -473,9 +587,18 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Share-sheet mode: close ourselves once the dispatch clears the intake.
-        if (shareMode) {
-            LaunchedEffect(share) { if (share == null && FlitEngine.state.value.running) finish() }
+        // Share-sheet mode: finish ONCE, and only from a live, unobstructed
+        // screen. A backgrounded activity (external chooser) or a modal Circle
+        // feed must never be finished by a stale intake clearing.
+        if (shareMode && !shareFinishDone) {
+            LaunchedEffect(share) {
+                if (share != null || shareFinishDone) return@LaunchedEffect
+                if (showCircle) return@LaunchedEffect
+                if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@LaunchedEffect
+                if (!FlitEngine.state.value.running) return@LaunchedEffect
+                shareFinishDone = true
+                finish()
+            }
         }
 
         // The no-AP moment: the engine holds a pending ask it can't present
@@ -523,8 +646,39 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        BackHandler(enabled = !showCircle && screen != Screen.Home) { screen = Screen.Home }
-        BackHandler(enabled = showCircle) { showCircle = false }
+        // One owner per back press. Material dialogs register a handler too;
+        // covering the gap where a sheet is up but nothing claims the event
+        // stops the default Activity.finish() — the "app closed" report.
+        val overlayOpen = pendingCircleOpen || showAddDialog || showNoteDialog ||
+            showQrDialog || showScanDialog || showKnownDialog || showPanicDialog ||
+            showRenameDialog || showThemeDialog || showBatteryDialog || showRelayDialog ||
+            showCircleStart || showCircleJoin || showCircleScan || showCircleInvite ||
+            peerMenuFor != null
+        BackHandler(enabled = showCircle) { showCircle = false } // Circle owns back while up
+        BackHandler(enabled = !showCircle && overlayOpen) {
+            // Dismiss only — never finish the activity out of a modal state.
+            when {
+                pendingCircleOpen -> pendingCircleOpen = false
+                peerMenuFor != null -> peerMenuFor = null
+                showBatteryDialog -> showBatteryDialog = false
+                showThemeDialog -> showThemeDialog = false
+                showRelayDialog -> showRelayDialog = false
+                showRenameDialog -> showRenameDialog = false
+                showNoteDialog -> showNoteDialog = false
+                showCircleInvite -> showCircleInvite = false
+                showCircleScan -> showCircleScan = false
+                showCircleJoin -> showCircleJoin = false
+                showCircleStart -> showCircleStart = false
+                showScanDialog -> showScanDialog = false
+                showQrDialog -> showQrDialog = false
+                showPanicDialog -> showPanicDialog = false
+                showKnownDialog -> showKnownDialog = false
+                showAddDialog -> showAddDialog = false
+            }
+        }
+        BackHandler(enabled = !showCircle && !overlayOpen && screen != Screen.Home) {
+            screen = Screen.Home
+        }
 
         // Direct-share targets live from the first second of the app. Trust
         // toggles and renames arriving via registration resync on their own;
@@ -1212,7 +1366,13 @@ class MainActivity : ComponentActivity() {
                     if (showCircle) {
                         Dialog(
                             onDismissRequest = { showCircle = false },
-                            properties = DialogProperties(usePlatformDefaultWidth = false),
+                            properties = DialogProperties(
+                                usePlatformDefaultWidth = false,
+                                // MainActivity's BackHandler is the single owner of
+                                // back here; the dialog window must not also claim
+                                // it and double-dismiss across the two windows.
+                                dismissOnBackPress = false,
+                            ),
                         ) {
                             MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
                                 Box(
@@ -1228,10 +1388,28 @@ class MainActivity : ComponentActivity() {
                                         onPost = { text -> FlitEngine.circlePost(text) },
                                         onFile = { pickCircleFile.launch(arrayOf("*/*")) },
                                         onOpenFile = { sha ->
-                                            lifecycleScope.launch {
-                                                val r = FlitEngine.circleReceivedFor(sha)
-                                                if (r != null) openReceived(r)
-                                                else FlitEngine.toast("that file hasn't landed here yet")
+                                            val key = sha.trim().lowercase(Locale.ROOT)
+                                            openingSha256 = key
+                                            lifecycleScope.launch(openGuard) {
+                                                try {
+                                                    val r = runCatching {
+                                                        FlitEngine.circleReceivedFor(sha)
+                                                    }.getOrNull()
+                                                    // A config change or the chooser itself can
+                                                    // destroy us mid-resolve; never launch from a dead UI.
+                                                    if (!isActive ||
+                                                        lifecycle.currentState == Lifecycle.State.DESTROYED
+                                                    ) return@launch
+                                                    if (r != null) openReceived(r)
+                                                    // Missing locally: say so, then free the card.
+                                                    else FlitEngine.toast("that file hasn't landed here yet")
+                                                } finally {
+                                                    // Success, failure or Missing — never leave a
+                                                    // card disabled after the attempt is over.
+                                                    if (lifecycle.currentState != Lifecycle.State.DESTROYED) {
+                                                        openingSha256 = null
+                                                    }
+                                                }
                                             }
                                         },
                                         onPoll = { question, options ->
@@ -1250,6 +1428,8 @@ class MainActivity : ComponentActivity() {
                                         },
                                         onQr = { showCircleInvite = true },
                                         onBack = { showCircle = false },
+                                        landedSha256 = landedShas,
+                                        openingSha256 = openingSha256,
                                     )
                                     snackbarHost(
                                         Modifier
@@ -1822,8 +2002,9 @@ class MainActivity : ComponentActivity() {
                     ) { on ->
                         prefs().edit().putBoolean("hiddenMode", on).apply()
                         if (state.running) {
-                            stopSharing()
+                            stopForRebind() // rebind, not an explicit Stop
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                if (isDestroyed) return@postDelayed
                                 startSharing()
                                 FlitEngine.toast(if (on) "hidden from now on" else "visible again")
                             }, 700)
@@ -2134,40 +2315,70 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun openReceived(r: FlitEngine.ReceivedFile) {
-        val uri = when {
+    /**
+     * Resolve a ledger entry to a readable content URI + MIME. The WHOLE
+     * construction — including FileProvider.getUriForFile and the resolver's
+     * type lookup — is guarded. A stale path, an authority mismatch or a
+     * revoked grant ends in a toast, never an exception on the main thread.
+     */
+    private fun resolveReceived(r: FlitEngine.ReceivedFile): Pair<Uri, String>? = runCatching {
+        val u = when {
             r.uri != null -> Uri.parse(r.uri)
-            r.path != null -> FileProvider.getUriForFile(this, "$packageName.fileprovider", r.path)
+            r.path != null -> {
+                // A file moved to Downloads/Flit after receipt has no local
+                // copy left; handing out a FileProvider URI to it is a lie.
+                if (!r.path.isFile) throw IllegalStateException("file gone")
+                FileProvider.getUriForFile(this, FILE_PROVIDER_AUTHORITY, r.path)
+            }
             else -> null
-        } ?: run { FlitEngine.toast("no location stored for ${r.name}"); return }
+        } ?: throw IllegalStateException("no location stored")
+        // Direct-to-storage entries carry a content URI: its own declared type
+        // beats a guess from the file name.
+        val m = if (r.uri != null) {
+            contentResolver.getType(u) ?: FlitEngine.guessMime(r.name)
+        } else {
+            FlitEngine.guessMime(r.name)
+        }
+        u to m
+    }.getOrNull()
+
+    private fun openReceived(r: FlitEngine.ReceivedFile) {
+        val (uri, mime) = resolveReceived(r) ?: run {
+            FlitEngine.toast("no location stored for ${r.name}")
+            return
+        }
         val view = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, FlitEngine.guessMime(r.name))
+            setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            // The grant rides on the base intent AND the chooser: OEM resolvers
+            // may rebuild EXTRA_INTENT, and ClipData keeps the read permission.
+            clipData = ClipData.newRawUri(r.name, uri)
         }
         val chooser = Intent.createChooser(view, r.name).apply {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             clipData = ClipData.newRawUri(r.name, uri)
         }
-        runCatching { startActivity(chooser) }
+        // Explicit, lifecycle-bound launch: a viewer result can never finish us.
+        runCatching { openExternal.launch(chooser) }
             .onFailure { FlitEngine.toast("nothing can open ${r.name}") }
     }
 
     private fun shareReceived(r: FlitEngine.ReceivedFile) {
-        val uri = when {
-            r.uri != null -> Uri.parse(r.uri)
-            r.path != null -> FileProvider.getUriForFile(this, "$packageName.fileprovider", r.path)
-            else -> null
-        } ?: run { FlitEngine.toast("no location stored for ${r.name}"); return }
+        val (uri, mime) = resolveReceived(r) ?: run {
+            FlitEngine.toast("no location stored for ${r.name}")
+            return
+        }
         val send = Intent(Intent.ACTION_SEND).apply {
-            type = FlitEngine.guessMime(r.name)
+            type = mime
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newRawUri(r.name, uri)
         }
         val chooser = Intent.createChooser(send, "Share ${r.name}").apply {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             clipData = ClipData.newRawUri(r.name, uri)
         }
-        runCatching { startActivity(chooser) }
+        runCatching { openExternal.launch(chooser) }
             .onFailure { FlitEngine.toast("share failed") }
     }
 
