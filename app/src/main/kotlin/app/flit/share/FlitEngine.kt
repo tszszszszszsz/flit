@@ -466,15 +466,24 @@ val share: StateFlow<ShareIntake?> = _share
             val policy = d.routePolicy
             val alias = d.alias.ifBlank { d.fingerprint.take(12) }
             var sent = false
-            // Bluetooth for AUTO/BLUETOOTH_ONLY device policies.
-            if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY) {
+            // Direct Wi-Fi first: a live local route always beats any detour.
+            if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.WIFI_ONLY) {
+                val r = runCatching { FlitRoster.routeFor(d.fingerprint) }.getOrNull()
+                if (r != null && !r.isBluetooth && r.port in 1..65535) {
+                    sent = runCatching {
+                        client?.sendPanic(SendTarget(r.host, r.port, r.tls), alert) == true
+                    }.getOrDefault(false)
+                }
+            }
+            // Bluetooth second for AUTO/BLUETOOTH_ONLY policies.
+            if (!sent && (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY)) {
                 if (!d.mac.isNullOrBlank() && btClient != null) {
                     sent = runCatching {
                         btClient!!.sendPanic(SendTarget(d.mac, 0, tls = true), alert) == true
                     }.getOrDefault(false)
                 }
             }
-            // Relay last for AUTO/RELAY_ONLY, and only when the device opted in.
+            // Relay strictly last, and only when the device opted in.
             if (!sent && d.relayFor && (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.RELAY_ONLY)) {
                 val relay = d.relay?.let { FlitRoute.parseRelay(it) } ?: relayConfig()?.let {
                     it.host to it.port
@@ -487,15 +496,6 @@ val share: StateFlow<ShareIntake?> = _share
                         val target = SendTarget(relay.first, relay.second, tls = true, relayFor = d.fingerprint)
                         sent = runCatching { dialer.sendPanic(target, alert) == true }.getOrDefault(false)
                     }
-                }
-            }
-            // Direct Wi-Fi route for AUTO/WIFI_ONLY.
-            if (!sent && (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.WIFI_ONLY)) {
-                val r = runCatching { FlitRoster.routeFor(d.fingerprint) }.getOrNull()
-                if (r != null && !r.isBluetooth && r.port in 1..65535) {
-                    sent = runCatching {
-                        client?.sendPanic(SendTarget(r.host, r.port, r.tls), alert) == true
-                    }.getOrDefault(false)
                 }
             }
             if (sent) reached++ else logLine("panic: no live route to $alias")
@@ -2263,8 +2263,7 @@ val share: StateFlow<ShareIntake?> = _share
 
     fun setQrOnly(on: Boolean) {
         if (!::appCtx.isInitialized) return
-        prefs().edit().putBoolean("qrOnly", on).apply()
-        FlitKnown.setQrOnly(appCtx, on)
+        FlitKnown.setQrOnly(appCtx, on) // single source of truth: known.qrOnly
         refreshKnown()
         if (_state.value.running || _state.value.starting) {
             stop()

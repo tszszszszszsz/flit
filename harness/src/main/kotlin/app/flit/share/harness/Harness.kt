@@ -142,7 +142,7 @@ serve [--alias N] [--port P] [--dir D] [--udp-port N] [--http] [--hidden] [--ann
 discover [--wait S] [--udp-port N] [--http] [--announce-to ip:port,...]
 send <ip[:port] | alias> <file...> [--http] [--pin PIN] [--parallel N] [--multi]
 info <ip[:port]> [--http]
-bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
+bt-sim [file...] [--bytes MB] [--no-tls] -- both ends in one process over the pipe carrier
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)

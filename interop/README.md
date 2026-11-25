@@ -51,7 +51,7 @@ Our stack: `:protocol` module (Kotlin), Netty server, own `PeerHttpClient` (JDK 
 
 ## Repro bootstraps
 - Node A: `flit-cli serve --dir received --port 53318 --udp-port 53319 --alias FlitAlpha --announce-to 127.0.0.1:53317`
-- Node B send: `flit-cli send --to 127.0.0.1:53318 <files>` (T0), `--to 127.0.0.1:53216` (T1 reverse).
+- Node B send: `flit-cli send 127.0.0.1:53318 <files>` (T0), `flit-cli send 127.0.0.1:53216 <files>` (T1 reverse).
 - CLI receive driving: `mkfifo cli-stdin`, `exec 3<> cli-stdin`, launch `script -qec "$HOME/.local/opt/localsend-cli" /dev/null <&3 > cli-tui.log 2>&1 &`,
   then `printf 'Y' >&3` when the offer dialog shows (same shell invocation; fd3 dies with the shell).
 

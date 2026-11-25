@@ -25,7 +25,7 @@ import kotlinx.serialization.Serializable
  * ```
  *
  * The event never carries file bytes — the sender delivers them separately
- * with `ProtocolClient.sendFiles` (the bulk transfer path), one peer at a
+ * with `ProtocolClient.sendFiles` (the direct per-member transfer path), one peer at a
  * time, and the receiver lands them hash-exact. A [FILE] body is exactly
  * `{name,size,sha256}`: it never carries the sender's local spool path, a
  * queue token, or any other key, so recipients locate the bytes by hash,

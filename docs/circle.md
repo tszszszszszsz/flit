@@ -146,15 +146,15 @@ is signed but not encrypted.
   `(lamport, authorFp, id)` so every member converges without a server.
 - **Dedup/replay:** bounded seen-id set (≈4096) and a clock-skew window; future
   or replayed events are refused. Same discipline as `PanicCore`, reused.
-- **Sync:** there is no id-summary/fetch handshake. Every `SYNC` — a pull, an
-  outbound fan-out post, or a calm tick — posts the **full bounded local log**
-  (the last `CircleCore.MAX_EVENTS_PER_REQUEST` events) over an existing
-  `Link`/`LinkProvider` session; the receiver verifies and dedups by event id,
-  folds the new events, and answers with its own **ordered log**. Because the
-  whole log travels each time, a lost one-shot is repaired by the next post or
-  tick: app-layer store-and-forward (bounded) lets an offline member catch up.
-  The relay is never given storage; it stays a blind pipe, and dialing through it
-  needs the per-device `relayFor` switch on (see "Transport and battery").
+- **Sync:** there is no id-summary/fetch handshake. An outbound `fanout()` posts
+  only the per-peer **delta** after that peer's `(lamport, id)` watermark; the
+  calm 30 s `sync()` repair tick posts the **full bounded log** so a lost delta
+  heals. Every payload is capped by `CircleCore.MAX_EVENTS_PER_REQUEST`, and
+  receivers verify cert-in-event, dedup by id and fold through the store's
+  reducers, answering with their own **ordered log**. App-layer store-and-forward
+  (bounded) lets an offline member catch up; the relay is never given storage.
+  Dialing through a relay needs the per-device `relayFor` switch on (see
+  "Transport and battery").
 - **Vote resolution:** the latest signed `Vote(pollId)` per member wins;
   tally counts winners per option. Changing an answer appends a new vote, so
   the history stays honest. Ties are displayed as ties, not hidden.

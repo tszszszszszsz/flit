@@ -22,7 +22,7 @@ preserves the original author as the trust anchor (a receiver gates on `originFp
 so a known intermediary cannot smuggle in an unknown author), and `id` plus the
 note survive for dedup. Hops are inside the signed canonical bytes, including the
 handoff, so a bumped count cannot be forged; `forward` returns null once
-`hops >= DEFAULT_MAX_HOPS` (3), and the UI toasts "alert reached its hop limit — it
+`hops + 1 >= DEFAULT_MAX_HOPS` (so forwarding stops once the received count is 2), and the UI toasts "alert reached its hop limit — it
 cannot be forwarded further" instead of sending.
 
 **Hardware evidence (one phone + the CLI box):** the box was added through the

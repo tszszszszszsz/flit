@@ -128,8 +128,11 @@ It is deliberately not the live engine state:
 
 - **Write** on every deliberate start — share-sheet, invite link, or silent
   restore — via `setSharingDesired(true)`.
-- **Clear** only on an explicit Stop (`setSharingDesired(false)`); rebinds keep
-  it.
+- **Clear** on an explicit Stop (`setSharingDesired(false)`), and in the service
+  when it owned a live foreground service that is genuinely stopping (including
+  a failed FGS promotion that calls `stopSelf`); internal rebinds (alias, relay,
+  Bluetooth, timeout) never clear it. `am force-stop` bypasses `onDestroy`
+  entirely, so it preserves the row and the next launch restores silently.
 - **Read** on a cold `onCreate()` and on `onResume()` via
   `shouldRestoreSharing(running, starting)`, which restores *silently* — no
   re-prompt on a cold start — and only when nothing is already up or coming up.

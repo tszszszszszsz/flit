@@ -6,9 +6,9 @@ import kotlinx.serialization.Serializable
  * Device announcement / registration info (v2.2).
  *
  * Wire fields are camelCase. `port` and `protocol` are required in multicast
- * announcements, but omitted from register/info responses — kotlinx-serialization
- * omits them when they equal their default values, which keeps both shapes valid.
- * `announce` is a legacy v2.0 field: tolerated when reading, never written.
+ * announcements and always written in register/info responses too — WireJson
+ * sets `encodeDefaults = true`, and the reference rust `RegisterDtoV2` requires
+ * them. `announce` is a legacy v2.0 field: tolerated when reading, never written.
  */
 @Serializable
 data class PeerInfo(

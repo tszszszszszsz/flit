@@ -86,6 +86,20 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 
+## Documentation
+
+Start at the [design index](docs/transport-bluetooth.md) for milestone status. Deep context:
+
+- [Architecture](docs/ARCHITECTURE.md) — module map, transport seam, state ownership, lifecycle, concurrency.
+- [Contracts](docs/CONTRACTS.md) — v2.2 wire, additive Flit routes, Link/ServerDelegate APIs, canonical signatures.
+- [Failure modes](docs/FAILURE-MODES.md) — what retries, concludes, keeps bytes, or drops, across every flow.
+- [Security](docs/SECURITY.md) — threat model, trust anchors, replay, invites, relay, panic, honest limits.
+- [Performance](docs/PERFORMANCE.md) — measured throughput, energy design, duty cycles, watermarks, caches.
+- [Testing](docs/TESTING.md) — rig command, evidence levels, device walks, reproduction recipes.
+- [Operations](docs/OPERATIONS.md) — CLI reference, box/phone setup, MIUI notes, logs, troubleshooting.
+- [Product decisions](docs/PRODUCT-DECISIONS.md) — non-profit constraint, surface contract revision, scope cuts, postmortems.
+- Focused designs: [Circle](docs/circle.md), [Bluetooth carrier](docs/bluetooth-carrier.md), [QR-only & panic](docs/qr-only-and-panic.md), [Open file & sharing restore](docs/open-file-and-sharing-restore.md), milestones [A](docs/milestone-a.md), [C](docs/milestone-c.md), [D](docs/milestone-d.md), [E](docs/milestone-e.md), and [store listing copy](docs/play-listing.md).
+
 ## Repo layout
 
 ```
@@ -112,8 +126,8 @@ the sender is the production protocol client riding the simulated Bluetooth pipe
 used before every commit:
 
 ```bash
-source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDebug \
-    :app:assembleRelease :harness:installDist
+source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :harness:test \
+    :app:assembleDebug :app:assembleRelease :harness:installDist :harness:distZip
 ```
 
 Interop testing uses the official `localsend-cli` v1.18.2 binary at
@@ -131,7 +145,8 @@ rig, shipped under a name that doesn't wear test-bench vocabulary.
 ./install-cli.sh --zip flit-cli-0.2.0.zip   # or install a CI artifact directly
 ```
 
-The canonical `flit-cli` command list (every command and flag, from `flit-cli` with no arguments):
+Common `flit-cli` commands (run `flit-cli` with no arguments for the complete
+flag list; `docs/OPERATIONS.md` is the canonical reference):
 
 ```bash
 flit-cli serve --dir ~/Public [--relay host:port --token T]   # receive; announces on the LAN like the app

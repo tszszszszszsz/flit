@@ -309,7 +309,8 @@ object CircleCore {
      * event's signature or acceptance; callers minting or accepting a file
      * announcement use this to refuse `token`, `path`, `spoolPath` or any
      * other extra key. That is what keeps a sender's local spool path off the
-     * wire: recipients resolve bytes by `sha256` through the bulk queue.
+     * wire: sha256 only correlates a landed file with its card locally; bytes
+     * are pushed by the sender with `sendFiles`, not pulled from a bulk queue.
      */
     fun validFileBody(body: String): Boolean {
         if (body.isBlank() || body.length > MAX_BODY_CHARS) return false
