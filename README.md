@@ -181,6 +181,15 @@ requires that switch on (with a relay address and token) to reach a peer that wa
 
 ## Licensing / provenance note
 
+Flit is free software under the **GNU GPL v3 or later** ([`LICENSE`](LICENSE)). Copyleft is
+deliberate: you may use, modify and redistribute it, but anything derived from it and
+distributed must carry the same license. There are no separate commercial or closed-source
+terms, and no dual-license escape hatch.
+
 This is a **clean-room implementation** of a wire protocol (protocols and file formats are not
 copyrightable). No LocalSend source code or assets are copied; only the protocol specification
 documentation is used as reference.
+
+Development happened privately and is published here with its **full commit history** — the
+scaffolding, the milestones, the regressions and their fixes are all in it. This is not an
+imported or rewritten repository, and more work is planned.

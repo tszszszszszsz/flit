@@ -711,12 +711,28 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
   `app/build/outputs/apk/release/app-release.apk`. Signing uses
   `keystore.properties` + `keystore/flit-release.jks` when present (both
   gitignored); without them release falls back to the **debug key** so a source
-  build still assembles (app/build.gradle.kts:11-17,31-56). A signed release
-  updates in place with `adb install -r`.
+  build still assembles (app/build.gradle.kts:11-17,31-56). The published
+  release key has subject `CN=Flit, OU=Flit contributors`; verify with
+  `apksigner verify --print-certs app-release.apk` (build-tools 36). `adb
+  install -r` only works when the new APK has the **same signing identity** as
+  the installed one. Moving from the debug-signed development build to the
+  release-signed one therefore needs an uninstall first, which clears local
+  app data (history, Circle membership, shared-desired flag); plan for that
+  rather than expecting an in-place update.
 - **CLI zip:** `harness/build/distributions/flit-cli-<version>.zip`, produced by
   `:harness:distZip`; CI uploads it as artifact named `flit-cli` (rig.yml:45-50).
   `install-cli.sh --zip <file>` installs that artifact to
   `~/.local/lib/flit-cli` with a launcher at `~/.local/bin/flit-cli`.
+- **License:** `LICENSE` is the full GNU GPL v3 text with
+  `SPDX-License-Identifier: GPL-3.0-or-later`. The earlier permissive MIT
+  license was replaced deliberately; derivatives that are distributed must
+  remain under the same license.
+- **Release verification:** the published bundle carries the signed APK, the
+  CLI zip and `SHA256SUMS.txt`. Check with `sha256sum -c SHA256SUMS.txt` and
+  re-check the APK signer before sideloading.
+- **Provenance:** development was private; the repository is published with its
+  full commit history (scaffolding, milestones, regressions and fixes), not as
+  a reconstructed snapshot. The tag is `v0.2.0`.
 - **Store metadata:** `fastlane/metadata/android/en-US/` holds title,
   short/full description and `changelogs/1.txt` ("First release").
   `RELEASE_NOTES.md` carries v0.2.0 notes plus a dated 2026-11-25 correction:
