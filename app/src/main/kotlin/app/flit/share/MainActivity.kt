@@ -43,6 +43,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -56,6 +57,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -120,6 +122,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -127,6 +130,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
@@ -139,6 +144,7 @@ import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -150,6 +156,9 @@ class MainActivity : ComponentActivity() {
 
     private var pendingPeer: FlitEngine.PeerEntry? = null
     private var shareMode = false
+
+    /** The latest ACTION_VIEW invite; a new link supersedes an in-flight join. */
+    private var pendingCircleJoin: Job? = null
 
     /** Direct-share target from the sheet: dispatch the intake to this fp the moment both it and the device are ready. */
     private val autoPeerFp = mutableStateOf<String?>(null)
@@ -274,6 +283,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        // singleTop re-entry: keep getIntent() in sync so a recreation cannot
+        // re-ingest the original (stale) link or share request.
+        setIntent(intent)
         ingestIntent(intent)
     }
 
@@ -296,13 +308,29 @@ class MainActivity : ComponentActivity() {
                 if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
             }
             Intent.ACTION_VIEW -> {
-                val link = intent.data?.toString() ?: return
-                val code = parseAddCode(link)
-                android.util.Log.i("FlitSend", "invite link parsed=${code != null} circle=${code?.circle} invite=${code?.invite?.take(8)}")
+                // An invite replaces any share-sheet context: no stale
+                // auto-dispatch to a peer, no auto-finish mid-invite.
+                shareMode = false
+                autoPeerFp.value = null
+                val uri = intent.data ?: return
+                // The manifest filters flit://add, but an explicit intent can
+                // still arrive here. Check scheme and authority before the
+                // tolerant code parser sees a lookalike like flit://add.evil.
+                if (!uri.scheme.equals("flit", ignoreCase = true)) return
+                val authority = uri.authority
+                if (!authority.equals("add", ignoreCase = true) &&
+                    !authority.equals("pair", ignoreCase = true)
+                ) return
+                val link = uri.toString()
+                val code = runCatching { parseAddCode(link) }.getOrNull()
                 if (code == null) {
                     FlitEngine.toast("that is not a Flit invite")
                     return
                 }
+                // Latest link wins: a repeat or a recreation must not stack
+                // two joins on the same engine.
+                pendingCircleJoin?.cancel()
+                pendingCircleJoin = null
                 if (code.circle.isNullOrBlank() || code.invite.isNullOrBlank()) {
                     FlitEngine.addFromScan(code)
                     return
@@ -310,13 +338,27 @@ class MainActivity : ComponentActivity() {
                 // A Circle invite needs a live dialer; start sharing first,
                 // then join as soon as the engine reports its identity.
                 if (!FlitEngine.state.value.running && !FlitEngine.state.value.starting) startSharing()
-                lifecycleScope.launch {
+                pendingCircleJoin = lifecycleScope.launch {
                     var waited = 0
-                    while (!FlitEngine.state.value.running && waited < 100) {
+                    while (isActive && !FlitEngine.state.value.running &&
+                        FlitEngine.state.value.error == null && waited < 100
+                    ) {
                         delay(200)
                         waited++
                     }
+                    // lifecycleScope cancels on destroy; re-check in case the
+                    // destroy lands between the last delay and the join.
+                    if (!isActive || lifecycle.currentState == Lifecycle.State.DESTROYED) {
+                        pendingCircleJoin = null
+                        return@launch
+                    }
+                    if (!FlitEngine.state.value.running) {
+                        FlitEngine.toast("sharing did not start — open Flit and try the invite again")
+                        pendingCircleJoin = null
+                        return@launch
+                    }
                     FlitEngine.joinCircle(code)
+                    pendingCircleJoin = null
                 }
             }
         }
@@ -495,6 +537,31 @@ class MainActivity : ComponentActivity() {
         // backgrounded flows (notification send, roster pinning) fall back to
         // system toasts — same message, same channel rules as before.
         val snackbar = remember { SnackbarHostState() }
+        // One host at a time: the Circle feed is a separate modal window, so
+        // it carries the snackbar while the one behind that window is omitted.
+        val snackbarHost: @Composable (Modifier) -> Unit = { hostModifier ->
+            SnackbarHost(hostState = snackbar, modifier = hostModifier) { data ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(FlitCorner.extraSmall),
+                    color = MaterialTheme.colorScheme.inverseSurface,
+                    shadowElevation = 3.dp,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp)
+                            .defaultMinSize(minHeight = 48.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        Text(
+                            data.visuals.message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.inverseOnSurface,
+                        )
+                    }
+                }
+            }
+        }
         var pendingToast by remember { mutableStateOf<Job?>(null) }
         val toastScope = rememberCoroutineScope()
         val uiSink = remember {
@@ -645,7 +712,7 @@ class MainActivity : ComponentActivity() {
                                                     "fp ${state.fingerprintShort}…",
                                                     fontSize = 11.sp,
                                                     fontFamily = FontFamily.Monospace,
-                                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.6f),
+                                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                                                 )
                                             }
                                             // Live transfer strip: slides in only while bytes flow.
@@ -692,7 +759,7 @@ class MainActivity : ComponentActivity() {
                                                             "${FlitEngine.fmtBytes(t.doneBytes)} / ${FlitEngine.fmtBytes(t.totalBytes)}",
                                                             style = MaterialTheme.typography.bodySmall
                                                                 .copy(fontFeatureSettings = "tnum"),
-                                                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
                                                         )
                                                     }
                                                 }
@@ -754,7 +821,7 @@ class MainActivity : ComponentActivity() {
                                                         s.text.take(160),
                                                         style = MaterialTheme.typography.bodySmall,
                                                         fontSize = 12.sp,
-                                                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f),
+                                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
                                                     )
                                                 }
                                                 Text(
@@ -763,7 +830,7 @@ class MainActivity : ComponentActivity() {
                                                             (s.sourceApp?.let { " (from $it)" } ?: "")
                                                     } else "copying shared files to a safe place…",
                                                     style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f),
+                                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
                                                 )
                                             }
                                         }
@@ -803,7 +870,7 @@ class MainActivity : ComponentActivity() {
                                                 ) {
                                                     Icon(
                                                         Icons.Filled.Refresh,
-                                                        contentDescription = "Send again",
+                                                        contentDescription = null, // adjacent Text already says "Send again to …"
                                                         tint = MaterialTheme.colorScheme.onSecondaryContainer,
                                                         modifier = Modifier.size(20.dp),
                                                     )
@@ -818,7 +885,7 @@ class MainActivity : ComponentActivity() {
                                                     Text(
                                                         "picks files right away — works offline, queues until it answers",
                                                         style = MaterialTheme.typography.bodySmall,
-                                                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f),
+                                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
                                                     )
                                                 }
                                             }
@@ -964,7 +1031,7 @@ class MainActivity : ComponentActivity() {
                                             onClick = { showPanicDialog = true },
                                             shape = CircleShape,
                                             contentPadding = PaddingValues(horizontal = 14.dp),
-                                            modifier = Modifier.height(36.dp),
+                                            modifier = Modifier.heightIn(min = 48.dp),
                                         ) { Text("Panic", style = MaterialTheme.typography.labelLarge) }
                                     }
                                     if (peers.isEmpty()) {
@@ -1139,74 +1206,67 @@ class MainActivity : ComponentActivity() {
                         onAdd = { showAddDialog = true },
                     )
 
-                    // Circle feed: a full-surface overlay hosted by Home, with
-                    // every action routed straight to the engine's Circle APIs.
+                    // Circle feed: a modal full-surface window, not a sibling
+                    // overlay — the dock/home below must not stay hit-testable
+                    // or reachable in semantics while the feed is up.
                     if (showCircle) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(MaterialTheme.colorScheme.background),
+                        Dialog(
+                            onDismissRequest = { showCircle = false },
+                            properties = DialogProperties(usePlatformDefaultWidth = false),
                         ) {
-                            CircleScreen(
-                                state = circleState,
-                                events = circleEvents,
-                                members = circleState?.members ?: emptyList(),
-                                meFp = meFp,
-                                onPost = { text -> FlitEngine.circlePost(text) },
-                                onFile = { pickCircleFile.launch(arrayOf("*/*")) },
-                                onPoll = { question, options ->
-                                    FlitEngine.circlePostPoll(question, options)
-                                },
-                                onVote = { pollId, option -> FlitEngine.circleVote(pollId, option) },
-                                onStartKick = { fp -> FlitEngine.circleStartKick(fp) },
-                                onVoteKick = { kickId, approve ->
-                                    FlitEngine.circleVoteKick(kickId, approve)
-                                },
-                                onKick = { fp -> FlitEngine.circleKick(fp) },
-                                onLeave = {
-                                    FlitEngine.circleLeave()
-                                    showCircle = false
-                                },
-                                onQr = { showCircleInvite = true },
-                                onBack = { showCircle = false },
-                            )
+                            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.colorScheme.background),
+                                ) {
+                                    CircleScreen(
+                                        state = circleState,
+                                        events = circleEvents,
+                                        members = circleState?.members ?: emptyList(),
+                                        meFp = meFp,
+                                        onPost = { text -> FlitEngine.circlePost(text) },
+                                        onFile = { pickCircleFile.launch(arrayOf("*/*")) },
+                                        onPoll = { question, options ->
+                                            FlitEngine.circlePostPoll(question, options)
+                                        },
+                                        onVote = { pollId, option -> FlitEngine.circleVote(pollId, option) },
+                                        onStartKick = { fp -> FlitEngine.circleStartKick(fp) },
+                                        onVoteKick = { kickId, approve ->
+                                            FlitEngine.circleVoteKick(kickId, approve)
+                                        },
+                                        onKick = { fp -> FlitEngine.circleKick(fp) },
+                                        onRole = { fp, role -> FlitEngine.circleSetRole(fp, role) },
+                                        onLeave = {
+                                            FlitEngine.circleLeave()
+                                            showCircle = false
+                                        },
+                                        onQr = { showCircleInvite = true },
+                                        onBack = { showCircle = false },
+                                    )
+                                    snackbarHost(
+                                        Modifier
+                                            .align(Alignment.BottomCenter)
+                                            .navigationBarsPadding()
+                                            .padding(bottom = 16.dp)
+                                            .padding(horizontal = 16.dp),
+                                    )
+                                }
+                            }
                         }
                     }
 
                     // Engine feedback hovers above the dock (dock = nav bars +
-                    // 16 gap + 56 FAB; snackbar sits 8 above that). Visually
-                    // the M3 snackbar contract: 48dp single line, extra-small
-                    // radius, inverse-surface trio — constants match the m3
-                    // defaults, spelled out so the contract is auditable in
-                    // one place (an action, if ever added, takes inversePrimary;
-                    // none today — engine toasts carry no actions).
-                    SnackbarHost(
-                        hostState = snackbar,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .navigationBarsPadding()
-                            .padding(bottom = 80.dp)
-                            .padding(horizontal = 16.dp),
-                    ) { data ->
-                        Surface(
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(FlitCorner.extraSmall),
-                            color = MaterialTheme.colorScheme.inverseSurface,
-                            shadowElevation = 3.dp,
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .padding(horizontal = 16.dp)
-                                    .defaultMinSize(minHeight = 48.dp),
-                                contentAlignment = Alignment.CenterStart,
-                            ) {
-                                Text(
-                                    data.visuals.message,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.inverseOnSurface,
-                                )
-                            }
-                        }
+                    // 16 gap + 56 FAB; snackbar sits 8 above that). The Circle
+                    // modal window has its own host while this one is hidden.
+                    if (!showCircle) {
+                        snackbarHost(
+                            Modifier
+                                .align(Alignment.BottomCenter)
+                                .navigationBarsPadding()
+                                .padding(bottom = 80.dp)
+                                .padding(horizontal = 16.dp),
+                        )
                     }
                 }
             }
@@ -1323,12 +1383,14 @@ class MainActivity : ComponentActivity() {
         }
 
         if (showScanDialog) {
-            QrScanCard(
-                onCode = { raw ->
-                    FlitEngine.addFromScan(raw)
-                },
-                onClose = { showScanDialog = false },
-            )
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                QrScanCard(
+                    onCode = { raw ->
+                        FlitEngine.addFromScan(raw)
+                    },
+                    onClose = { showScanDialog = false },
+                )
+            }
         }
 
         // ---- Circle sheets -------------------------------------------------
@@ -1416,19 +1478,21 @@ class MainActivity : ComponentActivity() {
         }
 
         if (showCircleScan) {
-            QrScanCard(
-                onCode = { raw ->
-                    showCircleScan = false
-                    val code = parseAddCode(raw)
-                    if (code == null) {
-                        FlitEngine.toast("that does not look like a Flit code")
-                    } else {
-                        pendingCircleOpen = true
-                        FlitEngine.joinCircle(code)
-                    }
-                },
-                onClose = { showCircleScan = false },
-            )
+            MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                QrScanCard(
+                    onCode = { raw ->
+                        showCircleScan = false
+                        val code = parseAddCode(raw)
+                        if (code == null) {
+                            FlitEngine.toast("that does not look like a Flit code")
+                        } else {
+                            pendingCircleOpen = true
+                            FlitEngine.joinCircle(code)
+                        }
+                    },
+                    onClose = { showCircleScan = false },
+                )
+            }
         }
 
         if (showCircleInvite) {
@@ -1714,7 +1778,7 @@ class MainActivity : ComponentActivity() {
                         subtitle = "“${FlitEngine.currentAlias()}” — how other devices see you",
                         onClick = showRename,
                     )
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     OptionRow(
                         title = "Known devices",
                         subtitle = if (knownCount == 0) {
@@ -1724,7 +1788,7 @@ class MainActivity : ComponentActivity() {
                         },
                         onClick = onShowKnown,
                     )
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     OptionRow(
                         title = "Theme",
                         subtitle = when (theme) {
@@ -1734,7 +1798,7 @@ class MainActivity : ComponentActivity() {
                         },
                         onClick = showTheme,
                     )
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Only trusted devices can send me files",
                         subtitle = "offers from devices you haven't trusted are declined automatically",
@@ -1743,7 +1807,7 @@ class MainActivity : ComponentActivity() {
                         prefs().edit().putBoolean("onlyTrusted", on).apply()
                         if (on && state.running) FlitEngine.toast("takes effect for new offers now")
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Hidden on the network",
                         subtitle = "stop announcing — nobody lists you until you send first, or they add you by address",
@@ -1758,13 +1822,13 @@ class MainActivity : ComponentActivity() {
                             }, 700)
                         }
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "QR-only mode",
                         subtitle = "only QR-paired devices can connect — no announcing or scanning",
                         initial = FlitEngine.qrOnly(),
                     ) { on -> FlitEngine.setQrOnly(on) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1785,7 +1849,7 @@ class MainActivity : ComponentActivity() {
                             TextButton(onClick = onResetDest) { Text("Reset") }
                         }
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Start on device boot",
                         subtitle = "be reachable again right after a reboot (best effort — tight systems allow it only after the first unlock)",
@@ -1793,7 +1857,7 @@ class MainActivity : ComponentActivity() {
                     ) { on ->
                         prefs().edit().putBoolean("startOnBoot", on).apply()
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Sound when transfers finish",
                         subtitle = "a short chime plays after a completed transfer",
@@ -1801,13 +1865,13 @@ class MainActivity : ComponentActivity() {
                     ) { on ->
                         prefs().edit().putBoolean("transferSound", on).apply()
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Keep the screen on while transferring",
                         subtitle = "stops the system from dozing a transfer you're watching",
                         initial = keepOn,
                     ) { on -> setKeepOn(on) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Crush files when sending",
                         subtitle = "text, notes, logs, JSON and code are gzip'd on the way — Flit receivers unpack them automatically",
@@ -1815,7 +1879,7 @@ class MainActivity : ComponentActivity() {
                     ) { on ->
                         prefs().edit().putBoolean("crushSend", on).apply()
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Parallel streams on Wi-Fi",
                         subtitle = "splits big files across several sockets for extra speed — only between Flit devices, every other receiver just gets the normal single-stream send",
@@ -1823,7 +1887,7 @@ class MainActivity : ComponentActivity() {
                     ) { on ->
                         prefs().edit().putBoolean("parallelStreams", on).apply()
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     SwitchOption(
                         title = "Transfer over Bluetooth",
                         subtitle = "direct link when devices are close — slower than Wi-Fi; both devices need sharing on, this option enabled, and a one-time pairing consent",
@@ -1832,7 +1896,7 @@ class MainActivity : ComponentActivity() {
                         prefs().edit().putBoolean("bluetoothTransfer", on).apply()
                         FlitEngine.bluetoothChanged()
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     val relayAddress = prefs().getString("relayAddress", "") ?: ""
                     OptionRow(
                         title = "Relay (optional)",
@@ -1843,24 +1907,25 @@ class MainActivity : ComponentActivity() {
                         },
                         onClick = showRelay,
                     )
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     if (Build.VERSION.SDK_INT >= 29) {
                         var showMirrorPicker by remember { mutableStateOf(false) }
                     var mirrorTarget by remember { mutableStateOf(FlitRoster.mirrorTarget()) }
                     val mirrorOn = mirrorOnState.value
+                    val setMirror: (Boolean) -> Unit = { v ->
+                        if (v && !mediaReadGranted()) {
+                            mirrorPerms.launch(mirrorPermissions())
+                        } else {
+                            mirrorOnState.value = v
+                            FlitRoster.setMirrorOn(v)
+                            if (v) FlitEngine.mirrorSeed(this@MainActivity)
+                            FlitEngine.mirrorRefresh()
+                        }
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable {
-                                if (!mirrorOn && !mediaReadGranted()) {
-                                    mirrorPerms.launch(mirrorPermissions())
-                                } else {
-                                    mirrorOnState.value = !mirrorOn
-                                    FlitRoster.setMirrorOn(!mirrorOn)
-                                    if (!mirrorOn) FlitEngine.mirrorSeed(this@MainActivity)
-                                    FlitEngine.mirrorRefresh()
-                                }
-                            }
+                            .toggleable(value = mirrorOn, role = Role.Switch, onValueChange = setMirror)
                             .padding(vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -1879,16 +1944,11 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         Spacer(Modifier.width(12.dp))
-                        Switch(checked = mirrorOn, onCheckedChange = { v ->
-                            if (v && !mediaReadGranted()) {
-                                mirrorPerms.launch(mirrorPermissions())
-                            } else {
-                                mirrorOnState.value = v
-                                FlitRoster.setMirrorOn(v)
-                                if (v) FlitEngine.mirrorSeed(this@MainActivity)
-                                FlitEngine.mirrorRefresh()
-                            }
-                        })
+                        Switch(
+                            checked = mirrorOn,
+                            onCheckedChange = null,
+                            modifier = Modifier.clearAndSetSemantics { },
+                        )
                     }
                     OptionRow(
                         title = "Mirror to",
@@ -1900,50 +1960,52 @@ class MainActivity : ComponentActivity() {
                     )
                     if (showMirrorPicker) {
                         val pinned = FlitRoster.all()
-                        AlertDialog(
-                            onDismissRequest = { showMirrorPicker = false },
-                            title = { Text("Mirror camera shots to") },
-                            text = {
-                                Column {
-                                    if (pinned.isEmpty()) {
-                                        Text(
-                                            "no trusted devices yet — add one on the Nearby screen first (send it something once, or scan its code)",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                        )
-                                    } else {
-                                        pinned.forEach { p ->
+                        MaterialTheme(colorScheme = FlitThemeColors(theme)) { // MIUI dialog windows resolve a light scheme — pin ours
+                            AlertDialog(
+                                onDismissRequest = { showMirrorPicker = false },
+                                title = { Text("Mirror camera shots to") },
+                                text = {
+                                    Column {
+                                        if (pinned.isEmpty()) {
                                             Text(
-                                                p.alias.ifBlank { p.fingerprint.take(12) },
-                                                style = MaterialTheme.typography.bodyLarge,
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .clickable {
-                                                        FlitRoster.setMirrorTarget(p.fingerprint)
-                                                        mirrorTarget = p.fingerprint
-                                                        FlitEngine.mirrorRefresh()
-                                                        showMirrorPicker = false
-                                                    }
-                                                    .padding(vertical = 12.dp),
+                                                "no trusted devices yet — add one on the Nearby screen first (send it something once, or scan its code)",
+                                                style = MaterialTheme.typography.bodyMedium,
                                             )
+                                        } else {
+                                            pinned.forEach { p ->
+                                                Text(
+                                                    p.alias.ifBlank { p.fingerprint.take(12) },
+                                                    style = MaterialTheme.typography.bodyLarge,
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .clickable {
+                                                            FlitRoster.setMirrorTarget(p.fingerprint)
+                                                            mirrorTarget = p.fingerprint
+                                                            FlitEngine.mirrorRefresh()
+                                                            showMirrorPicker = false
+                                                        }
+                                                        .padding(vertical = 12.dp),
+                                                )
+                                            }
                                         }
                                     }
-                                }
-                            },
-                            confirmButton = {
-                                TextButton(onClick = {
-                                    FlitRoster.setMirrorTarget(null)
-                                    mirrorTarget = null
-                                    FlitEngine.mirrorRefresh()
-                                    showMirrorPicker = false
-                                }) { Text("Nobody") }
-                            },
-                            dismissButton = {
-                                TextButton(onClick = { showMirrorPicker = false }) { Text("Cancel") }
-                            },
-                        )
+                                },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        FlitRoster.setMirrorTarget(null)
+                                        mirrorTarget = null
+                                        FlitEngine.mirrorRefresh()
+                                        showMirrorPicker = false
+                                    }) { Text("Nobody") }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showMirrorPicker = false }) { Text("Cancel") }
+                                },
+                            )
+                        }
                     }
                     }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     OptionRow(
                         title = "Background battery…",
                         subtitle = "let background sharing run without the system rationing it",
@@ -2126,11 +2188,14 @@ class MainActivity : ComponentActivity() {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable {
-                    val v = !on
-                    on = v
-                    onChange(v)
-                }
+                .toggleable(
+                    value = on,
+                    role = Role.Switch,
+                    onValueChange = { v ->
+                        on = v
+                        onChange(v)
+                    },
+                )
                 .padding(vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -2139,7 +2204,13 @@ class MainActivity : ComponentActivity() {
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.width(12.dp))
-            Switch(checked = on, onCheckedChange = { v -> on = v; onChange(v) })
+            // The row owns the switch semantics and the whole-row tap target;
+            // the thumb is decoration only (no duplicate toggle node).
+            Switch(
+                checked = on,
+                onCheckedChange = null,
+                modifier = Modifier.clearAndSetSemantics { },
+            )
         }
     }
 
@@ -2173,7 +2244,7 @@ class MainActivity : ComponentActivity() {
                 Text(
                     "Nothing happens to this device automatically. Forward sends the alert to your known devices only when you tap it.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = cs.onErrorContainer.copy(alpha = 0.8f),
+                    color = cs.onErrorContainer,
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -2521,7 +2592,7 @@ class MainActivity : ComponentActivity() {
                 Box(
                     modifier = Modifier
                         .size(12.dp)
-                        .background(color.copy(alpha = 0.55f), CircleShape),
+                        .background(color, CircleShape),
                 )
         }
     }
@@ -2680,12 +2751,12 @@ class MainActivity : ComponentActivity() {
         IconButton(
             onClick = onClick,
             interactionSource = interaction,
-            modifier = Modifier.size(40.dp),
+            modifier = Modifier.size(48.dp), // 48dp touch target; 40dp visual below
         ) {
             // Unclipped wrapper: the background + icon are clipped to the
             // pressed shape, but the badge is a sibling drawn on top so the
             // circle clip can't shave it into a crescent.
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()

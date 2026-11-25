@@ -311,6 +311,9 @@ val share: StateFlow<ShareIntake?> = _share
 
     private fun refreshCircle() {
         if (!::appCtx.isInitialized) return
+        // The invite is a bearer token but it is this device's own circle;
+        // persisting it keeps the host able to admit members after a restart.
+        circleInvite = prefs().getString("circleInvite", null)
         val st = FlitCircleStore.load(appCtx)
         _circleState.value = st
         _circleEvents.value = st?.events?.let { CircleCore.order(it) } ?: emptyList()
@@ -404,7 +407,6 @@ val share: StateFlow<ShareIntake?> = _share
             while (isActive && seq == startSeq) {
                 delay(if (first) 3_000L else 15_000L)
                 val active = _circleState.value ?: continue
-                if (first) logLine("circle sync armed for ${active.members.size} member(s)")
                 first = false
                 runCatching { FlitCircleSync.sync() }
                     .onFailure { logLine("circle sync: ${it.message ?: it.javaClass.simpleName}") }
@@ -430,9 +432,11 @@ val share: StateFlow<ShareIntake?> = _share
                 FlitCircleStore.Member(idf.fingerprint, currentAlias(), FlitCircleStore.Role.OWNER, System.currentTimeMillis()),
             ),
             events = emptyList(),
+            selfFp = idf.fingerprint.trim().uppercase(),
         )
         FlitCircleStore.save(appCtx, st)
         circleInvite = invite
+        prefs().edit().putString("circleInvite", invite).apply()
         refreshCircle()
         logLine("circle: started $id as owner")
         return QrAdd(
@@ -453,6 +457,7 @@ val share: StateFlow<ShareIntake?> = _share
     fun joinCircle(code: QrAdd) {
         if (!::appCtx.isInitialized) return
         circleInvite = code.invite
+        prefs().edit().putString("circleInvite", code.invite).apply()
         scope.launch(Dispatchers.IO) {
             runCatching { FlitCircleSync.join(code) }
                 .onFailure { logLine("circle join failed: ${it.message ?: it.javaClass.simpleName}") }
@@ -516,6 +521,13 @@ val share: StateFlow<ShareIntake?> = _share
         refreshCircle()
     }
 
+    /** Owner-only role change; the sync worker's guard and store reducer are the authority. */
+    fun circleSetRole(fp: String, role: FlitCircleStore.Role) = scope.launch(Dispatchers.IO) {
+        runCatching { FlitCircleSync.circleSetRole(fp, role) }
+            .onFailure { logLine("circle role change failed: ${it.message}") }
+        refreshCircle()
+    }
+
     fun circleLeave() {
         if (!::appCtx.isInitialized) return
         scope.launch(Dispatchers.IO) {
@@ -549,24 +561,36 @@ val share: StateFlow<ShareIntake?> = _share
         return null
     }
 
-    /** Server-side Circle route: JOIN hands out the key over authenticated TLS. */
-    internal fun onCircleRequest(req: CircleRequest): CircleResponse {
+    /**
+     * Server-side Circle route. The host state machine owns the truth:
+     * invite/JOIN, roster-gated SYNC, signature+replay verification, rekey
+     * on depart, and refusal of a departed fingerprint's later sync.
+     */
+    internal fun onCircleRequest(req: CircleRequest, ip: String = ""): CircleResponse {
         val st = _circleState.value ?: return CircleResponse(false, reason = "no circle")
-        if (req.circleId != st.id) return CircleResponse(false, reason = "wrong circle")
-        return when (req.action) {
-            "join" -> {
-                if (circleInvite.isNullOrBlank() || circleInvite != req.invite) {
-                    return CircleResponse(false, reason = "bad invite")
+        val idf = identity ?: return CircleResponse(false, reason = "identity unavailable")
+        val host = FlitCircleHost(idf, circleInvite.orEmpty(), st.keyB64)
+        val answer = host.onRequest(req, st)
+        if (answer.ok) {
+            // A member that reaches us by invite also gives us a return route;
+            // without this, later fan-out has an address-less fingerprint.
+            if (ip.isNotBlank() && req.memberFp.isNotBlank()) {
+                runCatching {
+                    FlitRoster.rememberRoute(
+                        req.memberFp.trim().uppercase(), ip,
+                        Protocol.DEFAULT_PORT, tls = true,
+                    )
                 }
-                CircleResponse(
-                    ok = true, key = st.keyB64,
-                    members = st.members.map { it.fp },
-                    events = st.events,
-                )
             }
-            "sync" -> CircleResponse(ok = true, members = st.members.map { it.fp }, events = st.events)
-            else -> CircleResponse(false, reason = "unknown action")
+            val next = host.accept(answer, st)
+            FlitCircleStore.save(appCtx, next)
+            _circleState.value = next
+            _circleEvents.value = CircleCore.order(next.events)
         }
+        if (host.isEvidence(answer, st) && ::appCtx.isInitialized) {
+            logLine("circle host: ${req.action} ${req.memberFp.take(12)} — ${answer.events.size} event(s)")
+        }
+        return answer
     }
 
     /** The last successfully-served peer (fingerprint, alias) for "send again". */
@@ -655,8 +679,8 @@ val share: StateFlow<ShareIntake?> = _share
             FlitEngine.onPanicReceived(alert, ip)
         }
 
-        override fun onCircle(request: CircleRequest): CircleResponse =
-            FlitEngine.onCircleRequest(request)
+        override fun onCircle(request: CircleRequest, ip: String): CircleResponse =
+            FlitEngine.onCircleRequest(request, ip)
 
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision {
             // QR-only is a carrier gate, not just a discoverability setting:

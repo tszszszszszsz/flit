@@ -1,6 +1,7 @@
 package app.flit.share.protocol.server
 
 import app.flit.share.protocol.Protocol
+import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.model.FileInfo
@@ -78,7 +79,7 @@ interface ServerDelegate {
      * dead carrier. Signature/replay checks belong to the delegate, which can
      * reuse `CircleCore.verify` / `CircleCore.evaluate`.
      */
-    fun onCircle(request: CircleRequest): CircleResponse =
+    fun onCircle(request: CircleRequest, ip: String = ""): CircleResponse =
         CircleResponse(ok = false, reason = "Circle support not enabled")
 }
 
@@ -933,32 +934,54 @@ class ServerCore(
     /**
      * Flit-only Circle route. Thin by design: decode the request, hand it to
      * the delegate (which owns governance, the key and the event store) and
-     * encode whatever decision it returns. Malformed wire gets 400; a delegate
-     * that throws gets 500; every real decision — including refusal — is a
-     * decodable 200 [CircleResponse]. The same semantics serve TCP and pipes.
+     * encode whatever decision it returns. Malformed/oversized wire gets 400,
+     * a bad identity header gets 403, a delegate that throws gets 500; every
+     * real decision — including refusal — is a decodable 200 [CircleResponse].
+     * The same semantics serve TCP and pipes. Signatures are still the
+     * delegate's concern: the route only checks shape, size and cert binding.
      */
     private suspend fun circleRoute(x: HttpExchange) {
-        val raw = x.readBodyText()
+        val raw = x.readBodyCapped(CircleCore.MAX_REQUEST_BYTES)
+        if (raw == null) {
+            x.respondText(400, MIME_TEXT, "Circle request too large")
+            return
+        }
         val request = runCatching { WireJson.decode<CircleRequest>(raw) }.getOrNull()
-        if (request == null || request.action.isBlank() || request.circleId.isBlank()) {
+        if (request == null || request.action !in setOf(CircleRequest.ACTION_JOIN, CircleRequest.ACTION_SYNC) ||
+            request.circleId.isBlank() ||
+            request.events.size > CircleCore.MAX_EVENTS_PER_REQUEST ||
+            request.events.any { !CircleCore.validShape(it) }
+        ) {
             x.respondText(400, MIME_TEXT, "Invalid circle request")
             return
         }
-        // Same pinning discipline as the panic route: the requester's own
-        // certificate is pinned under its real SHA-256 DER, so its events can
-        // be verified without trusting a self-declared authorFp. A missing or
-        // malformed header is tolerated (older/relayed senders); it simply
-        // leaves this peer unpinned.
-        x.header(Protocol.HEADER_CIRCLE_CERT)?.trim()?.takeIf { it.isNotBlank() }?.let { encoded ->
-            val der = runCatching { Base64.getDecoder().decode(encoded) }.getOrNull()
-            der?.let {
+        // The requester's own cert is pinned under its real SHA-256 DER, so its
+        // events can be verified without trusting a self-declared authorFp.
+        // No header is fine (relay/older senders carry certs on each event),
+        // but a PRESENT header must parse and, when memberFp is claimed, must
+        // name that exact fingerprint — a borrowed cert is a 403, not a 200.
+        val encodedCert = x.header(Protocol.HEADER_CIRCLE_CERT)?.trim()?.takeIf { it.isNotBlank() }
+        if (encodedCert != null) {
+            val der = runCatching { Base64.getDecoder().decode(encodedCert) }.getOrNull()
+            val cert = der?.let {
                 runCatching {
                     CertificateFactory.getInstance("X.509").generateCertificate(it.inputStream()) as X509Certificate
                 }.getOrNull()
-            }?.let { cert -> TlsIdentity.pin(cert) }
+            }
+            if (cert == null) {
+                x.respondText(403, MIME_TEXT, "Malformed sender certificate")
+                return
+            }
+            val pinnedFp = TlsIdentity.pin(cert)
+            if (request.memberFp.isNotBlank() &&
+                !pinnedFp.equals(request.memberFp.trim(), ignoreCase = true)
+            ) {
+                x.respondText(403, MIME_TEXT, "Certificate does not match member fingerprint")
+                return
+            }
         }
         val response = try {
-            delegate.onCircle(request)
+            delegate.onCircle(request, x.origin.orEmpty())
         } catch (_: Throwable) {
             x.respondText(500, MIME_TEXT, "Circle delegate error")
             return

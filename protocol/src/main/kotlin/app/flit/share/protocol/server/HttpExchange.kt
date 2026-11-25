@@ -50,6 +50,25 @@ interface HttpExchange {
         return String(out.toByteArray(), Charsets.UTF_8)
     }
 
+    /**
+     * Bounded variant for control routes: `null` means the body exceeded
+     * [maxBytes], so the caller can answer 400 instead of buffering a flood.
+     * The v2.2 routes keep using the unbounded [readBodyText] above.
+     */
+    suspend fun readBodyCapped(maxBytes: Int): String? {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val n = readBody(buf, 0, buf.size)
+            if (n <= 0) break
+            total += n
+            if (total > maxBytes) return null
+            out.write(buf, 0, n)
+        }
+        return String(out.toByteArray(), Charsets.UTF_8)
+    }
+
     /** Text response ([status] plain integer; contentType like "application/json"). */
     suspend fun respondText(status: Int, contentType: String, body: String)
 

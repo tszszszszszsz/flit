@@ -5,8 +5,11 @@ import kotlinx.serialization.Serializable
 /**
  * One immutable, signed entry in a Circle's append-only event log.
  *
- * Every field except [sig] is covered by the author's signature over the
- * canonical bytes (see `CircleCore.canonical`). [type] is one of the nine
+ * The signature covers every field except [sig] and [cert] (see
+ * `CircleCore.canonical`). [cert] is safe to leave out because its own SHA-256
+ * DER must equal [authorFp] before `CircleCore.verify` accepts it: a swapped
+ * or stripped certificate cannot borrow another device's signature. [type]
+ * is one of the nine
  * verbs below; [body] is a small JSON object whose shape depends on [type]:
  *
  * ```
@@ -21,10 +24,12 @@ import kotlinx.serialization.Serializable
  * rekey    {"keyB64":"...","gen":1}
  * ```
  *
- * The event never carries file bytes or a group key. It does carry the
- * signer's certificate so a receiver that has never met the author can pin
- * it and verify the signature; [authorFp] must equal that certificate's
- * fingerprint. File bytes travel the existing queue.
+ * The event never carries file bytes — those travel the existing queue. It
+ * DOES carry a group key inside a `rekey` body (`keyB64`), delivered only to
+ * an already-joined member over the pinned session; a chat/poll/file body
+ * never holds one. It also carries the signer's certificate so a receiver
+ * that has never met the author can pin it and verify the signature;
+ * [authorFp] must equal that certificate's fingerprint.
  */
 @Serializable
 data class CircleEvent(

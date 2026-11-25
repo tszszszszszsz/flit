@@ -39,7 +39,8 @@ no cables, and nothing leaving your network in between.
 **What we ask, and when**
 - Nearby-devices permission and radio-power prompts appear exactly when a transfer needs
   them, as the system's own dialogs, each asked once per device. Nothing asks at launch.
-- No tracking, no analytics, no accounts, nothing uploaded anywhere.
+- No tracking, no analytics, no accounts, no ads, no telemetry, no cloud — no
+  SDKs that phone home, and nothing uploaded anywhere.
 
 **For the technical**: chunked resumable uploads (hash-exact both ways), up to four
 parallel streams per transfer, optional on-the-wire compression for text-like files,

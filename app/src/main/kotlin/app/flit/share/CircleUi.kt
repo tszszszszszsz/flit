@@ -5,8 +5,10 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +36,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -46,6 +50,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.LaunchedEffect
@@ -53,6 +58,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -78,6 +86,10 @@ import kotlinx.serialization.json.JsonPrimitive
  * composer, member sheet) but the visual language is Flit's: M3 Expressive
  * tokens, 12/16/20 corner steps, no bubbles/tails, no emoji, no invented color.
  * Emphasized (bold) type is reserved for counts and actions.
+ *
+ * The feed has three honest presentation states: pending (no circle state
+ * yet), empty (no events yet), and the populated list. Unrecognized event
+ * bodies degrade to an in-band error card rather than leaking raw JSON.
  */
 
 @Composable
@@ -93,6 +105,7 @@ fun CircleScreen(
     onStartKick: (String) -> Unit,
     onVoteKick: (String, Boolean) -> Unit,
     onKick: (String) -> Unit,
+    onRole: (String, FlitCircleStore.Role) -> Unit,
     onLeave: () -> Unit,
     onQr: () -> Unit,
     onBack: () -> Unit,
@@ -104,12 +117,23 @@ fun CircleScreen(
     var question by remember { mutableStateOf("") }
     var choices by remember { mutableStateOf("") }
     var showMembers by remember { mutableStateOf(false) }
+    // Identity loads asynchronously, so meFp can briefly be blank. The store
+    // keeps exactly one OWNER — this device — so that roster entry is a safe
+    // fallback for recognising our own events during that window.
+    val selfFp = remember(meFp, state) {
+        if (meFp.isNotBlank()) meFp
+        else if (state?.role == FlitCircleStore.Role.OWNER) {
+            state.members.firstOrNull { it.role == FlitCircleStore.Role.OWNER }?.fp.orEmpty()
+        } else ""
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // ---- top bar: small app bar — title + member count, 1–2 actions ----
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .background(cs.surface)
+                .heightIn(min = 64.dp)
                 .statusBarsPadding()
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -147,7 +171,11 @@ fun CircleScreen(
                 Surface(
                     shape = RoundedCornerShape(FlitCorner.small),
                     color = cs.surfaceContainerLow,
-                    modifier = Modifier.clickable { showMembers = true },
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .clickable(role = Role.Button, onClickLabel = "View circle members") {
+                            showMembers = true
+                        },
                 ) {
                     Text(
                         text = "${m.alias.ifBlank { m.fp.take(6) }} · ${m.fp.take(6)}",
@@ -164,35 +192,57 @@ fun CircleScreen(
 
         // ---- chronological feed: mine to the end, theirs to the start ----
         val feedState = rememberLazyListState()
-        LaunchedEffect(events.size, events.lastOrNull()?.id) {
-            val last = events.lastOrNull() ?: return@LaunchedEffect
-            val nearBottom = feedState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
-                ?.let { it >= events.lastIndex - 2 } == true
-            // Always follow our own send; follow others only when the reader
-            // is already at the bottom, so scrolling back through history
+        // Reader position is derived continuously, not sampled inside the
+        // effect: layoutInfo can still describe the previous list on the
+        // frame a new event arrives, which used to mis-classify a reader
+        // who was scrolled up as "at bottom".
+        val atBottom by remember {
+            derivedStateOf {
+                val info = feedState.layoutInfo
+                val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+                info.totalItemsCount == 0 || lastVisible >= info.totalItemsCount - 2
+            }
+        }
+        var seenIds by remember { mutableStateOf(emptySet<String>()) }
+        LaunchedEffect(state?.id, events) {
+            if (events.isEmpty()) {
+                seenIds = emptySet()
+                return@LaunchedEffect
+            }
+            // Look at everything newly appended, not just the last event: a
+            // batch may place another member's event after our own send.
+            val fresh = events.filterNot { it.id in seenIds }
+            seenIds = events.mapTo(HashSet(events.size)) { it.id }
+            if (fresh.isEmpty()) return@LaunchedEffect
+            // Follow our own send unconditionally; follow someone else only
+            // when the reader was already at the bottom, so reading history
             // is never yanked away by an incoming message.
-            if (last.authorFp == meFp || nearBottom) {
+            if ((selfFp.isNotBlank() && fresh.any { it.authorFp == selfFp }) || atBottom) {
                 feedState.animateScrollToItem(events.lastIndex)
             }
         }
-        LazyColumn(
-            state = feedState,
-            modifier = Modifier.weight(1f),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(events, key = { it.id }) { event ->
-                FeedRow(
-                    event = event,
-                    mine = event.authorFp == meFp,
-                    author = members.firstOrNull { it.fp == event.authorFp }?.alias
-                        ?: event.authorFp.take(8),
-                    events = events,
-                    members = members,
-                    meFp = meFp,
-                    onVote = onVote,
-                    onVoteKick = onVoteKick,
-                )
+        when {
+            state == null -> PendingFeed(Modifier.weight(1f))
+            events.isEmpty() -> EmptyFeed(Modifier.weight(1f))
+            else -> LazyColumn(
+                state = feedState,
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(events, key = { it.id }) { event ->
+                    FeedRow(
+                        event = event,
+                        mine = event.authorFp == selfFp && selfFp.isNotBlank(),
+                        author = members.firstOrNull { it.fp == event.authorFp }?.alias
+                            ?: event.authorFp.take(8),
+                        events = events,
+                        members = members,
+                        meFp = selfFp,
+                        onVote = onVote,
+                        onVoteKick = onVoteKick,
+                    )
+                }
             }
         }
 
@@ -240,7 +290,7 @@ fun CircleScreen(
                                 question = ""
                                 choices = ""
                             },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                         ) { Text("Cancel", fontWeight = FontWeight.Bold) }
                         TextButton(
                             enabled = question.isNotBlank() && options.size >= 2,
@@ -250,7 +300,7 @@ fun CircleScreen(
                                 question = ""
                                 choices = ""
                             },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                         ) { Text("Post poll", fontWeight = FontWeight.Bold) }
                     }
                 }
@@ -272,7 +322,7 @@ fun CircleScreen(
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
-                placeholder = { Text("Message the circle") },
+                label = { Text("Message the circle") },
                 singleLine = true,
                 shape = RoundedCornerShape(FlitCorner.largeIncreased),
                 modifier = Modifier.weight(1f),
@@ -297,13 +347,69 @@ fun CircleScreen(
         MemberSheet(
             state = state,
             members = members,
-            meFp = meFp,
+            meFp = selfFp,
             onDismiss = { showMembers = false },
             onKick = { fp -> onKick(fp); showMembers = false },
+            onRole = onRole,
             onStartKick = { fp -> onStartKick(fp); showMembers = false },
             onQr = { onQr(); showMembers = false },
             onLeave = { onLeave(); showMembers = false },
         )
+    }
+}
+
+// ---- feed states -----------------------------------------------------------
+
+/** Honest "no circle yet" state. Per M3, a short indeterminate wait of a
+ *  few seconds gets an indicator; the label carries the meaning for TalkBack. */
+@Composable
+private fun PendingFeed(modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val typ = MaterialTheme.typography
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(
+                color = cs.primary,
+                modifier = Modifier.semantics { contentDescription = "Loading circle" },
+            )
+            Text("Preparing circle…", style = typ.bodyMedium, color = cs.onSurfaceVariant)
+        }
+    }
+}
+
+/** Empty feed: no posts, polls or files yet. The icon is decorative; M3 says
+ *  purely decorative graphics must be hidden from screen readers. */
+@Composable
+private fun EmptyFeed(modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val typ = MaterialTheme.typography
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Surface(
+            shape = RoundedCornerShape(FlitCorner.largeIncreased),
+            color = cs.surfaceContainerLow,
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.List,
+                    contentDescription = null,
+                    tint = cs.onSurfaceVariant,
+                    modifier = Modifier.size(32.dp),
+                )
+                Text("No messages yet", style = typ.titleMedium, color = cs.onSurface)
+                Text(
+                    text = "Posts, polls and file drops appear here.",
+                    style = typ.bodyMedium,
+                    color = cs.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
@@ -358,6 +464,7 @@ private fun FeedRow(
                     onVoteKick = onVoteKick,
                 )
                 CircleCard.SYSTEM -> SystemCard(author, body.text)
+                CircleCard.UNKNOWN -> UnknownCard(body.text)
             }
         }
     }
@@ -434,13 +541,19 @@ private fun PollCard(
             Text(question, style = typ.titleSmall, color = cs.onSurface)
             options.forEachIndexed { index, option ->
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .selectable(
+                            selected = myVote == index,
+                            role = Role.RadioButton,
+                            onClick = { onVote(pollId, index) },
+                        ),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    RadioButton(
-                        selected = myVote == index,
-                        onClick = { onVote(pollId, index) },
-                    )
+                    // The whole row is the radio-button target; M3 clears the
+                    // inner button's semantics when onClick is null.
+                    RadioButton(selected = myVote == index, onClick = null)
                     Text(
                         text = option,
                         style = typ.bodyMedium,
@@ -454,15 +567,19 @@ private fun PollCard(
                     )
                 }
             }
-            Text(
-                text = buildAnnotatedString {
-                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(total.toString()) }
-                    append(" votes · tap to change your vote")
-                },
-                style = typ.labelSmall,
-                color = cs.onSurfaceVariant,
-                modifier = Modifier.padding(start = 4.dp, top = 2.dp),
-            )
+            if (options.isEmpty()) {
+                Text("This poll has no options", style = typ.labelSmall, color = cs.error)
+            } else {
+                Text(
+                    text = buildAnnotatedString {
+                        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(total.toString()) }
+                        append(" votes · tap to change your vote")
+                    },
+                    style = typ.labelSmall,
+                    color = cs.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, top = 2.dp),
+                )
+            }
         }
     }
 }
@@ -478,7 +595,7 @@ private fun VoteCard(body: CircleBody) {
         else -> "vote"
     }
     Surface(
-        shape = RoundedCornerShape(FlitCorner.medium),
+        shape = RoundedCornerShape(FlitCorner.large),
         color = cs.surfaceContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -530,10 +647,16 @@ private fun KickCard(
             )
             if (!mine) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = { onVoteKick(body.kickId, true) }) {
+                    TextButton(
+                        onClick = { onVoteKick(body.kickId, true) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
                         Text("Approve", style = typ.labelLarge, fontWeight = FontWeight.Bold)
                     }
-                    TextButton(onClick = { onVoteKick(body.kickId, false) }) {
+                    TextButton(
+                        onClick = { onVoteKick(body.kickId, false) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
                         Text("Reject", style = typ.labelLarge, fontWeight = FontWeight.Bold)
                     }
                 }
@@ -545,7 +668,7 @@ private fun KickCard(
 @Composable
 private fun SystemCard(author: String, text: String) {
     Surface(
-        shape = RoundedCornerShape(FlitCorner.medium),
+        shape = RoundedCornerShape(FlitCorner.large),
         color = MaterialTheme.colorScheme.surfaceContainer,
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -555,6 +678,42 @@ private fun SystemCard(author: String, text: String) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
         )
+    }
+}
+
+/** Bounded, printable type name only — never the event body. */
+private fun safeTypeLabel(raw: String): String {
+    val cleaned = raw.trim().take(64).map { c ->
+        if (c.isLetterOrDigit() || c == '-' || c == '_' || c == '.') c else ' '
+    }.joinToString("").trim()
+    return cleaned.ifBlank { "unknown" }
+}
+
+/** In-band error state: an event of a type this build cannot render is shown
+ *  honestly instead of leaking raw JSON into the conversation. */
+@Composable
+private fun UnknownCard(type: String) {
+    val cs = MaterialTheme.colorScheme
+    val typ = MaterialTheme.typography
+    Surface(
+        shape = RoundedCornerShape(FlitCorner.large),
+        color = cs.surfaceContainerLow,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text("Unsupported circle event", style = typ.labelMedium, color = cs.error)
+            Text(
+                text = safeTypeLabel(type),
+                style = typ.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -568,13 +727,18 @@ private fun MemberSheet(
     meFp: String,
     onDismiss: () -> Unit,
     onKick: (String) -> Unit,
+    onRole: (String, FlitCircleStore.Role) -> Unit,
     onStartKick: (String) -> Unit,
     onQr: () -> Unit,
     onLeave: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
-    val canKick = state?.role?.name == "OWNER" || state?.role?.name == "ADMIN"
+    val canKick = state?.role == FlitCircleStore.Role.OWNER ||
+        state?.role == FlitCircleStore.Role.ADMIN
+    // Only the owner appoints or removes admins; the store refuses every
+    // other transition, so those controls never appear for anyone else.
+    val canManageRoles = state?.role == FlitCircleStore.Role.OWNER
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -605,7 +769,7 @@ private fun MemberSheet(
             ) {
                 for (m in members) {
                     val self = m.fp == meFp
-                    val owner = m.role.name == "OWNER"
+                    val owner = m.role == FlitCircleStore.Role.OWNER
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
@@ -624,12 +788,36 @@ private fun MemberSheet(
                         if (!self && !owner) {
                             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 if (canKick) {
-                                    TextButton(onClick = { onKick(m.fp) }) {
+                                    TextButton(
+                                        onClick = { onKick(m.fp) },
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                    ) {
                                         Text("Kick", style = typ.labelLarge, fontWeight = FontWeight.Bold)
                                     }
                                 }
-                                TextButton(onClick = { onStartKick(m.fp) }) {
+                                TextButton(
+                                    onClick = { onStartKick(m.fp) },
+                                    modifier = Modifier.heightIn(min = 48.dp),
+                                ) {
                                     Text("Start vote", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            if (canManageRoles) {
+                                val promote = m.role == FlitCircleStore.Role.MEMBER
+                                TextButton(
+                                    onClick = {
+                                        onRole(
+                                            m.fp,
+                                            if (promote) FlitCircleStore.Role.ADMIN
+                                            else FlitCircleStore.Role.MEMBER,
+                                        )
+                                    },
+                                    modifier = Modifier.heightIn(min = 48.dp),
+                                ) {
+                                    Text(
+                                        if (promote) "Make admin" else "Remove admin",
+                                        fontWeight = FontWeight.Bold,
+                                    )
                                 }
                             }
                         }
@@ -638,15 +826,22 @@ private fun MemberSheet(
             }
             HorizontalDivider(color = cs.outlineVariant)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onQr, modifier = Modifier.weight(1f)) {
+                TextButton(
+                    onClick = onQr,
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                ) {
                     Icon(
                         Icons.Default.Share,
-                        contentDescription = "Invite by QR",
+                        contentDescription = null, // adjacent Text labels the button
                         modifier = Modifier.size(18.dp),
                     )
                     Text("Invite by QR", style = typ.labelMedium, fontWeight = FontWeight.Bold)
                 }
-                TextButton(onClick = onLeave, modifier = Modifier.weight(1f)) {
+                TextButton(
+                    onClick = onLeave,
+                    colors = ButtonDefaults.textButtonColors(contentColor = cs.error),
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                ) {
                     Text("Leave circle", style = typ.labelMedium, fontWeight = FontWeight.Bold)
                 }
             }
@@ -656,7 +851,7 @@ private fun MemberSheet(
 
 // ---- event body parsing (presentation only, tolerant of unknown fields) ----
 
-private enum class CircleCard { MESSAGE, FILE, POLL, VOTE, KICK, SYSTEM }
+private enum class CircleCard { MESSAGE, FILE, POLL, VOTE, KICK, SYSTEM, UNKNOWN }
 
 private data class CircleBody(
     val kind: CircleCard,
@@ -698,7 +893,10 @@ private fun JsonObject.strings(key: String): List<String> =
 
 private fun parseBody(event: CircleEvent): CircleBody {
     val obj = bodyObject(event.body)
-    return when (event.type) {
+    // The store reduces lower-cased types; match that so casing never turns
+    // a known card into a spurious error card.
+    val type = event.type.trim().lowercase(Locale.ROOT)
+    return when (type) {
         "message" -> CircleBody(
             kind = CircleCard.MESSAGE,
             text = bodyString(event.body) ?: obj?.text("text") ?: event.body,
@@ -728,16 +926,17 @@ private fun parseBody(event: CircleEvent): CircleBody {
             targetFp = obj?.text("targetFp") ?: obj?.text("target") ?: "",
             approve = obj?.flag("approve"),
         )
-        else -> CircleBody(
-            kind = CircleCard.SYSTEM,
-            text = when (event.type) {
+        else -> {
+            val systemText = when (type) {
                 "join" -> "joined the circle"
                 "leave" -> "left the circle"
                 "role" -> "role changed"
                 "rekey" -> "key rotated"
-                else -> event.type
-            },
-        )
+                else -> null
+            }
+            if (systemText != null) CircleBody(kind = CircleCard.SYSTEM, text = systemText)
+            else CircleBody(kind = CircleCard.UNKNOWN, text = event.type.ifBlank { "empty type" })
+        }
     }
 }
 

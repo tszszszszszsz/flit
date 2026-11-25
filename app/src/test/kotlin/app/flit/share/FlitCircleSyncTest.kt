@@ -1,6 +1,10 @@
 package app.flit.share
 
+import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.model.CircleRequest
+import app.flit.share.protocol.model.CircleResponse
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -129,5 +133,212 @@ class FlitCircleSyncTest {
             "only kick events may resolve a vote-kick target",
         )
         assertTrue(circleKickTarget(listOf(open), "k-1")!!.isNotBlank())
+    }
+
+    @Test
+    fun `outbound bodies we mint all pass the strict gate`() {
+        assertTrue(circleBodyValid(CircleEvent.MESSAGE, """{"text":"hello"}"""))
+        assertTrue(circleBodyValid(CircleEvent.FILE, circleFileBody("a.gflit", 12L, "sha", "tok")))
+        assertTrue(circleBodyValid(CircleEvent.POLL, circlePollBody("p", "q", listOf("a", "b"))))
+        assertTrue(circleBodyValid(CircleEvent.VOTE, circleVoteBody("p", 1)))
+        assertTrue(circleBodyValid(CircleEvent.VOTE, circleKickVoteBody("k", "AABB", false)))
+        assertTrue(circleBodyValid(CircleEvent.JOIN, """{"alias":"Ann"}"""))
+        assertTrue(circleBodyValid(CircleEvent.LEAVE, circleLeaveBody("AABB")))
+        assertTrue(circleBodyValid(CircleEvent.KICK, circleKickOpenBody("k", "AABB")))
+        assertTrue(circleBodyValid(CircleEvent.KICK, circleKickExecuteBody("k", "AABB")))
+        assertTrue(circleBodyValid(CircleEvent.ROLE, circleRoleBody("AABB", FlitCircleStore.Role.ADMIN)))
+        assertTrue(circleBodyValid(CircleEvent.REKEY, circleRekeyBody("key", 3, listOf("AABB"))))
+    }
+
+    @Test
+    fun `malformed and unusable bodies never pass the outbound gate`() {
+        assertFalse(circleBodyValid(CircleEvent.MESSAGE, ""))
+        assertFalse(circleBodyValid(CircleEvent.MESSAGE, "not json"))
+        assertFalse(circleBodyValid(CircleEvent.MESSAGE, """["text"]"""))
+        assertFalse(circleBodyValid(CircleEvent.MESSAGE, """{"text":""}"""))
+        assertFalse(circleBodyValid(CircleEvent.MESSAGE, "x".repeat(CircleCore.MAX_BODY_CHARS + 1)))
+        assertFalse(circleBodyValid(CircleEvent.POLL, """{"pollId":"p","question":"q","options":[]}"""))
+        assertFalse(circleBodyValid(CircleEvent.VOTE, """{"pollId":"p"}"""))
+        assertFalse(circleBodyValid(CircleEvent.KICK, """{"kickId":"k"}"""))
+        assertFalse(circleBodyValid(CircleEvent.ROLE, """{"targetFp":"AABB"}"""))
+        assertFalse(circleBodyValid(CircleEvent.REKEY, """{"gen":2}"""))
+        assertFalse(circleBodyValid("unknown", """{"text":"hello"}"""))
+    }
+
+    @Test
+    fun `inbound gate is bounded and tolerant of inert history`() {
+        assertTrue(circleBodyReadable("{}")) // leave and host-minted rekey shapes
+        assertTrue(circleBodyReadable("""{"gen":2,"members":["AABB"]}"""))
+        assertFalse(circleBodyReadable(""))
+        assertFalse(circleBodyReadable("not json"))
+        assertFalse(circleBodyReadable("x".repeat(CircleCore.MAX_BODY_CHARS + 1)))
+    }
+
+    private fun state(vararg fps: String) = CircleState(
+        id = "c1",
+        keyB64 = "key",
+        role = Role.OWNER,
+        members = fps.map { Member(it, "", Role.MEMBER) },
+    )
+
+    @Test
+    fun `fan-out peers are normalised deduplicated and never self`() {
+        val st = state(" aabb ", "AABB", "ccdd", "ME")
+        assertEquals(listOf("AABB", "CCDD"), circlePeers(st, "me"))
+        assertTrue(circlePeers(state("ME"), " me ").isEmpty())
+    }
+
+    @Test
+    fun `fan-out skips backed-off peers but never busy-loops`() {
+        val st = state("AABB", "CCDD", "EEFF")
+        val retryAt = mapOf("AABB" to 10_000L, "CCDD" to 5_000L)
+        assertEquals(listOf("CCDD", "EEFF"), circleFanoutTargets(st, "ME", 9_999L, retryAt))
+        assertEquals(
+            listOf("AABB", "CCDD", "EEFF"),
+            circleFanoutTargets(st, "ME", 10_000L, retryAt),
+        )
+        assertEquals(5_000L, circleBackoffMs(0)) // first refusal = one spaced retry
+    }
+
+    @Test
+    fun `role body carries a canonical target and an assignable role`() {
+        val b = obj(circleRoleBody(" aabb ", FlitCircleStore.Role.ADMIN))
+        assertEquals("AABB", b.getValue("targetFp").jsonPrimitive.content)
+        assertEquals("ADMIN", b.getValue("role").jsonPrimitive.content)
+        assertEquals(setOf("targetFp", "role"), b.keys)
+    }
+
+    // ==== behavioural fan-out tests over the injectable carrier seam ============
+
+    private fun event(id: String = "e1", lamport: Long = 1L) = CircleEvent(
+        id = id,
+        circleId = "c1",
+        authorFp = "ME",
+        lamport = lamport,
+        type = CircleEvent.MESSAGE,
+        body = """{"text":"hello"}""",
+        sig = "sig",
+        createdMs = 1_000L,
+    )
+
+    private fun installSeam(
+        st: CircleState,
+        dial: suspend (String) -> FlitCircleSync.Route?,
+        now: () -> Long = { 1_000L },
+        logs: MutableList<String> = mutableListOf(),
+        me: String = "ME",
+    ) {
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { st }
+        FlitCircleSync.meHook = { me }
+        FlitCircleSync.clockHook = now
+        FlitCircleSync.logHook = { logs.add(it) }
+        FlitCircleSync.dialHook = dial
+    }
+
+    private fun route(
+        fp: String,
+        sync: suspend (CircleRequest) -> CircleResponse = { CircleResponse(true) },
+    ) = FlitCircleSync.Route(fp, sync = sync, join = { CircleResponse(false, reason = "unused") })
+
+    @Test
+    fun `fanout posts one delta per non-self peer and always logs evidence`() = runBlocking {
+        val ev = event()
+        val st = state("ME", "hostfp", "AABB").copy(events = listOf(ev))
+        val dialed = mutableListOf<String>()
+        val sent = mutableListOf<CircleRequest>()
+        val logs = mutableListOf<String>()
+        installSeam(st, logs = logs, dial = { fp ->
+            dialed += fp
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        try {
+            FlitCircleSync.fanout(st, listOf(ev))
+
+            assertEquals(listOf("HOSTFP", "AABB"), dialed)
+            assertEquals(2, sent.size)
+            assertTrue(sent.all {
+                it.action == CircleRequest.ACTION_SYNC && it.circleId == st.id &&
+                    it.memberFp == "ME" && it.events == listOf(ev)
+            }, sent.toString())
+            assertTrue(
+                logs.first().startsWith("circle fan-out: 1 new event(s), 2 peer(s)"),
+                logs.toString(),
+            )
+            assertEquals(2, logs.count { it.startsWith("circle fan-out: ok to ") })
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `fanout escalates backoff after refusals and resets after an answer`() = runBlocking {
+        var clock = 10_000L
+        val st = state("ME", "HOSTFP").copy(events = listOf(event()))
+        val dialed = mutableListOf<String>()
+        val logs = mutableListOf<String>()
+        var answers = 0
+        installSeam(st, now = { clock }, logs = logs, dial = { fp ->
+            dialed += fp
+            route(fp) {
+                answers += 1
+                if (answers <= 2) CircleResponse(false, reason = "offline") else CircleResponse(true)
+            }
+        })
+        try {
+            FlitCircleSync.fanout(st, listOf(event())) // fail #1 → 10 s backoff
+            assertEquals(1, dialed.size, "first attempt")
+
+            clock += 1_000L
+            FlitCircleSync.fanout(st, listOf(event())) // still backed off
+            assertEquals(1, dialed.size, "backed off after #1")
+
+            clock = 20_000L
+            FlitCircleSync.fanout(st, listOf(event())) // fail #2 → 20 s backoff
+            assertEquals(2, dialed.size, "retry after 10 s")
+
+            clock += 1_000L
+            FlitCircleSync.fanout(st, listOf(event())) // escalated, still skipped
+            assertEquals(2, dialed.size, "backed off after #2")
+
+            clock = 40_000L
+            FlitCircleSync.fanout(st, listOf(event())) // answer → clear backoff
+            assertEquals(3, dialed.size, "retry after 20 s")
+
+            clock += 1_000L
+            FlitCircleSync.fanout(st, listOf(event())) // no backoff left
+            assertEquals(4, dialed.size, "backoff cleared")
+            assertTrue(logs.count { it.contains("backed off") } >= 2, logs.toString())
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `second sync inside the calm interval makes zero dials`() = runBlocking {
+        var clock = 1_000L
+        val st = state("ME", "HOSTFP")
+        val dialed = mutableListOf<String>()
+        installSeam(st, now = { clock }, dial = { fp ->
+            dialed += fp
+            route(fp) { CircleResponse(true) }
+        })
+        try {
+            FlitCircleSync.sync()
+            assertEquals(1, dialed.size) // self excluded, host dialled once
+
+            clock += CIRCLE_SYNC_MIN_INTERVAL_MS - 1
+            FlitCircleSync.sync()
+            assertEquals(1, dialed.size) // calm interval refuses the second pass
+
+            clock += 1
+            FlitCircleSync.sync()
+            assertEquals(2, dialed.size) // and resumes on the next beat
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
     }
 }

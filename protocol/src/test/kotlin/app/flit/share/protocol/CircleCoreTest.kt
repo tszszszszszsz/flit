@@ -48,7 +48,7 @@ class CircleCoreTest {
         override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision =
             PrepareDecision.Accept(request.files.keys)
 
-        override fun onCircle(request: CircleRequest): CircleResponse {
+        override fun onCircle(request: CircleRequest, ip: String): CircleResponse {
             requests += request
             return answer(request)
         }

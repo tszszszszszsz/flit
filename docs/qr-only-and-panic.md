@@ -1,6 +1,7 @@
 # QR-only mode, known devices and panic
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
+> Hard constraint: no accounts, no cloud, no ads, no telemetry, no SDKs that phone home.
 
 ## QR-only, known devices and panic (2026-11-24)
 

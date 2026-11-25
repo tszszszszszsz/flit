@@ -187,6 +187,16 @@ class TlsIdentity private constructor(
         fun verify(fp: String, bytes: ByteArray, sig: String): Boolean =
             verifySignature(fp, bytes, sig)
 
+        /**
+         * Verify against a certificate we already hold in hand (e.g. the cert
+         * embedded in a first-seen Circle event). Unlike [verify], this never
+         * reads or writes the shared pin map: the caller binds [cert] to the
+         * claimed fingerprint first, checks the signature, and only then pins.
+         * A forged event can therefore no longer poison the pin store.
+         */
+        fun verifyWithCertificate(cert: X509Certificate, bytes: ByteArray, sig: String): Boolean =
+            verifySignature(cert, bytes, sig)
+
         /** Panic compatibility wrapper — identical check, no second crypto path. */
         fun verifyPanic(senderFp: String, canonical: ByteArray, sig: String): Boolean =
             verify(senderFp, canonical, sig)
@@ -261,14 +271,17 @@ private fun verifySignature(senderFp: String, canonical: ByteArray, sig: String)
     val fp = senderFp.trim().uppercase()
     val cert = TlsIdentity.pinned(fp) ?: return false
     if (TlsIdentity.fingerprintOf(cert) != fp) return false
-    return try {
-        val verifier = Signature.getInstance(signatureAlgorithm(cert.publicKey.algorithm))
-        verifier.initVerify(cert.publicKey)
-        verifier.update(canonical)
-        verifier.verify(Base64.getDecoder().decode(sig.trim()))
-    } catch (_: Exception) {
-        false // malformed base64, wrong algorithm, or plain forgery
-    }
+    return verifySignature(cert, canonical, sig)
+}
+
+/** The one crypto check, reused by pin-based and cert-in-hand verification. */
+private fun verifySignature(cert: X509Certificate, canonical: ByteArray, sig: String): Boolean = try {
+    val verifier = Signature.getInstance(signatureAlgorithm(cert.publicKey.algorithm))
+    verifier.initVerify(cert.publicKey)
+    verifier.update(canonical)
+    verifier.verify(Base64.getDecoder().decode(sig.trim()))
+} catch (_: Exception) {
+    false // malformed base64, wrong algorithm, or plain forgery
 }
 
 /** Trusts everything — peers are self-signed by design; identity is the announced fingerprint. */

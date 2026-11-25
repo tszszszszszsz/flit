@@ -7,6 +7,11 @@ A no-fluff, native-Kotlin file transfer app that speaks the
 [LocalSend protocol v2.2](https://github.com/localsend/protocol) so it interoperates with every
 existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves on it with:
 
+> **Non-profit, by construction.** Flit has **no accounts, no cloud, no ads, no telemetry,
+> and no SDKs that phone home**. There is no server to sign up with, nothing to pay for,
+> and no data collected about you — devices talk directly to each other, on your network
+> or over Bluetooth. This is a hard constraint on every feature, not a setting.
+
 | # | Differentiator | Status |
 |---|---|---|
 | 1 | Chunked **resumable** transfers (their issue #2127, open 20+ months) | **shipped** (Flit↔Flit extension: interrupted uploads keep their prefix on disk and resume after a reconnect, verified hash-exact in both directions) |
@@ -53,6 +58,15 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   progress ring around the dock's Send button while bytes are in flight. Tabs double as Home
   buttons, manual by-address peers persist across restarts, and files picked straight from
   the dock's Send stay ready under the "Ready to send" banner.
+- **Circle — accountless group coordination:** a temporary, fingerprint-pinned group with one
+  signed local event log (messages, file drops and re-votable polls) — authenticated by
+  fingerprint-pinned signatures and TLS-protected in transit, **not encrypted at rest** — founded
+  by a QR invite and synced over the same Wi‑Fi/Bluetooth/relay carriers. The founder is
+  owner and can appoint admins; leave or kick rotates the key and the host refuses the
+  departed device's later sync. No accounts, no server, no remote actions.
+  Two-node join/post/leave were walked on device; the multi-member mesh and
+  phone→host fan-out remain honestly listed as limitations — see
+  [the Circle design and evidence](docs/circle.md).
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 
@@ -107,6 +121,7 @@ flit-cli discover --wait 5                  # who else is speaking v2.2 here?
 flit-cli send <ip[:port]|alias> <file...> [--parallel N]
 flit-cli info <ip[:port]>
 flit-cli relay --port 53318 [--token T]     # blind pairer for peers that can't reach each other
+flit-cli circle <create|join|post|poll|vote|kick|leave|sync>   # accountless group coordination
 ```
 
 Needs java 21 at run time — the installed launcher says so in one line if the
@@ -126,5 +141,5 @@ queueing, and the address is configured by hand (no relay discovery, by design).
 ## Licensing / provenance note
 
 This is a **clean-room implementation** of a wire protocol (protocols and file formats are not
-copyrightable). No LocalSend source code or assets are copyied; only the protocol specification
+copyrightable). No LocalSend source code or assets are copied; only the protocol specification
 documentation is used as reference.

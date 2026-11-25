@@ -4,8 +4,12 @@ Brief (user, 2026-10-27): "make it simplest and most complex at the same time."
 The original Bluetooth contract was **the UI never learns Bluetooth exists**.
 That contract was deliberately revised on 2026-11-24: an explicit opt-in
 **Transfer over Bluetooth** option now exists, and **QR-only mode** lets a user
- refuse every device that did not enter their graph by QR. Everything else still
- holds: no accounts, no cloud, no telemetry, no silent carrier switches.
+refuse every device that did not enter their graph by QR. Everything else still
+holds: no accounts, no cloud, no telemetry, no silent carrier switches.
+
+> **Non-profit constraint (hard, everywhere):** no accounts, no cloud, no ads, no
+> telemetry, and no SDKs that phone home. Every design below is judged against it —
+> there is no server to register with and nothing to collect; peers connect directly.
 
 ## Focused design documents
 
@@ -15,9 +19,10 @@ That contract was deliberately revised on 2026-11-24: an explicit opt-in
 - [QR-only mode, known devices and panic](qr-only-and-panic.md) —
   the free-will base: QR v2 pairing, per-device route policy, signed alerts,
   and the safety rule that nothing ever auto-acts on a recipient's device.
-- [Circle — accountless group coordination](circle.md) — **design only**:
-  QR-founded groups with an encrypted local event log, file drops and
-  re-votable polls; threat model, scope cuts and test story.
+- [Circle — accountless group coordination](circle.md) — **v1 built**:
+  QR-founded groups with a signed (TLS-protected in transit, plaintext at rest)
+  local event log, file drops and re-votable polls; host/role enforcement,
+  threat model, scope cuts, evidence and honest limitations.
 - [Milestone C — process-death checkpoints](milestone-c.md) —
   queue rows before bytes, receiver sidecars, and the hardware walk.
 - [Milestone D — album mirror](milestone-d.md) —
@@ -26,6 +31,8 @@ That contract was deliberately revised on 2026-11-24: an explicit opt-in
   hunter, death contract, the 2026-11-18 defect and the passing redo walk.
 - [Milestone E — self-hosted relay](milestone-e.md) —
   blind pairer, `flit-cli relay`, app surface, and the relay-kill walk.
+- [Play listing draft](play-listing.md) — store copy and the data-safety form
+  (zero collection), kept honest against the constraint above.
 
 ## Milestone ladder
 
