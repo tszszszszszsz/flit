@@ -36,7 +36,7 @@ holds: no accounts, no cloud, no telemetry, no silent carrier switches.
 
 ## Milestone ladder
 
-- **B0** — this doc + `ConnectionProvider` seam introduced *without behavior change*
+- **B0** — this doc + the `Link`/`LinkProvider` seam introduced *without behavior change*
   (TCP still default; all 30 tests + parity green).
 - **B1** — ServerCore lift: ktor binder consumes it; RFCOMM request-reader + stream
   TLS shim land behind the seam with in-memory tests mirroring the v2 parity suite.
@@ -117,6 +117,8 @@ involved. Same discipline as the look rewrite.
   with a hash-exact landing and no leftover part. The mid-body
   throw/keep/resume loop is proven through the relay on hardware, not only
   in the harness.
-- Idea-3 (hotspot assist) parked pending a vocabulary decision; idea-4 items stay
-  measure-then-act only.
+- **Parked, not committed:** hotspot assist (the old "idea-3" note) stays parked
+  pending a vocabulary decision, and the remaining "idea-4"-style items are
+  measure-then-act only. Neither has a design doc or code in this repo — the rungs
+  above are the full committed ladder, so these are not pending work items.
 

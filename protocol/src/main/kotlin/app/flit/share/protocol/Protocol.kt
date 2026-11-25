@@ -58,6 +58,23 @@ object Protocol {
     const val HEADER_CIRCLE_CERT: String = "X-Flit-Circle-Cert"
 
     /**
+     * Flit-only marker on a prepare-upload request. A v2.2 sender never sends
+     * it, so the receiver can add Flit response semantics without changing a
+     * byte of the v2.2 answer.
+     */
+    const val HEADER_FLIT_CLIENT: String = "X-Flit-Client"
+    const val FLIT_CLIENT_VALUE: String = "1"
+
+    /**
+     * Flit-only answer to a marked prepare-upload that the receiver deliberately
+     * declined. Sent with 403 (same status as v2.2 rejection) so the client can
+     * tell "the peer said no — story over" from a dead carrier or a transient
+     * 409/5xx, which still throw.
+     */
+    const val HEADER_FLIT_REFUSAL: String = "X-Flit-Refusal"
+    const val REFUSAL_DECLINED: String = "declined"
+
+    /**
      * Identity of a resumable file across sessions: name + size + content
      * hash. Nobody ever uploads against a token they didn't first offer to
      * us in prepare (the part registry is verified against the live

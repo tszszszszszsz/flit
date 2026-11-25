@@ -72,6 +72,19 @@ interface HttpExchange {
     /** Text response ([status] plain integer; contentType like "application/json"). */
     suspend fun respondText(status: Int, contentType: String, body: String)
 
+    /**
+     * Text response with extra response headers. Additive: the default drops
+     * them, so every existing carrier and test double stays byte-for-byte
+     * unchanged. Only transports that override this (TCP/ktor and the pipe /
+     * Bluetooth carrier) actually emit them, for Flit-only answers.
+     */
+    suspend fun respondText(
+        status: Int,
+        contentType: String,
+        body: String,
+        headers: Map<String, String>,
+    ) = respondText(status, contentType, body)
+
     /** Status-only response, empty body. */
     suspend fun respondStatus(status: Int)
 }

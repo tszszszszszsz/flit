@@ -13,6 +13,7 @@ import java.util.Locale
 typealias Role = FlitCircleStore.Role
 typealias Member = FlitCircleStore.Member
 typealias CircleState = FlitCircleStore.CircleState
+typealias CircleDelivery = FlitCircleStore.CircleDelivery
 
 /** Pure JSON codec over the Circle state (no Android involved). */
 fun encode(state: CircleState): String = FlitCircleStore.encode(state)
@@ -30,7 +31,10 @@ fun reduce(state: CircleState, event: CircleEvent): CircleState =
 
 /**
  * One device's local view of a Circle: the group key, its own role, the roster,
- * the bounded signed event log, and the local rekey generation.
+ * the bounded signed event log, the local rekey generation, and any file
+ * deliveries this device announced ([CircleState.deliveries], keyed by sha256).
+ * Delivery status is local-only: it is never signed, never gossiped, and never
+ * carries the sender's spool path onto the wire.
  *
  * Event bodies are JSON. The store reads these fields (unknown keys are
  * ignored, so Agent C can add metadata freely):
@@ -86,6 +90,35 @@ object FlitCircleStore {
         val joinedMs: Long = 0,
     )
 
+    /**
+     * One file this device announced to the Circle, plus the locally recorded
+     * outcome for each recipient fingerprint. Stored in
+     * [CircleState.deliveries] under [sha256] (the same value the `file` event
+     * and the received-file lookup use).
+     *
+     * [spoolPath] is a local cache path: it never enters a signed event body.
+     * [statuses] is local-only (pending / sent / refused / failed); a member
+     * who joins later sees the announcement card but neither the bytes nor
+     * these states. Additive fields all have defaults so older rows decode.
+     */
+    @Serializable
+    data class CircleDelivery(
+        val id: String,
+        val name: String,
+        val size: Long,
+        val sha256: String,
+        val spoolPath: String,
+        val statuses: Map<String, String> = emptyMap(),
+        val createdMs: Long = 0L,
+    ) {
+        companion object {
+            const val PENDING = "pending"
+            const val SENT = "sent"
+            const val REFUSED = "refused"
+            const val FAILED = "failed"
+        }
+    }
+
     @Serializable
     data class CircleState(
         val id: String,
@@ -104,6 +137,12 @@ object FlitCircleStore {
          * member holds the local role), never a guess on an ambiguous roster.
          */
         val selfFp: String = "",
+        /**
+         * Announced files awaiting (or finished with) delivery, keyed by
+         * sha256. Additive with a default, so old rows and existing named
+         * argument constructors keep working; the codec normalises it on read.
+         */
+        val deliveries: Map<String, CircleDelivery> = emptyMap(),
     )
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -120,7 +159,10 @@ object FlitCircleStore {
      * Decoded rows are normalised: duplicate fingerprints/ids collapse to the
      * first occurrence, the log is trimmed to [EVENT_CAP], a negative
      * generation is floored at zero, and a second OWNER is demoted (there is
-     * exactly one founder). This makes old and hand-edited rows safe to fold.
+     * exactly one founder). Delivery rows with a blank key or sha are dropped
+     * and blank status fingerprints are stripped. This makes old and
+     * hand-edited rows safe to fold; a missing `deliveries` key becomes an
+     * empty map.
      */
     fun decode(raw: String?): CircleState? {
         if (raw.isNullOrBlank()) return null
@@ -147,10 +189,20 @@ object FlitCircleStore {
             if (e.id.isBlank() || e.id in events) continue
             events[e.id] = e
         }
+        // A delivery with no sha cannot be looked up from a file event; drop it.
+        // Blank fingerprints are decoration-free and stripped from statuses.
+        val deliveries = linkedMapOf<String, CircleDelivery>()
+        for ((key, delivery) in state.deliveries) {
+            val k = key.trim()
+            if (k.isBlank() || delivery.sha256.isBlank() || k in deliveries) continue
+            deliveries[k] = if (delivery.statuses.keys.all { it.isNotBlank() }) delivery
+            else delivery.copy(statuses = delivery.statuses.filterKeys { it.isNotBlank() })
+        }
         return state.copy(
             members = safeMembers,
             events = events.values.toList().takeLast(EVENT_CAP),
             rekeyGen = maxOf(0, state.rekeyGen),
+            deliveries = deliveries,
         )
     }
 
@@ -194,6 +246,32 @@ object FlitCircleStore {
         store(ctx).putString(KEY_CIRCLE, encode(next))
         next
     }
+
+    /**
+     * Atomic, local-only read-modify-write for delivery bookkeeping. The whole
+     * decode → fold → encode → persist sequence holds [ioLock], so a delivery
+     * update can never interleave with a sync `upsert` or another delivery
+     * write and clobber its event log, roster or statuses. Returns the new
+     * state (for the caller's StateFlow) or null when no row exists to update.
+     * [transform] must be a pure reducer; it is called exactly once per row.
+     */
+    fun update(ctx: Context, transform: (CircleState) -> CircleState): CircleState? =
+        synchronized(ioLock) {
+            val current = decode(store(ctx).string(KEY_CIRCLE)) ?: return@synchronized null
+            val next = transform(current)
+            store(ctx).putString(KEY_CIRCLE, encode(next))
+            next
+        }
+
+    /** Atomic convenience wrappers around the three pure delivery reducers. */
+    fun persistDelivery(ctx: Context, delivery: CircleDelivery): CircleState? =
+        update(ctx) { upsertDelivery(it, delivery) }
+
+    fun persistDeliveryStatus(ctx: Context, sha: String, fp: String, status: String): CircleState? =
+        update(ctx) { setDeliveryStatus(it, sha, fp, status) }
+
+    fun dropDelivery(ctx: Context, sha: String): CircleState? =
+        update(ctx) { removeDelivery(it, sha) }
 
     // ==== pure reducers =========================================================
 
@@ -332,7 +410,65 @@ object FlitCircleStore {
         return finaliseVoteKick(next, kickId, target)
     }
 
+    // ==== file delivery reducers (local-only, pure) =============================
+
+    /**
+     * Insert or replace a delivery record keyed by its [CircleDelivery.sha256].
+     * A retry that re-announces the same file with no statuses keeps the
+     * outcomes already recorded; an incoming non-empty status map replaces
+     * them. Blank keys and blank fingerprints are never stored.
+     */
+    fun upsertDelivery(state: CircleState, delivery: CircleDelivery): CircleState {
+        val sha = delivery.sha256.trim()
+        if (sha.isBlank()) return state
+        val key = deliveryKey(state, sha) ?: sha
+        val statuses = delivery.statuses.filterKeys { it.isNotBlank() }
+            .takeIf { it.isNotEmpty() } ?: state.deliveries[key]?.statuses.orEmpty()
+        val stored = delivery.copy(
+            id = delivery.id.trim(),
+            sha256 = sha,
+            statuses = statuses,
+        )
+        return state.copy(deliveries = state.deliveries + (key to stored))
+    }
+
+    /**
+     * Record one recipient's local outcome for a delivery. Unknown sha, blank
+     * fingerprint or blank status are inert: no phantom records are created.
+     * The latest status per fingerprint wins, matching vote semantics.
+     */
+    fun setDeliveryStatus(state: CircleState, sha: String, fp: String, status: String): CircleState {
+        val key = deliveryKey(state, sha) ?: return state
+        val who = fp.trim()
+        val value = status.trim()
+        if (who.isBlank() || value.isBlank()) return state
+        val delivery = state.deliveries[key] ?: return state
+        return state.copy(
+            deliveries = state.deliveries + (
+                key to delivery.copy(statuses = delivery.statuses + (who to value))
+                ),
+        )
+    }
+
+    /** Forget a delivery record; other records and the rest of the state survive. */
+    fun removeDelivery(state: CircleState, sha: String): CircleState {
+        val key = deliveryKey(state, sha) ?: return state
+        return state.copy(deliveries = state.deliveries - key)
+    }
+
     // ==== internals =============================================================
+
+    /** Accept a sha, the map key, a delivery id or a case variant of any of them. */
+    private fun deliveryKey(state: CircleState, ref: String): String? {
+        val key = ref.trim()
+        if (key.isBlank()) return null
+        if (key in state.deliveries) return key
+        return state.deliveries.entries.firstOrNull { (k, d) ->
+            k.equals(key, ignoreCase = true) ||
+                d.sha256.equals(key, ignoreCase = true) ||
+                d.id.equals(key, ignoreCase = true)
+        }?.key
+    }
 
     private fun append(state: CircleState, event: CircleEvent): CircleState {
         if (event.id.isBlank()) return state

@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.ContextCompat
 import app.flit.share.protocol.client.Link
 import app.flit.share.protocol.client.TlsLink
@@ -45,16 +46,24 @@ internal object FlitBluetooth {
 
     const val SERVICE_NAME = "Flit"
 
-    private const val RETRY_INITIAL_MS = 2_000L
-    private const val RETRY_MAX_MS = 60_000L
-
-    /** One listener per engine start; a restart cancels a pending retry. */
+    /** One listener at a time; a restart or stop cancels a pending retry. */
     @Volatile
     private var serverJob: Job? = null
 
-    fun hasPermission(ctx: Context): Boolean =
-        ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.BLUETOOTH_CONNECT) ==
-            PackageManager.PERMISSION_GRANTED
+    /**
+     * RFCOMM needs the modern nearby-device grant on Android 12+, but the
+     * legacy BLUETOOTH(/ADMIN) pair on 26–30 — where BLUETOOTH_CONNECT does not
+     * exist and was never requested. The names and the SDK split are pure
+     * policy (see [FlitBluetoothPolicy]); the runtime only maps them to grants.
+     */
+    fun hasPermission(ctx: Context): Boolean {
+        val sdkInt = Build.VERSION.SDK_INT
+        val granted = FlitBluetoothPolicy.requiredPermissions(sdkInt)
+            .filterTo(HashSet()) { name ->
+                ContextCompat.checkSelfPermission(ctx, name) == PackageManager.PERMISSION_GRANTED
+            }
+        return FlitBluetoothPolicy.allRequiredGranted(sdkInt, granted)
+    }
 
     private fun adapter(ctx: Context): BluetoothAdapter? =
         (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -116,8 +125,14 @@ internal object FlitBluetooth {
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
-                            throw IOException("bluetooth TLS handshake failed: ${e.message ?: e.javaClass.simpleName}", e)
-                        } ?: throw IOException("bluetooth TLS handshake timed out: $host")
+                            throw IOException(
+                                FlitBluetoothPolicy.handshakeFailureLog(
+                                    host, timeout = false, detail = e.message ?: e.javaClass.simpleName,
+                                ), e,
+                            )
+                        } ?: throw IOException(
+                            FlitBluetoothPolicy.handshakeFailureLog(host, timeout = true, detail = null),
+                        )
                         handedOff = true
                         wrapped
                     }
@@ -131,8 +146,12 @@ internal object FlitBluetooth {
      * Receiver's accept loop, the RFCOMM twin of the relay subscription
      * worker. Acquisition retries behind the scope's back until permission
      * and radio are there (the sheet may be answered after the option was
-     * enabled) or until listen() succeeds; a published listener is one-shot —
-     * engine stop closes it, accept() then returns and we do not re-listen.
+     * enabled) or until listen() succeeds. A published listener is no longer
+     * one-shot: a transient accept() failure closes that listener, waits a
+     * calm, bounded delay, listens again and re-publishes the new socket.
+     * Only a cancelled/inactive loop is a real stop. Log lines follow the
+     * facts — "listening" is written only after listen() actually returned a
+     * socket, and "stopped listening" only when that publication ends.
      */
     fun startServer(
         ctx: Context,
@@ -144,7 +163,8 @@ internal object FlitBluetooth {
     ) {
         serverJob?.cancel()
         serverJob = scope.launch(Dispatchers.IO) {
-            var waitMs = RETRY_INITIAL_MS
+            var waitMs = FlitBluetoothPolicy.RETRY_INITIAL_MS
+            var published = false
             while (isActive) {
                 val adapter = adapter(ctx)
                 if (!ready(ctx, adapter)) {
@@ -167,14 +187,30 @@ internal object FlitBluetooth {
                     runCatching { listening.close() }
                     return@launch
                 }
-                try {
-                    onSocket(listening)
+                onSocket(listening)
+                published = true
+                onLog("bluetooth link: listening")
+                // A fresh listener earns a fresh backoff; a later transient
+                // accept() failure must not inherit an old, capped delay.
+                waitMs = FlitBluetoothPolicy.RETRY_INITIAL_MS
+                val decision = try {
                     serveAccepted(listening, identity, server, onLog)
                 } finally {
                     runCatching { listening.close() }
                 }
-                return@launch
+                when (decision.action) {
+                    FlitBluetoothPolicy.AcceptAction.STOP -> {
+                        if (published) onLog("bluetooth link: stopped listening")
+                        return@launch
+                    }
+                    FlitBluetoothPolicy.AcceptAction.RELISTEN -> {
+                        // The reason already says the accept path died; the
+                        // retry line adds the honest delay before re-listening.
+                        waitMs = retryAfter(decision.log ?: "bluetooth link accept ended", waitMs, onLog)
+                    }
+                }
             }
+            if (published) onLog("bluetooth link: stopped listening")
         }
     }
 
@@ -190,29 +226,44 @@ internal object FlitBluetooth {
 
     /** Calm, cancellable backoff: 2s, 4s, 8s … capped at a minute. */
     private suspend fun retryAfter(why: String, waitMs: Long, onLog: (String) -> Unit): Long {
-        onLog("$why — retry in ${waitMs / 1000}s")
+        onLog(FlitBluetoothPolicy.retryLog(why, waitMs))
         delay(waitMs)
-        return minOf(waitMs * 2, RETRY_MAX_MS)
+        return FlitBluetoothPolicy.nextBackoffMs(waitMs)
     }
 
+    /**
+     * Accepts until the listener dies or the job is cancelled. A transient
+     * exception is no longer mistaken for an engine stop: the caller closes
+     * the listener and re-listens behind the calm delay. Cancellation and a
+     * closed/inactive scope are a real stop and carry no failure claim.
+     */
     private suspend fun CoroutineScope.serveAccepted(
         listening: BluetoothServerSocket,
         identity: TlsIdentity,
         server: ProtocolServer,
         onLog: (String) -> Unit,
-    ) {
+    ): FlitBluetoothPolicy.AcceptDecision {
         while (isActive) {
             val socket = try {
                 listening.accept()
             } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                break // engine stop closed the listener
-            } ?: break
+                return FlitBluetoothPolicy.acceptExit(active = false, cancelled = true, failure = null)
+            } catch (t: Exception) {
+                return FlitBluetoothPolicy.acceptExit(
+                    active = isActive,
+                    cancelled = false,
+                    failure = t.message ?: t.javaClass.simpleName,
+                )
+            } ?: return FlitBluetoothPolicy.acceptExit(
+                active = isActive,
+                cancelled = false,
+                failure = "no socket returned",
+            )
             // Child coroutine: one dead peer cannot stall the accept loop, and
             // scope cancellation closes every in-flight link.
             launch(Dispatchers.IO) { serveOne(socket, identity, server, onLog) }
         }
+        return FlitBluetoothPolicy.acceptExit(active = false, cancelled = false, failure = null)
     }
 
     private suspend fun serveOne(
@@ -228,14 +279,25 @@ internal object FlitBluetooth {
             onLog("bluetooth link socket: ${t.message ?: t.javaClass.simpleName}")
             return
         }
+        val peer = raw.origin ?: "peer"
+        // The dialer bounds its TLS handshake with the caller's timeout; the
+        // receiver must be bounded too. A stuck sender must not pin this IO
+        // thread forever. Closing raw on timeout/failure breaks the blocked
+        // handshake even though withTimeoutOrNull only cancels the coroutine.
         val link = try {
-            TlsLink(raw, identity, clientMode = false)
+            withTimeoutOrNull(FlitBluetoothPolicy.HANDSHAKE_TIMEOUT_MS) {
+                TlsLink(raw, identity, clientMode = false)
+            }
         } catch (e: CancellationException) {
             raw.close()
             throw e
         } catch (t: Throwable) {
             raw.close() // LinkServer never received the link — close the carrier ourselves.
-            onLog("bluetooth link handshake: ${t.message ?: t.javaClass.simpleName}")
+            onLog(FlitBluetoothPolicy.handshakeFailureLog(peer, timeout = false, detail = t.message ?: t.javaClass.simpleName))
+            return
+        } ?: run {
+            raw.close()
+            onLog(FlitBluetoothPolicy.handshakeFailureLog(peer, timeout = true, detail = null))
             return
         }
         try {
@@ -248,4 +310,78 @@ internal object FlitBluetooth {
             runCatching { link.close() }
         }
     }
+}
+
+/**
+ * Pure policy for the RFCOMM carrier — the parts that must hold on a bench
+ * with no radio and no Android runtime. The Android-facing object above asks
+ * this one which permissions are real, how long to back off, how an accept()
+ * ended, and what a failed handshake is honestly called. Every branch has JVM
+ * coverage in [app.flit.share.FlitBluetoothTest].
+ */
+internal object FlitBluetoothPolicy {
+
+    const val PERM_CONNECT = "android.permission.BLUETOOTH_CONNECT"
+    const val PERM_LEGACY = "android.permission.BLUETOOTH"
+    const val PERM_LEGACY_ADMIN = "android.permission.BLUETOOTH_ADMIN"
+
+    /** Android 12 replaced the install-time Bluetooth permissions with runtime ones. */
+    const val RUNTIME_PERM_SDK = 31
+
+    const val RETRY_INITIAL_MS = 2_000L
+    const val RETRY_MAX_MS = 60_000L
+
+    /** Receiver's TLS bound. The dialer uses the caller's connect timeout. */
+    const val HANDSHAKE_TIMEOUT_MS = 30_000L
+
+    /**
+     * API 26–30 speak the legacy names declared in the manifest, including
+     * BLUETOOTH_ADMIN for the listening side. BLUETOOTH_CONNECT is not granted
+     * (or even requested) there, so checking it alone kills RFCOMM on those
+     * devices. Android 12+ checks only the nearby-device connect grant; scan
+     * and advertise belong to FlitBleRadio, not to this carrier.
+     */
+    fun requiredPermissions(sdkInt: Int): List<String> =
+        if (sdkInt >= RUNTIME_PERM_SDK) listOf(PERM_CONNECT)
+        else listOf(PERM_LEGACY, PERM_LEGACY_ADMIN)
+
+    /**
+     * Every permission this API level needs must actually be granted. Extra
+     * grants (e.g. a CONNECT name on a legacy device) never stand in for the
+     * missing ones, and no requirements at all is never a yes.
+     */
+    fun allRequiredGranted(sdkInt: Int, granted: Set<String>): Boolean {
+        val needed = requiredPermissions(sdkInt)
+        return needed.isNotEmpty() && needed.all(granted::contains)
+    }
+
+    /** Calm, cancellable backoff: 2s, 4s, 8s … capped at a minute, no overflow. */
+    fun nextBackoffMs(waitMs: Long): Long {
+        if (waitMs <= 0) return RETRY_INITIAL_MS
+        return minOf(waitMs.coerceAtMost(RETRY_MAX_MS / 2) * 2, RETRY_MAX_MS)
+    }
+
+    /** The retry line names the reason and the real delay; no "listening" claim. */
+    fun retryLog(why: String, waitMs: Long): String = "$why — retry in ${waitMs / 1000}s"
+
+    enum class AcceptAction { RELISTEN, STOP }
+
+    data class AcceptDecision(val action: AcceptAction, val log: String?)
+
+    /**
+     * How accept() left the listener. Cancellation or an inactive scope is a
+     * genuine stop: quiet, no retry. Anything else while still active is
+     * transient — re-listen and say what actually happened. This function never
+     * claims "listening": only a successful listen() may do that.
+     */
+    fun acceptExit(active: Boolean, cancelled: Boolean, failure: String?): AcceptDecision = when {
+        cancelled || !active -> AcceptDecision(AcceptAction.STOP, null)
+        failure != null -> AcceptDecision(AcceptAction.RELISTEN, "bluetooth link accept failed: $failure")
+        else -> AcceptDecision(AcceptAction.RELISTEN, "bluetooth link accept ended — will listen again")
+    }
+
+    /** Timeout and failure are different claims, and both name the peer. */
+    fun handshakeFailureLog(peer: String, timeout: Boolean, detail: String?): String =
+        if (timeout) "bluetooth link TLS handshake timed out: $peer"
+        else "bluetooth link TLS handshake failed: ${detail ?: peer}"
 }

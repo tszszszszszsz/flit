@@ -17,16 +17,21 @@ Send files to the devices around you — directly, device to device, with no acc
 no cables, and nothing leaving your network in between.
 
 **How it works**
-- Everything on your Wi-Fi network appears in one shared list the moment you open the
-  app. Tap a device, pick your files, send.
+- Nearby devices speaking the v2.2 protocol appear in one shared list the moment you open
+  the app. Tap a device, pick your files, send. Options can narrow that list: **QR-only**
+  admits only devices you paired by QR, and **Trusted senders only** admits only devices
+  you pinned — both are off by default, so the open list is the default.
 - With no Wi-Fi network between the phones at all (mobile data only, a dead access
-  point), the roster keeps working: discovery and the transfer ride Bluetooth at exactly
-  that moment — same list, same speed readout, no new settings.
+  point), the roster keeps working: discovery rides Bluetooth at exactly that moment,
+  and the transfer does too once you opt in with **Transfer over Bluetooth** (off by
+  default) — same list, same speed readout.
 
 **Honest, by design**
 - Transfers are end-to-end TLS with per-device identities; every incoming device is
   verified by its fingerprint, not by a name anyone could claim. Trust ("pin") the
-  devices you know; unknown senders only appear when you allow it.
+  devices you know — by default other nearby v2.2 devices can also send, and
+  **Trusted senders only** (or **QR-only**) is the opt-in gate in Options that closes
+  the list to devices you already know.
 - Send later: a device can stay waiting while you share — the file goes the moment it
   is back. Interrupted transfers resume from where they stopped instead of starting over.
 - Received files land straight in your chosen folder (Downloads/Flit by default, or a

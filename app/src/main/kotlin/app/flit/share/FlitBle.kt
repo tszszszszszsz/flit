@@ -20,8 +20,10 @@ import java.util.UUID
  *    a short fingerprint prefix and no alias (such a row labels itself with
  *    the device address — the roster already does that for shy announces).
  *  - [stance]: the dormancy arbiter. A pure function of the world — access
- *    point up, permissions granted, radio powered, hidden mode — deciding
- *    advertise and/or scan. Turning dark is a decision this returns.
+ *    point up, permissions granted, radio powered, hidden mode, duty phase,
+ *    live peer — deciding advertise and/or scan. Turning dark is a decision
+ *    this returns; the no-AP radio rests 45 s of every 55 s and stops scanning
+ *    outright once a real peer row exists. [phaseOn] is the injectable clock.
  *
  * Nothing here is user-facing: no strings, no settings, no new vocabulary.
  */
@@ -129,22 +131,111 @@ object FlitBle {
     fun rowIsFree(lastTouchMs: Long?, now: Long): Boolean =
         lastTouchMs == null || now - lastTouchMs >= FRESH_TOUCH_MS
 
+    /** Manual stubs are user-typed addresses the prober owns, not found peers. */
+    const val MANUAL_ROW_PREFIX = "manual@"
+
     /**
-     * Decides the next stance. The rule is short on purpose: any reason the
-     * usual Wi-Fi path can't carry discovery turns this radio on; the exact
-     * reverse holds when the access point is back. Hidden mode keeps listen
-     * but never announces — the radio stays invisible, like UDP hidden mode.
+     * Is discovery silent — no live, non-manual row? The rescue sweep asks the
+     * same question; the arbiter uses it to put the ears to sleep once a real
+     * peer has been found. Rows are keyed by identity/address, [seenMs] is the
+     * row's last touch. Manual stubs and rows past the TTL never count.
+     */
+    fun hasLivePeer(
+        rows: Map<String, Long?>,
+        nowMs: Long,
+        ttlMs: Long,
+    ): Boolean = rows.any { (key, seenMs) ->
+        !key.startsWith(MANUAL_ROW_PREFIX) && seenMs != null && nowMs - seenMs < ttlMs
+    }
+
+    // ---- duty cycle ---------------------------------------------------------
+
+    /** The engine's discovery tick — also the pruner's cadence. */
+    const val DUTY_TICK_MS = 5_000L
+
+    /** 10 s on: two 5 s ticks. */
+    const val DUTY_ON_TICKS = 2L
+
+    /** 45 s off: nine 5 s ticks. */
+    const val DUTY_OFF_TICKS = 9L
+
+    /** One full cycle: 11 ticks = 55 s. */
+    const val DUTY_PERIOD_TICKS = DUTY_ON_TICKS + DUTY_OFF_TICKS
+
+    const val DUTY_ON_MS = DUTY_ON_TICKS * DUTY_TICK_MS
+    const val DUTY_OFF_MS = DUTY_OFF_TICKS * DUTY_TICK_MS
+    const val DUTY_PERIOD_MS = DUTY_PERIOD_TICKS * DUTY_TICK_MS
+
+    /**
+     * The phase itself: on for the first [onTicks] ticks of every [periodTicks]
+     * ticks. Pure modulo arithmetic — no clock, no state, no radio. Negative
+     * ticks wrap honestly through [Math.floorMod]. Degenerate budgets fail
+     * closed: a non-positive window never wakes, a window at least as long as
+     * the cycle leaves the radio always on.
+     */
+    fun phaseOn(
+        tick: Long,
+        onTicks: Long = DUTY_ON_TICKS,
+        periodTicks: Long = DUTY_PERIOD_TICKS,
+    ): Boolean = when {
+        onTicks <= 0L -> false
+        periodTicks <= onTicks -> true
+        else -> Math.floorMod(tick, periodTicks) < onTicks
+    }
+
+    /**
+     * Injectable phase source. The shipped [DutyPhase.DUTY] samples [phaseOn];
+     * tests and alternate cadences inject any predicate. The arbiter asks it
+     * exactly once per engine tick.
+     */
+    fun interface DutyPhase {
+        fun active(tick: Long): Boolean
+
+        companion object {
+            /** Historical behavior: every tick is on (debug / walkthrough). */
+            val ALWAYS = DutyPhase { true }
+            /** Always dark — useful to assert the resting branch. */
+            val NEVER = DutyPhase { false }
+            /** The shipped 10 s on / 45 s off cadence. */
+            val DUTY = DutyPhase { tick -> FlitBle.phaseOn(tick) }
+        }
+    }
+
+    /** Ticks since the epoch — the default phase input, sampled by the 5 s loop. */
+    fun clockTick(nowMs: Long = System.currentTimeMillis()): Long =
+        Math.floorDiv(nowMs, DUTY_TICK_MS)
+
+    /**
+     * Decides the next stance. The base rule is unchanged: any reason the usual
+     * Wi-Fi path can't carry discovery turns this radio on, and the exact
+     * reverse holds when the access point is back. What changed is the long-lived
+     * no-AP case: [phase] gates both announce and listen to a duty window, and a
+     * live non-manual [livePeer] row puts the ears to sleep outright — discovery
+     * already succeeded, so continuous scanning is pure battery burn until that
+     * row ages out. Hidden mode listens inside the on window but never announces.
+     *
+     * Defaults keep every existing call source-compatible: [livePeer] starts
+     * false, the phase is the shipped duty cadence, and [tick] comes from the
+     * wall clock — so the engine's existing 5 s loop samples a fresh phase
+     * without needing a counter. Tests and alternate cadences pass [tick] and
+     * [phase] explicitly.
      */
     fun stance(
         apUp: Boolean,
         perms: Boolean,
         radioOn: Boolean,
         hidden: Boolean,
-    ): Stance = when {
-        apUp -> Stance(advertise = false, scan = false)
-        !radioOn || !perms -> Stance(advertise = false, scan = false)
-        hidden -> Stance(advertise = false, scan = true)
-        else -> Stance(advertise = true, scan = true)
+        livePeer: Boolean = false,
+        phase: DutyPhase = DutyPhase.DUTY,
+        tick: Long = clockTick(),
+    ): Stance {
+        if (apUp || !radioOn || !perms) return Stance(advertise = false, scan = false)
+        val active = phase.active(tick)
+        return when {
+            hidden -> Stance(advertise = false, scan = active && !livePeer)
+            livePeer -> Stance(advertise = active, scan = false)
+            else -> Stance(advertise = active, scan = active)
+        }
     }
 
     /**

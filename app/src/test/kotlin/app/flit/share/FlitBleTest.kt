@@ -94,7 +94,7 @@ class FlitBleTest {
     fun `arbiter — access point up keeps the radio dark`() {
         assertEquals(
             FlitBle.Stance(advertise = false, scan = false),
-            FlitBle.stance(apUp = true, perms = true, radioOn = true, hidden = false),
+            FlitBle.stance(apUp = true, perms = true, radioOn = true, hidden = false, phase = FlitBle.DutyPhase.ALWAYS),
         )
     }
 
@@ -102,7 +102,7 @@ class FlitBleTest {
     fun `arbiter — no ap turns both radios on`() {
         assertEquals(
             FlitBle.Stance(advertise = true, scan = true),
-            FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = false),
+            FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = false, phase = FlitBle.DutyPhase.ALWAYS),
         )
     }
 
@@ -110,7 +110,7 @@ class FlitBleTest {
     fun `arbiter — hidden mode listens but never announces`() {
         assertEquals(
             FlitBle.Stance(advertise = false, scan = true),
-            FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = true),
+            FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = true, phase = FlitBle.DutyPhase.ALWAYS),
         )
     }
 
@@ -118,11 +118,11 @@ class FlitBleTest {
     fun `arbiter — missing permissions or a dead radio keep everything off`() {
         assertEquals(
             FlitBle.Stance(advertise = false, scan = false),
-            FlitBle.stance(apUp = false, perms = false, radioOn = true, hidden = false),
+            FlitBle.stance(apUp = false, perms = false, radioOn = true, hidden = false, phase = FlitBle.DutyPhase.ALWAYS),
         )
         assertEquals(
             FlitBle.Stance(advertise = false, scan = false),
-            FlitBle.stance(apUp = false, perms = true, radioOn = false, hidden = false),
+            FlitBle.stance(apUp = false, perms = true, radioOn = false, hidden = false, phase = FlitBle.DutyPhase.ALWAYS),
         )
     }
 
@@ -172,5 +172,143 @@ class FlitBleTest {
         assertNull(FlitBle.raiseAsk(apUp = false, permsOk = true, radioOn = true, askedPerms = true, askedPower = true))
         // Crisis healed by facts: grants arrived on their own.
         assertNull(FlitBle.raiseAsk(apUp = false, permsOk = true, radioOn = true, askedPerms = false, askedPower = false))
+    }
+
+    @Test
+    fun `duty constants close the ten-on forty-five-off cycle`() {
+        assertEquals(5_000L, FlitBle.DUTY_TICK_MS)
+        assertEquals(10_000L, FlitBle.DUTY_ON_MS)
+        assertEquals(45_000L, FlitBle.DUTY_OFF_MS)
+        assertEquals(11L, FlitBle.DUTY_PERIOD_TICKS)
+        assertEquals(55_000L, FlitBle.DUTY_PERIOD_MS)
+    }
+
+    @Test
+    fun `phase wakes for two ticks then rests for nine, every cycle`() {
+        val first = listOf(true, true) + List(9) { false }
+        assertEquals(first, (0 until 11).map { FlitBle.phaseOn(it.toLong()) })
+        assertEquals(first, (11 until 22).map { FlitBle.phaseOn(it.toLong()) }) // not a one-shot
+        assertTrue(FlitBle.phaseOn(22))
+        assertFalse(FlitBle.phaseOn(21))
+    }
+
+    @Test
+    fun `phase budgets are injectable and fail closed`() {
+        val seq = (0L..7L).map { FlitBle.phaseOn(it, onTicks = 1, periodTicks = 4) }
+        assertEquals(listOf(true, false, false, false, true, false, false, false), seq)
+        assertFalse(FlitBle.phaseOn(0, onTicks = 0), "a zero window never wakes")
+        assertFalse(FlitBle.phaseOn(0, onTicks = -1))
+        assertTrue(FlitBle.phaseOn(99, onTicks = 4, periodTicks = 4), "a full-on cycle stays on")
+        assertTrue(FlitBle.phaseOn(99, onTicks = 7, periodTicks = 4))
+    }
+
+    @Test
+    fun `negative ticks wrap instead of waking early`() {
+        assertTrue(FlitBle.phaseOn(-11)) // floorMod 0 of 11
+        assertTrue(FlitBle.phaseOn(-10))
+        assertFalse(FlitBle.phaseOn(-9))
+        assertFalse(FlitBle.phaseOn(-1))
+    }
+
+    @Test
+    fun `clock tick samples wall time at the engine cadence`() {
+        assertEquals(0L, FlitBle.clockTick(0L))
+        assertEquals(0L, FlitBle.clockTick(4_999L))
+        assertEquals(1L, FlitBle.clockTick(5_000L))
+        assertEquals(11L, FlitBle.clockTick(55_000L))
+    }
+
+    @Test
+    fun `four-arg stance stays source-compatible and samples the clock phase`() {
+        val before = FlitBle.clockTick()
+        val actual = FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = false)
+        val after = FlitBle.clockTick()
+        fun expected(tick: Long) = FlitBle.stance(
+            apUp = false, perms = true, radioOn = true, hidden = false, tick = tick,
+        )
+        // A tick boundary may fall on either side of the call; nothing else moves.
+        assertTrue(actual == expected(before) || actual == expected(after))
+    }
+
+    @Test
+    fun `stop rule — a live peer ends scanning but keeps the announce in its window`() {
+        val onTick = FlitBle.DUTY_ON_TICKS - 1
+        val args = arrayOf(false, true, true, false) // no ap, perms, powered, not hidden
+        fun stance(live: Boolean, tick: Long) = FlitBle.stance(
+            apUp = args[0], perms = args[1], radioOn = args[2], hidden = args[3],
+            livePeer = live, tick = tick,
+        )
+        assertEquals(FlitBle.Stance(advertise = true, scan = true), stance(false, onTick))
+        assertEquals(FlitBle.Stance(advertise = true, scan = false), stance(true, onTick),
+            "discovery succeeded: ears off, the announce still runs")
+    }
+
+    @Test
+    fun `duty rule — the resting window keeps both radios off with or without a peer`() {
+        val offTick = FlitBle.DUTY_ON_TICKS // first of the nine resting ticks
+        val idle = FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = false, tick = offTick)
+        val withPeer = FlitBle.stance(
+            apUp = false, perms = true, radioOn = true, hidden = false,
+            livePeer = true, tick = offTick,
+        )
+        assertEquals(FlitBle.Stance(advertise = false, scan = false), idle)
+        assertEquals(idle, withPeer)
+    }
+
+    @Test
+    fun `stop rule — hidden mode listens only inside the window, never with a live peer`() {
+        fun hidden(live: Boolean, tick: Long) = FlitBle.stance(
+            apUp = false, perms = true, radioOn = true, hidden = true,
+            livePeer = live, tick = tick,
+        )
+        assertEquals(FlitBle.Stance(advertise = false, scan = true), hidden(false, 0))
+        assertEquals(FlitBle.Stance(advertise = false, scan = false), hidden(false, 2))
+        assertEquals(FlitBle.Stance(advertise = false, scan = false), hidden(true, 0),
+            "hidden mode still obeys the live-peer stop rule")
+    }
+
+    @Test
+    fun `hard facts beat the phase — access point, permissions and power always dark`() {
+        val always = FlitBle.DutyPhase.ALWAYS
+        assertEquals(
+            FlitBle.Stance(advertise = false, scan = false),
+            FlitBle.stance(apUp = true, perms = true, radioOn = true, hidden = false, phase = always, tick = 0),
+        )
+        assertEquals(
+            FlitBle.Stance(advertise = false, scan = false),
+            FlitBle.stance(apUp = false, perms = false, radioOn = true, hidden = false, phase = always, tick = 0),
+        )
+        assertEquals(
+            FlitBle.Stance(advertise = false, scan = false),
+            FlitBle.stance(apUp = false, perms = true, radioOn = false, hidden = false, phase = always, tick = 0),
+        )
+    }
+
+    @Test
+    fun `phase source is injectable`() {
+        val base = { tick: Long, phase: FlitBle.DutyPhase ->
+            FlitBle.stance(apUp = false, perms = true, radioOn = true, hidden = false, phase = phase, tick = tick)
+        }
+        assertEquals(FlitBle.Stance(advertise = false, scan = false), base(100, FlitBle.DutyPhase.NEVER))
+        assertEquals(FlitBle.Stance(advertise = true, scan = true), base(100, FlitBle.DutyPhase.ALWAYS))
+        val odd = FlitBle.DutyPhase { it % 2L == 1L }
+        assertEquals(FlitBle.Stance(advertise = true, scan = true), base(1, odd))
+        assertEquals(FlitBle.Stance(advertise = false, scan = false), base(2, odd))
+    }
+
+    @Test
+    fun `live peer rows are fresh and non-manual only`() {
+        val now = 100_000L
+        val ttl = 30_000L
+        assertFalse(FlitBle.hasLivePeer(emptyMap(), now, ttl))
+        assertFalse(FlitBle.hasLivePeer(mapOf("manual@10.0.0.2:25000" to now), now, ttl))
+        assertFalse(FlitBle.hasLivePeer(mapOf("fp" to now - ttl), now, ttl), "edge is expired")
+        assertFalse(FlitBle.hasLivePeer(mapOf<String, Long?>("fp" to null), now, ttl))
+        assertTrue(FlitBle.hasLivePeer(mapOf("fp" to now - ttl + 1), now, ttl))
+        assertTrue(FlitBle.hasLivePeer(mapOf("fp" to now), now, ttl))
+        assertTrue(
+            FlitBle.hasLivePeer(mapOf("manual@10.0.0.2:25000" to now - 1_000, "fp" to now - 1_000), now, ttl),
+            "a stale manual stub must not hide a live real row",
+        )
     }
 }

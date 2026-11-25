@@ -183,16 +183,26 @@ private class LinkExchange(
         output.flush()
     }
 
+    override suspend fun respondText(status: Int, contentType: String, body: String, headers: Map<String, String>) {
+        if (responded) return
+        responded = true
+        val bytes = body.toByteArray(Charsets.UTF_8)
+        writeHead(status, contentType, bytes.size.toLong(), headers)
+        output.write(bytes)
+        output.flush()
+    }
+
     override suspend fun respondStatus(status: Int) {
         if (responded) return
         responded = true
         writeHead(status, null, 0L)
     }
 
-    private fun writeHead(status: Int, contentType: String?, len: Long) {
+    private fun writeHead(status: Int, contentType: String?, len: Long, headers: Map<String, String> = emptyMap()) {
         val head = buildString {
             append("HTTP/1.1 ").append(reason(status)).append("\r\n")
             if (contentType != null) append("Content-Type: ").append(contentType).append("\r\n")
+            headers.forEach { (name, value) -> append(name).append(": ").append(value).append("\r\n") }
             append("Content-Length: ").append(len).append("\r\n")
             append("Connection: close\r\n\r\n")
         }

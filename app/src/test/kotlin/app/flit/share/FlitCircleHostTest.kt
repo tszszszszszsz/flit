@@ -188,7 +188,8 @@ class FlitCircleHostTest {
         val result = h.onRequest(sync(memberFp, listOf(leave)), st)
         assertTrue(result.ok)
         assertEquals(listOf(ownerFp), result.members)
-        assertNotEquals("key-v1", result.key)
+        // SYNC never hands out the key; only JOIN does.
+        assertEquals("", result.key)
         val rekey = result.events.single { it.type == CircleEvent.REKEY }
         assertEquals(ownerFp, rekey.authorFp)
         assertTrue(CircleCore.verify(rekey)) // host-signed, cert pinned
@@ -197,7 +198,7 @@ class FlitCircleHostTest {
         val next = h.accept(result, st)
         assertEquals(listOf(ownerFp), next.members.map { it.fp })
         assertEquals(1, next.rekeyGen)
-        assertEquals(result.key, next.keyB64)
+        assertNotEquals("key-v1", next.keyB64)
         assertEquals(listOf(ownerFp, memberFp), st.members.map { it.fp }) // input untouched
 
         val later = h.onRequest(sync(memberFp), next)
@@ -226,23 +227,25 @@ class FlitCircleHostTest {
         )
         val intact = h.onRequest(sync(adminFp, listOf(ownerKick)), st)
         assertEquals(3, intact.members.size)
-        assertEquals("key-v1", intact.key)
+        assertEquals("", intact.key) // a SYNC answer never carries the group key
         assertEquals(0, intact.events.count { it.type == CircleEvent.REKEY })
     }
 
     @Test
-    fun `member supplied rekey is applied without a second host rekey`() {
+    fun `member supplied rekey is rejected and the host rotates once on departure`() {
         val h = host()
         val st = state(members = listOf(ownerMember, memberMember))
         val leave = signed(memberId, CircleEvent.LEAVE, """{"memberFp":"$memberFp"}""")
         val rekey = signed(memberId, CircleEvent.REKEY, """{"keyB64":"peer-key","gen":1}""", lamport = 2L)
 
         val result = h.onRequest(sync(memberFp, listOf(leave, rekey)), st)
-        assertEquals("peer-key", result.key)
+        assertEquals("", result.key) // SYNC never carries key material
         assertEquals(1, result.events.count { it.type == CircleEvent.REKEY })
-        assertEquals(rekey.id, result.events.first { it.type == CircleEvent.REKEY }.id)
+        val admitted = result.events.first { it.type == CircleEvent.REKEY }
+        assertNotEquals(rekey.id, admitted.id) // the member's key event was refused
+        assertEquals(ownerFp, admitted.authorFp) // the host rotated instead
         val next = h.accept(result, st)
-        assertEquals("peer-key", next.keyB64)
+        assertNotEquals("peer-key", next.keyB64)
         assertEquals(1, next.rekeyGen)
     }
 

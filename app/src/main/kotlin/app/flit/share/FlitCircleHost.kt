@@ -160,10 +160,24 @@ class FlitCircleHost(
         // 500-event cap. accept() runs LAST so a forged event cannot reserve a
         // legitimate id before its signature is checked.
         val ids = HashSet(current.events.map { it.id })
+        val roleOf = current.members.associate { normalized(it.fp) to it.role }
         val admitted = req.events.asSequence()
             .filter { it.circleId == current.id }
             .filter { it.type.trim().lowercase(Locale.ROOT) in CircleEvent.TYPES }
             .filter { it.body.length <= MAX_BODY_CHARS }
+            .filter { it.type != CircleEvent.FILE || CircleCore.validFileBody(it.body) }
+            // The cert header binds the REQUESTER to fp; every event it
+            // contributes must be authored by that same fingerprint. A
+            // self-signed sockpuppet cannot enter through SYNC.
+            .filter { normalized(it.authorFp) == fp }
+            // JOIN is a host-routed action, not something a member injects;
+            // REKEY is host-authority only, never a member's payload.
+            .filter { !it.type.equals(CircleEvent.JOIN, ignoreCase = true) }
+            .filter {
+                !it.type.equals(CircleEvent.REKEY, ignoreCase = true) ||
+                    roleOf[fp] == FlitCircleStore.Role.OWNER ||
+                    roleOf[fp] == FlitCircleStore.Role.ADMIN
+            }
             .filter { it.cert.isNotBlank() && CircleCore.verify(it) }
             .filter { ids.add(it.id) }
             .filter { CircleCore.accept(it) == CircleCore.Decision.Accept }
@@ -181,7 +195,9 @@ class FlitCircleHost(
 
         return CircleResponse(
             ok = true,
-            key = key,
+            // Only the invite-gated JOIN hands out the group key. A SYNC
+            // answer never carries it, even to an already-known member.
+            key = "",
             members = next.members.mapNotNull { normalized(it.fp) },
             events = CircleCore.order(next.events),
         )

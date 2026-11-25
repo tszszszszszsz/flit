@@ -14,8 +14,8 @@ import java.io.File
  *    outlives restarts; anything the queue remembers is immortal until
  *    the queue itself forgets (the whitelist wins unconditionally),
  *  - a copy staged in the last staging window may belong to a live
- *    staging flow that hasn't started the engine yet — age, not mtime
- *    gossip, is the only safe opinion here.
+ *    staging flow that hasn't started the engine yet — age derived from
+ *    file mtime is the only safe opinion here.
  *
  * Pure JVM: the caller lists candidates; this decides.
  */

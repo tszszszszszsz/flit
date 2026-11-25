@@ -14,7 +14,7 @@ import kotlinx.serialization.Serializable
  *
  * ```
  * message  {"text":"..."}
- * file     {"name":"...","size":123,"sha256":"...","token":"..."}
+ * file     {"name":"...","size":123,"sha256":"..."}
  * poll     {"pollId":"...","question":"...","options":["a","b"]}
  * vote     {"pollId":"...","option":1}  |  {"kickId":"...","approve":true}
  * join     {"alias":"..."}
@@ -24,8 +24,14 @@ import kotlinx.serialization.Serializable
  * rekey    {"keyB64":"...","gen":1}
  * ```
  *
- * The event never carries file bytes — those travel the existing queue. It
- * DOES carry a group key inside a `rekey` body (`keyB64`), delivered only to
+ * The event never carries file bytes — the sender delivers them separately
+ * with `ProtocolClient.sendFiles` (the bulk transfer path), one peer at a
+ * time, and the receiver lands them hash-exact. A [FILE] body is exactly
+ * `{name,size,sha256}`: it never carries the sender's local spool path, a
+ * queue token, or any other key, so recipients locate the bytes by hash,
+ * never by a path published in a signed, fanned-out event.
+ * `CircleCore.validFileBody` enforces that shape. The event DOES carry a
+ * group key inside a `rekey` body (`keyB64`), delivered only to
  * an already-joined member over the pinned session; a chat/poll/file body
  * never holds one. It also carries the signer's certificate so a receiver
  * that has never met the author can pin it and verify the signature;

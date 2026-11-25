@@ -5,6 +5,11 @@ import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.tls.TlsIdentity
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
@@ -25,8 +30,11 @@ import java.util.concurrent.ConcurrentHashMap
  * "JSON for that type's fields" means on this side. They are deliberately
  * pure so the shape can be tested without an Android context or a network.
  *
- * A `file` event is a REFERENCE only — name/size/sha/token. The bytes never
- * enter the event log; the existing queue/resume path moves them.
+ * A `file` event is a REFERENCE only — name/size/sha256, and nothing else.
+ * The sender's local spool path (the queue token) is deliberately NEVER on
+ * the wire. Bytes are pushed to members separately with `sendFiles`; sha256
+ * only lets a receiver correlate a landed file with its card locally. There
+ * is no pull-by-hash in v1 — a later joiner sees the card but not the bytes.
  */
 
 /** Minimum spacing between two [FlitCircleSync.sync] passes — no busy polling. */
@@ -64,10 +72,11 @@ internal fun circlePeers(state: CircleState, me: String): List<String> {
 }
 
 /**
- * Pure fan-out target selection. A peer we just failed to reach is skipped
- * until its backoff expires; the calm [FlitCircleSync.sync] pass retries it
- * with the full log instead. This is what keeps a post from hammering an
- * offline device — and it makes the decision testable without a socket.
+ * Pure peer target selection, shared by posts and the calm repair tick. A
+ * peer we just failed to reach is skipped until its backoff expires; the calm
+ * [FlitCircleSync.sync] pass then retries it with the full bounded log. This
+ * keeps a post (or a tick) from hammering an offline device — and makes the
+ * decision testable without a socket.
  */
 internal fun circleFanoutTargets(
     state: CircleState,
@@ -75,6 +84,47 @@ internal fun circleFanoutTargets(
     nowMs: Long,
     retryAt: Map<String, Long>,
 ): List<String> = circlePeers(state, me).filter { nowMs >= (retryAt[it] ?: 0L) }
+
+/** Hard ceiling on simultaneous peer dials (fan-out and repair share it). */
+internal const val CIRCLE_PEER_DIALS = 4
+
+/**
+ * What a peer acknowledged: the largest event of the batch it answered OK to.
+ * `(lamport, id)` is the stable identity used for delta selection, so a tie
+ * cannot make two devices disagree about what was already delivered.
+ */
+internal data class CircleWatermark(val lamport: Long, val id: String) {
+    companion object {
+        fun of(event: CircleEvent): CircleWatermark = CircleWatermark(event.lamport, event.id)
+    }
+}
+
+/**
+ * Pure delta selection. An unseen peer (or an ack whose event has since been
+ * trimmed out of the bounded log) gets a bounded full log; otherwise only the
+ * events after the watermark are offered. The cap also protects against a
+ * hand-edited, oversized state snapshot.
+ */
+internal fun circleDelta(
+    log: List<CircleEvent>,
+    watermark: CircleWatermark?,
+    limit: Int = CircleCore.MAX_EVENTS_PER_REQUEST,
+): List<CircleEvent> {
+    if (log.isEmpty() || limit <= 0) return emptyList()
+    if (watermark == null || log.none { it.id == watermark.id }) return log.takeLast(limit)
+    return CircleCore.order(log).filter { event ->
+        event.lamport > watermark.lamport ||
+            (event.lamport == watermark.lamport && event.id > watermark.id)
+    }.takeLast(limit)
+}
+
+/** Bounded full-log batch used only by the calm repair pass. */
+internal fun circleRepairBatch(events: List<CircleEvent>): List<CircleEvent> =
+    events.takeLast(minOf(CircleCore.MAX_EVENTS_PER_REQUEST, FlitCircleStore.EVENT_CAP))
+
+/** The ack recorded after an OK answer: the greatest event actually offered. */
+internal fun circleAckOf(batch: List<CircleEvent>): CircleWatermark? =
+    CircleCore.order(batch).lastOrNull()?.let(CircleWatermark::of)
 
 /**
  * Strict shape for an event WE mint. A malformed body must never be signed,
@@ -92,9 +142,14 @@ internal fun circleBodyValid(type: String, body: String): Boolean {
     val target = text("targetFp") ?: text("target")
     return when (type.trim().lowercase(Locale.ROOT)) {
         CircleEvent.MESSAGE -> text("text") != null
+        // A file announcement is name/size/sha256 and NOTHING else. In
+        // particular the sender's local spool path (the queue token) must
+        // never be minted into a signed, fanned-out event. Bytes are pushed
+        // with `sendFiles`, not fetched by this digest; sha256 only matches a
+        // landed file to its card locally.
         CircleEvent.FILE -> text("name") != null &&
             (obj["size"] as? JsonPrimitive)?.content?.toLongOrNull() != null &&
-            text("sha256") != null && text("token") != null
+            text("sha256") != null && obj.keys == setOf("name", "size", "sha256")
         CircleEvent.POLL -> text("pollId") != null && text("question") != null &&
             (obj["options"] as? JsonArray)?.isNotEmpty() == true
         CircleEvent.VOTE -> (text("pollId") != null && number("option") != null) ||
@@ -128,11 +183,11 @@ internal fun circlePollBody(id: String, question: String, options: List<String>)
     putJsonArray("options") { options.forEach { add(JsonPrimitive(it)) } }
 }.toString()
 
-internal fun circleFileBody(name: String, size: Long, sha: String, token: String): String = buildJsonObject {
+/** Wire body for a file announcement: name/size/sha256 only — no local path. */
+internal fun circleFileBody(name: String, size: Long, sha: String): String = buildJsonObject {
     put("name", name)
     put("size", size)
     put("sha256", sha)
-    put("token", token)
 }.toString()
 
 internal fun circleKickOpenBody(kickId: String, targetFp: String): String = buildJsonObject {
@@ -207,13 +262,19 @@ internal fun circleKickTarget(events: List<CircleEvent>, kickId: String): String
  * single engine-owned coroutine. Failures are swallowed (a peer being asleep
  * is normal in an offline-first group); a per-peer backoff shared by the pull
  * worker and the outbound fan-out keeps repeated calls from ever hammering a
- * device that is offline. Delivery is self-healing: every POST/SYNC carries
- * the full bounded local log, so a lost one-shot is repaired by the next tick.
+ * device that is offline. Posts carry only the delta since that peer last
+ * acknowledged an offered event; delivery stays self-healing because the calm
+ * [sync] tick re-offers the bounded full log as a repair pass. Dial exchanges
+ * are admitted through a small semaphore so a large roster cannot open an
+ * unbounded number of concurrent connections.
  */
 object FlitCircleSync {
 
     private val nextDialAt = ConcurrentHashMap<String, Long>()
     private val misses = ConcurrentHashMap<String, Int>()
+    /** Last acked event per peer; never read on the wire, only for delta math. */
+    private val watermarks = ConcurrentHashMap<String, CircleWatermark>()
+    private val peerGate = Semaphore(CIRCLE_PEER_DIALS)
     @Volatile private var nextSyncAt = 0L
     @Volatile private var cachedIdentity: TlsIdentity? = null
 
@@ -236,6 +297,13 @@ object FlitCircleSync {
     internal var clockHook: (() -> Long)? = null
     internal var logHook: ((String) -> Unit)? = null
 
+    /**
+     * Test seam for the commit at the end of [join]. Production persists atomically
+     * through the store; a pure test observes the exact state that would be saved
+     * without needing an Android context or SharedPreferences.
+     */
+    internal var joinPersistHook: ((CircleState) -> Unit)? = null
+
     /** Test-only: drop fakes and rate-limit state so tests cannot leak into each other. */
     internal fun resetForTest() {
         dialHook = null
@@ -243,8 +311,10 @@ object FlitCircleSync {
         meHook = null
         clockHook = null
         logHook = null
+        joinPersistHook = null
         nextDialAt.clear()
         misses.clear()
+        watermarks.clear()
         nextSyncAt = 0L
     }
 
@@ -274,13 +344,36 @@ object FlitCircleSync {
         if (hook != null) hook(line) else FlitEngine.logLine(line)
     }
 
+    /**
+     * Run one dial/exchange per peer with at most [CIRCLE_PEER_DIALS] in flight.
+     * Permits are taken in target order and children start undispatched, so
+     * the dial order stays deterministic even when the caller runs on a thread
+     * pool; a permit is held from before the dial until the answer is handled.
+     */
+    private suspend fun <T> dialBounded(
+        peers: List<String>,
+        exchange: suspend (String) -> T,
+    ): List<T> = coroutineScope {
+        peers.map { fp ->
+            peerGate.acquire()
+            async(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    exchange(fp)
+                } finally {
+                    peerGate.release()
+                }
+            }
+        }.awaitAll()
+    }
+
     // ==== public suspend API ====================================================
 
     /** Join a founded Circle from its QR code (bearer invite, no key in the QR). */
     suspend fun join(code: QrAdd) {
-        val ctx = context() ?: return
-        val identity = identity() ?: return
-        val me = circleFp(identity.fingerprint)
+        // The host only supplies circle data. Our own fingerprint comes from
+        // meFp(), which already prefers the test seam and otherwise reads the
+        // persisted identity — no separate signing identity is needed to join.
+        val me = meFp() ?: return
         val host = circleFp(code.fingerprint)
         val circleId = code.circle?.trim()?.takeIf { it.isNotBlank() } ?: return
         if (host.isBlank()) return
@@ -296,6 +389,18 @@ object FlitCircleSync {
         )
         val response = runCatching { route.join(request) }.getOrNull() ?: return
         if (!response.ok || response.key.isBlank()) return
+        // A rogue relay or on-path peer must not be able to substitute the
+        // group key: the answer is signed by the host named in the QR.
+        // Protocol suites own signature/signing verification; the pure sync
+        // seam returns synthetic answers with no Android keystore.
+        if (joinPersistHook == null && !CircleResponse.verify(response, host)) {
+            log("circle: host answer was not signed by ${host.take(12)} — not joined")
+            return
+        }
+        // Only now, after the host proved itself and accepted the invite, may
+        // this device persist the bearer token.
+        // Pure JVM tests use joinPersistHook and have no Android runtime.
+        if (joinPersistHook == null) FlitEngine.circleInviteAccepted(code.invite.orEmpty())
 
         // The host's roster is authoritative: never drop the host (or any
         // other member) from our dial list just because a seed event failed
@@ -312,6 +417,10 @@ object FlitCircleSync {
                 val withHost = if (list.any { it.fp == host }) list else list + Member(host, "", Role.OWNER)
                 if (withHost.any { it.fp == me }) withHost else withHost + Member(me, "", Role.MEMBER)
             }
+        // Local-only bookkeeping is NOT part of the host's answer. Rejoining
+        // replaces the authoritative circle fields (id/key/roster/events/gen)
+        // but must keep delivery rows keyed by sha, so a byte push that already
+        // landed is not forgotten. selfFp is this device's identity, set below.
         val joined = CircleState(
             id = circleId,
             keyB64 = response.key,
@@ -322,13 +431,33 @@ object FlitCircleSync {
             // Exact identity, not the store's legacy uniqueness inference: the
             // owner's role changes must track this device unambiguously.
             selfFp = me,
+            deliveries = storedState()?.deliveries.orEmpty(),
         )
         // Fold seed events through the store's reducers so the roster and the
         // rekey generation agree with what the host's log actually says.
-        FlitCircleStore.save(ctx, FlitCircleStore.merge(joined, fresh(joined, response.events)))
+        val seeded = FlitCircleStore.merge(joined, fresh(joined, response.events))
+        val persist = joinPersistHook
+        if (persist != null) {
+            persist(seeded)
+            return
+        }
+        val ctx = context() ?: return
+        // Atomic commit: re-read local-only state under the store lock so a
+        // delivery write landing between the host answer and this commit is
+        // not clobbered. First join has no row to update, so fall back to save.
+        val committed = FlitCircleStore.update(ctx) { current ->
+            seeded.copy(deliveries = current.deliveries)
+        }
+        if (committed == null) FlitCircleStore.save(ctx, seeded)
     }
 
-    /** Pull the full log from every other member, once per calm interval. */
+    /**
+     * Calm-tick repair: re-offer the bounded full log to every reachable
+     * member and pull whatever it has for us. Unlike [fanout] this ignores
+     * watermarks on purpose — a peer that missed a delta is healed here.
+     * Backed-off peers are skipped, exactly as in fan-out, and retried on a
+     * later tick once their backoff expires.
+     */
     suspend fun sync() {
         val seed = storedState() ?: return
         val me = meFp() ?: return
@@ -336,32 +465,46 @@ object FlitCircleSync {
         if (now < nextSyncAt) return
         nextSyncAt = now + CIRCLE_SYNC_MIN_INTERVAL_MS
 
-        for (fp in circlePeers(seed, me)) {
-            if (now < (nextDialAt[fp] ?: 0L)) continue
+        val peers = circlePeers(seed, me)
+        val targets = circleFanoutTargets(seed, me, now, nextDialAt)
+        val skipped = peers.size - targets.size
+        log(
+            "circle sync: full-log repair to ${targets.size} peer(s)" +
+                if (skipped > 0) ", $skipped backed off" else "",
+        )
+        if (targets.isEmpty()) {
+            pruneBackoff(peers.toSet())
+            return
+        }
+
+        dialBounded(targets) { fp ->
             // Re-read per peer: an earlier answer may have folded new events
             // (or a departure) that the next peer is entitled to see.
             val state = storedState(seed) ?: seed
+            val full = circleRepairBatch(state.events)
             val request = CircleRequest(
                 action = CircleRequest.ACTION_SYNC,
                 circleId = state.id,
                 invite = "",
                 memberFp = me,
-                events = state.events.takeLast(CircleCore.MAX_EVENTS_PER_REQUEST),
+                events = full,
                 body = "",
             )
             val route = dial(fp)
             if (route == null) {
                 log("circle sync: no route to ${fp.take(12)}")
                 noteFailure(fp, now)
-                continue
+                return@dialBounded
             }
             val response = runCatching { route.sync(request) }.getOrNull()
             if (response == null || !response.ok) {
                 log("circle sync: ${fp.take(12)} refused ${response?.reason ?: "no answer"}")
                 noteFailure(fp, now)
-                continue
+                return@dialBounded
             }
             noteSuccess(fp)
+            // The repair was accepted in full, so later posts may go delta-only.
+            circleAckOf(full)?.let { watermarks[fp] = it }
             val incoming = fresh(state, response.events)
             if (incoming.isNotEmpty()) {
                 log("circle sync: +${incoming.size} event(s) from ${fp.take(12)}")
@@ -393,9 +536,14 @@ object FlitCircleSync {
         post(CircleEvent.POLL, circlePollBody(id, question, options))
     }
 
-    /** Publish a file-drop reference — no bytes, just name/size/sha/token. */
-    internal suspend fun postFile(name: String, size: Long, sha: String, token: String) {
-        post(CircleEvent.FILE, circleFileBody(name, size, sha, token))
+    /**
+     * Publish a file-drop announcement — name/size/sha256 only, no bytes and
+     * no local path. The engine pushes the bytes via `sendFiles` and keeps the
+     * spool path local; sha256 only correlates a landed file with this card.
+     * No pull-by-hash in v1: a later joiner sees the card but not the bytes.
+     */
+    internal suspend fun postFile(name: String, size: Long, sha: String) {
+        post(CircleEvent.FILE, circleFileBody(name, size, sha))
     }
 
     /** Owner-only appointment/removal of an ADMIN (the store enforces authority). */
@@ -499,17 +647,24 @@ object FlitCircleSync {
     private fun fresh(state: CircleState, events: List<CircleEvent>): List<CircleEvent> =
         CircleCore.dedup(CircleCore.order(events.filter { event ->
             event.circleId == state.id &&
+                (event.type != CircleEvent.FILE || CircleCore.validFileBody(event.body)) &&
                 circleBodyReadable(event.body) &&
                 CircleCore.verify(event) &&
                 state.events.none { it.id == event.id }
         })).take(FlitCircleStore.EVENT_CAP)
 
     /**
-     * Best-effort delivery to every remaining member. Self-healing: we send
-     * the whole bounded local log, not just the event that triggered this
-     * call, so one lost one-shot is repaired by the next post or calm tick.
+     * Best-effort delivery to every remaining member. Each peer gets only the
+     * events newer than the last batch it acknowledged, so a post never puts
+     * the whole bounded log back on the wire. An OK answer advances that
+     * peer's watermark; a refusal leaves it untouched (and applies backoff),
+     * so the missing delta is retried — or repaired by [sync]'s full-log pass.
+     * An empty delta still makes one tiny probe: it keeps the watermark honest
+     * and lets us fold any answer the peer has for us.
+     *
      * Failures are recorded in the same per-peer backoff the pull worker uses;
      * a later attempt waits its turn instead of hammering a sleeping device.
+     * Dials are bounded by [CIRCLE_PEER_DIALS] rather than roster size.
      *
      * The state snapshot passed in by the caller is used only to detect a
      * stale circle id — the roster, id and event delta all come from a fresh
@@ -520,8 +675,6 @@ object FlitCircleSync {
         val me = meFp() ?: return
         val current = storedState(state) ?: return
         if (current.id != state.id) return // a rotated circle must not get old wire data
-        val pending = current.events.takeLast(CircleCore.MAX_EVENTS_PER_REQUEST)
-        if (pending.isEmpty()) return
 
         val now = nowMs()
         val targets = circleFanoutTargets(current, me, now, nextDialAt)
@@ -533,27 +686,30 @@ object FlitCircleSync {
         )
         if (targets.isEmpty()) return
 
-        val request = CircleRequest(
-            action = CircleRequest.ACTION_SYNC,
-            circleId = current.id,
-            invite = "",
-            memberFp = me,
-            events = pending,
-            body = "",
-        )
-        for (fp in targets) {
+        dialBounded(targets) { fp ->
+            // Per-peer delta: two members can be at different points in the log.
+            val delta = circleDelta(current.events, watermarks[fp])
+            val request = CircleRequest(
+                action = CircleRequest.ACTION_SYNC,
+                circleId = current.id,
+                invite = "",
+                memberFp = me,
+                events = delta,
+                body = "",
+            )
             val route = dial(fp)
             if (route == null) {
                 log("circle fan-out: no route to ${fp.take(12)}")
                 noteFailure(fp, now)
-                continue
+                return@dialBounded
             }
             val resp = runCatching { route.sync(request) }.getOrNull()
             if (resp == null || !resp.ok) {
                 log("circle fan-out: ${fp.take(12)} refused ${resp?.reason ?: "no answer"}")
                 noteFailure(fp, now)
             } else {
-                log("circle fan-out: ok to ${fp.take(12)} (${pending.size} event(s) offered)")
+                log("circle fan-out: ok to ${fp.take(12)} (${delta.size} event(s) offered)")
+                circleAckOf(delta)?.let { watermarks[fp] = it }
                 noteSuccess(fp)
             }
         }
@@ -570,10 +726,14 @@ object FlitCircleSync {
         nextDialAt.remove(fp)
     }
 
-    /** Backoff entries for departed peers are dead weight; drop them on a tick. */
+    /**
+     * Per-peer bookkeeping for departed members is dead weight; drop it on a
+     * tick. A peer that rejoins starts with no watermark and gets a full log.
+     */
     private fun pruneBackoff(peers: Set<String>) {
         nextDialAt.keys.toList().forEach { if (it !in peers) nextDialAt.remove(it) }
         misses.keys.toList().forEach { if (it !in peers) misses.remove(it) }
+        watermarks.keys.toList().forEach { if (it !in peers) watermarks.remove(it) }
     }
 
     /** The app context the engine published at boot; null before boot is safe. */

@@ -13,6 +13,7 @@ import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import app.flit.share.protocol.Protocol
 import app.flit.share.protocol.client.OutgoingFile
+import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
 import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
@@ -41,6 +42,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -61,8 +63,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -202,6 +207,26 @@ val share: StateFlow<ShareIntake?> = _share
 
     private val _received = MutableStateFlow<List<ReceivedFile>>(emptyList())
     val received: StateFlow<List<ReceivedFile>> = _received
+    /** Digest of a landed file by its ledger key, computed once at receive time. */
+    private val receivedDigests = ConcurrentHashMap<String, String>()
+
+    private fun receivedKey(r: ReceivedFile): String = r.path?.absolutePath ?: r.uri.orEmpty()
+
+    private fun digestOf(r: ReceivedFile): String? {
+        val stream = r.path?.inputStream() ?: runCatching {
+            r.uri?.let { appCtx.contentResolver.openInputStream(Uri.parse(it)) }
+        }.getOrNull() ?: return null
+        return stream.use { input ->
+            val md = MessageDigest.getInstance("SHA-256")
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+            md.digest().joinToString("") { "%02x".format(it) }
+        }
+    }
 
     // ==== received history ======================================================
 
@@ -240,6 +265,10 @@ val share: StateFlow<ShareIntake?> = _share
     private fun addReceived(r: ReceivedFile) {
         _received.update { (it + r).takeLast(20) }
         persistReceived()
+        // Compute once off the UI thread so "Open file" in Circle is O(1).
+        scope.launch(Dispatchers.IO) {
+            digestOf(r)?.let { receivedDigests[receivedKey(r)] = it }
+        }
     }
 
     /** Loaded at app boot: history is visible before the engine ever starts. */
@@ -296,6 +325,8 @@ val share: StateFlow<ShareIntake?> = _share
 
     private val _panicEvents = MutableStateFlow<List<PanicEvent>>(emptyList())
     val panicEvents: StateFlow<List<PanicEvent>> = _panicEvents
+    /** Signed alerts retained by id so Forward re-signs the original, not a copy. */
+    private val panicAlerts = ConcurrentHashMap<String, PanicAlert>()
 
     /** Circle: one active group, its members and the bounded event feed. */
     data class CircleRoute(val client: ProtocolClient, val target: SendTarget)
@@ -309,28 +340,54 @@ val share: StateFlow<ShareIntake?> = _share
     private val _circleEvents = MutableStateFlow<List<CircleEvent>>(emptyList())
     val circleEvents: StateFlow<List<CircleEvent>> = _circleEvents
 
+    /** Local delivery state for Circle file drops, keyed by sha256. */
+    private val _circleDeliveries = MutableStateFlow<Map<String, FlitCircleStore.CircleDelivery>>(emptyMap())
+    val circleDeliveries: StateFlow<Map<String, FlitCircleStore.CircleDelivery>> = _circleDeliveries
+    /** One delivery pass per sha at a time — no duplicate bytes or status clobber. */
+    private val circleDeliveryLocks = ConcurrentHashMap<String, Mutex>()
+    /** sha → (next attempt time, consecutive misses), capped 60 s. */
+    private val circleDeliveryBackoff = ConcurrentHashMap<String, Pair<Long, Int>>()
+
+    private var lastCircleSignature: String? = null
+
     private fun refreshCircle() {
         if (!::appCtx.isInitialized) return
         // The invite is a bearer token but it is this device's own circle;
         // persisting it keeps the host able to admit members after a restart.
         circleInvite = prefs().getString("circleInvite", null)
         val st = FlitCircleStore.load(appCtx)
+        val signature = listOf(
+            st?.id.orEmpty(), st?.keyB64.orEmpty(),
+            st?.events?.size.toString(), st?.events?.lastOrNull()?.id.orEmpty(),
+            st?.members?.map { "${it.fp}:${it.role.name}" }.orEmpty().joinToString(","),
+            st?.rekeyGen.toString(),
+            st?.deliveries?.map { "${it.key}:${it.value.statuses.values.joinToString(",")}" }
+                .orEmpty().joinToString(";"),
+        ).joinToString("|")
+        if (signature == lastCircleSignature) return // no-op tick: do not invalidate Compose
+        lastCircleSignature = signature
         _circleState.value = st
         _circleEvents.value = st?.events?.let { CircleCore.order(it) } ?: emptyList()
+        _circleDeliveries.value = st?.deliveries.orEmpty()
     }
 
     /** Incoming alert: signed, from a QR-known device, deduped, never auto-acting. */
     internal fun onPanicReceived(alert: PanicAlert, ip: String) {
-        if (!PanicCore.verify(alert) || !knownFingerprint(alert.senderFp)) {
-            logLine("panic: ignored unverified or QR-unknown sender ${alert.senderFp.take(12)}")
+        // A forward is re-signed by an intermediary; the ORIGINAL author is
+        // the trust anchor, so gate on originFp (defaulting to senderFp).
+        val origin = alert.originFp.ifBlank { alert.senderFp }
+        if (!PanicCore.verify(alert) || !knownFingerprint(origin)) {
+            logLine("panic: ignored unverified or QR-unknown origin ${origin.take(12)}")
             return
         }
         if (_panicEvents.value.any { it.id == alert.id }) return
-        val who = _knownDevices.value.firstOrNull { it.fingerprint.equals(alert.senderFp, true) }
+        panicAlerts[alert.id] = alert
+        val who = _knownDevices.value.firstOrNull { it.fingerprint.equals(origin, true) }
+        val via = if (alert.senderFp.equals(origin, true)) "" else " · via ${alert.senderFp.take(12)}"
         val event = PanicEvent(
-            id = alert.id, senderFp = alert.senderFp,
+            id = alert.id, senderFp = origin,
             alias = who?.alias?.ifBlank { null } ?: who?.label?.ifBlank { null },
-            text = alert.text, atMs = alert.sentMs, hops = alert.hops,
+            text = alert.text + via, atMs = alert.sentMs, hops = alert.hops,
         )
         _panicEvents.value = (listOf(event) + _panicEvents.value).take(20)
         logLine("panic: ${alert.senderFp.take(12)} — ${alert.text.take(80)}")
@@ -346,12 +403,22 @@ val share: StateFlow<ShareIntake?> = _share
         _panicEvents.value = _panicEvents.value.filterNot { it.id == id }
     }
 
-    /** Explicit forward only: a new signed alert with a hop count, never a remote action. */
+    /** Explicit forward only: re-signed by us, hop-limit checked, never a remote action. */
     fun forwardPanic(id: String) {
         val e = _panicEvents.value.firstOrNull { it.id == id } ?: return
         val idf = identity ?: return
-        val note = "↻ ${e.senderFp.take(12)}: ${e.text}".take(240)
-        val out = PanicCore.create(idf.fingerprint, note, idf, e.hops + 1)
+        // Re-sign the ORIGINAL alert: id, text and origin survive, so a
+        // looped alert is deduplicated instead of reappearing as "new".
+        val original = panicAlerts[id]
+        val out = if (original != null) {
+            PanicCore.forward(original, idf.fingerprint, idf)
+        } else {
+            PanicCore.create(idf.fingerprint, e.text, idf, e.hops)
+        }
+        if (out == null) {
+            toast("alert reached its hop limit — it cannot be forwarded further")
+            return
+        }
         scope.launch(Dispatchers.IO) { fanOutPanic(out) }
         dismissPanic(id)
     }
@@ -361,51 +428,185 @@ val share: StateFlow<ShareIntake?> = _share
         val idf = identity ?: run { toast("sharing is not ready yet"); return }
         val alert = PanicCore.create(idf.fingerprint, text.trim().take(240), idf)
         scope.launch(Dispatchers.IO) { fanOutPanic(alert) }
-        logLine("panic: alert sent to ${_knownDevices.value.size} known device(s)")
     }
 
-    private suspend fun fanOutPanic(alert: PanicAlert) {
-        val self = server?.selfInfo() ?: return
-        for (d in _knownDevices.value) {
+    /** Returns only devices that actually answered 200; never claims more. */
+    private suspend fun fanOutPanic(alert: PanicAlert): Int {
+        var reached = 0
+        val devices = _knownDevices.value
+        for (d in devices) {
             val policy = d.routePolicy
+            val alias = d.alias.ifBlank { d.fingerprint.take(12) }
             var sent = false
-            if (policy != FlitKnown.RoutePolicy.WIFI_ONLY && !d.mac.isNullOrBlank() && btClient != null) {
-                sent = runCatching {
-                    btClient!!.sendPanic(SendTarget(d.mac, 0, tls = true), alert)
-                }.isSuccess
+            // Bluetooth for AUTO/BLUETOOTH_ONLY device policies.
+            if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY) {
+                if (!d.mac.isNullOrBlank() && btClient != null) {
+                    sent = runCatching {
+                        btClient!!.sendPanic(SendTarget(d.mac, 0, tls = true), alert) == true
+                    }.getOrDefault(false)
+                }
             }
-            if (!sent && policy != FlitKnown.RoutePolicy.BLUETOOTH_ONLY && !d.relay.isNullOrBlank()) {
-                val host = d.relay.substringBeforeLast(':')
-                val port = d.relay.substringAfterLast(':').toIntOrNull()
-                if (port != null && port in 1..65535) {
-                    val cfg = relayConfig()
-                    if (cfg != null) {
-                        val target = SendTarget(
-                            cfg.host, cfg.port, tls = true,
-                            relayFor = d.fingerprint,
-                        )
-                        sent = runCatching { client?.sendPanic(target, alert) }.isSuccess
+            // Relay last for AUTO/RELAY_ONLY, and only when the device opted in.
+            if (!sent && d.relayFor && (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.RELAY_ONLY)) {
+                val relay = d.relay?.let { FlitRoute.parseRelay(it) } ?: relayConfig()?.let {
+                    it.host to it.port
+                }
+                if (relay != null) {
+                    val dialer = relayClientFor(
+                        d.fingerprint, d.token ?: relayConfig()?.token, relay.first, relay.second,
+                    )
+                    if (dialer != null) {
+                        val target = SendTarget(relay.first, relay.second, tls = true, relayFor = d.fingerprint)
+                        sent = runCatching { dialer.sendPanic(target, alert) == true }.getOrDefault(false)
                     }
                 }
             }
-            if (!sent && policy != FlitKnown.RoutePolicy.BLUETOOTH_ONLY && policy != FlitKnown.RoutePolicy.RELAY_ONLY) {
+            // Direct Wi-Fi route for AUTO/WIFI_ONLY.
+            if (!sent && (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.WIFI_ONLY)) {
                 val r = runCatching { FlitRoster.routeFor(d.fingerprint) }.getOrNull()
                 if (r != null && !r.isBluetooth && r.port in 1..65535) {
                     sent = runCatching {
-                        client?.sendPanic(SendTarget(r.host, r.port, r.tls), alert)
-                    }.isSuccess
+                        client?.sendPanic(SendTarget(r.host, r.port, r.tls), alert) == true
+                    }.getOrDefault(false)
                 }
             }
-            if (!sent) logLine("panic: no live route to ${d.alias.ifBlank { d.fingerprint.take(12) }}")
+            if (sent) reached++ else logLine("panic: no live route to $alias")
+        }
+        logLine("panic: $reached/${devices.size} known device(s) confirmed the alert")
+        return reached
+    }
+
+    private val circleDeliveryTerminal = setOf(
+        FlitCircleStore.CircleDelivery.SENT,
+        FlitCircleStore.CircleDelivery.REFUSED,
+        FlitCircleStore.CircleDelivery.FAILED,
+    )
+
+    /** Create/merge a delivery record, then push real bytes to current members. */
+    private suspend fun startCircleDelivery(name: String, size: Long, sha: String, spoolPath: String) {
+        val key = sha.trim()
+        val st = FlitCircleStore.load(appCtx)
+        if (st == null) {
+            runCatching { File(spoolPath).delete() }
+            return
+        }
+        val me = (st.selfFp.ifBlank { identity?.fingerprint.orEmpty() }).trim().uppercase()
+        val members = st.members.map { it.fp.trim().uppercase() }
+            .filter { it.isNotBlank() && it != me }.distinct()
+        val existing = st.deliveries[key]
+        // A repeated drop of the same bytes keeps honest outcomes and adds
+        // only new recipients; the superseded spool is reclaimed.
+        if (existing != null && existing.spoolPath != spoolPath) {
+            runCatching { File(existing.spoolPath).delete() }
+        }
+        val statuses = members.associateWith { fp ->
+            existing?.statuses?.get(fp)?.takeIf { it in circleDeliveryTerminal }
+                ?: FlitCircleStore.CircleDelivery.PENDING
+        }
+        if (statuses.isEmpty()) {
+            runCatching { File(spoolPath).delete() }
+            if (existing != null) FlitCircleStore.dropDelivery(appCtx, key)
+            return
+        }
+        val delivery = existing?.copy(
+            name = name, size = size, spoolPath = spoolPath,
+            statuses = statuses, createdMs = System.currentTimeMillis(),
+        ) ?: FlitCircleStore.CircleDelivery(
+            id = UUID.randomUUID().toString(),
+            name = name, size = size, sha256 = key, spoolPath = spoolPath,
+            statuses = statuses, createdMs = System.currentTimeMillis(),
+        )
+        FlitCircleStore.persistDelivery(appCtx, delivery)?.let { _circleDeliveries.value = it.deliveries }
+        deliverCirclePending(delivery)
+    }
+
+    /**
+     * One serialized pass per sha. A returned report concludes that recipient;
+     * a thrown carrier or a missing route stays PENDING for a later retry.
+     * Only current circle members are ever sent bytes — a kicked/left member
+     * does not receive the retry.
+     */
+    private suspend fun deliverCirclePending(delivery: FlitCircleStore.CircleDelivery) {
+        val key = delivery.sha256.trim()
+        val lock = circleDeliveryLocks.getOrPut(key) { Mutex() }
+        lock.withLock {
+            val state = FlitCircleStore.load(appCtx) ?: return@withLock
+            val current = state.deliveries[key] ?: return@withLock
+            val spool = File(current.spoolPath)
+            if (!spool.exists()) {
+                // The cache copy is gone; no honest retry is possible.
+                FlitCircleStore.dropDelivery(appCtx, key)?.let { _circleDeliveries.value = it.deliveries }
+                refreshCircle()
+                return@withLock
+            }
+            val self = server?.selfInfo() ?: return@withLock
+            val me = (state.selfFp.ifBlank { identity?.fingerprint.orEmpty() }).trim().uppercase()
+            val allowed = state.members.map { it.fp.trim().uppercase() }
+                .filter { it.isNotBlank() && it != me }.toSet()
+            var latestState = state
+            for ((fp, status) in current.statuses) {
+                if (fp !in allowed || status in circleDeliveryTerminal) continue
+                val next = runCatching { circleDial(fp) }.getOrNull()?.let { route ->
+                    val report = runCatching {
+                        route.client.sendFiles(
+                            route.target, self,
+                            listOf(PathOutgoing(spool.toPath(), current.name)),
+                            multi = false,
+                        )
+                    }.getOrNull()
+                    when {
+                        report == null -> FlitCircleStore.CircleDelivery.PENDING
+                        report.declined -> FlitCircleStore.CircleDelivery.REFUSED
+                        report.sent.any { it == current.name } -> FlitCircleStore.CircleDelivery.SENT
+                        report.failed.any { it.fileName == current.name } -> FlitCircleStore.CircleDelivery.FAILED
+                        else -> FlitCircleStore.CircleDelivery.PENDING
+                    }
+                } ?: FlitCircleStore.CircleDelivery.PENDING
+                if (next != status) {
+                    latestState = FlitCircleStore.persistDeliveryStatus(appCtx, key, fp, next) ?: latestState
+                }
+            }
+            val latest = latestState.deliveries[key] ?: current
+            _circleDeliveries.value = latestState.deliveries
+            if (latest.statuses.values.all { it in circleDeliveryTerminal }) {
+                runCatching { spool.delete() } // every current recipient concluded
+                circleDeliveryBackoff.remove(key)
+            } else {
+                val attempt = (circleDeliveryBackoff[key]?.second ?: 0) + 1
+                val wait = minOf(60_000L, 10_000L shl minOf(attempt, 3))
+                circleDeliveryBackoff[key] = System.currentTimeMillis() + wait to attempt
+            }
+            refreshCircle()
         }
     }
 
-    /** Calm Circle sync: one pull shortly after start, then on a 15 s beat. */
+    /** Calm retry tick for failed/pending drops; a report concludes, a throw stays owed. */
+    private fun startCircleDeliveryWorker(seq: Int) {
+        scope.launch(Dispatchers.IO) {
+            while (isActive && seq == startSeq) {
+                delay(30_000)
+                for (d in _circleDeliveries.value.values) {
+                    if (!isActive || seq != startSeq) return@launch
+                    val backoff = circleDeliveryBackoff[d.sha256]
+                    if (backoff != null && System.currentTimeMillis() < backoff.first) continue
+                    if (d.statuses.values.any {
+                            it == FlitCircleStore.CircleDelivery.PENDING ||
+                                it == FlitCircleStore.CircleDelivery.FAILED
+                        }
+                    ) {
+                        deliverCirclePending(d)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Calm Circle sync: one pull shortly after start, then on the 30 s gate. */
     private fun startCircleSyncWorker(seq: Int) {
         scope.launch(Dispatchers.IO) {
             var first = true
             while (isActive && seq == startSeq) {
-                delay(if (first) 3_000L else 15_000L)
+                delay(if (first) 3_000L else 30_000L)
                 val active = _circleState.value ?: continue
                 first = false
                 runCatching { FlitCircleSync.sync() }
@@ -456,8 +657,7 @@ val share: StateFlow<ShareIntake?> = _share
 
     fun joinCircle(code: QrAdd) {
         if (!::appCtx.isInitialized) return
-        circleInvite = code.invite
-        prefs().edit().putString("circleInvite", code.invite).apply()
+        // Never persist a bearer invite before the host proves it accepted.
         scope.launch(Dispatchers.IO) {
             runCatching { FlitCircleSync.join(code) }
                 .onFailure { logLine("circle join failed: ${it.message ?: it.javaClass.simpleName}") }
@@ -472,16 +672,34 @@ val share: StateFlow<ShareIntake?> = _share
         refreshCircle()
     }
 
-    fun circlePostFile(name: String, size: Long, sha: String, token: String) =
+    /**
+     * Resolve a Circle file event's sha256 to a file that actually landed
+     * here. The received ledger has no digest field, so re-hash its entries;
+     * it is bounded to the last 20 files and this runs on IO.
+     */
+    suspend fun circleReceivedFor(sha: String): ReceivedFile? = withContext(Dispatchers.IO) {
+        val target = sha.trim().lowercase()
+        if (target.isBlank()) return@withContext null
+        for (r in _received.value) {
+            val cached = receivedDigests[receivedKey(r)]
+            val match = cached?.equals(target, ignoreCase = true) ?: digestOf(r)?.equals(target, ignoreCase = true)
+            if (match == true) return@withContext r
+        }
+        return@withContext null
+    }
+
+    /**
+     * Announce a file drop, then deliver the bytes through the existing
+     * sendFiles path. [spoolPath] is local only — never put it on the wire.
+     */
+    fun circlePostFile(name: String, size: Long, sha: String, spoolPath: String) =
         scope.launch(Dispatchers.IO) {
-            val body = buildJsonObject {
-                put("name", JsonPrimitive(name))
-                put("size", JsonPrimitive(size))
-                put("sha256", JsonPrimitive(sha))
-                put("token", JsonPrimitive(token))
-            }.toString()
-            runCatching { FlitCircleSync.post("file", body) }
-                .onFailure { logLine("circle file event failed: ${it.message}") }
+            val posted = runCatching { FlitCircleSync.postFile(name, size, sha) }
+            if (posted.isFailure) {
+                logLine("circle file event failed: ${posted.exceptionOrNull()?.message}")
+                return@launch
+            }
+            startCircleDelivery(name, size, sha, spoolPath)
             refreshCircle()
         }
 
@@ -521,6 +739,13 @@ val share: StateFlow<ShareIntake?> = _share
         refreshCircle()
     }
 
+    /** Only a verified JOIN may adopt an invite as this device's circle bearer. */
+    internal fun circleInviteAccepted(invite: String) {
+        if (!::appCtx.isInitialized || invite.isBlank()) return
+        circleInvite = invite
+        prefs().edit().putString("circleInvite", invite).apply()
+    }
+
     /** Owner-only role change; the sync worker's guard and store reducer are the authority. */
     fun circleSetRole(fp: String, role: FlitCircleStore.Role) = scope.launch(Dispatchers.IO) {
         runCatching { FlitCircleSync.circleSetRole(fp, role) }
@@ -538,24 +763,39 @@ val share: StateFlow<ShareIntake?> = _share
         }
     }
 
-    /** Per-peer carrier choice for Circle sync: Bluetooth, relay, then Wi‑Fi. */
+    /** Per-peer carrier choice: direct Wi‑Fi, then Bluetooth, relay strictly last. */
     internal suspend fun circleDial(fp: String): CircleRoute? {
         val known = _knownDevices.value.firstOrNull { it.fingerprint.equals(fp, true) }
         val policy = known?.routePolicy ?: FlitKnown.RoutePolicy.AUTO
-        if (policy != FlitKnown.RoutePolicy.WIFI_ONLY && !known?.mac.isNullOrBlank() && btClient != null) {
-            return CircleRoute(btClient!!, SendTarget(known!!.mac, 0, tls = true))
-        }
-        if (policy != FlitKnown.RoutePolicy.BLUETOOTH_ONLY) {
-            val relay = relayRouteFor[fp] ?: relayConfig()
-            if (relay != null) {
-                return CircleRoute(
-                    client ?: return null,
-                    SendTarget(relay.host, relay.port, tls = true, relayFor = fp),
-                )
-            }
+
+        // A live remembered route always wins; relay is never a first choice.
+        if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.WIFI_ONLY) {
             val r = runCatching { FlitRoster.routeFor(fp) }.getOrNull()
-            if (r != null && !r.isBluetooth && r.port in 1..65535) {
-                return CircleRoute(client ?: return null, SendTarget(r.host, r.port, r.tls))
+            if (r != null && !r.isBluetooth && r.port in 1..65535 && client != null) {
+                return CircleRoute(client!!, SendTarget(r.host, r.port, r.tls))
+            }
+        }
+        if (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY) {
+            if (!known?.mac.isNullOrBlank() && btClient != null) {
+                return CircleRoute(btClient!!, SendTarget(known!!.mac, 0, tls = true))
+            }
+        }
+        // The per-device switch is the authority: an opted-out device never
+        // gets its Circle traffic routed through a relay.
+        if (known?.relayFor == true &&
+            (policy == FlitKnown.RoutePolicy.AUTO || policy == FlitKnown.RoutePolicy.RELAY_ONLY)
+        ) {
+            val relay = known.relay?.let { FlitRoute.parseRelay(it) }
+                ?: relayRouteFor[fp]?.let { it.host to it.port }
+                ?: relayConfig()?.let { it.host to it.port }
+            if (relay != null) {
+                val dialer = relayClientFor(
+                    fp, known.token ?: relayConfig()?.token, relay.first, relay.second,
+                ) ?: return null
+                return CircleRoute(
+                    dialer,
+                    SendTarget(relay.first, relay.second, tls = true, relayFor = fp),
+                )
             }
         }
         return null
@@ -574,7 +814,7 @@ val share: StateFlow<ShareIntake?> = _share
         if (answer.ok) {
             // A member that reaches us by invite also gives us a return route;
             // without this, later fan-out has an address-less fingerprint.
-            if (ip.isNotBlank() && req.memberFp.isNotBlank()) {
+            if (req.action == CircleRequest.ACTION_JOIN && ip.isNotBlank() && req.memberFp.isNotBlank()) {
                 runCatching {
                     FlitRoster.rememberRoute(
                         req.memberFp.trim().uppercase(), ip,
@@ -634,6 +874,18 @@ val share: StateFlow<ShareIntake?> = _share
     /** Bluetooth data carrier, built only when the option is on. */
     private var btClient: ProtocolClient? = null
     private var btServerSocket: android.bluetooth.BluetoothServerSocket? = null
+    /** Per-device relay dialers: a QR can carry a different relay + token. */
+    private val relayClients = ConcurrentHashMap<String, ProtocolClient>()
+
+    private fun relayClientFor(
+        fp: String, token: String?, host: String, port: Int,
+    ): ProtocolClient? {
+        val idf = identity ?: return null
+        if (!::appCtx.isInitialized) return null
+        // A rotated token or a different relay must never reuse a stale dialer.
+        val key = "$fp|$host|$port|${token.orEmpty()}"
+        return relayClients.getOrPut(key) { ProtocolClient(idf, RelayLinkProvider(idf, token)) }
+    }
 
     // Milestone E (opt-in, off by default): the subscription worker and the
     // per-peer mark that the last fingerprint-matched answer came through a
@@ -868,6 +1120,8 @@ val share: StateFlow<ShareIntake?> = _share
         btServerSocket = null
         runCatching { btClient?.close() }
         btClient = null
+        relayClients.values.forEach { runCatching { it.close() } }
+        relayClients.clear()
         runCatching { discovery?.stop() }
         runCatching { server?.close() }
         runCatching { client?.close() }
@@ -1041,8 +1295,9 @@ val share: StateFlow<ShareIntake?> = _share
             }
             btClient = bluetoothClient
             if (bluetoothClient != null) {
+                // FlitBluetooth logs only when a listener is actually published;
+                // starting the carrier is async and may retry or fail.
                 FlitBluetooth.startServer(appCtx, id, srv, scope, ::logLine) { btServerSocket = it }
-                logLine("bluetooth link: listening for direct transfers")
             }
             if (prefs().getBoolean("hiddenMode", false)) {
                 logLine("hidden mode: not announcing — others find this device by address, or when you send first")
@@ -1061,6 +1316,7 @@ val share: StateFlow<ShareIntake?> = _share
             }
             startHunter(seq)
             startCircleSyncWorker(seq)
+            startCircleDeliveryWorker(seq)
             startMirrorWatcher(seq)
             _lastPeer.value = lastPeerEntry()
         } catch (t: Throwable) {
@@ -1491,11 +1747,14 @@ val share: StateFlow<ShareIntake?> = _share
                 val apUp = !forced && wifiNetwork(cm()) != null
                 val permsOk = radio.hasPermissions()
                 val radioOn = radio.radioOn()
+                val hidden = prefs().getBoolean("hiddenMode", false)
+                val livePeer = _peers.value.keys.any { !it.startsWith(FlitBle.MANUAL_ROW_PREFIX) }
                 val stance = FlitBle.stance(
                     apUp = apUp,
                     perms = permsOk,
                     radioOn = radioOn,
-                    hidden = prefs().getBoolean("hiddenMode", false),
+                    hidden = hidden,
+                    livePeer = livePeer,
                 )
                 runCatching {
                     radio.apply(
@@ -1503,10 +1762,13 @@ val share: StateFlow<ShareIntake?> = _share
                         connectable = btClient != null,
                     )
                 }
-                if (stance.advertise != bleAdvertised) {
-                    bleAdvertised = stance.advertise
+                // Duty phases flip the radio silently; only a real change in
+                // the no-AP facts earns a line in the activity log.
+                val hardOn = !apUp && permsOk && radioOn && !hidden && !livePeer
+                if (hardOn != bleAdvertised) {
+                    bleAdvertised = hardOn
                     when {
-                        stance.advertise -> logLine("no Wi\u2011Fi network; direct discovery on")
+                        hardOn -> logLine("no Wi\u2011Fi network; direct discovery on")
                         // The borrowed voice tells the AP story only when the
                         // AP is the story: a radio going dark for its own
                         // reasons (ask pending, radio resting) never claims
@@ -1872,7 +2134,10 @@ val share: StateFlow<ShareIntake?> = _share
         val batch = FlitRoster.queued().first { it.fingerprint == fp }
         scope.launch(Dispatchers.IO) {
             try {
-                val spools = batch.uris.mapNotNull { spoolFileFor(it, "queue") }
+                val opened = batch.uris.mapIndexedNotNull { i, token ->
+                    spoolFileFor(token, "queue")?.let { Triple(token, batch.names.getOrNull(i) ?: it.name, it) }
+                }
+                val spools = opened.map { it.third }
                 if (spools.isEmpty()) {
                     // None of the row's items could be opened right now (a
                     // full disk, a revoked grant, a mid-write camera file).
@@ -1892,14 +2157,25 @@ val share: StateFlow<ShareIntake?> = _share
                         // died with no answer at all: the row survives and
                         // the receiver's on-disk prefix carries the resume
                         // (docs, milestones C and A).
-                        val report = dispatchTo(
+                        dispatchTo(
                             peer, SourceList(spools, emptyList()), null,
                             fromQueue = true, claimHeld = true,
                         )
-                        if (report == null) {
-                            logLine("nothing concluded for ${peer.displayName} — kept")
-                        } else {
-                            dropSent(batch, spools)
+                        runCatching {
+                            // Only tokens that actually reached the wire may
+                            // leave the row. A token that could not be opened
+                            // stays owed — the row is a promise, not a cache.
+                            val concluded = batch.copy(
+                                uris = opened.map { it.first },
+                                names = opened.map { it.second },
+                            )
+                            dropSent(concluded, spools)
+                            if (concluded.uris.size != batch.uris.size) {
+                                logLine(
+                                    "queue: ${batch.uris.size - concluded.uris.size} unopenable item(s) " +
+                                        "still owed to ${peer.displayName}",
+                                )
+                            }
                         }
                     } catch (e: Exception) {
                         // The row's keep IS the queue's promise: a send that
@@ -2353,9 +2629,8 @@ val share: StateFlow<ShareIntake?> = _share
             // relay is dialed there. `host:port` names the relay; the hint
             // names the peer, so the blind pairer can match a subscription.
             val relay = relayRouteFor[peer.info.fingerprint]
-            val policy = if (::appCtx.isInitialized) {
-                FlitKnown.policy(appCtx, peer.info.fingerprint)
-            } else FlitKnown.RoutePolicy.AUTO
+            val known = _knownDevices.value.firstOrNull { it.fingerprint.equals(peer.info.fingerprint, true) }
+            val policy = known?.routePolicy ?: FlitKnown.RoutePolicy.AUTO
             val dialer: ProtocolClient
             val target = when {
                 policy == FlitKnown.RoutePolicy.BLUETOOTH_ONLY ||
@@ -2363,10 +2638,16 @@ val share: StateFlow<ShareIntake?> = _share
                     dialer = btClient ?: throw IOException("Bluetooth link is off")
                     SendTarget(peer.ip, 0, tls = true)
                 }
-                relay != null || policy == FlitKnown.RoutePolicy.RELAY_ONLY -> {
-                    dialer = cli
-                    val r = relay ?: relayConfig() ?: throw IOException("relay is not configured")
-                    SendTarget(r.host, r.port, tls = true, relayFor = peer.info.fingerprint)
+                known?.relayFor != false && (relay != null || policy == FlitKnown.RoutePolicy.RELAY_ONLY) -> {
+                    val address = known?.relay?.let { FlitRoute.parseRelay(it) }
+                    val host = address?.first ?: relay?.host ?: relayConfig()?.host
+                        ?: throw IOException("relay is not configured")
+                    val port = address?.second ?: relay?.port ?: relayConfig()?.port
+                        ?: throw IOException("relay is not configured")
+                    dialer = relayClientFor(
+                        peer.info.fingerprint, known?.token ?: relayConfig()?.token, host, port,
+                    ) ?: cli
+                    SendTarget(host, port, tls = true, relayFor = peer.info.fingerprint)
                 }
                 else -> {
                     dialer = cli

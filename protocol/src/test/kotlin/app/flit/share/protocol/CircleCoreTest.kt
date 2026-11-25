@@ -157,7 +157,13 @@ class CircleCoreTest {
             }
         }
         val server = core(victim, delegate)
-        val x = wire(CircleRequest(CircleRequest.ACTION_SYNC, "circle-1", events = listOf(signed)), attacker)
+        val x = wire(
+            CircleRequest(
+                CircleRequest.ACTION_SYNC, "circle-1",
+                memberFp = attacker.fingerprint, events = listOf(signed),
+            ),
+            attacker,
+        )
         runBlocking { server.handle(x) }
         assertEquals(200, x.status)
         val response = WireJson.decode<CircleResponse>(x.response)
@@ -215,6 +221,32 @@ class CircleCoreTest {
         assertTrue(CircleCore.fresh("id-2", now + 2))
     }
 
+    // ---- file announcement body -------------------------------------------
+
+    @Test
+    fun `file announcement bodies carry only name size and sha256`() {
+        val identity = TlsIdentity.generate()
+        val good = """{"name":"notes.gflit","size":4096,"sha256":"abc123"}"""
+        assertEquals(setOf("name", "size", "sha256"), CircleCore.FILE_BODY_KEYS)
+        assertTrue(CircleCore.validFileBody(good))
+
+        // Additive: a clean file event still signs, verifies and passes the
+        // generic shape gate — this new check never changes an existing event.
+        val e = event(identity, CircleEvent.FILE, good)
+        assertTrue(CircleCore.validShape(e))
+        assertTrue(CircleCore.verify(e))
+        assertTrue(CircleCore.validFileBody(e.body))
+
+        // No queue token, local spool path or any other key may be published.
+        val leaking = """{"name":"a","size":1,"sha256":"s","token":"/cache/circle/a"}"""
+        assertFalse(CircleCore.validFileBody(leaking))
+        assertFalse(CircleCore.validFileBody("""{"name":"a","size":1,"sha256":"s","path":"/cache/circle/a"}"""))
+        assertFalse(CircleCore.validFileBody("""{"name":"a","size":1,"sha256":"s","spoolPath":"/cache/circle/a"}"""))
+        // The generic gate stays type-agnostic; the body gate is the one that
+        // refuses the leak, so no signed event is silently re-interpreted.
+        assertTrue(CircleCore.validShape(e.copy(body = leaking)))
+    }
+
     // ---- ordering / convergence -------------------------------------------
 
     @Test
@@ -226,7 +258,7 @@ class CircleCoreTest {
             event(a, CircleEvent.MESSAGE, """{"text":"a1"}""", lamport = 1, createdMs = now),
             event(b, CircleEvent.MESSAGE, """{"text":"b1"}""", lamport = 1, createdMs = now),
             event(a, CircleEvent.VOTE, """{"pollId":"p","option":0}""", lamport = 2, createdMs = now),
-            event(b, CircleEvent.FILE, """{"name":"x","size":1,"sha256":"s","token":"t"}""", lamport = 3, createdMs = now),
+            event(b, CircleEvent.FILE, """{"name":"x","size":1,"sha256":"s"}""", lamport = 3, createdMs = now),
             event(a, CircleEvent.POLL, """{"pollId":"p","question":"q","options":["a","b"]}""", lamport = 4, createdMs = now),
             event(b, CircleEvent.MESSAGE, """{"text":"b5"}""", lamport = 5, createdMs = now),
         )
@@ -331,8 +363,18 @@ class CircleCoreTest {
             invite = "bearer-token",
             memberFp = identity.fingerprint,
         )
-        val join = FakeExchange("POST", Protocol.PATH_CIRCLE_JOIN, body = WireJson.encode(request))
-        val sync = FakeExchange("POST", Protocol.PATH_CIRCLE_SYNC, body = WireJson.encode(request))
+        val certHeader = mapOf(
+            Protocol.HEADER_CIRCLE_CERT.lowercase() to
+                java.util.Base64.getEncoder().encodeToString(identity.certificate.encoded),
+        )
+        val join = FakeExchange(
+            "POST", Protocol.PATH_CIRCLE_JOIN,
+            body = WireJson.encode(request), headers = certHeader,
+        )
+        val sync = FakeExchange(
+            "POST", Protocol.PATH_CIRCLE_SYNC,
+            body = WireJson.encode(request), headers = certHeader,
+        )
         val bogus = FakeExchange("POST", "${Protocol.API_ROOT}/circle/sync", body = "{}")
         val malformed = FakeExchange("POST", Protocol.PATH_CIRCLE_SYNC, body = "{")
         val info = FakeExchange("GET", Protocol.PATH_INFO)

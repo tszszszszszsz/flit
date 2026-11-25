@@ -52,7 +52,7 @@ object PanicCore {
      * that bumps the count must re-sign with its own identity.
      */
     fun canonical(alert: PanicAlert): ByteArray =
-        canonical(alert.id, alert.senderFp, alert.sentMs, alert.text, alert.hops)
+        canonical(alert.id, alert.senderFp, alert.sentMs, alert.text, alert.hops, alert.originFp)
 
     /** Explicit-field form, handy for forging a test vector. */
     fun canonical(
@@ -61,6 +61,7 @@ object PanicCore {
         sentMs: Long,
         text: String,
         hops: Int,
+        originFp: String = "",
     ): ByteArray {
         val bytes = ByteArrayOutputStream()
         val out = DataOutputStream(bytes)
@@ -70,6 +71,7 @@ object PanicCore {
         out.writeLong(sentMs)
         field(out, text)
         out.writeInt(hops)
+        field(out, originFp)
         out.flush()
         return bytes.toByteArray()
     }
@@ -101,6 +103,7 @@ object PanicCore {
             sentMs = System.currentTimeMillis(),
             text = text,
             hops = hops,
+            originFp = fp,
         )
         return alert.copy(sig = identity.signPanic(canonical(alert)))
     }
@@ -173,7 +176,12 @@ object PanicCore {
         val fp = forwarderFp.trim().uppercase()
         require(fp.isNotBlank()) { "blank forwarder fingerprint" }
         TlsIdentity.pin(identity.certificate)
-        val next = alert.copy(senderFp = fp, hops = nextHops, sig = "")
+        val next = alert.copy(
+            senderFp = fp,
+            hops = nextHops,
+            sig = "",
+            originFp = alert.originFp.ifBlank { alert.senderFp },
+        )
         return next.copy(sig = identity.signPanic(canonical(next)))
     }
 

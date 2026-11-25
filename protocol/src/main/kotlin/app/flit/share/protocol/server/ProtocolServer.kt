@@ -71,6 +71,11 @@ private class KtorExchange(private val call: ApplicationCall) : HttpExchange {
         call.respondText(body, ContentType.parse(contentType), HttpStatusCode.fromValue(status))
     }
 
+    override suspend fun respondText(status: Int, contentType: String, body: String, headers: Map<String, String>) {
+        headers.forEach { (name, value) -> call.response.headers.append(name, value) }
+        call.respondText(body, ContentType.parse(contentType), HttpStatusCode.fromValue(status))
+    }
+
     override suspend fun respondStatus(status: Int) {
         call.respond(HttpStatusCode.fromValue(status))
     }

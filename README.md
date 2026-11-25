@@ -1,7 +1,7 @@
 # Flit (codename)
 
-**Send any file to any nearby device — over Wi‑Fi when there is one, Bluetooth when
-there isn't. Resume-proof, zero setup.**
+**Send any file to nearby v2.2 devices — over Wi‑Fi when there is one, Bluetooth when
+there isn't (opt-in). Resumable within a carrier, no accounts, no cloud.**
 
 A no-fluff, native-Kotlin file transfer app that speaks the
 [LocalSend protocol v2.2](https://github.com/localsend/protocol) so it interoperates with every
@@ -18,7 +18,7 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 | 2 | **Rescue mode**: direct transport when no network path exists | **shipped — Bluetooth direct-discovery (row 9)**; joining a phone's own hotspot works by-address; the multicast-blocking-network case now **sweeps**: an empty roster on Wi-Fi knocks on the whole subnet for a running v2.2 server (throttled, bounded, hidden-mode-respecting) |
 | 3 | **Crush & send**: text, notes, logs, JSON and code are gzip'd on the wire, Flit receivers unpack automatically (any other client still gets a valid `.gflit` gzip archive it can open) | **shipped** (free, Options → "Crush files when sending") |
 | 4 | Native speed: instant cold start, share-sheet-first UX | **shipped** (share intake spool, send-later queue, trusted peers + per-peer folder, progress notifications, QS tile) |
-| 5 | **Direct-to-MediaStore receive**: incoming files stream straight into a pending `Downloads/Flit/` row — no temp file, no second copy — with parallel uploads (4 streams) | **shipped** |
+| 5 | **Direct-to-storage receive**: on API 29+ for non-crushed wires, incoming files stream straight into a pending `Downloads/Flit/` row or a chosen SAF folder — no temp file, no second copy (old devices, crushed wires or a storage refusal take the classic two-step path) — with parallel uploads (4 streams) | **shipped** |
 | 6 | **Real on-device options**: Material You theme (dynamic color, light/dark/auto), rename from the app, trusted-senders-only gate, hidden mode (listen-only discovery), start-on-boot, default receive folder, battery-rationing opt-out helper | **shipped** |
 | 7 | **Receive ledger you can act on**: tap a received file to open it, one-tap re-share, clear anything | **shipped** |
 | 8 | **In-app note composer**: send a plain-text note to a peer straight from the app — no share sheet detour | **shipped** |
@@ -44,11 +44,15 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   the peer reappears). The queue's promise is kept: a second intake joins the waiting batch
   instead of dying as "send failed", a flush broken by the peer leaving keeps its row, and
   delivered batches release their storage grants — everything keeps its sentence. (Walked
-  on device against a flit-cli server: kept → merged → auto-sent 2/2 → cancel, all live.)
+  on device against a flit-cli server: kept → merged → auto-sent 2/2 → cancel, all live.
+  The grant-release path is **code-verified**, not device-walked: picker files are spooled
+  at intake, so that walk had cache-path tokens and no SAF grants in play.)
 - Multi-file sends stream concurrently (4 parallel), and a dropped connection mid-file is
-  recovered automatically: the receiver keeps the received prefix, the sender probes
-  `GET /api/flit/v1/partial`, and the transfer resumes from there (Flit↔Flit only; plain v2.2
-  peers get a clean full resend — the final sha256 gate verifies every landing either way).
+  recovered automatically **within the same carrier**: the receiver keeps the received
+  prefix, the sender probes `GET /api/flit/v1/partial`, and the transfer resumes from there
+  (Flit↔Flit only; plain v2.2 peers, or a Wi‑Fi↔Bluetooth switch whose origin no longer
+  matches the kept part, get a clean full resend — the final sha256 gate verifies every
+  landing either way).
 - Receive: progress notification with live speed; completed transfers land in
   `Downloads/Flit/`, in your default folder (Options), or straight into a
   per-peer folder for trusted peers — no double write either way. Received files
@@ -61,7 +65,11 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
 - **Circle — accountless group coordination:** a temporary, fingerprint-pinned group with one
   signed local event log (messages, file drops and re-votable polls) — authenticated by
   fingerprint-pinned signatures and TLS-protected in transit, **not encrypted at rest** — founded
-  by a QR invite and synced over the same Wi‑Fi/Bluetooth/relay carriers. The founder is
+  by a QR invite and synced over the same Wi‑Fi/Bluetooth/relay carriers. A file drop is
+  a signed `{name,size,sha256}` announcement plus a real per-member `sendFiles`
+  delivery from the sender's local spool (not the send-later queue); bytes land hash-exact
+  in History, delivery status is tracked only on the sender's own device (never gossiped),
+  and a device that joins later sees the card but not the old bytes. The founder is
   owner and can appoint admins; leave or kick rotates the key and the host refuses the
   departed device's later sync. No accounts, no server, no remote actions.
   Two-node join/post/leave were walked on device; the multi-member mesh and
@@ -88,11 +96,12 @@ source env.sh                 # puts JDK 21 first on PATH
 cd harness/build/install/flit-cli/bin && ./flit-cli
 ```
 
-commands: `serve`, `discover`, `send <ip[:port]|alias> <file...>`, `info <ip[:port]>`,
-`bt-sim` — runs a complete v2.2 exchange (info → register → files) both ends in one
-process: the receiver is the production server, the sender is the production protocol
-client riding the simulated Bluetooth pipe (`--bytes MB` for synthetic bodies,
-`--no-tls` for the plain carrier). The rig standard used before every commit:
+The full command list with every flag is in the [canonical `flit-cli` list](#desktop-companion-flit-cli)
+below — there is one list, not two. Of those, `bt-sim` runs a complete v2.2 exchange
+(info → register → files) both ends in one process: the receiver is the production server,
+the sender is the production protocol client riding the simulated Bluetooth pipe
+(`--bytes MB` for synthetic bodies, `--no-tls` for the plain carrier). The rig standard
+used before every commit:
 
 ```bash
 source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDebug \
@@ -114,14 +123,19 @@ rig, shipped under a name that doesn't wear test-bench vocabulary.
 ./install-cli.sh --zip flit-cli-0.2.0.zip   # or install a CI artifact directly
 ```
 
+The canonical `flit-cli` command list (every command and flag, from `flit-cli` with no arguments):
+
 ```bash
-flit-cli serve --dir ~/Public               # receive; announces on the LAN like the app
-flit-cli serve --dir ~/Public --hidden      # receive; stays off other devices' rosters entirely
-flit-cli discover --wait 5                  # who else is speaking v2.2 here?
-flit-cli send <ip[:port]|alias> <file...> [--parallel N]
+flit-cli serve --dir ~/Public [--relay host:port --token T]   # receive; announces on the LAN like the app
+flit-cli serve --dir ~/Public --hidden                      # receive; stays off other devices' rosters entirely
+flit-cli discover --wait 5                                  # who else is speaking v2.2 here?
+flit-cli send <ip[:port]|alias> <file...> [--parallel N] [--pin PIN] [--multi]
 flit-cli info <ip[:port]>
-flit-cli relay --port 53318 [--token T]     # blind pairer for peers that can't reach each other
-flit-cli circle <create|join|post|poll|vote|kick|leave|sync>   # accountless group coordination
+flit-cli bt-sim [file...] [--bytes MB] [--no-tls]           # both ends in one process over the pipe carrier
+flit-cli relay --port 53318 [--token T] [--park-timeout S]  # blind pairer for peers that can't reach each other
+flit-cli panic <ip[:port]> [--text NOTE]                    # signed informational alert
+flit-cli parse-qr <image...>                                # decode pairing codes from screenshots
+flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>   # accountless group coordination
 ```
 
 Needs java 21 at run time — the installed launcher says so in one line if the
@@ -134,9 +148,13 @@ which is exactly the peer the phone app's rescue sweep exists to find. `relay` i
 the milestone-E pairer for peers that cannot open a route to each other: it pairs a
 sender's `req <fingerprint>` with a receiver's long-lived `sub <fingerprint>` and
 copies bytes without ever parsing the protocol — TLS and the fingerprint proof run
-end-to-end between the peers, so the relay operator sees metadata (who paired, when,
-how many bytes), never content. Both peers must be live; there is no relay-side
-queueing, and the address is configured by hand (no relay discovery, by design).
+end-to-end between the peers. The current CLI logs only timestamps and opaque
+pairing ticket ids — no fingerprint, no byte count, never content. Both peers must be
+live; there is no relay-side
+queueing, and the address is configured by hand (no relay discovery, by design). On the
+phone the relay carrier is gated by the per-device **relayFor** switch in Known devices:
+a device opted out never has its traffic routed through the relay, and Circle dialing
+requires that switch on (with a relay address and token) to reach a peer that way.
 
 ## Licensing / provenance note
 

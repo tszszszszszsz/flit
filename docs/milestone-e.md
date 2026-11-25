@@ -2,7 +2,7 @@
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
 
-## Milestone E design — self-hosted relay (written before code; parked behind B)
+## Milestone E design — self-hosted relay (written before code; delivered 2026-11-24)
 
 The problem E answers: two peers that can establish *some* outbound
 reachability but never each other — different NATs, multicast-blocked
@@ -11,10 +11,12 @@ survives that world except one sentence: the candidate list runs out of
 addresses that answer. E adds one more candidate: a relay both peers can
 dial out to, run by whoever wants it (`flit-cli relay`), off by default.
 
-**The shape: a blind pairer, not a server.** The relay knows exactly two
-things per pair — that fingerprint A wants fingerprint B, and how many
-bytes it shuttled. It never parses the protocol, never stores a file,
-never terminates TLS. The sender dials the relay and opens with a fixed
+**The shape: a blind pairer, not a server.** The relay matches a request for
+fingerprint B with B's subscription using the one-line hello, then copies
+opaque bytes both ways. It never parses the protocol, never stores a file,
+never terminates TLS. The shipped CLI logs only a timestamp and opaque pairing
+ticket ids (`pair c3 + c4`, `pair c3 + c4 closed`) — no fingerprint, no byte
+counter. The sender dials the relay and opens with a fixed
 preamble (magic, target fingerprint, optional shared token); the
 receiver, while the engine runs, holds a long-lived subscription to the
 same relay ("I am B; pair me"). The relay matches, says OK to both, and
@@ -38,14 +40,16 @@ file, a fingerprint or a finished hash.
   `host:port` is the relay and whose hint names the peer; only the
   relay-aware provider reads it. This is smaller and truer than minting
   a per-send client per route.
-- **App module gains two thin Android-side pieces:** the relay dialer
-  (TCP to relay, preamble, wrap in `TlsLink(clientMode = true)`) and the
-  subscription worker (engine start → dial relay as self, hand each
-  paired pipe to the server's external door — `ProtocolServer.serve`,
-  which rides the exact same `ServerCore` and route semantics as the TCP
-  listener, landed with E and shared with B; reconnect with the same calm
-  backoff as the keeper). No new wire formats on the app side — the
-  preamble is the relay core's, already tested.
+- **Protocol module gains two thin pieces alongside the core:** the relay
+  dialer / link provider (`RelayLinkProvider`: TCP to relay, preamble, then
+  TLS inside the pipe) and the subscriber (`RelaySubscriber`: dial relay as
+  self, hand each paired pipe to the server's external door —
+  `ProtocolServer.serve`, which rides the exact same `ServerCore` and route
+  semantics as the TCP listener, landed with E and shared with B; reconnect
+  with the same calm backoff as the keeper). Both stay JVM-pure so they are
+  tested without Android. No new wire formats — the preamble is the relay
+  core's, already tested. The app module adds only the opt-in preference and
+  the engine's start/stop wiring (see Engine/roster below).
 - **Harness gains `flit-cli relay --port N [--token T]`** — a thin CLI
   wrapper over the same `RelayCore`, so the thing users self-host is the
   thing the tests exercise, not a lookalike.
@@ -66,9 +70,10 @@ relay — no new states, no new copy.
 
 **Honest edges, listed:** both peers must be live (no store-and-forward;
 an offline receiver's files wait on the sender's queue exactly as today);
-the relay operator sees metadata — which fingerprints paired, when, and
-how many bytes moved (never content, aliases, or names — those ride
-inside TLS); the relay is a single point of failure the user owns;
+the relay is blind: the current CLI logs only timestamps and opaque
+pairing ticket ids, not fingerprints or byte counts (content, aliases and
+names ride inside TLS anyway); the relay is a single point of failure the
+user owns;
 there is no relay *discovery* (the address is typed once per device, by
 design — a discovery protocol for relays would be a public directory and
 that is a different product); throughput is whatever the relay's uplink
@@ -107,13 +112,13 @@ endpoints with TLS inside the pipe, hash-exact.
 tickets retired by `withdraw`, constant-time token gate), 11 tests in
 `RelayCoreTest`. The harness surface landed too: `flit-cli relay
 --port P [--token T] [--park-timeout S]` runs the accept/pair/blind-copy
-loop over the same core, with 4 harness tests proving a real 3 MB
+loop over the same core, with 5 harness tests proving a real 3 MB
 protocol send lands hash-exact through the pairer, a wrong token is
 refused on the wire, an unpaired subscription times out cleanly, and a
 dead relay dial surfaces as `TransferUnreachable` (never a report).
 
-**Status (2026-11-24):** the app surface and the hardware walk are done —
-see the [main ladder](transport-bluetooth.md) for the relay-kill evidence.
-The "wait behind B" line above is the historical 2026-11-18 state, kept for
-the record.
+**Status (2026-11-24, final):** the app surface and the hardware walk are
+done — see the [main ladder](transport-bluetooth.md) for the relay-kill
+evidence. The "Status (2026-11-18)" entry above records the historical
+pre-app state, kept for the record.
 

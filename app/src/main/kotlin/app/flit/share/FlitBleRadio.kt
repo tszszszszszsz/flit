@@ -54,7 +54,11 @@ internal class FlitBleRadio(
 
     fun radioOn(): Boolean = runCatching { adapter()?.isEnabled == true }.getOrDefault(false)
 
-    /** Applies a stance; returns true when the radio state actually changed. */
+    /**
+     * Applies a stance; returns true when the radio state actually changed.
+     * A connectable request is honored only while the stance advertises — the
+     * carrier may be up while the duty window is resting.
+     */
     fun apply(
         stance: FlitBle.Stance,
         alias: String,
@@ -65,7 +69,12 @@ internal class FlitBleRadio(
     ): Boolean {
         val advBefore = advertising
         val scanBefore = scanning
-        if (stance.advertise) startAdvertising(alias, fingerprint, connectable) else stopAdvertising()
+        // Connectable advertising belongs to a live carrier *and* the on phase.
+        // [FlitBle.Stance.advertise] already folds in permissions, radio power
+        // and the duty window, so gating with it keeps a resting radio from
+        // leaving a connectable record on the air between discovery ticks.
+        val carrierConnectable = connectable && stance.advertise
+        if (stance.advertise) startAdvertising(alias, fingerprint, carrierConnectable) else stopAdvertising()
         if (stance.scan) startScan(dump) else stopScan()
         return advBefore != advertising || scanBefore != scanning
     }

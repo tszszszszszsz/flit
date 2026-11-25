@@ -13,8 +13,17 @@ hop-counted Flit-only route (`/api/flit/v1/panic`) with a self-signed cert pinne
 to the sender fingerprint. A QR v2 code carries the fingerprint plus optional
 MAC, relay and token; v1 codes still parse byte-for-byte. Panic is informational:
 a recipient sees a banner with fingerprint/alias/time/note and chooses
- Acknowledge / Dismiss / Forward. Nothing is wiped or changed remotely; Forward
-creates a new signed alert with a bumped hop and an explicit tap.
+ Acknowledge / Dismiss / Forward. Nothing is wiped or changed remotely.
+
+**Forward handoff and hop limit (as built).** Forward is an explicit tap only —
+nothing auto-forwards. `PanicCore.forward` re-signs the **original** alert with the
+forwarder's own identity: `senderFp` becomes this hop's sender, while `originFp`
+preserves the original author as the trust anchor (a receiver gates on `originFp`,
+so a known intermediary cannot smuggle in an unknown author), and `id` plus the
+note survive for dedup. Hops are inside the signed canonical bytes, including the
+handoff, so a bumped count cannot be forged; `forward` returns null once
+`hops >= DEFAULT_MAX_HOPS` (3), and the UI toasts "alert reached its hop limit — it
+cannot be forwarded further" instead of sending.
 
 **Hardware evidence (one phone + the CLI box):** the box was added through the
 QR v2 paste path (`scan: pinned Flit (szszszs) (code verified)`), the Known

@@ -317,7 +317,7 @@ class MainActivity : ComponentActivity() {
                 // still arrive here. Check scheme and authority before the
                 // tolerant code parser sees a lookalike like flit://add.evil.
                 if (!uri.scheme.equals("flit", ignoreCase = true)) return
-                val authority = uri.authority
+                val authority = uri.authority ?: return // e.g. flit:add?… has none
                 if (!authority.equals("add", ignoreCase = true) &&
                     !authority.equals("pair", ignoreCase = true)
                 ) return
@@ -1227,6 +1227,13 @@ class MainActivity : ComponentActivity() {
                                         meFp = meFp,
                                         onPost = { text -> FlitEngine.circlePost(text) },
                                         onFile = { pickCircleFile.launch(arrayOf("*/*")) },
+                                        onOpenFile = { sha ->
+                                            lifecycleScope.launch {
+                                                val r = FlitEngine.circleReceivedFor(sha)
+                                                if (r != null) openReceived(r)
+                                                else FlitEngine.toast("that file hasn't landed here yet")
+                                            }
+                                        },
                                         onPoll = { question, options ->
                                             FlitEngine.circlePostPoll(question, options)
                                         },
@@ -2083,9 +2090,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Circle file drop: the event carries only name/size/SHA-256 and a local
-     * spool token — bytes still travel through Flit's existing queue path.
-     * Copying out of SAF here makes the token survive grant revocation.
+     * Circle file drop: copy out of SAF into app cache (grant-proof), hash it,
+     * then post a file event carrying only name/size/SHA-256. The spool path
+     * stays local; bytes reach members through Flit's existing sendFiles path.
      */
     private fun circleAttach(uri: Uri) {
         val resolver = contentResolver

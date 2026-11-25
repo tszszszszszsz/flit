@@ -41,6 +41,7 @@ class FlitCircleStoreTest {
         events: List<CircleEvent> = emptyList(),
         rekeyGen: Int = 0,
         key: String = "key-v1",
+        deliveries: Map<String, FlitCircleStore.CircleDelivery> = emptyMap(),
     ) = FlitCircleStore.CircleState(
         id = "circle-1",
         keyB64 = key,
@@ -48,6 +49,20 @@ class FlitCircleStoreTest {
         members = members,
         events = events,
         rekeyGen = rekeyGen,
+        deliveries = deliveries,
+    )
+
+    private fun delivery(
+        id: String = "d-1",
+        name: String = "photo.jpg",
+        size: Long = 1_234L,
+        sha: String = "sha-aabb",
+        spoolPath: String = "/cache/circle/photo.jpg",
+        statuses: Map<String, String> = emptyMap(),
+        created: Long = 5_000L,
+    ) = FlitCircleStore.CircleDelivery(
+        id = id, name = name, size = size, sha256 = sha,
+        spoolPath = spoolPath, statuses = statuses, createdMs = created,
     )
 
     @Test
@@ -71,6 +86,7 @@ class FlitCircleStoreTest {
         assertEquals(FlitCircleStore.Role.OWNER, old?.role)
         assertEquals(0, old?.rekeyGen)
         assertEquals(emptyList(), old?.events)
+        assertEquals(emptyMap(), old?.deliveries) // additive field: old rows get an empty map
         assertEquals(0L, old?.members?.first()?.joinedMs)
         assertNull(decodeCircle(null))
         assertNull(decodeCircle("   "))
@@ -103,9 +119,14 @@ class FlitCircleStoreTest {
             id = "c", keyB64 = "k", role = FlitCircleStore.Role.MEMBER, members = emptyList(),
         )
         assertEquals(emptyList(), s.events)
+        assertEquals(emptyMap(), s.deliveries)
         assertEquals(0, s.rekeyGen)
         assertEquals(FlitCircleStore.Role.MEMBER, FlitCircleStore.Member("a", "A").role)
         assertEquals(0L, FlitCircleStore.Member("a", "A").joinedMs)
+        // Delivery fields are additive too: statuses and createdMs have defaults.
+        val bare = FlitCircleStore.CircleDelivery("d", "f.txt", 1L, "sha", "/cache/f")
+        assertEquals(emptyMap(), bare.statuses)
+        assertEquals(0L, bare.createdMs)
     }
 
     @Test
@@ -443,5 +464,103 @@ class FlitCircleStoreTest {
         // A corrupt-but-parseable old row cannot smuggle in an unbounded log.
         val trimmed = decodeCircle(FlitCircleStore.encode(state(events = many)))!!
         assertEquals(FlitCircleStore.EVENT_CAP, trimmed.events.size)
+    }
+
+    @Test
+    fun `codec roundtrip keeps deliveries and normalises corrupt delivery rows`() {
+        val d = delivery(statuses = mapOf("fp-admin" to CircleDelivery.SENT))
+        val source = state(deliveries = mapOf(d.sha256 to d))
+        assertEquals(source, decodeCircle(encode(source)))
+
+        val dirty = state(
+            deliveries = linkedMapOf(
+                "  " to delivery(id = "blank-key", sha = "sha-ignored"),
+                "sha-aabb" to delivery(statuses = mapOf("" to "sent", "fp-owner" to "sent")),
+                "no-sha" to delivery(id = "no-sha", sha = "   "),
+            ),
+        )
+        val clean = decodeCircle(encode(dirty))!!
+        assertEquals(listOf("sha-aabb"), clean.deliveries.keys.toList())
+        assertEquals(mapOf("fp-owner" to "sent"), clean.deliveries["sha-aabb"]!!.statuses)
+    }
+
+    @Test
+    fun `upsertDelivery adds then replaces by sha and keeps statuses on retry`() {
+        val s0 = state()
+        val d = delivery(statuses = mapOf("fp-admin" to CircleDelivery.PENDING))
+        val s1 = FlitCircleStore.upsertDelivery(s0, d)
+        assertEquals(mapOf(d.sha256 to d), s1.deliveries)
+        assertEquals(emptyMap(), s0.deliveries) // pure: input untouched
+
+        val s2 = FlitCircleStore.setDeliveryStatus(s1, d.sha256, "fp-admin", CircleDelivery.SENT)
+        val s3 = FlitCircleStore.upsertDelivery(s2, delivery(id = "d-1-retry", name = "photo-v2.jpg"))
+        // A retry that re-announces the same sha with no statuses keeps what we learned.
+        assertEquals(mapOf("fp-admin" to CircleDelivery.SENT), s3.deliveries[d.sha256]!!.statuses)
+        assertEquals("photo-v2.jpg", s3.deliveries[d.sha256]!!.name)
+
+        val explicit = delivery(statuses = mapOf("fp-member" to CircleDelivery.REFUSED))
+        val s4 = FlitCircleStore.upsertDelivery(s3, explicit)
+        assertEquals(mapOf("fp-member" to CircleDelivery.REFUSED), s4.deliveries[d.sha256]!!.statuses)
+        assertEquals(1, s4.deliveries.size) // no duplicate row for the same sha
+
+        val two = FlitCircleStore.upsertDelivery(s4, delivery(id = "d-2", sha = "sha-cc"))
+        assertEquals(2, two.deliveries.size)
+        assertEquals(s4, FlitCircleStore.upsertDelivery(s4, delivery(sha = "  "))) // blank sha inert
+    }
+
+    @Test
+    fun `setDeliveryStatus is per fingerprint, latest wins and unknown targets are inert`() {
+        val d = delivery()
+        val s0 = state(deliveries = mapOf(d.sha256 to d))
+        val s1 = FlitCircleStore.setDeliveryStatus(s0, d.sha256, "fp-admin", CircleDelivery.SENT)
+        val s2 = FlitCircleStore.setDeliveryStatus(s1, d.sha256, "fp-member", CircleDelivery.PENDING)
+        assertEquals(
+            mapOf("fp-admin" to "sent", "fp-member" to "pending"),
+            s2.deliveries[d.sha256]!!.statuses,
+        )
+        val s3 = FlitCircleStore.setDeliveryStatus(s2, d.sha256, "fp-admin", CircleDelivery.REFUSED)
+        assertEquals("refused", s3.deliveries[d.sha256]!!.statuses["fp-admin"])
+        assertEquals(emptyMap(), s0.deliveries[d.sha256]!!.statuses) // input untouched
+
+        assertEquals(s3, FlitCircleStore.setDeliveryStatus(s3, "sha-unknown", "fp-owner", "sent"))
+        assertEquals(s3, FlitCircleStore.setDeliveryStatus(s3, d.sha256, " ", "sent"))
+        assertEquals(s3, FlitCircleStore.setDeliveryStatus(s3, d.sha256, "fp-owner", ""))
+
+        // A delivery id or a case variant also resolves to the same sha row.
+        assertEquals(
+            CircleDelivery.FAILED,
+            FlitCircleStore.setDeliveryStatus(s3, d.id, "fp-owner", CircleDelivery.FAILED)
+                .deliveries[d.sha256]!!.statuses["fp-owner"],
+        )
+        assertEquals(
+            CircleDelivery.SENT,
+            FlitCircleStore.setDeliveryStatus(s3, d.sha256.uppercase(), "fp-owner", CircleDelivery.SENT)
+                .deliveries[d.sha256]!!.statuses["fp-owner"],
+        )
+    }
+
+    @Test
+    fun `removeDelivery forgets one record and ignores unknown shas`() {
+        val a = delivery(sha = "sha-a")
+        val b = delivery(id = "d-2", sha = "sha-b")
+        val s = FlitCircleStore.upsertDelivery(FlitCircleStore.upsertDelivery(state(), a), b)
+        val removed = FlitCircleStore.removeDelivery(s, a.sha256)
+        assertEquals(listOf("sha-b"), removed.deliveries.keys.toList())
+        assertEquals(s, FlitCircleStore.removeDelivery(s, "sha-unknown"))
+        assertEquals(emptyMap(), FlitCircleStore.removeDelivery(removed, b.sha256).deliveries)
+        assertEquals(s, FlitCircleStore.removeDelivery(s, "  "))
+    }
+
+    @Test
+    fun `event folds leave local delivery records untouched`() {
+        val d = delivery(statuses = mapOf("fp-admin" to CircleDelivery.SENT))
+        val s = state(deliveries = mapOf(d.sha256 to d))
+        val folded = FlitCircleStore.merge(s, listOf(
+            event("e-1", "fp-owner", "message", """{"text":"hi"}"""),
+            event("j-1", "fp-new", "join"),
+        ))
+        assertEquals(s.deliveries, folded.deliveries)
+        assertEquals(2, folded.events.size)
+        assertEquals(4, folded.members.size)
     }
 }

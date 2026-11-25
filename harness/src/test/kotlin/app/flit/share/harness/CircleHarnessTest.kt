@@ -1,6 +1,8 @@
 package app.flit.share.harness
 
 import app.flit.share.protocol.client.ProtocolClient
+import app.flit.share.protocol.client.SendError
+import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
@@ -19,7 +21,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
+import java.util.Random
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -223,24 +227,21 @@ class CircleHarnessTest {
                 )
 
                 // ---- 4. file-drop event: only a reference, hash-exact ----
-                val payload = ByteArray(4096).also { java.util.Random(7).nextBytes(it) }
+                val payload = ByteArray(4096).also { Random(7).nextBytes(it) }
                 val sha = ProtocolClient.sha256Hex { ByteArrayInputStream(payload) }
+                val announcement = circleFileAnnouncement("drop.bin", payload.size.toLong(), sha)
+                assertTrue(CircleCore.validFileBody(announcement))
                 val fileDrop = CircleCore.create(
-                    circleId, member, memberId, CircleEvent.FILE,
-                    buildJsonObject {
-                        put("name", JsonPrimitive("drop.bin"))
-                        put("size", JsonPrimitive(payload.size.toLong()))
-                        put("sha256", JsonPrimitive(sha))
-                        put("token", JsonPrimitive("resume-token-1"))
-                    }.toString(),
-                    lamport = 7L,
+                    circleId, member, memberId, CircleEvent.FILE, announcement, lamport = 7L,
                 )
                 val dropped = memberClient.sync(target, circleId, member, listOf(fileDrop))
                 assertNotNull(dropped)
                 assertTrue(dropped.ok)
                 val landed = dropped.events.single { it.type == CircleEvent.FILE }
                 assertTrue(CircleCore.verify(landed))
+                assertTrue(CircleCore.validFileBody(landed.body))
                 val manifest = Json.parseToJsonElement(landed.body).jsonObject
+                assertEquals(setOf("name", "size", "sha256"), manifest.keys)
                 assertEquals(sha, (manifest["sha256"] as JsonPrimitive).content)
                 assertEquals(payload.size.toLong(), (manifest["size"] as JsonPrimitive).content.toLong())
                 assertEquals("drop.bin", (manifest["name"] as JsonPrimitive).content)
@@ -369,5 +370,123 @@ class CircleHarnessTest {
         assertTrue(transport.contains("handshake failed"))
         assertTrue(transport.contains("no answer from host"))
         assertFalse(transport.contains("host refused"))
+    }
+
+    @Test
+    fun `circle file lands hash-exact bytes and walks pending to sent delivery status`() = runBlocking {
+        val circleId = "circle-file-walk"
+        val invite = "bearer-invite"
+        val senderId = TlsIdentity.generate()
+        val receiverId = TlsIdentity.generate()
+        val sender = senderId.fingerprint
+        val receiver = receiverId.fingerprint
+        val dest = Files.createTempDirectory("circle-file-landing")
+
+        val delegate = ConsoleDelegate()
+        delegate.circleHost.seed(circleId, invite, "group-key-v1", receiver, receiverId)
+        val server = ProtocolServer(
+            receiverId, delegate,
+            ServerConfig(alias = "circle-file-host", port = 0, tls = true, destDir = dest),
+        )
+        server.start()
+        val target = SendTarget("127.0.0.1", server.port, tls = true)
+        // A port nobody listens on: the carrier throws, so this recipient must
+        // stay pending (spool kept for retry), not be concluded as failed.
+        val deadPort = java.net.ServerSocket(0).use { it.localPort }
+        val dead = "DEAD-ROUTE-FP"
+
+        try {
+            val memberClient = ProtocolClient(senderId)
+            val joined = memberClient.circleJoin(
+                target,
+                CircleRequest(CircleRequest.ACTION_JOIN, circleId, invite = invite, memberFp = sender),
+            )
+            assertNotNull(joined, "join got no answer")
+            assertTrue(joined.ok, "join refused: ${joined.reason}")
+            assertEquals(setOf(receiver, sender), joined.members.toSet())
+
+            // Real bytes in a real spool file — the CLI drops a path, not an in-memory buffer.
+            val payload = ByteArray(8192).also { Random(11).nextBytes(it) }
+            val spool = Files.createTempFile("circle-drop", ".bin")
+            Files.write(spool, payload)
+            val sha = ProtocolClient.sha256Hex { java.io.FileInputStream(spool.toFile()) }
+            val name = spool.fileName.toString()
+
+            // The announcement is name/size/sha256 only: no local path, no token.
+            val announcement = circleFileAnnouncement(name, payload.size.toLong(), sha)
+            assertTrue(CircleCore.validFileBody(announcement))
+            val ev = CircleCore.create(circleId, sender, senderId, CircleEvent.FILE, announcement, lamport = 1L)
+            val posted = memberClient.sync(target, circleId, sender, listOf(ev))
+            assertNotNull(posted)
+            assertTrue(posted.ok, "file event refused: ${posted.reason}")
+            val landed = posted.events.single { it.type == CircleEvent.FILE }
+            assertTrue(CircleCore.verify(landed))
+            assertTrue(CircleCore.validFileBody(landed.body))
+            assertEquals(announcement, landed.body)
+            val manifest = Json.parseToJsonElement(landed.body).jsonObject
+            assertEquals(setOf("name", "size", "sha256"), manifest.keys)
+            assertFalse(landed.body.contains(spool.toString()), "sender's local spool path went on the wire")
+            assertFalse(manifest.containsKey("token"), "a queue token went on the wire")
+
+            // Production sendFiles to every current member (host here + a dead route).
+            val transitions = java.util.Collections.synchronizedList(mutableListOf<Pair<String, String>>())
+            val delivery = deliverCircleFile(
+                identity = senderId,
+                spoolPath = spool,
+                recipients = listOf(
+                    CircleRecipient(receiver, target),
+                    CircleRecipient(dead, SendTarget("127.0.0.1", deadPort, tls = true)),
+                ),
+                onStatus = { fp, status -> transitions += fp to status },
+            )
+
+            // Status transitions are local-only and observable: reachable member
+            // goes pending → sent; a thrown carrier stays pending for retry.
+            assertEquals(
+                listOf(receiver to CircleDeliveryStatus.PENDING, dead to CircleDeliveryStatus.PENDING,
+                    receiver to CircleDeliveryStatus.SENT),
+                transitions,
+            )
+            assertEquals(CircleDeliveryStatus.SENT, delivery.statuses[receiver])
+            assertEquals(CircleDeliveryStatus.PENDING, delivery.statuses[dead])
+            assertEquals(sha, delivery.sha256)
+            assertEquals(name, delivery.name)
+            assertEquals(payload.size.toLong(), delivery.size)
+            assertEquals(
+                listOf(announcement),
+                delegate.circleHost.snapshot().events.filter { it.type == CircleEvent.FILE }.map { it.body },
+                "the host log holds only the announcement — delivery status is local-only",
+            )
+
+            // Hash-exact landing on the receiver's disk, via the normal upload route.
+            val landedFiles = Files.list(dest).use { stream ->
+                stream.filter { Files.isRegularFile(it) }.toList()
+            }
+            assertEquals(1, landedFiles.size, "expected exactly one landed file")
+            assertContentEquals(payload, Files.readAllBytes(landedFiles.single()))
+            assertEquals(sha, ProtocolClient.sha256Hex { Files.newInputStream(landedFiles.single()) })
+
+            memberClient.close()
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `circle delivery outcome maps a returned report but never a throw`() {
+        val name = "drop.bin"
+        assertEquals(
+            CircleDeliveryStatus.SENT,
+            circleDeliveryOutcome(SendReport(listOf(name), emptyList(), "s1"), name),
+        )
+        assertEquals(
+            CircleDeliveryStatus.FAILED,
+            circleDeliveryOutcome(SendReport(emptyList(), listOf(SendError(name, "checksum mismatch")), "s1"), name),
+        )
+        assertEquals(
+            CircleDeliveryStatus.REFUSED,
+            circleDeliveryOutcome(SendReport(emptyList(), emptyList(), null), name),
+        )
+        assertEquals(CircleDeliveryStatus.PENDING, circleDeliveryOutcome(null, name))
     }
 }

@@ -4,14 +4,17 @@ import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -63,14 +66,34 @@ class FlitCircleSyncTest {
     }
 
     @Test
-    fun `file event references only a manifest - never bytes`() {
-        val b = obj(circleFileBody("notes.gflit", 4096L, "abc123", "resume-token"))
+    fun `file event references only name size and sha256 - never bytes token or local path`() {
+        val b = obj(circleFileBody("notes.gflit", 4096L, "abc123"))
         assertEquals("notes.gflit", b.getValue("name").jsonPrimitive.content)
         assertEquals(4096L, b.getValue("size").jsonPrimitive.content.toLong())
         assertEquals("abc123", b.getValue("sha256").jsonPrimitive.content)
-        assertEquals("resume-token", b.getValue("token").jsonPrimitive.content)
-        assertEquals(setOf("name", "size", "sha256", "token"), b.keys)
+        assertEquals(setOf("name", "size", "sha256"), b.keys)
+        assertFalse(b.containsKey("token"), "no spool token on the wire")
+        assertFalse(b.keys.any { it.contains("path", ignoreCase = true) }, "no local path on the wire")
         assertFalse(b.keys.any { it.contains("data", ignoreCase = true) || it.contains("bytes", ignoreCase = true) })
+    }
+
+    @Test
+    fun `file body gate accepts only name size sha256 and refuses any token or path field`() {
+        assertTrue(circleBodyValid(CircleEvent.FILE, circleFileBody("a.gflit", 12L, "sha")))
+        assertFalse(
+            circleBodyValid(CircleEvent.FILE, """{"name":"a.gflit","size":12,"sha256":"sha","token":"spool"}"""),
+            "the local resume token must never be minted into a signed file event",
+        )
+        assertFalse(
+            circleBodyValid(CircleEvent.FILE, """{"name":"a.gflit","size":12,"sha256":"sha","path":"/cache/circle/a"}"""),
+        )
+        assertFalse(
+            circleBodyValid(CircleEvent.FILE, """{"name":"a.gflit","size":12,"sha256":"sha","spoolPath":"/cache/circle/a"}"""),
+        )
+        assertFalse(
+            circleBodyValid(CircleEvent.FILE, """{"name":"a.gflit","size":12,"token":"spool"}"""),
+            "a missing sha256 is not a reference",
+        )
     }
 
     @Test
@@ -138,7 +161,7 @@ class FlitCircleSyncTest {
     @Test
     fun `outbound bodies we mint all pass the strict gate`() {
         assertTrue(circleBodyValid(CircleEvent.MESSAGE, """{"text":"hello"}"""))
-        assertTrue(circleBodyValid(CircleEvent.FILE, circleFileBody("a.gflit", 12L, "sha", "tok")))
+        assertTrue(circleBodyValid(CircleEvent.FILE, circleFileBody("a.gflit", 12L, "sha")))
         assertTrue(circleBodyValid(CircleEvent.POLL, circlePollBody("p", "q", listOf("a", "b"))))
         assertTrue(circleBodyValid(CircleEvent.VOTE, circleVoteBody("p", 1)))
         assertTrue(circleBodyValid(CircleEvent.VOTE, circleKickVoteBody("k", "AABB", false)))
@@ -157,6 +180,8 @@ class FlitCircleSyncTest {
         assertFalse(circleBodyValid(CircleEvent.MESSAGE, """["text"]"""))
         assertFalse(circleBodyValid(CircleEvent.MESSAGE, """{"text":""}"""))
         assertFalse(circleBodyValid(CircleEvent.MESSAGE, "x".repeat(CircleCore.MAX_BODY_CHARS + 1)))
+        assertFalse(circleBodyValid(CircleEvent.FILE, """{"name":"a","size":"oops","sha256":"s"}"""))
+        assertFalse(circleBodyValid(CircleEvent.FILE, """{"name":"a","size":12}"""))
         assertFalse(circleBodyValid(CircleEvent.POLL, """{"pollId":"p","question":"q","options":[]}"""))
         assertFalse(circleBodyValid(CircleEvent.VOTE, """{"pollId":"p"}"""))
         assertFalse(circleBodyValid(CircleEvent.KICK, """{"kickId":"k"}"""))
@@ -240,6 +265,63 @@ class FlitCircleSyncTest {
         fp: String,
         sync: suspend (CircleRequest) -> CircleResponse = { CircleResponse(true) },
     ) = FlitCircleSync.Route(fp, sync = sync, join = { CircleResponse(false, reason = "unused") })
+
+    @Test
+    fun `rejoin keeps existing delivery rows and replaces only host-owned fields`() = runBlocking {
+        val delivery = CircleDelivery(
+            id = "d-1",
+            name = "notes.gflit",
+            size = 12L,
+            sha256 = "sha-rejoin",
+            spoolPath = "/cache/circle/notes.gflit", // local-only, never on the wire
+            statuses = mapOf("AABB" to CircleDelivery.SENT),
+            createdMs = 5L,
+        )
+        val prior = state("ME", "HOSTFP").copy(
+            keyB64 = "old-key",
+            events = listOf(event("old-event")),
+            deliveries = mapOf(delivery.sha256 to delivery),
+        )
+        var persisted: CircleState? = null
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { prior }
+        FlitCircleSync.meHook = { "ME" }
+        FlitCircleSync.dialHook = { fp ->
+            FlitCircleSync.Route(
+                peer = fp,
+                sync = { CircleResponse(false, reason = "unused") },
+                join = { req ->
+                    assertEquals("c1", req.circleId)
+                    assertEquals("ME", req.memberFp)
+                    // No seed events: verification of fabricated signatures is
+                    // not what this test is about; the local rows are.
+                    CircleResponse(true, key = "new-key", members = listOf("hostfp", "ME"))
+                },
+            )
+        }
+        FlitCircleSync.joinPersistHook = { persisted = it }
+        try {
+            FlitCircleSync.join(QrAdd(fingerprint = "hostfp", circle = "c1", invite = "invite"))
+
+            val joined = assertNotNull(persisted, "join must persist a joined state")
+            assertEquals(
+                mapOf(delivery.sha256 to delivery),
+                joined.deliveries,
+                "rejoining must not wipe locally recorded delivery rows",
+            )
+            assertEquals("new-key", joined.keyB64, "host key replaces the stale local one")
+            assertEquals("ME", joined.selfFp, "selfFp tracks this device exactly")
+            assertEquals(emptyList(), joined.events, "stale local log is not carried over")
+            assertEquals(
+                setOf("HOSTFP", "ME"),
+                joined.members.map { it.fp }.toSet(),
+                "host roster is authoritative",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
 
     @Test
     fun `fanout posts one delta per non-self peer and always logs evidence`() = runBlocking {
@@ -340,5 +422,260 @@ class FlitCircleSyncTest {
             FlitCircleSync.resetForTest()
         }
         Unit
+    }
+
+    // ==== watermarked delta fan-out and bounded repair =========================
+
+    @Test
+    fun `delta selection offers only events after the acked watermark`() {
+        val log = listOf(event("e1", 1L), event("e2", 2L), event("e3", 3L))
+        assertEquals(log, circleDelta(log, null), "a new peer gets the whole bounded log")
+        assertEquals(
+            listOf(log[1], log[2]),
+            circleDelta(log, CircleWatermark(1L, "e1")),
+        )
+        assertEquals(listOf(log[2]), circleDelta(log, CircleWatermark(2L, "e2")))
+        assertTrue(circleDelta(log, CircleWatermark(3L, "e3")).isEmpty())
+        assertEquals(
+            listOf(log[2]),
+            circleDelta(log, CircleWatermark(2L, "e2"), limit = 1),
+            "the delta is capped too",
+        )
+        assertEquals(
+            log.takeLast(2),
+            circleDelta(log, CircleWatermark(0L, "trimmed-away"), limit = 2),
+            "an ack whose event left the bounded log falls back to a full repair",
+        )
+        assertEquals(CircleWatermark(3L, "e3"), circleAckOf(log))
+        assertNull(circleAckOf(emptyList()))
+    }
+
+    @Test
+    fun `fanout advances a per-peer watermark and sends only the delta on the next post`() = runBlocking {
+        val e1 = event("e1", 1L)
+        val e2 = event("e2", 2L)
+        val st = state("ME", "AABB", "CCDD").copy(events = listOf(e1))
+        val sentByPeer = mutableMapOf<String, MutableList<CircleRequest>>()
+        installSeam(st, dial = { fp ->
+            route(fp) { req ->
+                sentByPeer.getOrPut(fp) { mutableListOf() } += req
+                CircleResponse(true)
+            }
+        })
+        try {
+            FlitCircleSync.fanout(st, listOf(e1))
+            val next = st.copy(events = listOf(e1, e2))
+            FlitCircleSync.stateHook = { next }
+            FlitCircleSync.fanout(next, listOf(e2))
+
+            listOf("AABB", "CCDD").forEach { fp ->
+                assertEquals(
+                    listOf(listOf(e1), listOf(e2)),
+                    sentByPeer.getValue(fp).map { it.events },
+                    "$fp must see a full log once, then only the new event",
+                )
+            }
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `a refused delta does not advance the watermark and is offered again`() = runBlocking {
+        var clock = 1_000L
+        val e1 = event("e1", 1L)
+        val e2 = event("e2", 2L)
+        val st = state("ME", "AABB").copy(events = listOf(e1))
+        val sent = mutableListOf<CircleRequest>()
+        var refuseOnce = true
+        installSeam(st, now = { clock }, dial = { fp ->
+            route(fp) { req ->
+                sent += req
+                if (refuseOnce) {
+                    refuseOnce = false
+                    CircleResponse(false, reason = "offline")
+                } else CircleResponse(true)
+            }
+        })
+        try {
+            FlitCircleSync.fanout(st, listOf(e1))
+            val next = st.copy(events = listOf(e1, e2))
+            FlitCircleSync.stateHook = { next }
+            clock = 11_000L // backoff from the refusal has expired
+            FlitCircleSync.fanout(next, listOf(e2))
+
+            assertEquals(
+                listOf(listOf(e1), listOf(e1, e2)),
+                sent.map { it.events },
+                "a peer that did not ack must get the whole unacked log again",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `calm sync re-offers the full log after a delta ack and resets the watermark`() = runBlocking {
+        val e1 = event("e1", 1L)
+        val e2 = event("e2", 2L)
+        val e3 = event("e3", 3L)
+        val st = state("ME", "AABB").copy(events = listOf(e1, e2))
+        val sent = mutableListOf<CircleRequest>()
+        installSeam(st, dial = { fp ->
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        try {
+            FlitCircleSync.fanout(st, listOf(e2))
+            val withThird = st.copy(events = listOf(e1, e2, e3))
+            FlitCircleSync.stateHook = { withThird }
+            FlitCircleSync.fanout(withThird, listOf(e3))
+            assertEquals(listOf(listOf(e1, e2), listOf(e3)), sent.map { it.events })
+
+            sent.clear()
+            FlitCircleSync.sync()
+            assertEquals(
+                listOf(listOf(e1, e2, e3)),
+                sent.map { it.events },
+                "the calm tick repairs with the full log even though the watermark is current",
+            )
+
+            val e4 = event("e4", 4L)
+            FlitCircleSync.stateHook = { withThird.copy(events = listOf(e1, e2, e3, e4)) }
+            sent.clear()
+            FlitCircleSync.fanout(withThird.copy(events = listOf(e1, e2, e3, e4)), listOf(e4))
+            assertEquals(
+                listOf(listOf(e4)),
+                sent.map { it.events },
+                "after the repair the next post is delta-only again",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `repair pass caps the offered log at the store event cap`() = runBlocking {
+        val many = (1..FlitCircleStore.EVENT_CAP + 5).map { event("e$it", it.toLong()) }
+        assertEquals(
+            FlitCircleStore.EVENT_CAP,
+            circleRepairBatch(many).size,
+        )
+        val sent = mutableListOf<CircleRequest>()
+        installSeam(state("ME", "AABB").copy(events = many), dial = { fp ->
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        try {
+            FlitCircleSync.sync()
+            assertEquals(1, sent.size)
+            assertEquals(
+                many.takeLast(FlitCircleStore.EVENT_CAP),
+                sent.first().events,
+                "a hand-edited oversized state must not put more than the bounded log on the wire",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `sync skips backed-off peers and repairs them on a later tick`() = runBlocking {
+        var clock = 1_000L
+        val logs = mutableListOf<String>()
+        val st = state("ME", "AABB", "CCDD").copy(events = listOf(event()))
+        val dialed = mutableListOf<String>()
+        var aabbRefusals = 0
+        installSeam(st, now = { clock }, logs = logs, dial = { fp ->
+            dialed += fp
+            route(fp) {
+                if (fp == "AABB" && aabbRefusals < 3) {
+                    aabbRefusals++
+                    CircleResponse(false, reason = "offline")
+                } else CircleResponse(true)
+            }
+        })
+        try {
+            // Escalate AABB to a 40 s backoff (three failures, last at t=31s).
+            listOf(1_000L, 11_000L, 31_000L).forEach { at ->
+                clock = at
+                dialed.clear()
+                FlitCircleSync.fanout(st, listOf(event()))
+                assertTrue("AABB" in dialed, "AABB should be tried at $at")
+            }
+            assertEquals(3, aabbRefusals)
+
+            clock = 32_000L
+            dialed.clear()
+            FlitCircleSync.sync()
+            assertEquals(listOf("CCDD"), dialed, "backed-off peer must not be dialled on the tick")
+            assertTrue(
+                logs.any { it.startsWith("circle sync:") && it.contains("backed off") },
+                logs.toString(),
+            )
+
+            clock = 62_000L
+            dialed.clear()
+            FlitCircleSync.sync()
+            assertEquals(listOf("CCDD"), dialed, "still inside the backoff at the next tick")
+
+            clock = 92_000L
+            dialed.clear()
+            FlitCircleSync.sync()
+            assertEquals(listOf("AABB", "CCDD"), dialed, "repair resumes once the backoff expires")
+            assertEquals(3, aabbRefusals, "the resumed repair was answered")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    private fun concurrencyProbe(
+        peerCount: Int,
+        action: suspend () -> Unit,
+    ): Pair<Int, Int> {
+        val active = AtomicInteger(0)
+        val peak = AtomicInteger(0)
+        val st = state("ME", *((1..peerCount).map { "P$it" }).toTypedArray())
+            .copy(events = listOf(event()))
+        installSeam(st, dial = { fp ->
+            val seen = active.incrementAndGet()
+            peak.updateAndGet { maxOf(it, seen) }
+            delay(40L)
+            active.decrementAndGet()
+            route(fp)
+        })
+        return runBlocking {
+            try {
+                action()
+            } finally {
+                FlitCircleSync.resetForTest()
+            }
+            peak.get() to active.get()
+        }
+    }
+
+    @Test
+    fun `fanout caps concurrent peer dials at four`() {
+        val (peak, stillActive) = concurrencyProbe(10) {
+            val st = state("ME", *((1..10).map { "P$it" }).toTypedArray())
+                .copy(events = listOf(event()))
+            FlitCircleSync.fanout(st, listOf(event()))
+        }
+        assertEquals(0, stillActive, "every permit must be released")
+        assertTrue(peak <= CIRCLE_PEER_DIALS, "peak $peak exceeded the dial cap")
+        assertEquals(CIRCLE_PEER_DIALS, peak, "the cap must actually admit four peers")
+    }
+
+    @Test
+    fun `sync caps concurrent peer dials at four`() {
+        val (peak, stillActive) = concurrencyProbe(10) {
+            FlitCircleSync.sync()
+        }
+        assertEquals(0, stillActive, "every permit must be released")
+        assertTrue(peak <= CIRCLE_PEER_DIALS, "peak $peak exceeded the dial cap")
+        assertEquals(CIRCLE_PEER_DIALS, peak, "the repair tick must also stay bounded")
     }
 }

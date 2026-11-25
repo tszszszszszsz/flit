@@ -2,19 +2,22 @@
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
 
-# Phase B — Bluetooth as an invisible transport
+# Phase B — Bluetooth as a fallback transport
 
 Brief (user, 2026-10-27): "make it simplest and most complex at the same time."
 
-That is the contract: **the UI never learns Bluetooth exists; the engine never forgets.**
-No settings, no toggle, no new vocabulary anywhere in the strings. If a Wi-Fi access
-point exists between two devices, Flit behaves exactly as it does today. When it can't
-exist (mobile data only, hotspot dead, airplane mode with radio toggled), a peer simply
-shows up in the same list and files stream the same way — slower, honestly labeled by
-the existing speed readout, never explained by the app.
+The **original contract** was **the UI never learns Bluetooth exists; the engine never
+forgets** — no settings, no toggle, no new vocabulary. That contract was **deliberately
+superseded on 2026-11-24** by an explicit opt-in **Transfer over Bluetooth** option (off
+by default); see the dated correction in `RELEASE_NOTES.md`. Outside that one option the
+surfaces are still unchanged: if a Wi-Fi access point exists between two devices, Flit
+behaves exactly as it does today. When it can't exist (mobile data only, hotspot dead,
+airplane mode with radio toggled), a peer simply shows up in the same list and files
+stream the same way — slower, honestly labeled by the existing speed readout.
 
-The depth is spent entirely underneath to buy that silence. Everything below is engine
-truth; none of it is surface.
+The depth is spent underneath. Most of it is engine truth, not surface — but the engine
+*does* have explicit carrier branches (see "Transport arbitration" below); only the
+protocol wire itself is transport-blind.
 
 ## The one suspension of disbelief
 
@@ -23,37 +26,54 @@ flit `/partial` resume extension) is HTTP/1.1 over TLS, spoken by a hand-rolled 
 (`PeerHttpClient` — raw `Socket`, one exchange per connection, fingerprint-pinned, no
 hostname verification by design) and served by Ktor/Netty over TCP.
 
-Bluetooth offers a reliable byte stream (RFCOMM, or LE L2CAP CoC). TLS runs fine on any
-reliable stream. Therefore: **the same protocol semantics ride an unchanged brain over
-a second pipe.** No protocol fork, no v3, no transport-aware code paths beyond the two
-binders described below. Resume tokens (`/partial`, ChunkTracker) work identically —
-a mid-transfer drop reconnects and continues, transport-independent.
+Bluetooth offers a reliable byte stream (RFCOMM — the built carrier; there is no LE L2CAP
+CoC path in the code). TLS runs fine on any reliable stream. Therefore: **the same
+protocol semantics ride an unchanged wire brain over a second pipe.** No protocol fork
+and no v3: the client (`Link`/`LinkProvider`) and server (`LinkServer`) seams are shared.
+That claim is about the *protocol*, not the whole app — the engine has explicit carrier
+branches (TCP, relay, Bluetooth; see "Transport arbitration" below). Resume tokens
+(`/partial`, ChunkTracker) behave the same **within one carrier**, not across carriers:
+the kept prefix is bound to the requester's origin (an IP over Wi-Fi, a MAC over
+Bluetooth), and `ServerCore.partsBase` refuses a part whose `senderIp` differs from that
+origin, so a Wi-Fi↔Bluetooth switch takes a clean full resend. A **receiver restart**
+is the remaining exception to "drop reconnects and continues": the in-memory session
+is gone, and resume works only because the `.token` / `.pieces` sidecars are swept
+back into the parts registry at start (`repopulateParts`), which re-binds the kept
+prefix to the new requester's origin.
 
 ## Surface contract (hard rules)
 
-1. **Zero new strings on the happy path.** The roster row, transfer strip, snackbars:
-   unchanged. If the engine ever must explain itself, it borrows the existing voice
-   ("no Wi‑Fi between us — trying the direct way"), never the word Bluetooth.
-2. **Zero new settings — deliberately revised 2026-11-24.** The original contract had
-   no Bluetooth setting at all; the user explicitly asked for an option to transfer
-   over Bluetooth, so Options now carries **Transfer over Bluetooth** (off by
-   default, inert when left off). The rest of the rule holds: power-on stays a
-   contextual system ask, once per device, in the system's own voice. Turning the
-   option on opens an RFCOMM listener (connectable BLE advertising) and lets the
-   hunter dial a peer's Bluetooth address. A permission or radio-power consent
-   answered after the toggle rebinds the carrier once, so a late grant still
-   brings the listener up. Wi-Fi still wins whenever it answers: Bluetooth is a
-   fallback carrier, not a faster one.
-3. **Permissions are contextual too.** BLUETOOTH_SCAN + BLUETOOTH_CONNECT (API 31+;
-   the Redmi test device is API 36, dynamic color stock, so this is the primary path)
-   are requested at the precise moment a no-AP transfer needs them, with a one-line
-   honest explanation. Never on app launch, never bundled with other permissions.
+1. **Zero new strings on the happy path — with a short exception list.** The roster
+   row, transfer strip and snackbars are unchanged. If the engine ever must explain
+   itself it borrows the existing voice ("no Wi‑Fi between us — trying the direct way"),
+   never the word Bluetooth. The exceptions are (a) the opt-in **Transfer over Bluetooth**
+   row in Options, (b) the per-device route-policy labels **Auto / Wi‑Fi / Bluetooth /
+   Relay** in Known devices, and (c) the honest carrier log lines described below. None
+   of them renames a roster row or a transfer strip.
+2. **Original "zero new settings" contract — deliberately revised 2026-11-24.** The
+   original contract had no Bluetooth setting at all; the user explicitly asked for an
+   option to transfer over Bluetooth, so Options now carries **Transfer over Bluetooth**
+   (off by default, inert when left off). The rest of the rule holds: power-on stays a
+   contextual system ask, once per device, in the system's own voice. Turning the option
+   on opens an RFCOMM listener and lets the hunter dial a peer's Bluetooth address;
+   **advertising is connectable only while that carrier is on** (`connectable =
+   btClient != null` in the engine) — discovery-only advertising stays non-connectable.
+   A permission or radio-power consent answered after the toggle rebinds the carrier
+   once, so a late grant still brings the listener up. Wi-Fi still wins whenever it
+   answers: Bluetooth is a fallback carrier, not a faster one.
+3. **Permissions are contextual too.** BLUETOOTH_ADVERTISE + BLUETOOTH_SCAN +
+   BLUETOOTH_CONNECT (API 31+; the Redmi test device is API 36, dynamic color stock, so
+   this is the primary path) are all three asked together as the system's
+   Nearby-devices sheet at the precise moment a no-AP transfer needs them, with a
+   one-line honest explanation. Never on app launch, and never bundled with unrelated
+   permissions (the three radio permissions are one OS-defined group).
 4. **The roster stays one list.** A dual-transport peer is one row. "2 online" counts
    peers, not transports (this is also where the pre-existing loopback self-peer bug
    gets fixed — B3's natural test case).
 5. **Trust semantics unchanged.** Fingerprints pin over BLE discovery exactly as they
    pin over mDNS today; QR codes already carry them; the trust toggle, destination
-   trees and only-trusted gate apply to both transports verbatim.
+   trees and only-trusted gate apply to both transports verbatim. Trust is this QR /
+   `TlsIdentity` fingerprint pinning — **not** OS bond state; see "First-contact cost".
 
 ## Engine architecture
 
@@ -82,20 +102,31 @@ duplex stream in server/client-mode TLS with our same TlsIdentity). Framework co
 in crypto terms: ~150 lines, well-trodden, unit-testable against an in-memory pipe.
 
 **2. Discovery = BLE advertise + scan.** Own clean-room service UUID flips on only
-with the engine. Advertisement carries the same identity fields the UDP announce
-carries (alias, model, fingerprint) in the manufacturer-data payload. Scan builds
-roster entries attributed `source: ble`. Dormancy rule: while a direct AP is up,
-the radio stays dark — Wi-Fi discovery owns the list. The arbiter flips to BLE only
-when the AP criterion fails; flipping back is automatic.
+with the engine. The announce rides **service data** under that 128-bit UUID (via
+`addServiceData`, not manufacturer data) and carries a binary fingerprint plus alias
+on extended advertising; the legacy record carries only an 8-byte fingerprint prefix
+and no alias. There is **no model field** in the BLE payload (the UDP announce has one;
+the radio does not). Scan builds roster entries attributed `source: ble`. Dormancy
+rule: while a direct AP is up, the radio stays dark — Wi-Fi discovery owns the list.
+The arbiter flips to BLE only when the AP criterion fails; flipping back is automatic.
 
-**3. Transport arbitration.** Rank: Wi-Fi (any sane AP) → Bluetooth. A transport is
-pinned per transfer; if BT drops, resume over whichever transport rises (the resume
-token is peer+file-keyed, not transport-keyed — already true). No user choice, ever.
+**3. Transport arbitration.** Rank: Wi-Fi (any sane AP) → Bluetooth, with the opt-in
+relay as a last resort. The engine has explicit carrier branches here: it builds a TCP
+client, a `RelayLinkProvider` client and a `FlitBluetooth.LinkProvider` client and the
+hunter carries a route `kind` (TCP/Bluetooth) so a MAC is never dialed as an IP. Each
+dial is pinned to the carrier that chose it. A mid-transfer drop **resumes only on the
+same origin**: Wi-Fi parts key on the peer's IP, Bluetooth parts on its MAC, and
+`ServerCore.partsBase` refuses a part whose `senderIp` differs from the requester's
+origin. A Wi-Fi↔Bluetooth switch therefore takes a clean full resend, not a
+cross-carrier continuation. Carrier enablement is opt-in; there is no per-transfer
+manual carrier switch.
 
-**4. First-contact cost (recorded honestly).** The OS inserts itself once per peer:
-incoming RFCOMM from an unpaired device raises the system pairing consent sheet. Flit
-maps that moment onto its existing roster-trust flow (accept once → trusted → roster
-remembers). This is one dialog per new device, once — it can't be removed, only placed.
+**4. First-contact cost (recorded honestly).** The OS may insert itself: incoming RFCOMM
+from an unpaired device can raise the system's own pairing/bond consent sheet. **Flit has
+no bond-state listener** — accepting that system dialog does *not* pin a peer in Flit's
+roster. Trust is always QR-invite fingerprint pinning (`TlsIdentity`), exactly as over
+Wi-Fi; the OS dialog is a platform step around the carrier, not a Flit trust decision.
+Flit cannot remove the sheet, only trigger it.
 
 **5. The rescue sweep (milestone 1).** A multicast-blocked access point (hotel Wi-Fi,
 corporate VLANs, some routers) swallows discovery announces while both machines sit on
@@ -124,10 +155,27 @@ remaining visible to multicast and manual address.
 
 ## Verification reality (one Android test device)
 
-- `PeerHttpClient`'s socket construction and the RFCOMM binder both sit behind a
-  `ConnectionProvider` seam, injectable — the entire protocol-parity suite runs the
-  **same tests over an in-memory duplex pipe through the real hand-HTTP + TLS shim
-  stack** (that's the "most complex" made testable without a radio).
+**As-built RFCOMM listener, retries and honest logs.** The accept loop acquires a
+listener only while `BLUETOOTH_CONNECT` is granted and the radio is on; while either
+is missing it logs `bluetooth link waiting — permission or radio off — retry in Ns`
+and retries on a calm 2 → 4 → 8 … → 60 s backoff, so a consent answered *after* the
+option was enabled still brings the listener up. A `listen()` failure is logged as
+`bluetooth link listen failed: … — retry in Ns` and retried likewise.
+`bluetooth link: listening` is written **only after** a socket was actually
+published, and `bluetooth link: stopped listening` only when that publication
+ends. A transient `accept()` failure closes that listener and re-listens behind
+the same backoff (`bluetooth link accept failed: … — retry in Ns`); cancellation
+is the only real stop. Each accepted socket is TLS-wrapped with a timeout and fed
+to `LinkServer`; socket and handshake failures get their own honest
+`bluetooth link socket:` / `bluetooth link TLS handshake …` lines rather than a
+success claim. All of this is JVM-testable policy, but a real two-phone RFCOMM
+handshake has no hardware here (see the walkthrough record).
+
+- `PeerHttpClient`'s socket construction and the Bluetooth link both sit behind the
+  `Link`/`LinkProvider` seam (the server side feeds `LinkServer`), injectable — the
+  entire protocol-parity suite runs the **same tests over an in-memory duplex pipe
+  through the real hand-HTTP + TLS shim stack** (that's the "most complex" made
+  testable without a radio).
 - Harness `bt-sim` (B4, shipped): both ends of a run in one process — the receiver
   is the same `ServerCore` the TCP binder feeds, spoken to through the same
   `LinkServer` the RFCOMM binder rides, wrapped in the same `TlsLink`; the sender is
@@ -223,7 +271,7 @@ remaining visible to multicast and manual address.
   carrier is on. A new **Transfer over Bluetooth** option (off by default)
   binds it; the hunter carries a route `kind` (TCP/Bluetooth) so a MAC never
   gets dialed as an IP. On-device smoke: toggling the option restarted the
-  engine and logged `bluetooth link: listening for direct transfers` with no
+  engine and logged `bluetooth link: listening` with no
   crash. **Not verified:** a real phone-to-phone RFCOMM transfer — there is no
   second phone, and the bench box has no Bluetooth adapter (`bluetoothctl
   list` is empty), so the real socket path cannot be exercised here. Listed,

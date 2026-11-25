@@ -8,10 +8,11 @@ import kotlinx.serialization.Serializable
  * device: it is delivered to the app delegate, which decides what (if
  * anything) a human sees.
  *
- * [sig] is Base64 of a signature over [PanicAlert]'s immutable core fields
- * (id, senderFp, sentMs, text) — see `PanicCore.canonical`. [hops] is
- * deliberately outside the signed bytes so a relay can increment it without
- * breaking the original sender's signature.
+ * [sig] is Base64 of a signature over every immutable field — id, senderFp,
+ * sentMs, text AND [hops] — see `PanicCore.canonical`. Because hops is signed,
+ * a relay that increments it changes the signed bytes and MUST re-sign with
+ * its own identity (`PanicCore.forward`); a bumped count with the original
+ * signature fails verification.
  */
 @Serializable
 data class PanicAlert(
@@ -21,4 +22,6 @@ data class PanicAlert(
     val text: String,
     val hops: Int = 0,
     val sig: String = "",
+    /** Original author, preserved across re-signed forwards for trust gating. */
+    val originFp: String = "",
 )

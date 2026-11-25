@@ -45,7 +45,20 @@ data class SendTarget(
 
 data class SendError(val fileName: String, val reason: String)
 
-data class SendReport(val sent: List<String>, val failed: List<SendError>, val sessionId: String?)
+/**
+ * [sent] landed, [failed] were refused by the receiver's digest gate, and
+ * [sessionId] is null only when no session was ever armed. [declined] is the
+ * additive, honest marker for a deliberate prepare-level refusal: the peer
+ * SPOKE "no" with `X-Flit-Refusal: declined`, so the batch's story is over
+ * even though nothing was sent. It defaults to false, so every existing
+ * caller and report shape is unchanged.
+ */
+data class SendReport(
+    val sent: List<String>,
+    val failed: List<SendError>,
+    val sessionId: String?,
+    val declined: Boolean = false,
+)
 
 /**
  * The carrier died and there is no receiver answer to speak of — connect
@@ -218,6 +231,9 @@ class ProtocolClient(
     ): SendReport {
         check(files.isNotEmpty()) { "no files given" }
 
+        // A peer may also decline a mid-transfer re-prepare (resume retry).
+        // Remember it so the final report is honest about a concluded refusal.
+        val sawDecline = java.util.concurrent.atomic.AtomicBoolean(false)
         val infos: HashMap<String, FileInfo> = HashMap()
         val outgoingById: HashMap<String, OutgoingFile> = HashMap()
         val prepareHashMap: LinkedHashMap<String, FileInfo> = LinkedHashMap()
@@ -242,7 +258,7 @@ class ProtocolClient(
                 preparePath,
                 WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareHashMap)),
                 timeoutMs = ACCEPT_TIMEOUT_MS, // receivers may wait for a human to accept
-                extraHeaders = if (multi) mapOf(MULTI_HEADER to "1") else emptyMap(),
+                extraHeaders = prepareHeaders(multi),
             )
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -254,6 +270,20 @@ class ProtocolClient(
         }
         if (prepare.status == 204) {
             return SendReport(emptyList(), emptyList(), null)
+        }
+        if (prepare.status == 403 &&
+            prepare.headers[Protocol.HEADER_FLIT_REFUSAL.lowercase()] == Protocol.REFUSAL_DECLINED
+        ) {
+            // A deliberate prepare-level refusal is an answer from a live peer:
+            // conclude the batch with a report. An unmarked 403 (a v2.2 peer),
+            // a 409 or a 5xx stays a TransferException — transient, retriable.
+            val reason = prepare.text().ifBlank { Protocol.REFUSAL_DECLINED }
+            return SendReport(
+                emptyList(),
+                files.map { SendError(it.wireName, reason) },
+                null,
+                declined = true,
+            )
         }
         if (prepare.status != 200) {
             throw TransferException(prepare.status, prepare.text())
@@ -309,7 +339,14 @@ class ProtocolClient(
                                     Protocol.PATH_PREPARE_UPLOAD + (pin?.let { "?pin=" + enc(it) } ?: ""),
                                     WireJson.encode(PrepareUploadRequest(self.sansAnnounce(), prepareMap1)),
                                     ACCEPT_TIMEOUT_MS,
+                                    extraHeaders = prepareHeaders(false),
                                 )
+                                if (resp.status == 403 &&
+                                    resp.headers[Protocol.HEADER_FLIT_REFUSAL.lowercase()] == Protocol.REFUSAL_DECLINED
+                                ) {
+                                    sawDecline.set(true)
+                                    return@uploadAttempts null
+                                }
                                 if (resp.status != 200) return@uploadAttempts null
                                 val p = json<PrepareUploadResponse>(resp)
                                 val t = p.files[fileId] ?: return@uploadAttempts null
@@ -341,7 +378,7 @@ class ProtocolClient(
         val failed = results.filter { it.second != null }.map { (fileId, reason) ->
             SendError(infos[fileId]?.fileName ?: fileId, reason ?: "error")
         }
-        return SendReport(sent, failed, prepared.sessionId)
+        return SendReport(sent, failed, prepared.sessionId, declined = sawDecline.get())
     }
 
     private suspend fun uploadAttempts(
@@ -653,6 +690,16 @@ class ProtocolClient(
 
         /** Marks a prepare-upload as multi-socket capable (Flit↔Flit only). */
         internal const val MULTI_HEADER = "X-Flit-Multi"
+
+        /**
+         * Prepare headers: the Flit client marker is always sent (so the
+         * receiver may answer a refusal honestly); the multi marker is only
+         * sent when the caller asked for turbo.
+         */
+        internal fun prepareHeaders(multi: Boolean): Map<String, String> = buildMap {
+            if (multi) put(MULTI_HEADER, "1")
+            put(Protocol.HEADER_FLIT_CLIENT, Protocol.FLIT_CLIENT_VALUE)
+        }
 
         /** Hex SHA-256 of a freshly opened stream; used as the upload checksum. */
         fun sha256Hex(open: () -> InputStream): String {

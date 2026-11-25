@@ -23,7 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -74,6 +74,7 @@ import java.util.Date
 import java.util.Locale
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
@@ -90,6 +91,8 @@ import kotlinx.serialization.json.JsonPrimitive
  * The feed has three honest presentation states: pending (no circle state
  * yet), empty (no events yet), and the populated list. Unrecognized event
  * bodies degrade to an in-band error card rather than leaking raw JSON.
+ * File cards report delivery counts from the device's local record only; a
+ * file event with no local record says so instead of pretending bytes landed.
  */
 
 @Composable
@@ -100,6 +103,7 @@ fun CircleScreen(
     meFp: String,
     onPost: (String) -> Unit,
     onFile: () -> Unit,
+    onOpenFile: (String) -> Unit, // sha256 from the file event body
     onPoll: (String, List<String>) -> Unit,
     onVote: (String, Int) -> Unit,
     onStartKick: (String) -> Unit,
@@ -125,6 +129,17 @@ fun CircleScreen(
         else if (state?.role == FlitCircleStore.Role.OWNER) {
             state.members.firstOrNull { it.role == FlitCircleStore.Role.OWNER }?.fp.orEmpty()
         } else ""
+    }
+    // Delivery status is device-local and never gossiped. File cards read the
+    // local record by sha; an announcement without one says so explicitly.
+    val deliveries = state?.deliveries.orEmpty()
+    // Every poll and kick card used to walk the whole log once per member and
+    // re-parse each vote body on the main thread. Do the work once here for the
+    // whole screen: one JSON parse per event body, then derive every tally from
+    // that memoized array. Remembered keys use value equality, so a refresh
+    // that republishes an unchanged log does not redo any of this.
+    val feedData = remember(events, members, selfFp) {
+        computeFeedData(events, members, selfFp)
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -230,17 +245,19 @@ fun CircleScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(events, key = { it.id }) { event ->
+                itemsIndexed(events, key = { _, event -> event.id }) { index, event ->
                     FeedRow(
                         event = event,
+                        body = feedData.parsed[index].body,
                         mine = event.authorFp == selfFp && selfFp.isNotBlank(),
                         author = members.firstOrNull { it.fp == event.authorFp }?.alias
                             ?: event.authorFp.take(8),
-                        events = events,
                         members = members,
-                        meFp = selfFp,
+                        tallies = feedData.tallies,
+                        deliveries = deliveries,
                         onVote = onVote,
                         onVoteKick = onVoteKick,
+                        onOpenFile = onOpenFile,
                     )
                 }
             }
@@ -418,17 +435,18 @@ private fun EmptyFeed(modifier: Modifier = Modifier) {
 @Composable
 private fun FeedRow(
     event: CircleEvent,
+    body: CircleBody,
     mine: Boolean,
     author: String,
-    events: List<CircleEvent>,
     members: List<FlitCircleStore.Member>,
-    meFp: String,
+    tallies: CircleTallies,
+    deliveries: Map<String, FlitCircleStore.CircleDelivery>,
     onVote: (String, Int) -> Unit,
     onVoteKick: (String, Boolean) -> Unit,
+    onOpenFile: (String) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
-    val body = remember(event.id, event.body, event.type) { parseBody(event) }
     Box(
         modifier = Modifier.fillMaxWidth(),
         contentAlignment = if (mine) Alignment.CenterEnd else Alignment.CenterStart,
@@ -445,21 +463,25 @@ private fun FeedRow(
             )
             when (body.kind) {
                 CircleCard.MESSAGE -> MessageCard(body.text)
-                CircleCard.FILE -> FileCard(body.name, body.size)
+                CircleCard.FILE -> FileCard(
+                    name = body.name,
+                    size = body.size,
+                    sha256 = body.sha256,
+                    delivery = body.sha256.takeIf { it.isNotBlank() }?.let { deliveries[it] },
+                    onOpenFile = onOpenFile,
+                )
                 CircleCard.POLL -> PollCard(
                     question = body.text,
                     pollId = body.pollId,
                     options = body.options,
-                    events = events,
-                    members = members,
-                    meFp = meFp,
+                    tally = tallies.poll(body.pollId),
                     onVote = onVote,
                 )
                 CircleCard.VOTE -> VoteCard(body)
                 CircleCard.KICK -> KickCard(
                     body = body,
-                    events = events,
                     members = members,
+                    tally = tallies.kick(body.kickId),
                     mine = mine,
                     onVoteKick = onVoteKick,
                 )
@@ -487,9 +509,32 @@ private fun MessageCard(text: String) {
 }
 
 @Composable
-private fun FileCard(name: String, size: Long) {
+private fun FileCard(
+    name: String,
+    size: Long,
+    sha256: String,
+    delivery: FlitCircleStore.CircleDelivery?,
+    onOpenFile: (String) -> Unit,
+) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
+    // Counts come only from this device's delivery record; the announcement
+    // alone never implies that any bytes landed. Unknown states are not
+    // silently folded into a success bucket.
+    val counts = remember(delivery) {
+        val buckets = intArrayOf(0, 0, 0, 0)
+        delivery?.statuses?.values?.forEach { raw ->
+            val index = when (raw.trim().lowercase(Locale.ROOT)) {
+                FlitCircleStore.CircleDelivery.PENDING -> 0
+                FlitCircleStore.CircleDelivery.SENT -> 1
+                FlitCircleStore.CircleDelivery.REFUSED -> 2
+                FlitCircleStore.CircleDelivery.FAILED -> 3
+                else -> -1
+            }
+            if (index >= 0) buckets[index]++
+        }
+        buckets
+    }
     Surface(
         shape = RoundedCornerShape(FlitCorner.large),
         color = cs.surfaceContainerLow,
@@ -510,6 +555,45 @@ private fun FileCard(name: String, size: Long) {
                 style = typ.labelMedium,
                 color = cs.onSurfaceVariant,
             )
+            if (delivery == null) {
+                // Delivery status is local to the sender and never gossiped.
+                // A recipient has no record even when the bytes already landed
+                // in History, so never claim "not delivered" on their behalf.
+                Text(
+                    text = "file drop · open to view if it arrived",
+                    style = typ.labelSmall,
+                    color = cs.onSurfaceVariant,
+                )
+            } else {
+                Text(
+                    text = buildAnnotatedString {
+                        append("local · ")
+                        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(counts[1].toString()) }
+                        append(" sent · ")
+                        append(counts[0].toString())
+                        append(" pending · ")
+                        append(counts[2].toString())
+                        append(" refused · ")
+                        append(counts[3].toString())
+                        append(" failed")
+                    },
+                    style = typ.labelSmall,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 2,
+                )
+            }
+            // The callback resolves sha256 to a landed local copy; when none
+            // exists it reports that honestly. Status text above is the truth.
+            if (sha256.isNotBlank()) {
+                TextButton(
+                    onClick = { onOpenFile(sha256) },
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .semantics { contentDescription = "Open $name" },
+                ) {
+                    Text("Open file", style = typ.labelMedium, fontWeight = FontWeight.Bold)
+                }
+            }
         }
     }
 }
@@ -519,16 +603,15 @@ private fun PollCard(
     question: String,
     pollId: String,
     options: List<String>,
-    events: List<CircleEvent>,
-    members: List<FlitCircleStore.Member>,
-    meFp: String,
+    tally: PollTally,
     onVote: (String, Int) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
-    val tally = remember(events, members, pollId) { pollTally(events, members, pollId) }
-    val myVote = remember(events, pollId, meFp) { latestPollVote(events, pollId, meFp) }
-    val total = remember(tally) { tally.values.sum() }
+    // Counts, my vote and the total were computed once for the whole screen.
+    val counts = tally.counts
+    val myVote = tally.myVote
+    val total = tally.total
     Surface(
         shape = RoundedCornerShape(FlitCorner.large),
         color = cs.surfaceContainerLow,
@@ -561,7 +644,7 @@ private fun PollCard(
                         modifier = Modifier.weight(1f),
                     )
                     Text(
-                        text = (tally[index] ?: 0).toString(),
+                        text = (counts[index] ?: 0).toString(),
                         style = typ.labelLarge.copy(fontWeight = FontWeight.Bold),
                         color = if (myVote == index) cs.primary else cs.onSurfaceVariant,
                     )
@@ -611,15 +694,15 @@ private fun VoteCard(body: CircleBody) {
 @Composable
 private fun KickCard(
     body: CircleBody,
-    events: List<CircleEvent>,
     members: List<FlitCircleStore.Member>,
+    tally: Pair<Int, Int>,
     mine: Boolean,
     onVoteKick: (String, Boolean) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
     val target = members.firstOrNull { it.fp == body.targetFp }
-    val tally = remember(events, members, body.kickId) { kickTally(events, members, body.kickId) }
+    // Computed once for the whole screen; only the target alias is local here.
     val (yes, no) = tally
     Surface(
         shape = RoundedCornerShape(FlitCorner.large),
@@ -858,6 +941,7 @@ private data class CircleBody(
     val text: String = "",
     val name: String = "",
     val size: Long = 0L,
+    val sha256: String = "",
     val pollId: String = "",
     val options: List<String> = emptyList(),
     val kickId: String = "",
@@ -868,13 +952,33 @@ private data class CircleBody(
 
 private val circleJson = Json { ignoreUnknownKeys = true; isLenient = true }
 
-private fun bodyObject(body: String): JsonObject? = runCatching {
-    circleJson.parseToJsonElement(body) as? JsonObject
-}.getOrNull()
+/** One event body parsed exactly once; the object feeds both its card and every tally. */
+private data class ParsedEvent(
+    val event: CircleEvent,
+    val body: CircleBody,
+    val obj: JsonObject?,
+)
 
-private fun bodyString(body: String): String? = runCatching {
-    (circleJson.parseToJsonElement(body) as? JsonPrimitive)?.content
-}.getOrNull()
+private data class PollTally(
+    val counts: Map<Int, Int>,
+    val myVote: Int?,
+    val total: Int,
+)
+
+private data class CircleTallies(
+    val polls: Map<String, PollTally>,
+    val kicks: Map<String, Pair<Int, Int>>,
+) {
+    fun poll(pollId: String): PollTally = polls[pollId] ?: EmptyPollTally
+    fun kick(kickId: String): Pair<Int, Int> = kicks[kickId] ?: (0 to 0)
+}
+
+private val EmptyPollTally = PollTally(emptyMap(), null, 0)
+
+private data class CircleFeedData(
+    val parsed: Array<ParsedEvent>,
+    val tallies: CircleTallies,
+)
 
 private fun JsonObject.text(key: String, fallback: String = ""): String =
     (this[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() } ?: fallback
@@ -891,20 +995,33 @@ private fun JsonObject.flag(key: String): Boolean? =
 private fun JsonObject.strings(key: String): List<String> =
     (this[key] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content } ?: emptyList()
 
-private fun parseBody(event: CircleEvent): CircleBody {
-    val obj = bodyObject(event.body)
+private fun parseEvent(event: CircleEvent): ParsedEvent {
+    // Exactly one parseToJsonElement per body. The object is shared by the
+    // visible card and by the tally pass instead of being re-parsed for every
+    // (card, member) pair.
+    val element = runCatching { circleJson.parseToJsonElement(event.body) }.getOrNull()
+    val obj = element as? JsonObject
+    return ParsedEvent(event, parseBody(event, element, obj), obj)
+}
+
+private fun parseBody(
+    event: CircleEvent,
+    element: JsonElement?,
+    obj: JsonObject?,
+): CircleBody {
     // The store reduces lower-cased types; match that so casing never turns
     // a known card into a spurious error card.
     val type = event.type.trim().lowercase(Locale.ROOT)
     return when (type) {
         "message" -> CircleBody(
             kind = CircleCard.MESSAGE,
-            text = bodyString(event.body) ?: obj?.text("text") ?: event.body,
+            text = (element as? JsonPrimitive)?.content ?: obj?.text("text") ?: event.body,
         )
         "file" -> CircleBody(
             kind = CircleCard.FILE,
             name = obj?.text("name") ?: "file",
             size = obj?.longNumber("size") ?: 0L,
+            sha256 = obj?.text("sha256")?.trim() ?: "",
         )
         "poll" -> CircleBody(
             kind = CircleCard.POLL,
@@ -940,61 +1057,105 @@ private fun parseBody(event: CircleEvent): CircleBody {
     }
 }
 
-/** Latest vote per author wins — events arrive in CircleCore order. */
-private fun latestPollVote(events: List<CircleEvent>, pollId: String, fp: String): Int? {
-    var best = Long.MIN_VALUE
-    var result: Int? = null
-    for (e in events) {
-        if (e.type != "vote" || e.authorFp != fp) continue
-        val obj = bodyObject(e.body) ?: continue
-        if ((obj.text("pollId") ?: obj.text("poll")) != pollId) continue
-        val option = obj.integer("option", -1)
-        if (option < 0) continue
-        if (e.lamport >= best) {
-            best = e.lamport
-            result = option
-        }
-    }
-    return result
-}
-
-private fun pollTally(
+/**
+ * Parses each body once, then derives *every* poll and kick tally in one pass.
+ * The old path had each card tally independently, which re-walked the log once
+ * per member and re-parsed vote bodies on the main thread; a new
+ * events list recomposed every card and multiplied that work by the card count.
+ *
+ * Vote identity rules are preserved exactly: raw (non-lowercased) event types,
+ * `lamport >=` tie-breaking so later events win, option >= 0 for polls, and an
+ * open/admin kick with no explicit answer counting as the author's yes.
+ */
+private fun computeFeedData(
     events: List<CircleEvent>,
     members: List<FlitCircleStore.Member>,
-    pollId: String,
-): Map<Int, Int> {
-    val counts = HashMap<Int, Int>()
-    for (m in members) {
-        val option = latestPollVote(events, pollId, m.fp) ?: continue
-        counts[option] = (counts[option] ?: 0) + 1
-    }
-    return counts
-}
+    meFp: String,
+): CircleFeedData {
+    val parsed = Array(events.size) { index -> parseEvent(events[index]) }
 
-private fun kickTally(
-    events: List<CircleEvent>,
-    members: List<FlitCircleStore.Member>,
-    kickId: String,
-): Pair<Int, Int> {
-    var yes = 0
-    var no = 0
-    for (m in members) {
-        var best = Long.MIN_VALUE
-        var vote: Boolean? = null
-        for (e in events) {
-            if (e.authorFp != m.fp || (e.type != "vote" && e.type != "kick")) continue
-            val obj = bodyObject(e.body) ?: continue
-            if (obj.text("kickId") != kickId) continue
-            // An open/admin kick with no explicit answer is the author's yes.
-            val approve = obj.flag("approve") ?: (e.type == "kick")
-            if (e.lamport >= best) {
-                best = e.lamport
-                vote = approve
+    // Latest vote per subject per author. Maps keep insertion order irrelevant:
+    // only the highest lamport for an author is kept, ties going to the later
+    // event in CircleCore order, exactly as the per-card scans did.
+    val pollVotes = HashMap<String, HashMap<String, Pair<Long, Int>>>()
+    val kickVotes = HashMap<String, HashMap<String, Pair<Long, Boolean>>>()
+    val pollIds = LinkedHashSet<String>()
+    val kickIds = LinkedHashSet<String>()
+
+    for (p in parsed) {
+        val event = p.event
+        val obj = p.obj ?: continue
+        when (event.type) {
+            "vote" -> {
+                val pollId = obj.text("pollId") ?: obj.text("poll")
+                val option = obj.integer("option", -1)
+                if (option >= 0) {
+                    pollIds.add(pollId)
+                    val byAuthor = pollVotes.getOrPut(pollId) { HashMap() }
+                    val previous = byAuthor[event.authorFp]
+                    if (previous == null || event.lamport >= previous.first) {
+                        byAuthor[event.authorFp] = event.lamport to option
+                    }
+                }
+                val kickId = obj.text("kickId")
+                kickIds.add(kickId)
+                val approve = obj.flag("approve") ?: false // a vote needs an explicit answer
+                val byAuthor = kickVotes.getOrPut(kickId) { HashMap() }
+                val previous = byAuthor[event.authorFp]
+                if (previous == null || event.lamport >= previous.first) {
+                    byAuthor[event.authorFp] = event.lamport to approve
+                }
+            }
+            "kick" -> {
+                val kickId = obj.text("kickId")
+                kickIds.add(kickId)
+                // An open/admin kick with no explicit answer is the author's yes.
+                val approve = obj.flag("approve") ?: true
+                val byAuthor = kickVotes.getOrPut(kickId) { HashMap() }
+                val previous = byAuthor[event.authorFp]
+                if (previous == null || event.lamport >= previous.first) {
+                    byAuthor[event.authorFp] = event.lamport to approve
+                }
+            }
+            "poll" -> {
+                // Keep zero-vote polls present so their cards show a 0 tally.
+                pollIds.add(
+                    obj.text("pollId")?.takeIf { it.isNotBlank() }
+                        ?: obj.text("id") ?: event.id,
+                )
             }
         }
-        if (vote == true) yes++ else if (vote == false) no++
     }
-    return yes to no
+
+    val pollResults = HashMap<String, PollTally>(pollIds.size)
+    for (pollId in pollIds) {
+        val counts = HashMap<Int, Int>()
+        val byAuthor = pollVotes[pollId]
+        for (m in members) {
+            val option = byAuthor?.get(m.fp)?.second ?: continue
+            counts[option] = (counts[option] ?: 0) + 1
+        }
+        // "My vote" is not restricted to the roster, so read all authors.
+        val myVote = byAuthor?.get(meFp)?.second
+        pollResults[pollId] = PollTally(counts, myVote, counts.values.sum())
+    }
+
+    val kickResults = HashMap<String, Pair<Int, Int>>(kickIds.size)
+    for (kickId in kickIds) {
+        var yes = 0
+        var no = 0
+        val byAuthor = kickVotes[kickId]
+        for (m in members) {
+            when (byAuthor?.get(m.fp)?.second) {
+                true -> yes++
+                false -> no++
+                null -> Unit
+            }
+        }
+        kickResults[kickId] = yes to no
+    }
+
+    return CircleFeedData(parsed, CircleTallies(pollResults, kickResults))
 }
 
 private fun timeOf(atMs: Long): String =

@@ -36,9 +36,11 @@ no public directory, no auto-actions.
   local label).
 - Three event kinds, nothing else in v1:
   1. **Message** — short signed text.
-  2. **FileDrop** — a reference to a file (name, size, SHA-256, resume token).
-     The bytes are pulled through the existing queue/resume path; the event
-     never contains file data.
+  2. **FileDrop** — a *reference only*: `{name, size, sha256}`. The event never
+     contains file bytes, and never contains the sender's local spool path (a
+     "token"). The sender keeps the bytes in its own cache and delivers them
+     per member with the existing `sendFiles` reception path; see
+     [File delivery](#file-delivery-as-built).
   3. **Poll** — a question with options, plus signed **Vote** events. A member
      can change their answer by publishing a newer vote; the tally uses each
      member's latest vote, while the feed keeps the change visible.
@@ -70,6 +72,13 @@ event vending machine.
   `FlitCircleStore` reducers. A leave or kick rekeys the group, and a later
   `SYNC` from a departed fingerprint is refused. Wrong-circle and bad-invite
   requests get honest refusal reasons, not silent success.
+- **The remembered return route is TCP/IP only.** The host stores a return route
+  only for an accepted `JOIN` that arrived with an IP, as `ip:53317` TLS TCP
+  (`FlitRoster.rememberRoute` with `Protocol.DEFAULT_PORT`); a `SYNC` alone
+  remembers nothing, and port-0 / direct-radio rows remember nothing by design.
+  A Bluetooth MAC or a relay pairing is **not** an IP route: a Bluetooth- or
+  relay-joining member needs a **Known devices** entry (MAC, or relay address +
+  token with `relayFor` on) to be dialed back for later fan-out.
 - **Owner and admins.** The founder is `OWNER`; only the owner can appoint or
   remove an `ADMIN`. This is now a real, wired action —
   `FlitEngine.circleSetRole(fp, role)` publishes a `role` event, the owner-only
@@ -103,7 +112,7 @@ codes are retired by starting a new Circle.
 | Adversary | What holds | What does not |
 | --- | --- | --- |
 | Passive network observer | event traffic is TLS-protected; signatures prove authorship | sees IPs/MACs, timing and byte counts; stored event bodies are plaintext JSON (authenticated, **not encrypted at rest**) |
-| Malicious relay | pairs blindly, never reads content | sees which fingerprints paired and traffic volume |
+| Malicious relay | pairs blindly, never reads content | shipped CLI logs only timestamps and opaque pairing ticket ids — no fingerprint, no byte count; never content (TLS) |
 | Stolen QR photo | bearer invite can join | does not reveal the group key without a TLS session to the host |
 | Compromised member | can read the plaintext log and emit as that member | cannot forge another fingerprint (signature + pinning) |
 
@@ -127,30 +136,91 @@ Here `body` is a small plaintext JSON object whose shape depends on `type`
 (`message`, `file`, `poll`, `vote`, `join`, `leave`, `kick`, `role`, `rekey`); it
 is signed but not encrypted.
 
-- **Canonical bytes** cover every field except `sig`; the author signs them
-  with its `TlsIdentity`. This generalises the existing panic-signing primitive
-  into a shared `sign(bytes)` / `verify(fp, bytes, sig)` pair, with the panic
-  route kept as a thin wrapper. No second crypto implementation.
+- **Canonical bytes** cover every field except `sig` **and `cert`**; the author
+  signs them with its `TlsIdentity`, and `verify` binds the omitted certificate to
+  `authorFp` by its own SHA-256 DER hash before pinning it (an event carrying a
+  substituted cert cannot pass). This generalises the existing panic-signing
+  primitive into a shared `sign(bytes)` / `verify(fp, bytes, sig)` pair, with the
+  panic route kept as a thin wrapper. No second crypto implementation.
 - **Ordering:** Lamport clock per author; deterministic total order by
   `(lamport, authorFp, id)` so every member converges without a server.
 - **Dedup/replay:** bounded seen-id set (≈4096) and a clock-skew window; future
   or replayed events are refused. Same discipline as `PanicCore`, reused.
-- **Sync:** peers exchange event-id summaries, then fetch only missing events
-  over an existing `Link`/`LinkProvider` session. App-layer store-and-forward
-  (bounded log) lets an offline member catch up when it returns. The relay is
-  never given storage; it stays a blind pipe.
+- **Sync:** there is no id-summary/fetch handshake. Every `SYNC` — a pull, an
+  outbound fan-out post, or a calm tick — posts the **full bounded local log**
+  (the last `CircleCore.MAX_EVENTS_PER_REQUEST` events) over an existing
+  `Link`/`LinkProvider` session; the receiver verifies and dedups by event id,
+  folds the new events, and answers with its own **ordered log**. Because the
+  whole log travels each time, a lost one-shot is repaired by the next post or
+  tick: app-layer store-and-forward (bounded) lets an offline member catch up.
+  The relay is never given storage; it stays a blind pipe, and dialing through it
+  needs the per-device `relayFor` switch on (see "Transport and battery").
 - **Vote resolution:** the latest signed `Vote(pollId)` per member wins;
   tally counts winners per option. Changing an answer appends a new vote, so
   the history stays honest. Ties are displayed as ties, not hidden.
+
+## File delivery (as built)
+
+A file drop is two separate things: a small **announcement** in the signed event
+log, and the **bytes**, delivered out of band. They are not one transfer, and
+the announcement by itself proves nothing was delivered.
+
+- **Announce.** The sender spools the picked file under `cacheDir/circle/...`,
+  hashes it, and calls `FlitEngine.circlePostFile(name, size, sha, spoolPath)`.
+  The engine publishes a `file` event whose body is **exactly**
+  `{name, size, sha256}` — no bytes, no spool path, no queue token — and creates
+  a local delivery record keyed by that SHA-256. The event is signed and fanned
+  out to the current members like any other event; it is the promise of a file,
+  not the file.
+- **Deliver.** The engine then runs a calm, per-member delivery loop using the
+  **existing `sendFiles` protocol** with a `PathOutgoing` backed by the private
+  spool. It does **not** enqueue anything on the send-later / bulk queue. Each
+  recipient gets an ordinary reception in History, and the landing is accepted
+  only when its hash matches the announced SHA-256 (the same hash-exact gate
+  every Flit receive uses). The spool path never leaves the sender's device.
+- **Record locally.** For each member fingerprint the sender's own record holds
+  one status: `pending`, `sent`, `refused`, or `failed`. The file card shows
+  those counts and an **Open file** action that resolves a landed file by sha.
+  With no local record (a recipient's card, or a later joiner) the UI says
+  **"file drop · open to view if it arrived"**: delivery status is sender-local
+  and never gossiped, so a recipient's card cannot claim the bytes are missing.
+- **Status semantics (app, as built).** The app derives each recipient's status
+  from the outcome of its per-member `sendFiles` call, not from a gossiped event:
+  no route or a **thrown** carrier → `pending` (spool kept, owed a retry); a
+  returned report that **declined** → `refused`; a returned report whose `failed`
+  list contains the file → `failed`; a returned report that **sent** the name →
+  `sent`. **`sent`, `refused` and `failed` are terminal** for that recipient;
+  `pending` is the only owed state. A calm ~30 s worker retries rows with a
+  pending or failed recipient, to current members only; the spool is deleted once
+  every recipient is terminal, after which there is nothing left to retry.
+- **Status is local-only.** Delivery status lives solely in the sender's
+  `CircleDelivery` record on that device. It is **not** an event, is not
+  gossiped, and is not visible to any other member — a recipient sees the file
+  land in its own History but cannot see the sender's counts. The card's
+  "local · …" line is that one device's view, nothing more.
+- **Later joiners.** Delivery targets are the members present when the drop is
+  posted. A device that joins afterwards folds the `file` event from the log
+  and sees the card, but **does not receive the old bytes** — there is no
+  retroactive backfill, and its card shows the neutral "open to view if it arrived" line.
+
+> **Correction (2026-11-25):** earlier text said "file bytes use the bulk queue
+> path unchanged" and described a "resume token" in the file event. That was
+> never the delivery path. The event is `{name,size,sha256}` only, and bytes go
+> by a direct per-member `sendFiles` call from the sender's spool.
 
 ## Transport and battery
 
 Events ride the already-existing route policy: **Wi‑Fi and Bluetooth are both
 first-class carriers**, chosen per peer, never silently — plus the blind relay
-when neither local carrier answers. Each member can sync over either radio;
-bonded aggregation of both at once is deliberately out of scope here. Sync happens on foreground
+when neither local carrier answers. The relay is **not** automatic: the peer
+must have a Known-device entry with `relayFor` on and a relay address/token
+before `circleDial` will route through it, and an opted-out device is never
+sent that way. Each member can sync over either radio; bonded aggregation of
+both at once is deliberately out of scope here. Sync happens on foreground
 and on a calm periodic tick; no always-on scanning, no new radio duty cycle.
-Message/poll events are tiny; file bytes use the bulk queue path unchanged.
+Message/poll events are tiny. File bytes are a separate, calm per-member
+`sendFiles` delivery from the sender's local spool — **not** the send-later /
+bulk queue (see [File delivery](#file-delivery-as-built)).
 
 ## Explicit scope cuts for v1
 
@@ -165,10 +235,18 @@ demands them.
 - **Pure JVM:** canonical/sign/verify; forged author rejected; dedup and replay
   window; Lamport convergence from scrambled delivery order; vote change and
   tie handling; file-drop manifest validation; QR v3 Circle fields parse.
-- **Harness, two nodes (phone + box CLI):** message sync, poll re-vote, file
-  drop landing hash-exact through the existing queue, and offline catch-up —
-  once over direct Wi‑Fi and once through the relay — plus role promotion and a
+- **Harness, two JVM nodes over the production endpoints:** message sync, poll
+  re-vote, a real file drop whose bytes go to each member with `sendFiles` and
+  land hash-exact while the local delivery record moves through its statuses, and
+  an **empty-delta pull** that returns the already-stored log (the harness's
+  catch-up path — a direct in-process TLS server on 127.0.0.1, no relay: a relay
+  hop needs a Known-device entry with `relayFor` on), plus role promotion and a
   kick/rekey that refuses a later sync from the departed fingerprint.
+
+  > **Correction (2026-11-25):** earlier text claimed "offline catch-up — once over
+  > direct Wi‑Fi and once through the relay." The harness test only issues a `SYNC`
+  > with an empty event delta and checks the stored event comes back; it does not
+  > drive a relay, so the claim is downgraded to the empty-delta pull above.
 - **Host state machine:** a pure, deterministic host verifies every incoming
   event against the roster, admits `JOIN` only with the right invite, folds
   `SYNC` through the store reducers, and refuses departed members and
@@ -179,10 +257,11 @@ demands them.
 ## Relationship to the rest of Flit
 
 Circle reuses QR v3 invites, known devices, route policy, TLS pinning, the
-relay, the queue with process-death checkpoints, the resume gate and the SHA-256
-landing proof. The only new machinery is the pure event log and a thin feed UI.
-That is the difference between a Swiss‑Army knife and a drawer of half-finished
-tools.
+relay, the normal `sendFiles` reception path and the SHA-256 landing proof. File
+bytes are **not** put on the send-later queue; the sender drives delivery per
+member from a local spool. The new machinery is the pure event log, the local
+delivery record and a thin feed UI. That is the difference between a
+Swiss‑Army knife and a drawer of half-finished tools.
 
 ## Build and verification record (2026-11-24)
 
@@ -192,7 +271,7 @@ signing, additive `/circle/join` and `/circle/sync` routes, a default-refusing
 delegate hook, `FlitCircleStore` governance (full leave, admin kick,
 changeable majority vote-kick, rekey generation), QR v3 invite codes with no
 key on the wire, a calm app sync worker, an M3 activity feed, and
-`flit-cli circle <create|join|post|poll|vote|kick|leave|sync>`. The phone is now a
+`flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>`. The phone is now a
 **full host** (`FlitCircleHost` behind `FlitEngine.onCircleRequest`): it verifies
 incoming events, gates the roster, applies rekey and refuses departed members,
 and the owner→admin role change is wired through `circleSetRole` and the
@@ -228,6 +307,12 @@ have been removed — the feed content, not those lines, is the evidence.
   per-peer logs; the phone→host device re-walk is the final verification item.
   Until it passes, the direction stays listed here rather than claimed as
   device-verified.
+- **File delivery is at-post-time and status is local-only:** bytes go to the
+  members present when the drop is posted. A later joiner folds the signed
+  announcement and sees the card, but never receives the old bytes (no
+  backfill); its card shows the neutral "open to view if it arrived" line. Delivery
+  statuses are recorded only in the sender's local state — they are not
+  gossiped, so no other member can see your delivery counts.
 - **Multi-member mesh:** only the two-node walk (phone + box CLI) has been on
   hardware. A genuine three-or-more-device mesh needs hardware not on this rig.
 - **One Circle at a time:** v1 supports one active Circle per device and a
@@ -241,7 +326,9 @@ have been removed — the feed content, not those lines, is the evidence.
   It does not reveal the group key without a TLS session to the host; retire a
   suspicious code by starting a new Circle.
 - **Blind relay:** store-and-forward is app-layer and bounded; the relay itself
-  stores nothing and has no discovery, so peers must be configured by hand.
+  stores nothing and has no discovery, so peers must be configured by hand — a
+  Known-device entry with an address/token and `relayFor` on is required before
+  Circle or dispatch traffic will use it.
 
 ### Final 2026-11-25 polish wave — honest close
 

@@ -31,6 +31,9 @@ object CircleCore {
     /** Largest accepted event body (a chat line / file-metadata JSON object). */
     const val MAX_BODY_CHARS = 16 * 1024
 
+    /** The exact, closed key set of a [CircleEvent.FILE] announcement body. */
+    val FILE_BODY_KEYS: Set<String> = setOf("name", "size", "sha256")
+
     /** Largest accepted id / circleId / authorFp / type string. */
     const val MAX_FIELD_CHARS = 256
 
@@ -297,6 +300,28 @@ object CircleCore {
             e.lamport >= 0L && e.createdMs > 0L &&
             e.body.isNotBlank() && e.body.length <= MAX_BODY_CHARS &&
             e.cert.length <= MAX_CERT_CHARS
+
+    /**
+     * Additive, type-specific gate for a [CircleEvent.FILE] body: a bounded
+     * JSON object with EXACTLY [FILE_BODY_KEYS] — non-blank `name` and `sha256`
+     * strings and a non-negative integer `size`. [validShape] deliberately
+     * stays type-agnostic (bounds only), so this never changes an existing
+     * event's signature or acceptance; callers minting or accepting a file
+     * announcement use this to refuse `token`, `path`, `spoolPath` or any
+     * other extra key. That is what keeps a sender's local spool path off the
+     * wire: recipients resolve bytes by `sha256` through the bulk queue.
+     */
+    fun validFileBody(body: String): Boolean {
+        if (body.isBlank() || body.length > MAX_BODY_CHARS) return false
+        val obj = bodyObject(body) ?: return false
+        if (obj.keys != FILE_BODY_KEYS) return false
+        val name = text(obj, "name") ?: return false
+        val sha = text(obj, "sha256") ?: return false
+        val sizeValue = obj["size"] as? JsonPrimitive ?: return false
+        if (sizeValue.isString) return false // "12" is not the integer 12
+        val size = sizeValue.content.toLongOrNull() ?: return false
+        return name.length <= MAX_FIELD_CHARS && sha.length <= MAX_FIELD_CHARS && size >= 0L
+    }
 
     /**
      * Production replay guard: atomic check-and-record over ONE bounded id

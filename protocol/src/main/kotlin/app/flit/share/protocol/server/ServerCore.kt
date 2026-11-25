@@ -309,7 +309,18 @@ class ServerCore(
 
         val decision = delegate.onPrepare(req, peerIp)
         if (decision is PrepareDecision.Decline) {
-            x.respondText(403, MIME_TEXT, "Rejected")
+            // A deliberate refusal is a concluded story, not a dead carrier.
+            // Only a Flit-marked sender gets the extra header, so a v2.2 peer
+            // still sees the unchanged `403 Rejected` answer and keeps
+            // treating it as its own business.
+            if (x.header(Protocol.HEADER_FLIT_CLIENT) == Protocol.FLIT_CLIENT_VALUE) {
+                x.respondText(
+                    403, MIME_TEXT, "Rejected",
+                    mapOf(Protocol.HEADER_FLIT_REFUSAL to Protocol.REFUSAL_DECLINED),
+                )
+            } else {
+                x.respondText(403, MIME_TEXT, "Rejected")
+            }
             return
         }
         val acceptIds = (decision as? PrepareDecision.Accept)?.ids ?: req.files.keys
@@ -621,7 +632,9 @@ class ServerCore(
                 keepPartAfterAbort(pf.temp, t, resumed || (config.resume && bytes > 0), peerIp)
             }
             pf.settled = true
-            markSessionEnded(sessionId, cancelled = false)
+            // The carrier died mid-upload: this is a cancelled session, never
+            // a successful receive. The cancel route reports the same truth.
+            markSessionEnded(sessionId, cancelled = true)
             throw e
         } catch (e: Throwable) {
             runCatching { sink?.done(false) }
@@ -630,7 +643,7 @@ class ServerCore(
                 keepPartAfterAbort(pf.temp, t, resumed || (config.resume && bytes > 0), peerIp)
             }
             pf.settled = true
-            markSessionEnded(sessionId, cancelled = false)
+            markSessionEnded(sessionId, cancelled = true)
             x.respondText(500, MIME_TEXT, "Unknown error")
         }
 
@@ -772,13 +785,13 @@ class ServerCore(
             runCatching { if (sentInChunk in 1 until len) tracker.add(start, sentInChunk) }
             runCatching { keepChunkPart(pf, tracker, peerIp) }
             pf.sessionRef?.lastTouch = System.currentTimeMillis()
-            markSessionEnded(sessionId, cancelled = false)
+            markSessionEnded(sessionId, cancelled = true)
             throw e
         } catch (e: Throwable) {
             runCatching { if (sentInChunk in 1 until len) tracker.add(start, sentInChunk) }
             runCatching { keepChunkPart(pf, tracker, peerIp) }
             pf.sessionRef?.lastTouch = System.currentTimeMillis()
-            markSessionEnded(sessionId, cancelled = false)
+            markSessionEnded(sessionId, cancelled = true)
             x.respondText(500, MIME_TEXT, "Unknown error")
         }
     }
@@ -955,30 +968,32 @@ class ServerCore(
             x.respondText(400, MIME_TEXT, "Invalid circle request")
             return
         }
-        // The requester's own cert is pinned under its real SHA-256 DER, so its
-        // events can be verified without trusting a self-declared authorFp.
-        // No header is fine (relay/older senders carry certs on each event),
-        // but a PRESENT header must parse and, when memberFp is claimed, must
-        // name that exact fingerprint — a borrowed cert is a 403, not a 200.
+        // Circle is an authenticated group protocol: every request must carry
+        // the requester's certificate and its claimed memberFp must be that
+        // certificate's own fingerprint. An absent header used to let anyone
+        // who merely knew a member's public fingerprint claim that identity,
+        // harvest the group key and rewrite that member's route. No longer.
         val encodedCert = x.header(Protocol.HEADER_CIRCLE_CERT)?.trim()?.takeIf { it.isNotBlank() }
-        if (encodedCert != null) {
-            val der = runCatching { Base64.getDecoder().decode(encodedCert) }.getOrNull()
-            val cert = der?.let {
-                runCatching {
-                    CertificateFactory.getInstance("X.509").generateCertificate(it.inputStream()) as X509Certificate
-                }.getOrNull()
-            }
-            if (cert == null) {
-                x.respondText(403, MIME_TEXT, "Malformed sender certificate")
-                return
-            }
-            val pinnedFp = TlsIdentity.pin(cert)
-            if (request.memberFp.isNotBlank() &&
-                !pinnedFp.equals(request.memberFp.trim(), ignoreCase = true)
-            ) {
-                x.respondText(403, MIME_TEXT, "Certificate does not match member fingerprint")
-                return
-            }
+        if (encodedCert == null) {
+            x.respondText(403, MIME_TEXT, "Missing sender certificate")
+            return
+        }
+        val der = runCatching { Base64.getDecoder().decode(encodedCert) }.getOrNull()
+        val cert = der?.let {
+            runCatching {
+                CertificateFactory.getInstance("X.509").generateCertificate(it.inputStream()) as X509Certificate
+            }.getOrNull()
+        }
+        if (cert == null) {
+            x.respondText(403, MIME_TEXT, "Malformed sender certificate")
+            return
+        }
+        val pinnedFp = TlsIdentity.pin(cert)
+        if (request.memberFp.isBlank() ||
+            !pinnedFp.equals(request.memberFp.trim(), ignoreCase = true)
+        ) {
+            x.respondText(403, MIME_TEXT, "Certificate does not match member fingerprint")
+            return
         }
         val response = try {
             delegate.onCircle(request, x.origin.orEmpty())
@@ -986,7 +1001,9 @@ class ServerCore(
             x.respondText(500, MIME_TEXT, "Circle delegate error")
             return
         }
-        x.respondText(200, MIME_JSON, WireJson.encode(response))
+        // Sign the answer so a joiner can pin it to the host fingerprint from
+        // the QR — a rogue relay or on-path peer cannot substitute the key.
+        x.respondText(200, MIME_JSON, WireJson.encode(CircleResponse.sign(response, identity)))
     }
 
     /**

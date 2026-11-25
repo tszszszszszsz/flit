@@ -5,6 +5,7 @@ import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
 import app.flit.share.protocol.client.PathOutgoing
 import app.flit.share.protocol.client.ProtocolClient
+import app.flit.share.protocol.client.SendReport
 import app.flit.share.protocol.client.SendTarget
 import app.flit.share.protocol.client.TlsLink
 import app.flit.share.protocol.discovery.UdpDiscovery
@@ -26,7 +27,6 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
-import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -146,19 +146,25 @@ bt-sim [file...] [--bytes MB] -- both ends in one process over the pipe carrier
 relay [--port P] [--token T] [--park-timeout S] -- blind pairer for unreachable peers (milestone E)
 panic <ip[:port]> [--text NOTE] -- send a signed informational panic alert
 parse-qr <image...>   pairing codes out of screenshots (png/jpg)
-circle <create|join|post|poll|vote|role|kick|leave|sync> [--circle ID] [--invite TOKEN]
+circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--invite TOKEN]
        [--text TEXT] [--file PATH] [--target FP] [--role ADMIN|MEMBER] [--option N]
        [--host ip[:port]] -- accountless group coordination over the production Circle routes
+       post --file publishes a signed name/size/sha256 reference only;
+       file --file publishes it AND sends the real bytes to every current member via sendFiles
 """
     )
 }
 
 private fun circleUsage() {
     println(
-        """circle <create|join|post|poll|vote|role|kick|leave|sync>
+        """circle <create|join|post|poll|vote|role|kick|leave|sync|file>
   create          mint a circle id + invite token; print the host command
   join            --host ip[:port] --circle ID --invite TOKEN — fetch the group key
-  post            --text NOTE | --file PATH — signed message / file-drop event
+  post            --text NOTE — signed message; --file PATH — file-drop ANNOUNCEMENT only
+                  ({name,size,sha256}: no bytes, no path, no token)
+  file            --file PATH — announce the file AND send real bytes to every current
+                  member with the production sendFiles; status is local-only
+                  (pending → sent/refused/failed); a thrown carrier leaves it pending for retry
   poll            --text QUESTION --option A --option B ... — signed poll event
   vote            --option N — change your answer on the latest poll
   role            --target FP --role ADMIN|MEMBER — OWNER appoints/removes an admin
@@ -313,6 +319,10 @@ internal class CircleHostState {
             .filter { it.circleId == id }
             .filter { it.type.trim().lowercase(Locale.ROOT) in CircleEvent.TYPES }
             .filter { it.body.length <= MAX_BODY_CHARS }
+            // A file announcement is EXACTLY {name,size,sha256}. This is the
+            // gate that keeps a sender's local spool path (or a queue token)
+            // off the signed, fanned-out wire — recipients locate bytes by hash.
+            .filter { it.type != CircleEvent.FILE || CircleCore.validFileBody(it.body) }
             .filter { it.cert.isNotBlank() && CircleCore.verify(it) }
             // Local id dedup first, then the production replay/window guard:
             // an old signed join/role/kick/rekey is history, not governance.
@@ -854,6 +864,173 @@ private fun circleEvent(
     lamport = circleNextLamport(st),
 )
 
+// ==== Circle file drop: real bytes over sendFiles, local-only status =========
+
+/**
+ * The exact, closed wire shape of a `file` announcement. No local path and no
+ * queue token: `{name,size,sha256}` only, exactly what `CircleCore.validFileBody`
+ * and the app's `circleFileBody` accept. Kept here so the CLI mints the same
+ * body the phone does.
+ */
+internal fun circleFileAnnouncement(name: String, size: Long, sha256: String): String =
+    buildJsonObject {
+        put("name", JsonPrimitive(name))
+        put("size", JsonPrimitive(size))
+        put("sha256", JsonPrimitive(sha256))
+    }.toString()
+
+/** Mirror of the app's local-only per-recipient status vocabulary. */
+internal object CircleDeliveryStatus {
+    const val PENDING = "pending"
+    const val SENT = "sent"
+    const val REFUSED = "refused"
+    const val FAILED = "failed"
+}
+
+/**
+ * One announced file and its LOCAL-ONLY outcome per recipient fingerprint.
+ * Mirrors `FlitCircleStore.CircleDelivery` (the harness module has no app
+ * dependency): statuses are never gossiped and a later joiner sees the card
+ * but neither these states nor the bytes.
+ */
+internal data class CircleFileDelivery(
+    val sha256: String,
+    val name: String,
+    val size: Long,
+    /** fingerprint → pending | sent | refused | failed. */
+    val statuses: LinkedHashMap<String, String> = LinkedHashMap(),
+)
+
+/** A current member plus the production route we can reach it on. */
+internal data class CircleRecipient(
+    val fingerprint: String,
+    /** null = no route known yet; the recipient stays pending for retry. */
+    val target: SendTarget?,
+)
+
+/**
+ * Pure conclusion from a *returned* report. A throw is deliberately not a
+ * conclusion — the carrier never spoke, so the spool stays for retry and the
+ * status remains [CircleDeliveryStatus.PENDING].
+ */
+internal fun circleDeliveryOutcome(report: SendReport?, wireName: String): String = when {
+    report == null -> CircleDeliveryStatus.PENDING
+    report.sent.contains(wireName) -> CircleDeliveryStatus.SENT
+    report.failed.any { it.fileName == wireName } -> CircleDeliveryStatus.FAILED
+    else -> CircleDeliveryStatus.REFUSED // 204 decline: peer spoke, no bytes landed
+}
+
+/**
+ * Send one dropped file's real bytes to every current recipient with the
+ * PRODUCTION [ProtocolClient.sendFiles] — no new wire format. [spoolPath] is
+ * opened as [PathOutgoing] named by the announced [name]; the path itself is
+ * never put in an event body.
+ *
+ * Every recipient starts [PENDING] and every transition is reported through
+ * [onStatus] (including the initial pending) so callers can observe the
+ * pending → sent/refused/failed sequence. A thrown carrier leaves the
+ * recipient pending — "throw keeps spool for retry" — exactly the app's
+ * delivery contract. Statuses stay local; nothing here is gossiped.
+ */
+internal suspend fun deliverCircleFile(
+    identity: TlsIdentity,
+    spoolPath: Path,
+    recipients: Collection<CircleRecipient>,
+    onStatus: ((fingerprint: String, status: String) -> Unit)? = null,
+): CircleFileDelivery {
+    val outgoing = PathOutgoing(spoolPath, spoolPath.fileName.toString())
+    val name = outgoing.wireName
+    val sha = ProtocolClient.sha256Hex { outgoing.openStream() }
+    val delivery = CircleFileDelivery(sha, name, outgoing.size)
+    for (r in recipients) {
+        delivery.statuses[r.fingerprint] = CircleDeliveryStatus.PENDING
+        onStatus?.invoke(r.fingerprint, CircleDeliveryStatus.PENDING)
+    }
+    ProtocolClient(identity).use { cli ->
+        val self = PeerInfo(
+            alias = "flit-circle-file",
+            version = Protocol.VERSION,
+            deviceModel = System.getenv("FLIT_MODEL"),
+            deviceType = "headless",
+            fingerprint = identity.fingerprint,
+            port = Protocol.DEFAULT_PORT,
+            protocol = "https",
+        )
+        for (r in recipients) {
+            val target = r.target
+            val outcome = if (target == null) {
+                CircleDeliveryStatus.PENDING // no route yet — keep the spool for retry
+            } else {
+                runCatching {
+                    cli.sendFiles(target = target, self = self, files = listOf(PathOutgoing(spoolPath, name)))
+                }.fold(
+                    onSuccess = { report -> circleDeliveryOutcome(report, name) },
+                    onFailure = { CircleDeliveryStatus.PENDING },
+                )
+            }
+            if (delivery.statuses[r.fingerprint] != outcome) {
+                delivery.statuses[r.fingerprint] = outcome
+                onStatus?.invoke(r.fingerprint, outcome)
+            }
+        }
+    }
+    return delivery
+}
+
+/** Best-effort fingerprint → route sweep on the rig's normal discovery path. */
+private suspend fun discoverCircleRoutes(identity: TlsIdentity, waitSecs: Int = 3): MutableMap<String, SendTarget> {
+    val routes = LinkedHashMap<String, SendTarget>()
+    val delegate = ConsoleDelegate()
+    val server = ProtocolServer(
+        identity, delegate,
+        ServerConfig(alias = "flit-circle-file", port = 0, tls = true, destDir = Path.of("flit-tmp-circle-file")),
+    )
+    server.start()
+    val client = ProtocolClient(identity)
+    val discovery = UdpDiscovery(
+        udpPort = Protocol.MULTICAST_PORT,
+        own = server::selfInfo,
+        onPeerDiscovered = delegate::announceSeen,
+        registerPoster = { ip, port, proto, self ->
+            client.register(SendTarget(ip, port, proto == "https"), self)
+        },
+    )
+    try {
+        discovery.create()
+        discovery.start(announceIntervalMillis = 500)
+        kotlinx.coroutines.delay(waitSecs * 1000L)
+    } finally {
+        discovery.stop()
+        server.close()
+        client.close()
+    }
+    for ((fp, pair) in delegate.seen) {
+        val (ip, info) = pair
+        routes[normalized(fp) ?: fp] = SendTarget(ip, info.port, info.protocol == "https")
+    }
+    return routes
+}
+
+/** Every current member except self, with a discovered route where one exists. */
+private suspend fun circleRecipients(identity: TlsIdentity, st: CircleCliState, me: String): List<CircleRecipient> {
+    val routes = discoverCircleRoutes(identity)
+    // The host is always a member; learn its fingerprint from its own info route.
+    val hostRaw = st.host.takeIf { it.isNotBlank() }
+    if (hostRaw != null) {
+        val hostTarget = circleTarget(hostRaw)
+        runCatching { ProtocolClient(identity).use { it.info(hostTarget) } }
+            .getOrNull()?.fingerprint?.let { fp ->
+                routes.putIfAbsent(normalized(fp) ?: fp, hostTarget)
+            }
+    }
+    val meNorm = normalized(me)
+    return st.members.mapNotNull { raw ->
+        val fp = normalized(raw) ?: return@mapNotNull null
+        if (fp == meNorm) return@mapNotNull null
+        CircleRecipient(fp, routes[fp])
+    }
+}
+
 private suspend fun circle(args: ParsedArgs) {
     val sub = args.positional.drop(1).firstOrNull() ?: run { circleUsage(); return }
     val identity = loadOrCreateIdentity()
@@ -914,15 +1091,9 @@ private suspend fun circle(args: ParsedArgs) {
                 val p = Path.of(file)
                 if (!Files.isRegularFile(p)) { println("!! no file: $file"); return }
                 val bytes = Files.readAllBytes(p)
-                val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
-                    .joinToString("") { "%02x".format(it) }
-                val token = UUID.randomUUID().toString().replace("-", "").take(16)
-                body = buildJsonObject {
-                    put("name", JsonPrimitive(p.fileName.toString()))
-                    put("size", JsonPrimitive(bytes.size.toLong()))
-                    put("sha256", JsonPrimitive(sha))
-                    put("token", JsonPrimitive(token))
-                }.toString()
+                val sha = ProtocolClient.sha256Hex { java.io.FileInputStream(p.toFile()) }
+                // Announcement only: {name,size,sha256}, never a path or queue token.
+                body = circleFileAnnouncement(p.fileName.toString(), bytes.size.toLong(), sha)
                 type = CircleEvent.FILE
             } else {
                 val text = args.opt("--text") ?: run { println("!! post needs --text or --file"); return }
@@ -932,6 +1103,36 @@ private suspend fun circle(args: ParsedArgs) {
             val ev = circleEvent(st, identity, type, body)
             st.events.add(ev)
             pushCircleEvent(st, identity, ev)
+        }
+        "file" -> {
+            if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }
+            val file = args.opt("--file") ?: run { println("!! file needs --file PATH"); return }
+            val spool = Path.of(file)
+            if (!Files.isRegularFile(spool)) { println("!! no file: $file"); return }
+            val name = spool.fileName.toString()
+            val size = Files.size(spool)
+            val sha = ProtocolClient.sha256Hex { java.io.FileInputStream(spool.toFile()) }
+
+            // 1. signed announcement — {name,size,sha256} only, no bytes/path.
+            val ev = circleEvent(st, identity, CircleEvent.FILE, circleFileAnnouncement(name, size, sha))
+            st.events.add(ev)
+            pushCircleEvent(st, identity, ev)
+
+            // 2. refresh the roster, then deliver real bytes to every member.
+            if (st.host.isNotBlank()) {
+                val result = circleExchange(identity, circleTarget(st.host), st, emptyList())
+                result.getOrNull()?.takeIf { it.ok }?.let { mergeCircleAnswer(st, it) }
+                saveCircleState(st)
+            }
+            val recipients = circleRecipients(identity, st, me)
+            if (recipients.isEmpty()) {
+                println("${ts()} no other current member with a route — announcement only; nothing sent")
+            }
+            val delivery = deliverCircleFile(identity, spool, recipients) { fp, status ->
+                println("${ts()}   ${fp.take(12)} ${status.padEnd(7)} $name")
+            }
+            val tally = delivery.statuses.values.groupingBy { it }.eachCount()
+            println("${ts()} file $sha: ${tally.entries.sortedBy { it.key }} (status is local-only, never gossiped)")
         }
         "poll" -> {
             if (st.circleId.isBlank()) { println("!! no circle — join or create first"); return }

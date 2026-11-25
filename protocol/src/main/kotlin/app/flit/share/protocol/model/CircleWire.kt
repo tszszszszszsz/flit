@@ -1,7 +1,13 @@
 package app.flit.share.protocol.model
 
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.serialization.Serializable
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.util.Base64
 
 /**
  * Flit-only Circle request, additive under `/api/flit/v1`. One shape serves
@@ -43,8 +49,62 @@ data class CircleResponse(
     val members: List<String> = emptyList(),
     val events: List<CircleEvent> = emptyList(),
     val reason: String = "",
+    /** DER cert of the answering host; joiners pin it to the QR fingerprint. */
+    val serverCert: String = "",
+    /** Signature over every field except [serverCert] and [sig]. */
+    val sig: String = "",
 ) {
     companion object {
         fun refused(reason: String): CircleResponse = CircleResponse(ok = false, reason = reason)
+
+        /** Deterministic bytes covered by the host signature. */
+        fun canonical(r: CircleResponse): ByteArray {
+            val bytes = ByteArrayOutputStream()
+            val out = DataOutputStream(bytes)
+            out.writeUTF("FLITCIRCLE1")
+            out.writeBoolean(r.ok)
+            out.writeUTF(r.key)
+            out.writeInt(r.members.size)
+            r.members.forEach { out.writeUTF(it) }
+            out.writeInt(r.events.size)
+            r.events.forEach {
+                out.writeUTF(it.id)
+                out.writeUTF(it.circleId)
+                out.writeUTF(it.authorFp)
+                out.writeLong(it.lamport)
+                out.writeUTF(it.type)
+                out.writeUTF(it.body)
+                out.writeLong(it.createdMs)
+            }
+            out.writeUTF(r.reason)
+            out.flush()
+            return bytes.toByteArray()
+        }
+
+        fun sign(r: CircleResponse, identity: TlsIdentity): CircleResponse {
+            val encoded = Base64.getEncoder().encodeToString(identity.certificate.encoded)
+            return r.copy(
+                serverCert = encoded,
+                sig = identity.sign(canonical(r.copy(serverCert = "", sig = ""))),
+            )
+        }
+
+        /** Verify signature AND that the signer cert's fingerprint matches its claim. */
+        fun verify(r: CircleResponse, expectedHostFp: String? = null): Boolean {
+            if (r.sig.isBlank() || r.serverCert.isBlank()) return false
+            val cert = runCatching {
+                CertificateFactory.getInstance("X.509")
+                    .generateCertificate(Base64.getDecoder().decode(r.serverCert).inputStream()) as X509Certificate
+            }.getOrNull() ?: return false
+            val fp = runCatching { TlsIdentity.fingerprintOf(cert) }.getOrNull() ?: return false
+            if (expectedHostFp != null && !fp.equals(expectedHostFp, true)) return false
+            val bare = r.copy(serverCert = "", sig = "")
+            // Verify against the cert IN THE ANSWER before touching the global
+            // pin map — otherwise a forged answer cannot be checked on first
+            // contact and pin-after-verify becomes pin-before-verify.
+            if (!TlsIdentity.verifyWithCertificate(cert, canonical(bare), r.sig)) return false
+            TlsIdentity.pin(cert)
+            return true
+        }
     }
 }

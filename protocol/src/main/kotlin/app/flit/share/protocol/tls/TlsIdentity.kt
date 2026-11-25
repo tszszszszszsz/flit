@@ -25,7 +25,6 @@ import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.Base64
 import java.util.Date
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.KeyManager
 import javax.net.ssl.KeyManagerFactory
@@ -159,26 +158,35 @@ class TlsIdentity private constructor(
         const val DEFAULT_PASSWORD = "flit"
 
         /**
+         * Maximum number of certificates kept as signature pins. A flood of
+         * first-seen Circle/panic certificates must not grow the store without
+         * bound; the least recently accessed pin is evicted at this cap.
+         */
+        const val MAX_PINS = 512
+
+        /**
          * Certificates trusted for device signatures (panic alerts and Circle
          * events alike), keyed by the SHA-256 of their DER — the very same
          * value announced as a device fingerprint.
          * Pinning by the certificate's OWN digest (never a caller-supplied
          * label) is what makes a claimed senderFp unforgeable: an attacker's
          * cert lands under the attacker's fingerprint, not the victim's.
+         * Bounded and LRU: every [pinned] lookup counts as an access, so pins
+         * still in use survive while stale ones are evicted first.
          */
-        private val panicPins = ConcurrentHashMap<String, X509Certificate>()
+        private val panicPins = PinCache(MAX_PINS)
 
         /** Pins [cert] under its own fingerprint; returns that fingerprint. */
         fun pin(cert: X509Certificate): String {
             val fp = certificateFingerprint(cert)
-            panicPins[fp] = cert
+            panicPins.put(fp, cert)
             return fp
         }
 
-        fun pinned(fingerprint: String): X509Certificate? = panicPins[fingerprint.trim().uppercase()]
+        fun pinned(fingerprint: String): X509Certificate? = panicPins.get(fingerprint)
 
         fun forgetPin(fingerprint: String) {
-            panicPins.remove(fingerprint.trim().uppercase())
+            panicPins.remove(fingerprint)
         }
 
         fun fingerprintOf(cert: X509Certificate): String = certificateFingerprint(cert)
@@ -254,6 +262,42 @@ class TlsIdentity private constructor(
             return TlsIdentity(alias, ks, DEFAULT_PASSWORD)
         }
     }
+}
+
+/**
+ * Bounded, thread-safe pin store keyed by uppercase-hex certificate fingerprint.
+ * Backed by an access-ordered map: [get] promotes an entry, so pins that keep
+ * being verified stay resident and only stale pins are evicted at [capacity].
+ * Kept internal (not part of the public TlsIdentity API) so the eviction policy
+ * can be exercised directly with a small capacity in unit tests.
+ */
+internal class PinCache(private val capacity: Int = TlsIdentity.MAX_PINS) {
+    init {
+        require(capacity > 0) { "capacity must be positive" }
+    }
+
+    private val lock = Any()
+    private val pins = object : LinkedHashMap<String, X509Certificate>(capacity, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, X509Certificate>?): Boolean =
+            size > capacity
+    }
+
+    fun put(fingerprint: String, cert: X509Certificate) = synchronized(lock) {
+        pins[fingerprint.trim().uppercase()] = cert
+    }
+
+    /** Returns the pinned certificate and promotes it in the access order. */
+    fun get(fingerprint: String): X509Certificate? = synchronized(lock) {
+        pins[fingerprint.trim().uppercase()]
+    }
+
+    fun remove(fingerprint: String) = synchronized(lock) {
+        pins.remove(fingerprint.trim().uppercase())
+    }
+
+    fun size(): Int = synchronized(lock) { pins.size }
+
+    fun clear() = synchronized(lock) { pins.clear() }
 }
 
 /** Uppercase-hex SHA-256 of a certificate's DER encoding — the wire fingerprint. */

@@ -23,7 +23,7 @@ data class Pinned(
 data class QueuedSend(
     val fingerprint: String,
     val alias: String,
-    /** SAF URIs with persistable grants only — share-sheet streams cannot be kept. */
+    /** Spool absolute paths or persistable SAF URIs — share-sheet streams cannot be kept. */
     val uris: List<String>,
     val names: List<String>,
     val createdMs: Long,

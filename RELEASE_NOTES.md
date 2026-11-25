@@ -4,9 +4,9 @@
 
 * **Works when Wi‑Fi doesn't.** With no network between the phones (mobile data only,
   dead access point) the roster keeps working: the engine lights Bluetooth discovery at
-  exactly that moment, and the same secure v2.2 exchange rides it. No new settings, no
-  new vocabulary — the prompts you see are the OS's own (nearby-devices permission, radio
-  power), each asked once per device.
+  exactly that moment, and the same secure v2.2 exchange rides the Bluetooth carrier once
+  you turn on **Transfer over Bluetooth** (off by default). The prompts you see are the
+  OS's own (nearby-devices permission, radio power), each asked once per device.
 * **The "send later" queue keeps its promise end to end:** a second share to an
   already-waiting peer joins that batch instead of failing; a flush broken by the peer
   walking out keeps its row and retries when they're back; completed batches release
@@ -17,7 +17,15 @@
   simulated Bluetooth pipe against the production server and client — the
   transport-agnostic regression gate for everything above.
 * Same wire protocol v2.2, byte-identical on the Bluetooth pipe; TLS and resume behave
-  exactly as over Wi‑Fi.
+  exactly as over Wi‑Fi — **within one carrier**: the kept prefix is bound to the
+  requester's origin (IP over Wi‑Fi, MAC over Bluetooth), so switching carriers takes a
+  clean full resend rather than a cross-transport continuation.
+
+> **Dated correction (2026-11-25):** the original v0.2.0 copy said "No new settings, no
+> new vocabulary — the prompts you see are the OS's own." That contract was superseded
+> on **2026-11-24** by the opt-in **Transfer over Bluetooth** option in Options (off,
+> inert by default). It is deliberately a new setting and a new string; discovery-only
+> LE still surfaces nothing. Bluetooth is a reachability fallback, not a speed upgrade.
 
 ---
 

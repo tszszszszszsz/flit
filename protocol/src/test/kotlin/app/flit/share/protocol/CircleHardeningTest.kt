@@ -268,6 +268,39 @@ class CircleHardeningTest {
         assertEquals(0 to 0, CircleCore.kickTally(kicks, member.fingerprint, members))
     }
 
+    // ---- file announcement body -------------------------------------------
+
+    @Test
+    fun `file body gate refuses extra keys wrong types and oversized metadata`() {
+        assertTrue(CircleCore.validFileBody("""{"name":"a.gflit","size":12,"sha256":"deadbeef"}"""))
+        assertTrue(CircleCore.validFileBody("""{"name":"a","size":0,"sha256":"s"}"""))
+
+        val longName = "x".repeat(CircleCore.MAX_FIELD_CHARS + 1)
+        val longSha = "y".repeat(CircleCore.MAX_FIELD_CHARS + 1)
+        val rejected = listOf(
+            "", " ", "{", "[]", "null",
+            "x".repeat(CircleCore.MAX_BODY_CHARS + 1),
+            """{"name":"a","size":12}""",
+            """{"name":"a","sha256":"s"}""",
+            """{"size":12,"sha256":"s"}""",
+            """{"name":"","size":12,"sha256":"s"}""",
+            """{"name":"a","size":12,"sha256":""}""",
+            """{"name":"a","size":-1,"sha256":"s"}""",
+            """{"name":"a","size":"12","sha256":"s"}""",
+            """{"name":"a","size":1.5,"sha256":"s"}""",
+            """{"name":"a","size":null,"sha256":"s"}""",
+            """{"name":"a","size":12,"sha256":"s","token":"t"}""",
+            """{"name":"a","size":12,"sha256":"s","path":"/cache/circle/a"}""",
+            """{"name":"a","size":12,"sha256":"s","spoolPath":"/cache/circle/a"}""",
+            """{"name":"a","size":12,"sha256":"s","extra":1}""",
+            """{"name":"$longName","size":12,"sha256":"s"}""",
+            """{"name":"a","size":12,"sha256":"$longSha"}""",
+        )
+        for (body in rejected) {
+            assertFalse(CircleCore.validFileBody(body), "accepted a bad file body: ${body.take(80)}")
+        }
+    }
+
     // ---- deterministic order ----------------------------------------------
 
     @Test
@@ -387,7 +420,7 @@ class CircleHardeningTest {
         assertEquals(200, accepted.status)
         assertEquals("group-key", WireJson.decode<CircleResponse>(accepted.response).key)
         val relayed = call(server, exchange(raw = validBody))
-        assertEquals(200, relayed.status, "relayed sender without cert header")
+        assertAnswer(relayed, 403, "Missing sender certificate")
 
         val throwing = object : ServerDelegate {
             override fun onPrepare(request: PrepareUploadRequest, peerIp: String): PrepareDecision =
@@ -401,7 +434,10 @@ class CircleHardeningTest {
             ServerConfig(tls = false, destDir = Files.createTempDirectory("circle-hardening-throw")),
             throwing,
         )
-        assertAnswer(call(brokenServer, exchange(raw = validBody)), 500, "Circle delegate error")
+        assertAnswer(
+            call(brokenServer, exchange(raw = validBody, headers = mapOf(certHeader to ownCert))),
+            500, "Circle delegate error",
+        )
     }
 
     @Test
