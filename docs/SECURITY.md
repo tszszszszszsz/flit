@@ -1,4 +1,4 @@
-# Security — threat model, trust anchors, and honest limits
+# Security — threat model, trust anchors, and limits
 
 > Part of the Flit design set. [Ladder and index](transport-bluetooth.md) ·
 > [Circle](circle.md) · [QR-only, known devices and panic](qr-only-and-panic.md) ·
@@ -8,15 +8,7 @@
 > **Non-profit constraint (hard, everywhere):** no accounts, no cloud, no ads, no
 > telemetry, no SDKs that phone home. Every mechanism below is local or
 > peer-to-peer; there is no identity server, no key escrow and no data collector
-> to audit. This document describes what the code actually enforces, not what a
-> policy page promises.
-
-## Evidence policy
-
-Claims are tagged by where the evidence comes from. A pure test proves a
-decision function; a harness run proves the production endpoints over a pipe or
-loopback; a device walk proves the built APK or CLI on the rig phone. One category
-never substitutes for another.
+> to audit.
 
 - **Code reality** — traced to specific files and lines; no execution implied.
 - **Pure-test evidence** — JVM tests in `protocol/src/test`, `app/src/test`.
@@ -27,8 +19,8 @@ never substitutes for another.
   record it.
 
 Rig status at the time of writing: 82 protocol + 210 app + 10 harness = 302
-tests, 0 failures (last green commit `72225f8`). Where a property is asserted
-only by a code comment or an unrun path, this document says "not verified".
+tests, 0 failures (last green commit `72225f8`). Properties asserted only by a
+code comment or an unrun path are marked "not verified".
 
 ## Assets and trust boundaries
 
@@ -50,7 +42,7 @@ Boundaries where untrusted input crosses into a decision:
 
 ## Threat model
 
-The table is the honest answer to "what does this design hold against". It is
+The table answers "what does this design hold against". It is
 deliberately symmetric: every row states both the guarantee and the gap.
 
 | Adversary | What holds | What does not hold |
@@ -62,7 +54,7 @@ deliberately symmetric: every row states both the guarantee and the gap.
 | Stolen Circle invite (v3 QR) | the code carries no group key; the key arrives only inside a TLS session to the host named in the QR, and the answer is signed by that host | the invite token is a bearer credential: whoever holds the photo can complete a JOIN while it is valid. Retiring a suspicious code means starting a new Circle |
 | Compromised circle member | cannot forge another fingerprint (signature + cert pin), cannot inject `JOIN` or `REKEY` through `SYNC`, cannot read a key the host never sends in a sync answer | can read the whole plaintext log and can emit signed events as itself; earlier events already stored on a departed device cannot be erased |
 | Malicious panic sender | must own the private key for the claimed `senderFp`; hops and author are signed; recipient gates on the original `originFp` being QR-known; dedup stops replays | any QR-known device can send a loud banner; panic is informational and never wipes, locks or acts on the recipient |
-| Local attacker with device access | no cloud copy to pull, no account to reset, `android:allowBackup="false"` | can read the app's plaintext state, preferences, spool and ledger; there is no content cipher and no screen lock of our own |
+| Local attacker with device access | no cloud copy to pull, no account to reset, `android:allowBackup="false"` | can read the app's plaintext state, preferences, spool and ledger; there is no content cipher and no screen lock of its own |
 | Malicious external viewer | Flit hands one content URI with a scoped read grant, never the private key or the whole spool | whatever the user chooses to do with that file is outside Flit's control |
 
 ## Trust anchor: fingerprint and certificate pinning
@@ -80,12 +72,12 @@ no hostname to validate.
   (`TlsIdentity.kt:212-251`). `DEFAULT_ALIAS` is `flit-device`,
   `DEFAULT_PASSWORD` is `flit`. Loaded identities re-check certificate validity
   (`TlsIdentity.kt:253-263`).
-- The TLS context uses a trust-all manager and presents our own client
+- The TLS context uses a trust-all manager and presents its own client
   certificate (`TlsIdentity.kt:142-145`, `:331-336`). The hand-rolled
   `PeerHttpClient` deliberately omits hostname verification: peers are reached
   by IP and authenticated by the announced fingerprint instead
   (`protocol/.../client/PeerHttpClient.kt:19-21`). The key manager ignores the
-  peer's `certificate_authorities` list so stock SunX509 still selects our
+  peer's `certificate_authorities` list so stock SunX509 still selects the
   self-signed client cert (`TlsIdentity.kt:81-140`).
 - **Invariant:** TLS provides confidentiality and transport integrity; it does
   **not** by itself establish *which* device is on the other end. Identity is
@@ -307,7 +299,7 @@ The timing of persistence is load-bearing:
   `refreshCircle` loads it on every rebind (`:381-399`). Pure JVM tests use a
   `joinPersistHook` and therefore skip both the on-device signature check and
   the write — a deliberate seam, not a claim about device behavior.
-- The 2026-11-25 polish wave fixed a real bug here: the invite token had been
+- A 2026-11-25 fix addressed a real bug here: the invite token had been
   memory-only, so a host could not admit members after a restart; it is now
   persisted (`docs/circle.md:343-352`).
 
@@ -414,7 +406,7 @@ TLS inside the pipe (`protocol/.../relay/RelayEndpoints.kt:25-109`).
   `:140`, `:211`). A malicious relay can refuse, delay, drop or kill a pair; it
   cannot forge a file, a fingerprint or a finished hash
   (`docs/milestone-e.md:14-28`).
-- **Per-device opt-in is about *our* traffic, not the relay's door.** A Known
+- **Per-device opt-in governs a device's traffic, not the relay's door.** A Known
   devices entry needs an address/token and `relayFor` on before Flit will route
   that device's sends, Circle dials or panic fan-out through a relay
   (`FlitEngine.kt:477-491`, `:813-830`, `:796-832`; `README.md:163-165`). An
@@ -457,7 +449,7 @@ was delivered (`docs/circle.md:162-166`):
   gossiped, and a recipient's card cannot claim the bytes are missing
   (`docs/circle.md:181-204`). A later joiner folds the signed announcement but
   gets no backfill of old bytes.
-- The Open affordance has three honest states: disabled "Opening…" while the
+- The Open affordance has three states: disabled "Opening…" while the
   hash resolves, "Landed here" + "Open file" only when a local copy with that
   SHA-256 exists, and no button at all otherwise. Hashes are compared
   case-insensitively, matching the engine (`docs/open-file-and-sharing-restore.md:143-161`).
@@ -505,7 +497,7 @@ The app asks for the minimum local capabilities and exposes almost nothing:
   anyone with access to the device state can read them. Do not put secrets in
   Circle messages (`docs/circle.md:110-129`, `:330-334`).
 
-## Honest limitations (recorded, not hidden)
+## Limitations
 
 1. **No content encryption at rest.** The group key is membership/rekey
    material, not a cipher. A member in the roster can read everything; a
@@ -525,7 +517,7 @@ The app asks for the minimum local capabilities and exposes almost nothing:
    not indefinite replay memory.
 6. **Relay is blind, optional and single-point.** No discovery, no
    store-and-forward, no per-peer ACL; the token is one shared secret; both
-   peers must be live. Opt-in controls our use of it, not who else may use it.
+   peers must be live. Opt-in controls Flit's use of it, not who else may use it.
 7. **Panic is informational.** Any QR-known device can raise a banner; there is
    no remote action, no wipe and no automatic forwarding. Two-phone mesh hops
    are not verified.
@@ -562,15 +554,14 @@ phone→host Circle fan-out with a clean peer-side confirmation (still
 test-evidenced only — `docs/circle.md:310-319`, `:343-361`); Wi-Fi Aware on this
 rig; any multi-member panic-hop walk beyond the one-phone-plus-box case.
 
-## Inconsistencies found while writing
+## Inconsistencies
 
-These are recorded for the orchestrator rather than silently resolved in this
-document. None changes a runtime behavior; all are stale comments or wording
-that disagree with the focused docs.
+None changes a runtime behavior; all are stale comments or wording that disagree
+with the focused docs.
 
 1. **`CircleCore.validFileBody` KDoc is stale.** `protocol/.../CircleCore.kt:312`
    says recipients locate bytes "by `sha256` through the bulk queue". The
-   authoritative correction in `docs/circle.md:162-209` says bytes are **not**
+   correction in `docs/circle.md:162-209` says bytes are **not**
    on the send-later/bulk queue; they go by a direct per-member `sendFiles` call
    from the sender's spool. `CircleEvent.kt:27-32` similarly calls `sendFiles`
    "the bulk transfer path". The enforcement code (`validFileBody`) is correct;
@@ -581,7 +572,7 @@ that disagree with the focused docs.
    stops when the *current* count would be 2, and the receiver's `evaluate`
    drops alerts at `hops >= 3`. The effective result (at most two re-signed
    forwards) matches the doc's "three relays" story, but the literal condition
-   differs; this document quotes the code.
+   differs.
 3. **QR-only flag is written to two preference keys.** `FlitEngine.setQrOnly`
    (`:2264-2268`) writes both the plain `"qrOnly"` key and
    `FlitKnown.setQrOnly`'s `"known.qrOnly"`; reads use only `known.qrOnly`. The

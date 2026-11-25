@@ -6,17 +6,6 @@
 > [Circle](circle.md) · [Open file / sharing restore](open-file-and-sharing-restore.md) ·
 > milestones [A](milestone-a.md), [C](milestone-c.md), [D](milestone-d.md), [E](milestone-e.md).
 
-This document answers one question for every flow in Flit: **when something goes
-wrong, does it retry, conclude, keep bytes, or drop them?** It records the
-contract that makes that decision, the on-disk state that survives each kind of
-death, and the concrete recovery path. It deliberately says "not verified"
-where the rig had no hardware to walk a case.
-
-## Evidence legend
-
-Every claim below is tagged with the strongest evidence that actually exists for
-it. The four levels are never mixed silently:
-
 | Tag | Meaning |
 | --- | --- |
 | **CODE** | Read from the source at the `file:line` cited. States what the program does, not what was observed running. |
@@ -34,8 +23,8 @@ SDKs; every recovery path below is local.
 ## 0. The one contract that decides every outcome
 
 Almost every "retry or conclude" question reduces to a single rule at the
-protocol/app boundary. It was written after milestone A's first hardware walk
-caught a defect that deleted a batch (see [milestone A](milestone-a.md#as-first-hardware-walk-caught-a-c-era-defect-2026-11-15--and-the-fix-is-the-contract)).
+protocol/app boundary. Milestone A's first hardware walk caught a defect that
+deleted a batch (see [milestone A](milestone-a.md#as-first-hardware-walk-caught-a-c-era-defect-2026-11-15)).
 
 > **A returned `SendReport` means exactly one thing: the receiver spoke.**
 > A thrown `TransferUnreachable` means no receiver answer exists.
@@ -163,7 +152,7 @@ receiver no longer holds, the attach answers `409 Resume base no longer held`
 and writes nothing (`ServerCore.kt:491-498`, `:511-515`). The 2026-11-18 walk
 caught the old behaviour — a claimed part was deleted before the plain attach
 could use it, leaving a 711 MB tail written as a fresh file — see
-[transport ladder](transport-bluetooth.md#c--process-death-checkpoints). Pinned by
+[transport ladder](transport-bluetooth.md). Pinned by
 `ResumeAndTurboTest` (`a resume header with no held base is refused with 409 and
 writes nothing`).
 
@@ -174,10 +163,10 @@ writes nothing`).
 DEVICE: 2026-11-14 400 MB force-stop walk — 127,959,040-byte part + sidecar
 survived both deaths, restart re-registered it with empty `senderIp`, resume
 landed hash-exact and consumed part/sidecar/row
-([milestone C](milestone-c.md#milestone-c-on-hardware-2026-11-14--the-walk-that-proves-both-truths)).
+([milestone C](milestone-c.md#milestone-c-on-hardware-2026-11-14)).
 DEVICE: 2026-11-24 300 MiB camera shot killed at 33,980,416 B → `recv-resume … from
 33980416 bytes` → hash-exact, no leftover part
-([transport ladder](transport-bluetooth.md#c--process-death-checkpoints)).
+([transport ladder](transport-bluetooth.md)).
 
 ### 2.2 Mid-body death, turbo (multi-socket)
 
@@ -196,9 +185,8 @@ back to the plain single-stream resume of the receiver's salvage base
 part — PURE: `ResumeAndTurboTest` (`a failed chunk claim leaves the kept part
 intact for a plain resume`). DEVICE: a late kill ~90 % through an 800 MiB
 multi-socket send landed hash-exact but took the **clean full-resend** path — a
-sparse prefix near completion is not advertised as a resume base. This is a
-listed limitation, not a hidden gap
-([transport ladder](transport-bluetooth.md#c--process-death-checkpoints)).
+sparse prefix near completion is not advertised as a resume base
+([transport ladder](transport-bluetooth.md)).
 
 ### 2.3 Queue rows and spools — the checkpoint that survives process death
 
@@ -215,8 +203,8 @@ after the far side speaks. `QueuedSend` lives in the app's own SharedPreferences
   (`:2221-2226`) because a row keeps **tokens**, never spool paths; the next
   flush re-spools from source.
 - **Unopenable items:** if no token can be opened (full disk, revoked grant,
-  mid-write camera file) the row is kept with an honest log, not a "send failed"
-  lie (`:2174-2183`). If some open, `dropSent` removes **only** the opened
+  mid-write camera file) the row is kept with a log entry, not a "send failed"
+  message (`:2174-2183`). If some open, `dropSent` removes **only** the opened
   tokens/names; a batch merged in mid-flight stays owed
   (`QueuedSend.without()`, `FlitRoster.kt:49-62`; `dropSent`, `FlitEngine.kt:2792-2806`).
 - **Merging:** a second intake joins the waiting batch — tokens union with
@@ -239,7 +227,7 @@ occurrence`, `the mirror duty rides a merge`) and `FlitSpoolTest`
 unconditionally`). DEVICE: 2026-10-30 queue walk — serve killed → "kept,
 sends when it reappears" → second file merged into one row → serve restarted →
 `sent 2/2`, both landed; cancel walked too
-([bluetooth carrier](bluetooth-carrier.md#queue-on-hardware-2026-10-30-d1-walk)).
+([bluetooth carrier](bluetooth-carrier.md)).
 The grant-release leg is **code-verified only**: that walk used cache-path
 tokens, so no SAF grant was in play (see [README](README.md#current-capabilities-verified-on-device)).
 
@@ -268,7 +256,7 @@ prefix and the file takes a clean full resend — hash-exact either way.
 order`, `a route listed twice is probed once`, `the hunt stays calm`,
 `the fingerprint is the whole accept rule`). DEVICE: 2026-11-15 hunt walk caught
 the C-era defect and its redo showed hunt → remembered route → flush → resume
-([milestone A](milestone-a.md#as-first-hardware-walk-caught-a-c-era-defect-2026-11-15--and-the-fix-is-the-contract));
+([milestone A](milestone-a.md#as-first-hardware-walk-caught-a-c-era-defect-2026-11-15));
 2026-11-24 relay-kill walk below.
 
 ### 2.5 Relay death and blind-pairer refusal
@@ -281,7 +269,7 @@ holds a long-lived subscription, hands each paired pipe to the same
 `ProtocolServer.serve` door, and re-subscribes with the keeper's calm backoff
 (`FlitEngine.kt:1709-1721`). Within the pipe the protocol is unchanged — TLS,
 register, prepare, upload, `/partial` all run end to end
-([milestone E](milestone-e.md#the-shape-a-blind-pairer-not-a-server)).
+([milestone E](milestone-e.md)).
 
 Failure outcomes:
 
@@ -290,7 +278,7 @@ Failure outcomes:
   resumes from the receiver's prefix. DEVICE: 2026-11-24 — 300 MiB shot cut by
   `kill -9` on the relay, `recv-resume … from 31866880 bytes`, exact killed
   prefix, hash-exact landing, no leftover part
-  ([transport ladder](transport-bluetooth.md#e--self-hosted-relay)).
+  ([transport ladder](transport-bluetooth.md)).
 - **Unpaired subscription** times out cleanly; **wrong token** is refused on
   the wire; **dead relay dial** surfaces `TransferUnreachable`, never a report.
   SIM/HARN: `RelayServerTest` (`a pair that never comes times out cleanly …`,
@@ -329,7 +317,7 @@ fingerprint is skipped (`FlitCircleStore` removes it from `members`), and the
 worker retries pending/failed rows only after their backoff expires.
 
 **Precision note.** The doc text says "a calm ~30 s worker retries rows with a
-pending or failed recipient" ([Circle](circle.md#status-semantics-app-as-built)).
+pending or failed recipient" ([Circle](circle.md)).
 In code the worker tick is 30 s, while the *per-delivery* backoff is
 `minOf(60_000, 10_000 shl attempt)` → 20/40/60 s (`FlitEngine.kt:603-605`), and
 `deliverCirclePending` skips already-terminal recipients. An all-terminal row
@@ -341,7 +329,7 @@ receives no old bytes; its card shows the neutral "file drop · open to view if 
 arrived" line. Status is sender-local, so a recipient's card cannot claim bytes
 are missing.
 
-**Open file states** ([open-file doc](open-file-and-sharing-restore.md#circle-card--three-honest-states)):
+**Open file states** ([open-file doc](open-file-and-sharing-restore.md#circle-card--three-states)):
 `Opening…` (disabled), `Landed here` + `Open file` (only when a local SHA-256
 match exists), or no button (`Not here yet · no local copy to open`). A failed
 open ends in a toast, not a crash. A `FileProvider` root for `Download/Flit/` and
@@ -388,14 +376,14 @@ from that constant.
   key and signs a `rekey` event (`:213-242`). A member-supplied rekey is
   rejected; `applyRekey` only accepts a known signer and a non-decreasing gen
   (`:386-398`). Earlier events already stored on a departed device **stay
-  plaintext** — there is no content cipher to erase. This is recorded, not
-  hidden ([Circle](circle.md#threat-model-and-safety-rails)).
+  plaintext** — there is no content cipher to erase
+  ([Circle](circle.md#threat-model-and-safety-rails)).
 - **Vote-kick:** one latest vote per current member; a changed vote can block a
   kick before it lands; strict majority of current members decides
   (`:490-524`). Ties are displayed as ties.
 
 **Evidence.** PURE: `CircleCoreTest`, `CircleHardeningTest`,
-`FlitCircleHostTest` (team's `wrong circle … refusals`, `join requires the
+`FlitCircleHostTest` (`wrong circle … refusals`, `join requires the
 invite`, `sync refuses outsiders`, `a signed certificate cannot claim another
 member fingerprint`, `wrong circle unknown type oversized and replayed events
 are skipped`, `leave removes the member bumps the generation and host rekeys`,
@@ -416,12 +404,12 @@ the box's poll and two bot messages (`:302-308`).
   walk could not produce a clean peer-side confirmation because the demo bots'
   CLI state and their `serve` process shared identities. The behavioural
   fan-out tests pass with an injected carrier; the device re-walk is the final
-  verification item. Recorded explicitly in
-  [Circle](circle.md#known-limitations-recorded-not-hidden) and still open in
-  the 2026-11-25 close (`:357-361`).
+  verification item. See
+  [Circle](circle.md#known-limitations) and the 2026-11-25
+  close (`:357-361`).
 - Multi-member mesh, one Circle at a time, no content encryption, bearer invite,
   blind relay requiring a manual Known-device entry with `relayFor` — all listed
-  in the same section. None is contradicted here.
+  in the same section.
 
 ---
 
@@ -456,7 +444,7 @@ Panic is informational: nothing is wiped or changed remotely
 cases). DEVICE: one phone + CLI box — QR v2 paste pinned the box, phone-sent
 alert logged with fingerprint/text on the box, box-sent alert produced the
 phone banner with alias/note/safety copy
-([QR-only / panic](qr-only-and-panic.md#hardware-evidence-one-phone--the-cli-box)).
+([QR-only / panic](qr-only-and-panic.md)).
 **Not verified:** two-phone mesh hops — listed limitation.
 
 ---
@@ -502,7 +490,7 @@ start, and leaves the engine alive while a Flit surface is foreground
 (`:161-173`). `onDestroy` calls `FlitEngine.stop()` **only** for an instance that
 owned the engine through a live, non-timed-out FGS (`:175-184`).
 
-### 5.3 MIUI and OS limits — honest boundaries
+### 5.3 MIUI and OS limits
 
 - MIUI can still kill the process (battery saver, autostart rules, memory
   pressure). The persisted flag means sharing returns **the next time the user
@@ -532,13 +520,13 @@ and no `FATAL`/`am_crash`/`Force finishing`, back returned to the feed,
 `serving https://0.0.0.0:53317…` automatically with the Home card showing Stop
 ([open-file doc](open-file-and-sharing-restore.md#device-evidence-2026-11-25-final-build)).
 Earlier capture: 8-minute screen-off idle soak with an empty crash buffer
-([bluetooth carrier](bluetooth-carrier.md#idle-soak-020-on-hardware-2026-10-30-d1-close)).
+([bluetooth carrier](bluetooth-carrier.md)).
 
 ---
 
 ## 6. Recovery recipes (operator-facing)
 
-Each recipe states what is automatic and what the user must do. None needs an
+Each recipe states what is automatic and the manual step. None needs an
 account, a server, or a settings change beyond the opt-ins already documented.
 
 1. **A send is killed mid-body (sender or receiver).** Automatic: owe row stays
@@ -557,7 +545,7 @@ account, a server, or a settings change beyond the opt-ins already documented.
 4. **Wi‑Fi multicast blocked but peers are on the same LAN.** Automatic: an empty
    roster starts a throttled subnet sweep (≤24 knocks, ≥120 s between rounds,
    one round per silent roster, hidden mode stands down). A dial-only peer is
-   kept fresh by a ~15 s re-register keeper; three misses retire it honestly.
+   kept fresh by a ~15 s re-register keeper; three misses retire it.
 5. **No route at all (NATs / cellular).** Configure the self-hosted relay once in
    Options and give the peer a Known-device entry with its relay address/token
    and `relayFor` on. Both peers must be live; the relay is last in priority so a
@@ -602,9 +590,9 @@ account, a server, or a settings change beyond the opt-ins already documented.
 
 ---
 
-## 8. Limitations and inconsistencies found while writing
+## 8. Limitations and inconsistencies
 
-These are recorded rather than smoothed over. None changes a shipped contract.
+None changes a shipped contract.
 
 1. **Two-phone RFCOMM transfer is not verified.** The rig has one phone and the
    bench box has no Bluetooth adapter (`bluetoothctl list` empty). The carrier
@@ -613,15 +601,15 @@ These are recorded rather than smoothed over. None changes a shipped contract.
    hops.
 2. **Wi‑Fi Aware is absent on the rig phone** (`pm has-feature
    android.software.wifi.aware` → false, 2026-11-21), so that ladder rung was
-   parked on hardware grounds, not silently cut.
+   parked on hardware grounds.
 3. **Outbound phone→host Circle fan-out remains test-evidenced only** (the
    2026-11-25 close still lists it). Inbound sync, join, leave and governance are
    device-evidenced.
-4. **The task brief's "8 MiB Circle file drop" is not supported by the source
-   docs or code I read.** The documented device drop is 35 B
+4. **The "8 MiB Circle file drop" is not supported by the source docs or
+   code.** The documented device drop is 35 B
    (`open-check.txt`), the harness payload is 8192 B, and `8 MiB` is the turbo
-   chunk hint. Treated as "not verified" here; no claim was built on it.
-5. **Wording precision, not a contradiction:** [Circle](circle.md#status-semantics-app-as-built)
+   chunk hint. Treated as "not verified" here.
+5. **Wording precision, not a contradiction:** [Circle](circle.md)
    calls `failed` terminal and also says the worker retries failed recipients.
    In code (`FlitEngine.kt:507-511`, `:575-596`, `:612-629`) `FAILED` is terminal
    for that recipient in a pass; the worker tick re-enters the row so an

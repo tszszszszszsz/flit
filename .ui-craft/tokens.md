@@ -1,8 +1,8 @@
 # Flit — Token Spine (adopted system: Material 3 Expressive)
 
 Per craft-intent "ecosystem briefs use the official system": Jetpack Compose **material3 1.4.0**
-(BOM 2026.06.00). This file records which tokens Flit uses and the few places Flit adds its own.
-Values are from m3.material.io / the M3 token sets; nothing invented unless marked **ours**.
+(BOM 2026.06.00). Values are from m3.material.io / the M3 token sets; nothing invented unless
+marked **ours**.
 
 **Craft Read (2026-10-27):** native Android app UI (full M3 Expressive reskin) for a single-owner
 local file-sharing user, product language, Material You dynamic color + Google-blue static

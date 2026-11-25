@@ -2,9 +2,9 @@
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
 
-## Milestone C design — process-death checkpoints (written before code)
+## Milestone C design — process-death checkpoints
 
-Read out of the code as it stands (2026-11-14), then converged. Three facts:
+Read out of the code as it stands (2026-11-14). Three facts:
 
 1. **The sender's owe-state already survives death — for queue batches.**
    `dropQueue` fires only after `dispatchTo` *returns* (the far side spoke:
@@ -25,14 +25,12 @@ Read out of the code as it stands (2026-11-14), then converged. Three facts:
    any path that lands the peer as a live row auto-flushes. No new machinery
    needed there.
 
-The design, in one sentence each:
-
 - **One truth for owe-state: the queue row, written *before* bytes move.**
   A fresh dispatch converges onto the queue's machinery — enqueue the row at
   dispatch time, send through the same path, `dropQueue` on confirmed success
   exactly as the flush path does today. The enqueue-on-failure dance in the
   fresh path dies; every send the engine attempts is owed somewhere first.
-  This is the convergence the milestone names: the queue IS the checkpoint.
+
 - **One truth for progress: the receiver's disk.** No sender-side byte
   counters to persist — the sender re-learns the prefix through `/partial` on
   every re-entry, and the hash gate verifies every landing. A file that fully
@@ -42,10 +40,10 @@ The design, in one sentence each:
   server start sweeps parts (and sidecars) back into the `parts` registry
   with an empty senderIp — which the probe already accepts from anyone.
   The 24-hour aging stays as-is.
-- **Honest edges, listed:** non-persistable sources (mixed spool+URI grants)
+- **Edges, listed:** non-persistable sources (mixed spool+URI grants)
   cannot be checkpointed and stay best-effort; a resumed-after-death prefix is
   served with an empty senderIp, trusted only because the probe is a read of
-  byte count, not of content; the checkpoint covers deaths of *our* process —
+  byte count, not of content; the checkpoint covers deaths of the app process —
   a receiver that died loses nothing (its parts are durable), a sender that
   died keeps its owe and re-enters.
 
@@ -54,7 +52,7 @@ Tests: token sidecar round-trip; a fresh `ServerCore` over a dirty dest answers
 visible the moment dispatch starts); the death walk on hardware — transfer
 running, `am kill`, restart, same prefix, hash-exact end.
 
-### Milestone C on hardware (2026-11-14) — the walk that proves both truths
+### Milestone C on hardware (2026-11-14)
 
 Fixture: the box serves the freshly rebuilt `flit-cli` (the C build — verified
 by the `.part.token` literal in its installed jar); the phone runs the freshly
@@ -70,8 +68,8 @@ pushed to the phone's `Download/`. Then, chronologically:
    *before* any byte moves; 3–4 s later, mid-body, the sender's process is
    killed outright: `adb shell am force-stop app.flit.share`.
 2. **The receiver's disk keeps the prefix — and its own discoverability.**
-   The abrupt disconnect surfaces as a checksum mismatch, which is exactly an
-   honest prefix: the server kept it as `.bigresume.bin.part` —
+   The abrupt disconnect surfaces as a checksum mismatch; the server kept the
+   prefix as `.bigresume.bin.part` —
    **127,959,040 bytes (32 %)** — and wrote the token sidecar
    `.bigresume.bin.part.token` beside it at keep time
    (`41133d96bf74e2023c12bfa26f953f0d`, the content-bound
@@ -94,15 +92,13 @@ pushed to the phone's `Download/`. Then, chronologically:
    the sender attaches with `X-Flit-Resume` on its own and streams only the
    remaining 272 MB. Seven seconds later:
    `sent 1/1 to Flit (szszszs): bigresume.bin`.
-6. **The verdict.** The receiver's log says it plainly —
-   `recv-resume bigresume.bin from 127959040 bytes` — and the landing is
-   hash-exact: `sha256sum` on the box equals the reference hash above. The
-   part and its sidecar are gone from the directory (consumed by the success
-   move); the queue row is gone from the phone (precise drop, sent tokens
-   out, grants released). Screenshot: `/tmp/opencode/ui-resume-done.png`.
+6. The receiver's log records `recv-resume bigresume.bin from 127959040
+   bytes`, and the landing is hash-exact: `sha256sum` on the box equals the
+   reference hash above. The part and its sidecar are gone from the directory
+   (consumed by the success move); the queue row is gone from the phone
+   (precise drop, sent tokens out, grants released). Screenshot:
+   `/tmp/opencode/ui-resume-done.png`.
 
 One death was simulated twice over and the transfer still cost only the bytes
-that never landed. The queue row was the checkpoint, the receiver's disk was
-the progress, and neither side was told anything the other didn't already
-speak.
+that never landed.
 

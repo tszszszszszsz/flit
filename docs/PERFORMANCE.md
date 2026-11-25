@@ -4,31 +4,10 @@
 > [Bluetooth carrier](bluetooth-carrier.md) · [Circle](circle.md) ·
 > [Open-file / sharing restore](open-file-and-sharing-restore.md) ·
 > [README](../README.md).
->
-> Scope: measured throughput, radio duty cycle and energy design, every periodic
-> worker and its cadence, fan-out watermarks and full-log repair, concurrency
-> caps, the digest cache, memoized tallies, `StateFlow` content-diffing, spool
-> and replay costs, the tradeoffs behind each choice, and an explicit list of
-> what was **not** measured. This document does not restate wire contracts
-> ([CONTRACTS.md](CONTRACTS.md)), failure conclusions
-> ([FAILURE-MODES.md](FAILURE-MODES.md)) or security trust anchors
-> ([SECURITY.md](SECURITY.md)); it reads the same code and says what the
-> machinery costs.
 
-## Evidence policy
+Current rig state: **82 protocol + 210 app + 10 harness = 302 tests, 0 failures**; last commit `72225f8`. Older docs quote older counts (76, 86, 115) from the era in which they were written — those are historical, not current, figures.
 
-Four buckets are kept separate. Nothing here crosses one silently.
-
-| Bucket | What it is | How to read a claim labeled this way |
-| --- | --- | --- |
-| **Code reality** | A constant, branch or data structure in the checked-out source, cited as `file:line` | True of the code as built; not a runtime observation |
-| **Pure-test evidence** | A deterministic JVM test (`protocol/src/test`, `app/src/test`) | Proves the pure arithmetic/state machine, not a device outcome |
-| **Harness/sim evidence** | `flit-cli bt-sim`, the two in-process Circle nodes, `RelayServerTest` | Real protocol stack, one process or loopback; no radio or phone power data |
-| **On-device evidence** | A logged walk on the Redmi Note 10S / API 36 phone and/or the harness box | Observed on that one rig only; no generalization to other ROMs or radios |
-
-Current rig state from the shared contract: **82 protocol + 210 app + 10 harness = 302 tests, 0 failures**; last commit `72225f8`. Older docs quote older counts (76, 86, 115) from the era in which they were written — those are historical, not current, figures.
-
-There is **no power monitor, battery-current sample, profiler trace or frame-time capture anywhere in this repo**. Every energy statement below is duty-cycle arithmetic plus design intent, or an honest on-device observation (an idle soak, a log line), never a measured mAh or watt figure. Where that matters it is said explicitly.
+There is **no power monitor, battery-current sample, profiler trace or frame-time capture anywhere in this repo**. Every energy statement below is duty-cycle arithmetic plus design intent, or an on-device observation (an idle soak, a log line), never a measured mAh or watt figure.
 
 ---
 
@@ -36,7 +15,7 @@ There is **no power monitor, battery-current sample, profiler trace or frame-tim
 
 ### 1.1 The one hard number
 
-On 2026-11-24 a **512 MiB** file sent from the reference CLI to the phone completed in **15.9 s** in both the single-stream and the multi-socket configuration: **32.1 MiB/s, roughly 270 Mbps** ([bluetooth-carrier.md](bluetooth-carrier.md), "Speed, measured 2026-11-24"). The same number for both modes is the point: the ceiling is this Wi-Fi link and the phone's storage, not Flit's HTTP/TLS framing, and turbo is resume-aware but cannot outrun the radio. Bluetooth is a reachability fallback, never a speed upgrade.
+On 2026-11-24 a **512 MiB** file sent from the reference CLI to the phone completed in **15.9 s** in both the single-stream and the multi-socket configuration: **32.1 MiB/s, roughly 270 Mbps** ([bluetooth-carrier.md](bluetooth-carrier.md), "Speed, measured 2026-11-24"). The same number for both modes means the ceiling is this Wi-Fi link and the phone's storage, not Flit's HTTP/TLS framing; turbo is resume-aware but cannot outrun the radio. Bluetooth is a reachability fallback, never a speed upgrade.
 
 That is one file, one link, one phone, one day. It is **not** a throughput matrix: no LTE/cellular figure, no RFCOMM figure, no cross-device comparison and no CPU cost were captured alongside it.
 
@@ -85,7 +64,7 @@ When no usable Wi-Fi network answers (`wifiNetwork()`, `FlitEngine.kt:1865-1874`
 | `DUTY_PERIOD_MS` | 55,000 | 10 s on / 45 s off |
 | `FRESH_TOUCH_MS` | 10,000 | A Wi-Fi/manual touch this recent owns the row; the radio may only fill lapses |
 
-`phaseOn(tick) = Math.floorMod(tick, 11) < 2`, with `clockTick = floorDiv(nowMs, 5000)`; negative ticks wrap honestly, a non-positive window never wakes and a window at least as long as the period stays always on (fail-closed, `FlitBle.kt:176-184`). `FlitBleTest` asserts 5,000 / 10,000 / 45,000 / 11 / 55,000 exactly, the repeated 11-tick pattern, the wrap cases and the degenerate windows.
+`phaseOn(tick) = Math.floorMod(tick, 11) < 2`, with `clockTick = floorDiv(nowMs, 5000)`; negative ticks wrap, a non-positive window never wakes and a window at least as long as the period stays always on (fail-closed, `FlitBle.kt:176-184`). `FlitBleTest` asserts 5,000 / 10,000 / 45,000 / 11 / 55,000 exactly, the repeated 11-tick pattern, the wrap cases and the degenerate windows.
 
 The resulting stance (`FlitBle.kt:232-238`):
 
@@ -106,9 +85,9 @@ Connectable advertising — required for RFCOMM — is `connectable && stance.ad
 
 ### 2.4 Observed idle behaviour, and what it does not prove
 
-The 2026-10-30 idle soak ([bluetooth-carrier.md](bluetooth-carrier.md), "Idle soak, 0.2.0 on hardware") ran 8 minutes screen-off with the engine serving: empty crash buffer, process alive, radios in the state the user left them (Bluetooth off), and only the mprober's honest refusals against a serve-down box in the log. That is evidence the rationing *rests* without a surprise; it is **not** a power measurement. No current draw, charge delta or wake count was recorded.
+The 2026-10-30 idle soak ([bluetooth-carrier.md](bluetooth-carrier.md), "Idle soak, 0.2.0 on hardware") ran 8 minutes screen-off with the engine serving: empty crash buffer, process alive, radios in the state the user left them (Bluetooth off), and only the mprober's refusals against a serve-down box in the log. That is evidence the rationing *rests* without a surprise; it is **not** a power measurement. No current draw, charge delta or wake count was recorded.
 
-OS-level energy limits are outside app control and are documented as such ([open-file-and-sharing-restore.md](open-file-and-sharing-restore.md), "Honest MIUI / Android limitations"): MIUI battery saver, autostart rules and memory pressure can kill the process, and Android 15 rations `dataSync` foreground time to about six hours a day. At the cap `onTimeout()` drops the notification rather than crashing, leaving the engine alive while a Flit surface is open; the next cold open silently restores sharing from the persisted `sharingDesired` row. The Options "Background battery" helper sends the user to system settings; it cannot change the ROM's policy. Keep-screen-on is a deliberate counter-trade: `FLAG_KEEP_SCREEN_ON` is held **only while a transfer is in flight** and only when the option is on (default true) (`MainActivity.kt:571-586`, `FlitEngine.transferActive`). It spends display power to keep a long transfer from being interrupted by sleep.
+OS-level energy limits are outside app control and are documented as such ([open-file-and-sharing-restore.md](open-file-and-sharing-restore.md), "MIUI / Android limitations"): MIUI battery saver, autostart rules and memory pressure can kill the process, and Android 15 rations `dataSync` foreground time to about six hours a day. At the cap `onTimeout()` drops the notification rather than crashing, leaving the engine alive while a Flit surface is open; the next cold open restores sharing from the persisted `sharingDesired` row. The Options "Background battery" helper sends the user to system settings; it cannot change the ROM's policy. Keep-screen-on is a deliberate counter-trade: `FLAG_KEEP_SCREEN_ON` is held **only while a transfer is in flight** and only when the option is on (default true) (`MainActivity.kt:571-586`, `FlitEngine.transferActive`). It spends display power to keep a long transfer from being interrupted by sleep.
 
 ---
 
@@ -139,8 +118,6 @@ The hunter schedule deserves a note: `huntDelayMs(attempt) = listOf(2_000, 5_000
 
 ## 4. Circle: watermarks, fan-out and full-log repair
 
-This is the subtlest cost centre in the app and the one most likely to be misread, so the code is described precisely.
-
 ### 4.1 Bounds (code reality)
 
 `FlitCircleStore.EVENT_CAP = 500` (`FlitCircleStore.kt:72`); `CircleCore.MAX_EVENTS_PER_REQUEST = 1024`, `MAX_SEEN = 4096`, `MAX_BODY_CHARS = 16 KiB`, `MAX_REQUEST_BYTES = 8 MiB`, field caps 256 chars, signature cap 1024, cert cap 8 KiB (`protocol/.../circle/CircleCore.kt:29-50`). A single event body is a small JSON object; file drops are `{name, size, sha256}` only — no bytes, no spool path. The host refuses more than 1024 events in one request (`ServerCore.kt:957-965`). PanicCore uses a separate 1024-id seen set and 3-hop cap; TLS pin cache is an LRU of 512 (`TlsIdentity.kt:163-177`). All of these are memory ceilings, not measured working sets.
@@ -149,7 +126,7 @@ This is the subtlest cost centre in the app and the one most likely to be misrea
 
 A `CircleWatermark` is `(lamport, id)` — the greatest event a peer acknowledged (`FlitCircleSync.kt:91-100,126-127`). The tie-break on `id` makes the delta stable when two events share a Lamport value.
 
-- **Fan-out on a post** (`fanout`, `:656-716`) is delta-only: `circleDelta(current.events, watermarks[fp])` offers only events newer than that peer's watermark, capped at `MAX_EVENTS_PER_REQUEST`. An OK advances the watermark; a refusal leaves it untouched and applies per-peer backoff. An empty delta still makes one tiny probe so the answer can be folded and the watermark stays honest. Dials are bounded by `CIRCLE_PEER_DIALS = 4` (`:88-89`), not by roster size.
+- **Fan-out on a post** (`fanout`, `:656-716`) is delta-only: `circleDelta(current.events, watermarks[fp])` offers only events newer than that peer's watermark, capped at `MAX_EVENTS_PER_REQUEST`. An OK advances the watermark; a refusal leaves it untouched and applies per-peer backoff. An empty delta still makes one tiny probe so the answer can be folded and the watermark stays current. Dials are bounded by `CIRCLE_PEER_DIALS = 4` (`:88-89`), not by roster size.
 - **The calm repair tick** (`sync`, `:454-515`) deliberately ignores watermarks: `circleRepairBatch(state.events)` posts the bounded full log to each reachable peer, and the answer is folded. This is what heals a delta a peer missed. It is gated by `CIRCLE_SYNC_MIN_INTERVAL_MS = 30 s` and skips backed-off peers.
 - **Per-peer backoff** is `min(5_000 shl n, 120_000)` with `n` clamped 0..5 (`:43-54`). Because the first recorded refusal is attempt 1, the real delays are 10 s, 20 s, 40 s, 80 s, 120 s, then 120 s. Any answer resets the peer's misses and watermark book stays current; departed fingerprints' bookkeeping is pruned on a tick (`:729-737`).
 - **Host side no-op** (`FlitCircleHost.isEvidence`, `FlitCircleHost.kt:106-115`): a sync that only echoes the stored log is not "evidence" and stays out of the noisy diagnostic path. A plain echo still costs a verify-and-fold pass, but no state change and no log line.
@@ -160,7 +137,7 @@ A file announcement is signed and fanned out like any other event. The bytes are
 
 ### 4.4 Inconsistency found while reading
 
-[circle.md](circle.md) §"Event log (the only genuinely new core)" says that **every** `SYNC` — pull, outbound post or calm tick — "posts the full bounded local log" and that "the whole log travels each time". The code does not do that for posts: `fanout` uses per-peer watermark deltas (§4.2 above), and only the calm repair tick re-offers the full bounded log. The document's "store-and-forward ... a lost one-shot is repaired by the next post or tick" is true of the **tick**, not of every post. This is flagged rather than silently reconciled, per the shared contract; the performance story here follows the code.
+[circle.md](circle.md) §"Event log (the only new core)" says that **every** `SYNC` — pull, outbound post or calm tick — "posts the full bounded local log" and that "the whole log travels each time". The code does not do that for posts: `fanout` uses per-peer watermark deltas (§4.2 above), and only the calm repair tick re-offers the full bounded log. The document's "store-and-forward ... a lost one-shot is repaired by the next post or tick" is true of the **tick**, not of every post.
 
 ---
 
@@ -225,7 +202,7 @@ The same idea exists in two smaller places: `FlitCircleHost.isEvidence` (§4.2) 
 
 A round fires only while discovery is silent (no live non-manual row), never in hidden mode, and at most once per 120 s. It walks the device's own Wi-Fi subnets (station and SoftAP, VPNs excluded, IPv4 only), skipping `manual@` addresses. Each host first gets a 250 ms TCP connect filter, then a `register` with a 400 ms budget, TLS first for a TLS route (plain first otherwise). Up to 24 knocks run concurrently; a single range beyond 1024 hosts is refused before allocation.
 
-On-device evidence ([bluetooth-carrier.md](bluetooth-carrier.md), "Rescue sweep on hardware", 2026-11-14): a `/24` produced `253 hosts, nothing found in 2774 ms`, and the next logged empty round was ~120 s later (the throttle read from timestamps, since empty rounds log once). A dial-only box was found unassisted: `found 1 (...) in 2773 ms` with no multicast, no typed address and no QR. A real defect was caught by that walk: the 120 s walk outlived the 30 s roster TTL, so a dial-only peer blinked; the keeper fixed it with a 15 s targeted re-register, three consecutive misses retiring the row. After the fix the row held at 2.5 min with exactly one found line in the log. Hidden mode produced **zero** sweep lines for 26 s (a round would have fired within ~10 s), and the self-dial case showed a cold TLS handshake outrunning the 400 ms register budget — an honest limit, not a hidden one.
+On-device evidence ([bluetooth-carrier.md](bluetooth-carrier.md), "Rescue sweep on hardware", 2026-11-14): a `/24` produced `253 hosts, nothing found in 2774 ms`, and the next logged empty round was ~120 s later (the throttle read from timestamps, since empty rounds log once). A dial-only box was found unassisted: `found 1 (...) in 2773 ms` with no multicast, no typed address and no QR. A real defect was caught by that walk: the 120 s walk outlived the 30 s roster TTL, so a dial-only peer blinked; the keeper fixed it with a 15 s targeted re-register, three consecutive misses retiring the row. After the fix the row held at 2.5 min with exactly one found line in the log. Hidden mode produced **zero** sweep lines for 26 s (a round would have fired within ~10 s), and the self-dial case showed a cold TLS handshake outrunning the 400 ms register budget.
 
 Pure-test evidence backs the pure parts: `FlitBleTest` duty/stance/hasLivePeer; `FlitSubnet.hosts` cap and prefix admission. There is no harness timing suite for the sweep itself.
 
@@ -280,16 +257,16 @@ On the receive side, API 29+ non-crushed wires stream straight into a pending `D
 - **Storage write amplification**: the spool path adds one cache copy; direct receive removes one. Neither was quantified on device.
 - **Wi-Fi Aware**: feature absent on the rig phone (`adb shell pm has-feature android.software.wifi.aware` → false, 2026-11-21); no Aware carrier exists to benchmark.
 - **Multi-member mesh**: only the two-node walk (phone + box CLI) has been on hardware; three-or-more-device fan-out cost is not observed ([circle.md](circle.md)).
-- **Phone→host Circle fan-out on device**: behaviour is test-evidenced with an injected carrier; the 2026-11-25 walk could not produce a clean peer-side confirmation, so its live wire cost is not measured ([circle.md](circle.md), final polish wave).
+- **Phone→host Circle fan-out on device**: behaviour is test-evidenced with an injected carrier; the 2026-11-25 walk could not produce a clean peer-side confirmation, so its live wire cost is not measured ([circle.md](circle.md)).
 - **Cross-ROM/RAM behaviour**: MIUI autostart/battery rules and the Android 15 `dataSync` ~6 h cap are ROM/OS limits; no other device was available.
 - **Sweep beyond one subnet**: the hardware walk was a `/24`; the 1024-host cap is a pure admission rule, not a measured worst case.
 - **Wire-byte totals** for Circle repair beyond the structural caps (1024 events/request, 8 MiB request body, 16 KiB event body); no traffic capture was published.
 
 ---
 
-## 11. Consistency notes for the orchestrator
+## 11. Consistency notes
 
-1. **circle.md "every SYNC posts the full bounded log"** conflicts with `FlitCircleSync.fanout`, which posts per-peer watermark deltas; only the calm `sync()` repair tick posts the full bounded log. Documented in §4.4. The existing doc is the source of truth by contract, so this is reported, not silently rewritten.
+1. **circle.md "every SYNC posts the full bounded log"** conflicts with `FlitCircleSync.fanout`, which posts per-peer watermark deltas; only the calm `sync()` repair tick posts the full bounded log. Documented in §4.4.
 2. **Historical test counts** in the milestone docs (76 / 86 / 115) are from their respective eras and do not match the current 302-test rig; they are not contradictions, but a docs index that states a single current number should say which era each older figure belongs to.
-3. **README/Play "four parallel streams"** matches the client (`TURBO_MAX_STREAMS = 4`); the server's `MAX_TURBO_STREAMS = 6` is unused headroom from the shipped client's perspective. Calling this out avoids a reader thinking six streams are active.
+3. **README/Play "four parallel streams"** matches the client (`TURBO_MAX_STREAMS = 4`); the server's `MAX_TURBO_STREAMS = 6` is unused headroom from the shipped client's perspective.
 4. **Circle delivery backoff** in `FlitEngine` starts at an effective 20 s (`10s << attempt`, attempt = 1), not 10 s; the Circle *sync* backoff starts at 10 s (`5s << 1`). The two schedules are different by design and are both stated exactly in §3/§4.3.

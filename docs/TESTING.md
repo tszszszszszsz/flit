@@ -1,28 +1,13 @@
 # Testing and evidence
 
-> Part of the Flit engineering story. [Main ladder](transport-bluetooth.md) ·
+> Part of the Flit engineering docs. [Main ladder](transport-bluetooth.md) ·
 > [Architecture](ARCHITECTURE.md) · [Operations](OPERATIONS.md) ·
 > [Contracts](CONTRACTS.md) · [Failure modes](FAILURE-MODES.md) ·
 > [Performance](PERFORMANCE.md) · [Security](SECURITY.md).
->
-> This document owns the exact rig command, the current test inventory by module
-> and class, the device-walk evidence table, the reproduction recipes, the flaky
-> patterns and the rules for adding tests. It does **not** duplicate the CLI flag
-> reference ([Operations](OPERATIONS.md)) or the wire contracts
-> ([Contracts](CONTRACTS.md)).
 
-## 1. Evidence policy
+## 1. Evidence levels
 
-There are four levels. Every claim in this document and its sibling docs carries
-one of them; where several are present the **weakest** one governs what may be
-asserted (the rule in [Product decisions](PRODUCT-DECISIONS.md#8-how-we-work)).
-
-| Level | What it is | What it may claim |
-| --- | --- | --- |
-| **Code reality** | A path traced through source, with `file:line`. | What the code does on that path; not that it ran successfully on hardware. |
-| **Pure-test evidence** | A JVM unit test with no Android runtime, no radio and no external peer. | That the pure seam holds for the inputs the test supplies. |
-| **Harness/sim evidence** | An in-process or CLI run using the production protocol client/server over a pipe, loopback TLS or the blind relay. | That the production seam works end-to-end in that process; not that a phone did it. |
-| **On-device evidence** | A walk on the Redmi Note 10S (API 36, MIUI) or on the box with the app/CLI, dated and logged. | That the observed path worked on that hardware at that time. |
+Where several levels apply to a claim, the **weakest** one governs what may be asserted.
 
 Rules applied here:
 
@@ -82,7 +67,7 @@ zip, with `--no-daemon --stacktrace` (`.github/workflows/rig.yml:35-43`):
   :harness:installDist :harness:distZip
 ```
 
-Two honest notes about these commands:
+Two notes about these commands:
 
 1. The README command does **not** include `:harness:test`. The 302-test figure
    (which includes the 10 harness tests) is realized by the CI command, or by
@@ -93,7 +78,7 @@ Two honest notes about these commands:
    `app/build.gradle.kts:15-33`). That is a build-integrity check, not a
    release-signing verification.
 
-**Verification record for this document.** The three test tasks were run fresh
+**Verification record.** The three test tasks were run fresh
 on 2026-11-25 in `/home/szszszs/flit` (JDK 21.0.13, Gradle 8.14.3):
 
 ```bash
@@ -147,7 +132,7 @@ radio.
 | Class | # | What it pins |
 | --- | --- | --- |
 | `FlitBleTest` | 29 | BLE record codec (extended/legacy, fingerprint+alias, codepoint-safe clipping, garbage refused, both self-ghost kinds), arbiter (AP up dark, no-AP on, hidden listen-only, missing perm/dead radio off), rank rule, contextual ask book, 10-on/45-off duty constants and injectable phase, live-peer stop rule. |
-| `FlitBluetoothTest` | 14 | Android 12 permission split and legacy API 26-30 set, all-grants rule, RFCOMM backoff doubling/cap/no overflow, honest retry logs, quiet cancellation, transient accept failure re-listens, bounded handshake. |
+| `FlitBluetoothTest` | 14 | Android 12 permission split and legacy API 26-30 set, all-grants rule, RFCOMM backoff doubling/cap/no overflow, retry logs, quiet cancellation, transient accept failure re-listens, bounded handshake. |
 | `FlitCircleHostTest` | 19 | Wrong circle/unknown action refusals, invite + fingerprint gate on JOIN, signed-log return, outsider/blank SYNC refusal, verify-before-fold, cert cannot claim another fingerprint, wrong type/oversized/replayed skip, leave/kick/role governance and rekey invariants, departed member refused, replay roll-off, bounded log and roster, repeatable answers. |
 | `FlitCircleStoreTest` | 25 | Store codec and tolerant decode (defaults, corrupt, duplicate, oversized trim, negative generation), roster folds (join/leave/kick/vote/role/rekey), generation saturation, per-fingerprint delivery records (upsert/status/remove) untouched by event folds. |
 | `FlitCircleSyncTest` | 27 | Backoff escalation/cap, Lamport next, canonical message/poll/vote/file/kick/role/rekey bodies, strict outbound and inbound body gates, fan-out peer normalization and concurrency cap (4), per-peer watermarks, delta-only posts, refused delta not acked, calm full-log repair after ack, backed-off repair. |
@@ -157,10 +142,10 @@ radio.
 | `FlitQrTest` | 22 | v2/v3 URI round-trips (including relay-only codes and v3 with no key on the wire), order/dupe resolution, junk refused, on-screen and camera-shaped frames decoded (canvas-gray, RGB, y-plane with strides, rotation), skewed non-code stays calm, unicode alias. |
 | `FlitRosterTest` | 12 | Batch merge semantics (token union, age kept, aliases, mid-flight merge, last-token removal, first-occurrence twins), sharing-desired codec and reducer, restore only when desired and neither running nor starting. |
 | `FlitRouteTest` | 7 | Bluetooth MAC route distinct from TCP twin, legacy TCP route decode, typed relay parse, candidate priority order and dedup, calm hunt backoff, fingerprint-only accept rule. |
-| `FlitSpeedEdgeTest` | 4 | First huge sample only seeds baseline, irregular intervals honest, decreasing/repeated counts never negative, 100× jump limited. |
+| `FlitSpeedEdgeTest` | 4 | First huge sample only seeds baseline, irregular intervals, decreasing/repeated counts never negative, 100× jump limited. |
 | `FlitSpeedTest` | 4 | Repeated samples in one paint window do not inflate rate, no negative/gigabit spike, reset forgets prior baseline. |
 | `FlitSpoolTest` | 5 | Start sweep reclaims killed-session copies only; young staging kept; queue whitelist wins; crush copies are litter; look-alikes/directories ignored. Real mtimes on a temp root, no Robolectric. |
-| `FlitSubnetTest` | 8 | /24 and /30 host walks, self/network/broadcast excluded, /31-/32 and out-of-range prefixes refused, IPv6 not walked, /16 over the 1024-knock cap refused, boundary at 253/252, honest labels. |
+| `FlitSubnetTest` | 8 | /24 and /30 host walks, self/network/broadcast excluded, /31-/32 and out-of-range prefixes refused, IPv6 not walked, /16 over the 1024-knock cap refused, boundary at 253/252, labels. |
 | `SharingRestoreTest` | 11 | Fresh row not desired, absent/blank/corrupt decode safe, `with` flips and stamps, envelope can grow, idempotent encode/decode, old bare-word rows, restore only after process death and not when already up/starting. |
 | `SheetUiTest` | 3 | Initials from first two words, stable in-range hue per fingerprint, count phrasing rule of one. |
 
@@ -180,8 +165,7 @@ same `RelayServer` the CLI runs, with TLS inside the blind pipe
 
 ## 5. What the suites establish, by flow
 
-This is the cross-flow reading of §4; the per-class tables are the authority for
-counts.
+The per-class tables in §4 are the authority for counts.
 
 - **Wire parity.** `DtoParityTest`, `LinkServerParityTest` and the CLI `bt-sim`
   run one unchanged v2.2 brain over three pipes: TCP/Netty, an in-memory duplex
@@ -218,14 +202,14 @@ counts.
   the actual RFCOMM socket path is not exercised on this bench.
 - **Lifecycle and hygiene.** `SharingRestoreTest` and `FlitRosterTest` pin the
   persisted sharing-desired restore; `FlitSpoolTest`, `FlitSpeedTest` and
-  `FlitSpeedEdgeTest` pin litter cleanup and honest progress; `SheetUiTest`
+  `FlitSpeedEdgeTest` pin litter cleanup and progress; `SheetUiTest`
   pins small render rules.
 
 ## 6. Device-walk evidence table
 
 Every row below is an observation recorded in a focused doc or commit body;
 the level column is the strongest level actually available. A row marked
-*not verified* is a limit, not an unstated gap.
+*not verified* is a limit.
 
 | Claim | Level | Exact observation | Source |
 | --- | --- | --- | --- |
@@ -239,7 +223,7 @@ the level column is the strongest level actually available. A row marked
 | Album mirror and dedup | **On-device** | Synthetic camera shot queued, sent and landed hash-exact in ~200 ms; a restart re-sent nothing. | `docs/transport-bluetooth.md:66-71` |
 | Subnet rescue sweep finds a dial-only peer and keeps it fresh | **On-device** | 2026-11-14: `sweep 192.168.100.0/24: 253 hosts … found 1 (Flit (szszszs)@192.168.100.12)` with multicast out and no manual/QR trust; keeper held the row 2.5 min; hidden mode produced zero sweep lines. | `docs/bluetooth-carrier.md:288-341` |
 | Interop with a real v2.2 peer | **Harness/sim** (loopback CLI) + **on-device** (wireless day 2) | `localsend-cli` v1.18.2 both directions: our receive `recv-ok`, our send `sent 1/1` byte-identical. Day 1's multicast row was later corrected: day 2 proved phone↔box multicast both directions once the app's announce TX was wired; it was not a permanent kernel failure. | `interop/README.md` T0/T1, W0-W5 and "Corrects day-1 T0-m" |
-| BLE permission/radio/hotspot UX on one phone | **On-device** | 2026-10-29/30 walks: system permission sheet and enable dialog presented once each, radio flip lines, hotspot classifier honest in three parts, 8-minute idle soak with empty crash buffer. | `docs/bluetooth-carrier.md:192-262` |
+| BLE permission/radio/hotspot UX on one phone | **On-device** | 2026-10-29/30 walks: system permission sheet and enable dialog presented once each, radio flip lines, hotspot classifier in three parts, 8-minute idle soak with empty crash buffer. | `docs/bluetooth-carrier.md:192-262` |
 | Phone-to-phone RFCOMM transfer | **Not verified** | No second phone; bench box has no Bluetooth adapter (`bluetoothctl list` empty). Only the toggle → `bluetooth link: listening` smoke and the pipe parity/`bt-sim` sim were run. | `docs/bluetooth-carrier.md:266-278` |
 | Three-or-more-member Circle mesh | **Not verified** | Only the two-node phone+CLI walk exists; a real multi-member mesh needs hardware not on this rig. | `docs/circle.md:326-327,360-361` |
 | Outbound phone→host Circle fan-out as a device observation | **Test-evidenced only** | Behavioural fan-out tests pass with an injected carrier; device walk could not produce a clean peer-side confirmation because demo bots' CLI state and their `serve` process shared identities. | `docs/circle.md:312-319,357-361` |
@@ -248,8 +232,7 @@ the level column is the strongest level actually available. A row marked
 
 ## 7. Reproduction recipes
 
-Commands are from the shipped CLI usage (`harness/src/main/kotlin/app/flit/share/harness/Harness.kt:136-176`),
-not from memory. Build first:
+Commands are from the shipped CLI usage (`harness/src/main/kotlin/app/flit/share/harness/Harness.kt:136-176`). Build first:
 
 ```bash
 cd /home/szszszs/flit
@@ -306,7 +289,7 @@ flit-cli bt-sim [file...] [--bytes MB] [--no-tls]
 One process, two ends: receiver is the production `ServerCore` behind
 `LinkServer`, sender is the production `ProtocolClient` over `SimLinkProvider`;
 `--bytes` mints a synthetic random body when no file is given; `--no-tls` makes
-`/info` honestly say `http` (`BtSim.kt:27-43,44-49,96-101`). A green run prints
+`/info` say `http` (`BtSim.kt:27-43,44-49,96-101`). A green run prints
 `info: …`, `sent N/N`, exit 0; a failed file exits 3. This is the transport-
 agnostic regression gate, not a radio proof.
 
@@ -347,7 +330,7 @@ the device fan-out observation ambiguous (`docs/circle.md:357-361`). Each CLI
 command is one-shot: it loads the state file, performs one request and saves it
 (`Harness.kt:1035-1039`).
 
-### 7.5 Device walk recipes (for the orchestrator)
+### 7.5 Device walk recipes
 
 These reproduce the recorded evidence; they are **not** part of the automated
 rig and must be reported as device walks only when actually run.
@@ -381,7 +364,7 @@ and the earlier `T0-m` conclusion is kept only as history.
 ## 8. Flaky patterns and fixes
 
 These are the timing and state hazards observed while running the suite, with
-the mitigation each test uses. None is a license to weaken an assertion.
+the mitigation each test uses.
 
 | Pattern | Where | Symptom | Mitigation |
 | --- | --- | --- | --- |
@@ -424,7 +407,7 @@ the mitigation each test uses. None is a license to weaken an assertion.
    such as `PeerHttpClient.testAbortBytes` to `0L`; delete nothing that a
    queue whitelist should keep. If the test can hang, add the watchdog/timeout
    shape from `LinkServerParityTest`.
-6. **Name and count honestly.** A file may hold more than one test class (see
+6. **Verify names and counts.** A file may hold more than one test class (see
    §4), so verify the report by class name, not by file name. After adding a
    test, re-run with `--rerun-tasks` and update the count in §2, §4 and the
    cross-linked docs (`OPERATIONS.md`, `PERFORMANCE.md`, `SECURITY.md`,
@@ -455,5 +438,4 @@ the mitigation each test uses. None is a license to weaken an assertion.
 Historical counts in those docs describe the suite at the time they were
 written: 30 at B0, 76 at milestone 1, 86 at milestone D, 115 at milestone E,
 then 121, 126, 145, 183, 231, 286 and 302 at `72225f8`. The CI workflow header
-(`.github/workflows/rig.yml:1-3`) still quotes 36/67/4; that line is stale and
-is reconciled in the report to the orchestrator, not silently edited here.
+(`.github/workflows/rig.yml:1-3`) still quotes 36/67/4; that line is stale.

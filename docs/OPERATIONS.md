@@ -2,36 +2,14 @@
 
 > Part of the Flit design set. [Transport ladder and index](transport-bluetooth.md) ·
 > [README](../README.md).
-> This is the operator's runbook: what to type on the box, what to grant on the
-> phone, what the log lines mean, which walks have actually been performed, and
-> how to stop and clean up afterwards. It does not restate wire contracts
-> ([CONTRACTS.md](CONTRACTS.md)), failure conclusions
-> ([FAILURE-MODES.md](FAILURE-MODES.md)), the threat model ([SECURITY.md](SECURITY.md)),
-> performance reasoning ([PERFORMANCE.md](PERFORMANCE.md)) or the test inventory
-> ([TESTING.md](TESTING.md)); it points at them where an operator needs the
-> underlying rule.
-
-## Evidence boundaries (read first)
-
-Everything here is separated into three kinds of statement:
-
-- **Code-verified** — a flag, default, log string, exit code or stop path read
-  from source (mostly `harness/src/main/kotlin/app/flit/share/harness/Harness.kt`,
-  `RelayServer.kt`, `BtSim.kt` and the app's `FlitEngine.kt` / `FlitService.kt` /
-  `MainActivity.kt`, with file:line given where it matters).
-- **Pure/harness evidence** — a test or an in-process rig run, not a device walk.
-- **On-device evidence** — an actual hardware walk recorded in the focused docs,
-  with the device/date named. Where a direction or carrier was not walked, this
-  doc says "not verified" rather than implying it worked.
 
 The rig's last green standard is **302 tests, 0 failures** (82 protocol + 210 app
 + 10 harness). Earlier design docs quote smaller counts (76, 115) and the CI
 workflow comment quotes 36/67/4; those are historical snapshots of the same
-suite at earlier commits, not the current inventory. The authoritative current
-number is the one in [TESTING.md](TESTING.md) and the orchestrator's final record.
-The last commit before this documentation wave is `72225f8` (Open-file crash +
-sharing restore), preceded by `2034fa6` (Circle file delivery + 20-agent quality
-wave).
+suite at earlier commits, not the current inventory. The current inventory is in
+[TESTING.md](TESTING.md).
+The last commit is `72225f8` (Open-file crash + sharing restore), preceded by
+`2034fa6` (Circle file delivery + quality pass).
 
 ## 1. Rig at a glance
 
@@ -70,7 +48,7 @@ than a JVM class-file stack trace (install-cli.sh:1-70).
 
 The canonical command list is the no-argument output of `flit-cli` itself,
 defined at `Harness.kt:136-156`. The README's shorter list is a user-facing
-summary; where the two differ, the help text and the arg parser are authoritative
+summary; where the two differ, the help text and the arg parser decide
 and the differences are recorded at the end of this section.
 
 ```
@@ -111,7 +89,7 @@ come from `Protocol.DEFAULT_PORT = 53317` and `MULTICAST_PORT = 53317`
   directory.
 - `--udp-port N`: discovery multicast port; default 53317. Dial-only operation
   uses a port nobody listens on, e.g. `--udp-port 9999`.
-- `--http`: plain HTTP instead of TLS (honest `/info` protocol label).
+- `--http`: plain HTTP instead of TLS; `/info` reports `http`.
 - `--hidden`: never announce, never register back; reachable only by address,
   by a peer's rescue sweep, or when it sends first.
 - `--announce-to ip:port,…`: unicast announce copies for networks that strip
@@ -157,7 +135,7 @@ wrapped in `TlsLink` when TLS is on. It exercises `/info`, `/register`,
 carrier. With no files, one synthetic random file of `--bytes MB` (default 4) is
 generated; `--dir` sets the landing dir (default `flit-sim-received`), `--sender`
 the alias, `--pin`, `--parallel`, `--multi` mirror `send`. `--no-tls` is
-implemented (`BtSim.kt:49`, `/info` then honestly reports `http`) but omitted
+implemented (`BtSim.kt:49`, `/info` then reports `http`) but omitted
 from the no-arg help string — see the discrepancy note. Exit codes: 1 when
 neither files nor `--bytes` are given, 2 if `/info` gets no answer, 3 if any file
 fails. This is **harness evidence**, not a radio walk.
@@ -228,7 +206,7 @@ semantics and evidence live in [Circle](circle.md#file-delivery-as-built).
   `info` got no answer, bt-sim `/info` got no answer; **3** = at least one file
   failed to send. Normal `exitProcess(0)` is implicit.
 
-### 2.3 Differences from the README summary (recorded, not silently reconciled)
+### 2.3 Differences from the README summary
 
 1. The README's "canonical list" line for `bt-sim` includes `--no-tls`; the
    `usage()` string at Harness.kt:145 omits it while `BtSim.kt:49` implements it.
@@ -276,8 +254,8 @@ so updates land in place. One earlier debug-signed build needed a single
 uninstall before the signed update took (bluetooth-carrier.md:288-291) — if a
 signature mismatch appears, uninstall once and reinstall. Wi‑Fi Aware is
 **absent**: `adb shell pm has-feature android.software.wifi.aware` answered
-`false` on 2026-11-21, which is why milestone B (fat pipe) is parked, not cut
-silently (transport-bluetooth.md:96-100).
+`false` on 2026-11-21, which is why milestone B (fat pipe) is parked by a
+hardware gate (transport-bluetooth.md:96-100).
 
 ### 4.2 Runtime permissions and when they are asked
 
@@ -300,7 +278,7 @@ The manifest declares `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`,
 | Battery-optimization exemption | Options → "Background battery" → system settings (`ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`) | MIUI may kill the engine; persisted sharing intent restores it on next open, not by MIUI restarting us |
 
 **The opt-in carrier gate is separate from the permission gate.** Bluetooth
-radio use is off until the user enables **Transfer over Bluetooth** in Options
+radio use is off until **Transfer over Bluetooth** is enabled in Options
 (pref `bluetoothTransfer`, default false); discovery-only LE surfaces nothing
 on its own. The connectedDevice FGS type is requested only when that option is
 on *and* `FlitBluetooth.hasPermission()` is true (FlitService.kt:127-153);
@@ -317,7 +295,7 @@ devices store, or when "trusted senders only" is on and the fingerprint is not
 pinned; the decision never uses an IP (FlitEngine.kt:967-989). Logs are
 `declined QR-unknown device <alias> (<fp12>)` and `declined offer from <alias>
 (<ip>) — device not trusted`. A decline is a receiver answer that concludes the
-story; it is different from a carrier death, which throws and keeps the row
+attempt; it is different from a carrier death, which throws and keeps the row
 ([FAILURE-MODES.md](FAILURE-MODES.md)).
 
 **Known devices / relay gate.** Each Known device row has a route policy
@@ -389,8 +367,8 @@ Other tags: `FlitSend` also carries `Log.i` for share intake (`ingest
 action=…`, `share-in: direct target …`, `direct-share dispatch to …`);
 `FlitOpen` logs `open-file path failed` with a throwable when an Open detour
 fails; the BLE radio logs warnings under its own `FlitBleRadio` tag
-(`advertising set failed`, `scan start failed`, `scan failed: <code>`) and is
-otherwise silent on purpose.
+(`advertising set failed`, `scan start failed`, `scan failed: <code>`); it
+otherwise emits no log lines.
 
 ### 5.2 CLI log (`flit-cli`, stdout/stderr)
 
@@ -491,12 +469,12 @@ file pushed to the phone's `Download/`.
    next touch auto-flushes: `queue: 1 queued for <peer> — sending now`. The
    first attempt probes `/partial`; the receiver answers from disk; the sender
    attaches with `X-Flit-Resume`.
-5. Verdict: box logs `recv-resume <name> from <prefix> bytes`, landing is
+5. Box logs `recv-resume <name> from <prefix> bytes`, landing is
    hash-exact, part and sidecar are gone, phone's row is gone. The A-era final
    walk used a 300 MiB camera shot killed 0.8 s after `recv-start` with a
    33,980,416 B part; a late kill near completion instead took a clean full
    resend (a sparse prefix is not advertised as a resume base)
-   ([transport-bluetooth.md](transport-bluetooth.md#post-ship-ladder-agreed-2026-10-30)).
+   ([transport-bluetooth.md](transport-bluetooth.md#post-ship-ladder-2026-10-30)).
 
 ### 6.5 Relay-only receiver and relay kill (milestone E, on-device evidence)
 
@@ -517,7 +495,7 @@ flit-cli serve --dir ~/Public --relay 127.0.0.1:53318 --token T # terminal B
    with a hash-exact landing and no leftover part (300 MiB walk). This is the
    throw/keep/resume loop proven through the blind pipe on hardware, not just
    in the harness ([milestone-e.md](milestone-e.md),
-   [transport-bluetooth.md](transport-bluetooth.md#post-ship-ladder-agreed-2026-10-30)).
+   [transport-bluetooth.md](transport-bluetooth.md#post-ship-ladder-2026-10-30)).
 
 ### 6.6 Send-later queue (on-device evidence)
 
@@ -527,8 +505,8 @@ flit-cli serve --dir ~/Public --relay 127.0.0.1:53318 --token T # terminal B
 2. Pick a second file into the same dead peer; it **merges** into the one row
    ("2 file(s) waiting") instead of dying as "send failed".
 3. Restart `serve`; the mprober notices within a beat, logs
-   `queue: 2 queued … — sending now` → `sent 2/2`; both files land (duplicate
-   naming is honest).
+   `queue: 2 queued … — sending now` → `sent 2/2`; both files land (a duplicate
+   name gets a `(1)` suffix).
 4. Cancellation: queue a third file, press the row's X → `queued send
    cancelled`, row gone. Grant release on delivered SAF batches is
    **code-verified, not device-walked**: picker files are spooled at intake, so
@@ -547,8 +525,8 @@ flit-cli serve --dir ~/Public --relay 127.0.0.1:53318 --token T # terminal B
    `sweep: 192.168.100.12 quiet — its row retires`, and the next throttled walk
    logs `nothing found`. Restoring `serve` re-finds it. A workaround for
    multicast-blocked APs is `--announce-to ip:port,…` unicast announce copies.
-   Honest edge: a slow/cold v2.2 server can miss the sweep's 400 ms register
-   budget and still arrives by multicast, manual address or once warmed.
+   A slow/cold v2.2 server can miss the sweep's 400 ms register budget and still
+   arrive by multicast, manual address or once warmed.
 
 ### 6.8 Circle two-node walk (on-device evidence)
 
@@ -573,7 +551,7 @@ departure and refuses later syncs from departed fingerprints.
 **Not device-proven:** outbound phone→host fan-out from the app. The behavioural
 tests pass with an injected carrier, but the device walk could not get a clean
 peer-side confirmation because the demo bots' CLI state and their `serve`
-process shared identities ([circle.md](circle.md#known-limitations-recorded-not-hidden)).
+process shared identities ([circle.md](circle.md#known-limitations)).
 A genuine three-or-more-device mesh, and phone→host fan-out, stay listed as
 limitations. A file drop from the CLI uses `circle file --file PATH` (bytes via
 `sendFiles`); `circle post --file PATH` announces only.
@@ -634,8 +612,8 @@ Root cause, per-layer fix and the MIUI/Android 15 caveats are in
 
 | Symptom | What the log says | What it means / what to do |
 | --- | --- | --- |
-| "app closed / sharing off after opening a file" | no `stopped`, no `am_crash`, no `RemoteServiceException`; possibly `system refused foreground service (…)` | four stacked seams (activity auto-finish, ambiguous back ownership, missing FileProvider root, memory-only `running`). Fixed in the working tree; relaunch restores silently from `sharingDesired`. An explicit Stop is honoured. See [open-file-and-sharing-restore.md](open-file-and-sharing-restore.md) |
-| MIUI kills sharing in background | process disappears with no `stopped` line | battery/autostart/memory outside app control; exclude from battery optimization in Options, grant autostart, and rely on next-open silent restore |
+| "app closed / sharing off after opening a file" | no `stopped`, no `am_crash`, no `RemoteServiceException`; possibly `system refused foreground service (…)` | four stacked seams (activity auto-finish, ambiguous back ownership, missing FileProvider root, memory-only `running`). Fixed in the working tree; relaunch restores from `sharingDesired`. An explicit Stop is honoured. See [open-file-and-sharing-restore.md](open-file-and-sharing-restore.md) |
+| MIUI kills sharing in background | process disappears with no `stopped` line | battery/autostart/memory outside app control; exclude from battery optimization in Options, grant autostart, and rely on the next-open restore |
 | `dataSync` FGS times out (~6 h/day on Android 15) | notification removed, engine still serving while a Flit screen is open | `onTimeout()` deliberately drops the notification to avoid a fatal `RemoteServiceException`; background is not guaranteed for the rest of the budget; next cold open restores |
 | Peer invisible on roster | `mprober ip:port: no answer`, or `hidden: not announcing`, or `declined QR-unknown device …` | hidden peer is found by address/sweep/send-first; QR-only declines unknown fingerprints at prepare; check Known devices and route policy |
 | Multicast stripped by the AP | no `seen … (multi …)` lines; empty roster | start the phone's rescue sweep, add a manual address, or run `serve --announce-to ip:port,…` for unicast announce copies |
@@ -650,9 +628,8 @@ Root cause, per-layer fix and the MIUI/Android 15 caveats are in
 | FGS start refused from boot | `boot: FGS rationed — starting engine-only` | Android 15 bans `dataSync` FGS at BOOT; engine runs until a surface opens, then restore; not a crash |
 
 Two cross-cutting rules when debugging: a **returned report means the receiver
-spoke** (sent/refused/declined — the story concludes), while a **throw means the
-carrier died with no answer** (keep the row and bytes). And a hash mismatch is
-never papered over: every landing is verified by sha256
+spoke** (sent/refused/declined), while a **throw means the carrier died with no
+answer** (keep the row and bytes). Every landing is verified by sha256
 ([FAILURE-MODES.md](FAILURE-MODES.md),
 [CONTRACTS.md](CONTRACTS.md)).
 
@@ -675,9 +652,7 @@ never papered over: every landing is verified by sha256
   (FlitService.kt:175-184) — including an FGS-start error path that calls
   `stopSelf(startId)` (FlitService.kt:99-116). A plain
   `adb shell am force-stop app.flit.share` does **not** reach `onDestroy`, so it
-  leaves the persisted intent set and the next cold open silently restores
-  sharing. This divergence between "explicit Stop only" in the prose and the
-  broader code condition is flagged in the integration report.
+  leaves the persisted intent set and the next cold open restores sharing.
 
 ### 8.2 Stopping a stuck process
 
@@ -747,18 +722,16 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
   specification as reference only, no LocalSend source or assets) is stated in
   the [README](../README.md#licensing--provenance-note).
 
-## 10. Known limits of this runbook
+## 10. Known limits
 
 - Two-phone RFCOMM transfer and a multi-member Circle mesh were not walked —
   no second phone on the rig, no Bluetooth adapter on the box. `bt-sim` and the
   harness two-node tests cover those paths in process only.
 - Wi‑Fi Aware is absent on the rig phone; milestone B is parked by a hardware
-  gate, not a silent decision.
+  gate.
 - The phone→host Circle fan-out direction remains test-evidenced only.
 - Grant release on delivered SAF batches is code-verified, not device-walked.
 - MIUI autostart/battery behavior and Android 15's ~6 h `dataSync` cap are ROM/OS
-  limits outside the app; this document records them rather than claiming a
-  background guarantee.
+  limits outside the app; no background guarantee is claimed.
 - Where the README CLI summary and the actual `flit-cli` help/arg parser disagree
-  (§2.3), the help text and parser were treated as the source of truth and the
-  difference was recorded rather than silently editing either document.
+  (§2.3), the help text and parser decide.

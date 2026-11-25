@@ -3,7 +3,7 @@
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
 > **Status: v1 built, 2026-11-24.** JVM-pure event core, governance store,
 > QR v3 invites, app sync worker, M3 feed, harness CLI and the two-node walks
-> are in. See the evidence section at the end.
+> are in.
 
 > **Non-profit constraint (hard, everywhere):** no accounts, no cloud, no ads,
 > no telemetry, no SDKs that phone home. A Circle is a temporary group of devices
@@ -59,7 +59,7 @@ no public directory, no auto-actions.
 
 A Circle has a **host** — the device that founded it and holds the authoritative
 roster, event log and group key. The harness box has always hosted its Circle in
-the rig; this wave makes the **phone a real host too**, rather than a read-only
+the rig; the phone also runs a **real host**, rather than a read-only
 event vending machine.
 
 - **Phone as host.** The app's host path (`FlitCircleHost`, wired from
@@ -71,7 +71,7 @@ event vending machine.
   authenticated TLS session; `SYNC` folds verified events through the
   `FlitCircleStore` reducers. A leave or kick rekeys the group, and a later
   `SYNC` from a departed fingerprint is refused. Wrong-circle and bad-invite
-  requests get honest refusal reasons, not silent success.
+  requests get refusal reasons, not silent success.
 - **The remembered return route is TCP/IP only.** The host stores a return route
   only for an accepted `JOIN` that arrived with an IP, as `ip:53317` TLS TCP
   (`FlitRoster.rememberRoute` with `Protocol.DEFAULT_PORT`); a `SYNC` alone
@@ -104,7 +104,7 @@ group key *inside that session*. A relay or a network observer sees only
 TLS-opaque bytes — the secrecy here is the transport's, not a group-key cipher.
 
 The QR is therefore a bearer invite, not the key itself: a photographed code
-can be used by whoever holds it. That is stated honestly in the UI; suspicious
+can be used by whoever holds it. That is stated in the UI; suspicious
 codes are retired by starting a new Circle.
 
 ## Threat model and safety rails
@@ -128,7 +128,7 @@ Non-negotiables: no file opens automatically; no vote triggers an action;
 leaving a Circle deletes the local key and hides the feed, never wipes or
 changes another device. There is no remote auto-action of any kind.
 
-## Event log (the only genuinely new core)
+## Event log (the only new core)
 
 `@Serializable CircleEvent(id, circleId, authorFp, lamport, type, body, sig, createdMs, cert)`
 
@@ -156,8 +156,8 @@ is signed but not encrypted.
   Dialing through a relay needs the per-device `relayFor` switch on (see
   "Transport and battery").
 - **Vote resolution:** the latest signed `Vote(pollId)` per member wins;
-  tally counts winners per option. Changing an answer appends a new vote, so
-  the history stays honest. Ties are displayed as ties, not hidden.
+  tally counts winners per option. Changing an answer appends a new vote.
+  Ties are displayed as ties.
 
 ## File delivery (as built)
 
@@ -203,13 +203,12 @@ the announcement by itself proves nothing was delivered.
   and sees the card, but **does not receive the old bytes** — there is no
   retroactive backfill, and its card shows the neutral "open to view if it arrived" line.
 
-> **Correction (2026-11-25):** earlier text said "file bytes use the bulk queue
-> path unchanged" and described a "resume token" in the file event. That was
-> never the delivery path. The event is `{name,size,sha256}` only, and bytes go
-> by a direct per-member `sendFiles` call from the sender's spool.
+> **Delivery path (2026-11-25):** the event is `{name,size,sha256}` only, with no
+> resume token, and bytes go by a direct per-member `sendFiles` call from the
+> sender's spool — not the bulk queue path.
 
 **Open file action (2026-11-25 fix).** The card's Open affordance now has three
-honest states: a disabled "Opening…" button while the hash is resolving, "Landed
+states: a disabled "Opening…" button while the hash is resolving, "Landed
 here" + "Open file" only when a local copy with that SHA-256 exists, and no
 button at all otherwise ("Not here yet · no local copy to open"). The open uses
 a FileProvider URI valid for `Download/Flit` as well as the spool/cache roots,
@@ -253,10 +252,9 @@ demands them.
   hop needs a Known-device entry with `relayFor` on), plus role promotion and a
   kick/rekey that refuses a later sync from the departed fingerprint.
 
-  > **Correction (2026-11-25):** earlier text claimed "offline catch-up — once over
-  > direct Wi‑Fi and once through the relay." The harness test only issues a `SYNC`
-  > with an empty event delta and checks the stored event comes back; it does not
-  > drive a relay, so the claim is downgraded to the empty-delta pull above.
+  > **Test scope (2026-11-25):** the harness test only issues a `SYNC` with an empty
+  > event delta and checks the stored event comes back; it does not drive a relay,
+  > so the verified catch-up path is the empty-delta pull above.
 - **Host state machine:** a pure, deterministic host verifies every incoming
   event against the roster, admits `JOIN` only with the right invite, folds
   `SYNC` through the store reducers, and refuses departed members and
@@ -270,8 +268,7 @@ Circle reuses QR v3 invites, known devices, route policy, TLS pinning, the
 relay, the normal `sendFiles` reception path and the SHA-256 landing proof. File
 bytes are **not** put on the send-later queue; the sender drives delivery per
 member from a local spool. The new machinery is the pure event log, the local
-delivery record and a thin feed UI. That is the difference between a
-Swiss‑Army knife and a drawer of half-finished tools.
+delivery record and a thin feed UI.
 
 ## Build and verification record (2026-11-24)
 
@@ -307,14 +304,14 @@ phone's Downloads for manual opening. The two one-shot diagnostic lines from
 that first walk (`invite link parsed=…`, `circle sync armed…`) were noise and
 have been removed — the feed content, not those lines, is the evidence.
 
-## Known limitations (recorded, not hidden)
+## Known limitations
 
 - **Outbound phone→host fan-out:** in the 2026-11-24 walk an event posted on the
   phone did not produce a device log line, even though it landed locally and the
   harness two-node test proves fan-out. Inbound sync, join, leave and governance
-  are device-evidenced; that one direction was **test-evidenced only**. This
-  wave hardens the sync worker's outbound fan-out and adds evidence-bearing
-  per-peer logs; the phone→host device re-walk is the final verification item.
+  are device-evidenced; that one direction was **test-evidenced only**. The sync
+  worker's outbound fan-out is hardened with evidence-bearing per-peer logs;
+  the phone→host device re-walk is the final verification item.
   Until it passes, the direction stays listed here rather than claimed as
   device-verified.
 - **File delivery is at-post-time and status is local-only:** bytes go to the
@@ -340,16 +337,16 @@ have been removed — the feed content, not those lines, is the evidence.
   Known-device entry with an address/token and `relayFor` on is required before
   Circle or dispatch traffic will use it.
 
-### Final 2026-11-25 polish wave — honest close
+### Final state (2026-11-25)
 
-The eleven-agent polish wave closed the P0 host gap (the phone now runs a real
-`FlitCircleHost` behind `onCircleRequest`), wired owner→admin role changes,
-hardened the protocol core (size caps, replay guards, pin-after-verify,
-deterministic dedup), added atomic store persistence, a real a11y/M3 pass, and
-a two-node harness walk covering role, admin kick, rekey and departed-member
-refusal. Two additional device bugs were found and fixed: the invite token is
-now persisted (a host could not admit members after a restart) and JOIN/SYNC
-now remembers the requester's return route.
+The P0 host gap is closed: the phone runs a real `FlitCircleHost` behind
+`onCircleRequest`. Owner→admin role changes are wired, the protocol core is
+hardened (size caps, replay guards, pin-after-verify, deterministic dedup),
+store persistence is atomic, and an a11y/M3 pass is applied. A two-node harness
+walk covers role, admin kick, rekey and departed-member refusal. Two additional
+device bugs were fixed: the invite token is now persisted (a host could not
+admit members after a restart) and JOIN/SYNC now remembers the requester's
+return route.
 
 **Verified on device:** QR-decoded invite → join; phone as host logging
 `circle host: join` and `sync … event(s)`; inbound event rendered in the M3
@@ -358,4 +355,4 @@ discards the key. **Still not device-proven:** outbound phone→host fan-out
 posting from the app — the behavioural fan-out tests pass with an injected
 carrier, but the device walk could not produce a clean peer-side confirmation
 because the demo bots' CLI state and their `serve` process shared identities.
-This remains test-evidenced only, recorded here rather than hidden.
+This remains test-evidenced only.

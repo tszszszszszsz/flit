@@ -2,9 +2,7 @@
 
 > Part of the Flit design set. [Ladder and index](transport-bluetooth.md) ·
 > [Circle](circle.md) · [README](../README.md).
-> **Status: fix implemented in the working tree, 2026-11-25.** Evidence is
-> separated below into code-verified, pure-test-verified and device-walked — no
-> claim is made beyond what was actually observed.
+> **Status: fix implemented in the working tree, 2026-11-25.**
 
 > **Non-profit constraint (hard, everywhere):** no accounts, no cloud, no ads,
 > no telemetry, no SDKs that phone home. This fix adds one local
@@ -20,8 +18,8 @@
 
 Reproduced from code and device log: the tap itself does not kill the process —
 a *stack* of four independent weaknesses lines up on exactly that detour
-(share-sheet entry → modal Circle → external chooser → return). They are
-recorded here because each was a real fault, not a symptom to paper over.
+(share-sheet entry → modal Circle → external chooser → return). Each weakness
+was a real fault.
 
 ## Root cause (as traced)
 
@@ -40,8 +38,7 @@ recorded here because each was a real fault, not a symptom to paper over.
    been copied to the public bucket (or to a SAF tree) can leave a ledger row
    whose path is under `Download/Flit/`. `FileProvider.getUriForFile()` throws
    when no `<paths>` root covers the file, and `digestOf()` read a stale path
-   first — so the open path could fail hard instead of degrading to an honest
-   message. The chooser also carried the read grant on only one of the two
+   first — so the open path could fail hard instead of degrading to a message. The chooser also carried the read grant on only one of the two
    intents, which OEM resolvers may rebuild.
 4. **There was no persisted "sharing is on" intent.** `FlitEngine.state.running`
    is in-memory. The FGS's `onDestroy()` called `FlitEngine.stop()`, the FGS
@@ -50,7 +47,7 @@ recorded here because each was a real fault, not a symptom to paper over.
    sharing off. The connected-device FGS type was requested unconditionally on
    API 34+, including Wi‑Fi-only sessions with no Bluetooth grant; a strict ROM
    (MIUI among them) can reject `startForeground()` for that, silently dropping
-   us to "engine-only", which dies as soon as the chooser backgrounds us.
+   the service to "engine-only", which dies as soon as the chooser backgrounds it.
 
 None of these is a Circle bug: they are activity-lifecycle, URI-grant,
 foreground-service and state-persistence seams that the share-sheet → Circle →
@@ -111,7 +108,7 @@ declared in the manifest. If a ROM rejects one of the types with a
 `SecurityException`, the service retries with the `dataSync` baseline: losing
 the `connectedDevice` label is better than losing the FGS.
 
-The stop path is honest as well: a refused start `stopSelf(startId)`s **only
+The stop path: a refused start `stopSelf(startId)`s **only
 that start** instead of poisoning every later Stop; `START_STICKY` is kept for a
 live FGS; `onTimeout()` removes the notification promptly (avoiding the fatal
 `RemoteServiceException`) while leaving the engine running for as long as a
@@ -120,16 +117,16 @@ for an instance that actually owned the engine through a live, non-timed-out
 FGS. An external chooser taking the foreground is therefore an ordinary
 background transition — not a service teardown.
 
-### Persisted intent — `running` is not user intent
+### Persisted intent — `running` is not the sharing intent
 
 `FlitRoster.SharingDesired` is a new local row (`sharingDesired` in the app's
-own `SharedPreferences`) meaning "the user last asked for sharing to be ON".
+own `SharedPreferences`) recording the last explicit sharing intent (ON).
 It is deliberately not the live engine state:
 
 - **Write** on every deliberate start — share-sheet, invite link, or silent
   restore — via `setSharingDesired(true)`.
 - **Clear** on an explicit Stop (`setSharingDesired(false)`), and in the service
-  when it owned a live foreground service that is genuinely stopping (including
+  when it owned a live foreground service that is stopping (including
   a failed FGS promotion that calls `stopSelf`); internal rebinds (alias, relay,
   Bluetooth, timeout) never clear it. `am force-stop` bypasses `onDestroy`
   entirely, so it preserves the row and the next launch restores silently.
@@ -143,21 +140,21 @@ corrupt and forward-newer rows all decode to "not desired" and never throw.
 `with()` and `shouldRestore()` are pure and unit-tested. No account, no cloud —
 the row is a few bytes in the app's own preferences.
 
-### Circle card — three honest states
+### Circle card — three states
 
 The file card's open affordance no longer offers a button that can only
 dead-end. It derives per-card state from one normalised set of landed SHA-256
 values (received ledger plus sender spools, rebuilt off the UI thread after a
 fresh process):
 
-| Card state | What the user sees | What a tap does |
+| Card state | Visible state | What a tap does |
 | --- | --- | --- |
 | resolving | **"Opening…"**, disabled button, spinner | nothing; a second tap cannot launch a second chooser |
 | landed | **"Landed here"** + **"Open file"** | opens the chooser for that exact hash |
 | not landed | **"Not here yet · no local copy to open"** | no button at all |
 
 Hashes are compared case-insensitively, matching the engine's own comparison.
-Merged semantics labels keep TalkBack honest ("Open … landed on this device",
+Merged semantics labels keep TalkBack accurate ("Open … landed on this device",
 "Opening …, please wait"). The set is released in a `finally`, so no card stays
 disabled after an attempt finishes. With no local record the neutral
 "file drop · open to view if it arrived" line is kept — delivery status is
@@ -181,7 +178,7 @@ process death.
 - A card with no local copy shows no Open button; while a hash is being resolved
   the button is disabled; neither state can close the app.
 - A failed open (no location, no viewer, a revoked grant, a stale path) ends in
-  an honest toast, not a crash or a vanished app.
+  a toast, not a crash or a vanished app.
 - Relaunch after the process was killed: sharing comes back silently — no
   notification prompt on cold start, no duplicate engine. An explicit Stop
   stays stopped; that is the one case where the persisted row is false.
@@ -198,14 +195,14 @@ process death.
 | Process killed (MIUI, memory, dataSync cap) | unchanged (`true`) | false until next open |
 | Next cold `onCreate`/`onResume` | read | restored silently if desired and not already up |
 
-## Honest MIUI / Android limitations
+## MIUI / Android limitations
 
-These are recorded, not hidden:
+These are recorded:
 
 - **MIUI can still kill the process.** Battery saver, "autostart" rules and
   memory pressure are outside app control. The persisted intent means the
   *next time the user opens Flit* sharing comes back; it does **not** mean MIUI
-  will restart us on its own. A user who force-stops Flit or revokes autostart
+  will restart the app on its own. A user who force-stops Flit or revokes autostart
   will still see sharing off until they open the app or start it explicitly.
 - **An explicit Stop is honoured.** If the user turned sharing off, the row is
   false and nothing silently turns it back on — by design.
@@ -216,9 +213,9 @@ These are recorded, not hidden:
   The next cold open restores sharing from the persisted row.
 - **A strict ROM may refuse the FGS start altogether.** The service then runs
   engine-only: it serves peers while Flit is foreground, but background
-  sharing is not guaranteed. The user is told with one toast, not silently
+  sharing is not guaranteed. The user is told with one toast;
   misled.
-- **Bluetooth is opt-in and stays honest on this device.** The engine still
+- **Bluetooth is opt-in on this device.** The engine still
   logs "bluetooth link waiting — permission or radio off" while Wi‑Fi carries
   the roster; that is unrelated to this fix and is documented in
   [the transport ladder](transport-bluetooth.md).
@@ -237,15 +234,13 @@ These are recorded, not hidden:
   engine serving (`serving https://0.0.0.0:53317`, periodic `mprober … ok` and
   `circle sync: full-log repair`) through 21:30 with no `stopped` line, no
   `am_crash` and no `RemoteServiceException`. That is consistent with the
-  fixed behaviour; the orchestrator owns the final tap → chooser → return walk
-  and the green-rig record, so this document does not claim more than the log
-  shows.
+  fixed behaviour; the final tap → chooser → return walk and the green-rig
+  record are not claimed here.
 
-> **Correction (2026-11-25):** an earlier draft of this wave attributed the
-> "app closes, sharing off" report to a single FileProvider throw. The log and
-> the code show a stack of lifecycle, dialog, URI-grant, FGS-type and
-> state-persistence faults; fixing only the URI would have left the app-close
-> and the next-launch behaviour intact.
+> **Root-cause scope (2026-11-25):** the "app closes, sharing off" report is a
+> stack of lifecycle, dialog, URI-grant, FGS-type and state-persistence faults,
+> not a single FileProvider throw; fixing only the URI would have left the
+> app-close and the next-launch behaviour intact.
 
 ## Device evidence (2026-11-25, final build)
 

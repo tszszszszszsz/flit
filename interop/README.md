@@ -8,14 +8,14 @@ Our stack: `:protocol` module (Kotlin), Netty server, own `PeerHttpClient` (JDK 
 |---|----------|--------|
 | T0-s | Harness↔harness send (3 files, parallel 2, mTLS, dedup `payload (3).txt`) | PASS (3/3, exit 0) |
 | T0-d | Discovery harness↔harness | PASS via **unicast fallback announce** (`--announce-to`) |
-| T1-r | Real CLI → us: CLI registers + sends payload, we auto-accept | PASS (`recv-ok`, CLI TUI `Sent 1 file (32 B)`) |
+| T1-r | Real CLI → us: CLI registers + sends payload, auto-accepted | PASS (`recv-ok`, CLI TUI `Sent 1 file (32 B)`) |
 | T1-s | Us → real CLI: prepare-upload + upload to the rustls server, `Y` in CLI TUI | PASS (`sent 1/1`, CLI TUI `Received 1 file (30 B)`, byte-identical) |
 | T0-m | Multicast 224.0.0.0/4 announce | **FAIL — kernel-level broken here** (`ping 224.0.0.1` 100 % loss; receiver socket joined on iface gets nothing; no firewall rules). Mitigation: unicast announce fallback. |
 
 ## Root causes diagnosed this session (clean-room, from observed wire behavior)
 
 1. **Ktor CIO TLS client unusable for LocalSend** — threw `Invalid TLS record type code: 116`
-   against rustls servers. Retired for the client side; **replaced transport with our
+   against rustls servers. Retired for the client side; **replaced transport with a
    minimal HTTP/1.1 client over JDK `SSLSocket`** (`PeerHttpClient`): one exchange per
    connection, content-length bodies, minimal chunked decode, no hostname verification
    (peers are IP-addressed; authentication is fingerprint-based per protocol spec).
@@ -32,7 +32,7 @@ Our stack: `:protocol` module (Kotlin), Netty server, own `PeerHttpClient` (JDK 
    `X509ExtendedKeyManager`: selection matches by key algorithm only, CA list ignored.
 
 3. **Strict JSON on prepare-upload** — upsteam `RegisterDtoV2` (serde) declares `port` and
-   `protocol` with **no defaults**; our earlier `encodeDefaults=false` omitted
+   `protocol` with **no defaults**; an earlier `encodeDefaults=false` omitted
    `protocol:"https"` → CLI answers `400 {"message":"Invalid JSON body"}`. Wire JSON now
    always carries default-valued fields (`WireJson` `encodeDefaults = true`); serde readers
    ignore extra fields on responses, so the changed response shape stays compatible.
@@ -47,7 +47,7 @@ Our stack: `:protocol` module (Kotlin), Netty server, own `PeerHttpClient` (JDK 
 - Rebuild ritual: restart `flit-cli serve` after every `installDist` (JVM holds the old
   jars; a stale session also blocks the single slot until `POST …/cancel?sessionId=…`).
   Bin renamed 2026-11-14: the same code ships as `flit-cli` — earlier records here
-  say `harness serve`; those are history, the lines above are how to run it now.
+  say `harness serve`.
 
 ## Repro bootstraps
 - Node A: `flit-cli serve --dir received --port 53318 --udp-port 53319 --alias FlitAlpha --announce-to 127.0.0.1:53317`
@@ -98,7 +98,7 @@ phone↔box multicast delivers both directions once announce TX is wired properl
 2. **Announcement TX wiring on Android**:
    - a `runCatching` wrapping **both** `s.networkInterface = ni` and `s.send()` silently
      skipped the send whenever `setNetworkInterface` threw — which it does for
-     netd-marked sockets on this device. **This is the proven killer**: with the
+     netd-marked sockets on this device. **This is the cause**: with the
      day-1 pin active the announce socket was marked, every announce threw-and-skipped,
      silently (W2 worked because it is TCP, not UDP).   - supporting observation (not cleanly isolated): a raw `nc -u` datagram sent as the
      app's own UID (`run-as app.flit.share nc -u -p 53317 224.0.0.167 53317`) always
@@ -158,7 +158,7 @@ the debug build: identical (all PASS).
 - Local release key: `keystore/` + `keystore.properties` (gitignored).
 - APK: 5.35 MB.
 
-### R8 findings (the debugging story, worth keeping)
+### R8 findings
 
 1) **`start failed: Class a does not have a public non-arg constructor`** —
    netty's `ReflectiveChannelFactory` does `getConstructor().newInstance()` on
@@ -174,11 +174,11 @@ the debug build: identical (all PASS).
    device's verifier, not (only) full-mode class merging.
    **Final rule set: keep `io.netty.**` / `io.ktor.**` verbatim, shrink only app
    code** (+ kotlinx-serialization serializer keeps per runtime docs). APK 5.35 MB —
-   acceptable; correctness verified on-device was the winning criterion.
+   acceptable; correctness was verified on-device.
    `fullMode=false` stays as a defensive default (closest to the tested debug config).
 3) Keeping netty bodies surfaced its optional compression backends (brotli4j,
    zstd-jni, lz4, jzlib, ning-lzf, oracle-svm, pkitesting) as missing classes —
-   all `-dontwarn` (guarded at runtime; we use JDK gzip/deflate).
+   all `-dontwarn` (guarded at runtime; JDK gzip/deflate is used).
 - Diag tooling: `Log.e("FlitEngine", "engine start failed", e)` in the engine's
   catch → `adb logcat -d | grep -a FlitEngine` (obfuscated stack) +
   `mapping.txt` deobfuscation of `c6.a`/`y5.x0` to identify the reflective ctor

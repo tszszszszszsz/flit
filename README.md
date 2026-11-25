@@ -12,7 +12,7 @@ existing LocalSend install (Windows/macOS/Linux/iOS + their CLI), and improves o
 > and no data collected about you — devices talk directly to each other, on your network
 > or over Bluetooth. This is a hard constraint on every feature, not a setting.
 
-| # | Differentiator | Status |
+| # | Capability | Status |
 |---|---|---|
 | 1 | Chunked **resumable** transfers (their issue #2127, open 20+ months) | **shipped** (Flit↔Flit extension: interrupted uploads keep their prefix on disk and resume after a reconnect, verified hash-exact in both directions) |
 | 2 | **Rescue mode**: direct transport when no network path exists | **shipped — Bluetooth direct-discovery (row 9)**; joining a phone's own hotspot works by-address; the multicast-blocking-network case now **sweeps**: an empty roster on Wi-Fi knocks on the whole subnet for a running v2.2 server (throttled, bounded, hidden-mode-respecting) |
@@ -73,7 +73,7 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   owner and can appoint admins; leave or kick rotates the key and the host refuses the
   departed device's later sync. No accounts, no server, no remote actions.
   Two-node join/post/leave were walked on device; the multi-member mesh and
-  phone→host fan-out remain honestly listed as limitations — see
+  phone→host fan-out remain listed as limitations — see
   [the Circle design and evidence](docs/circle.md).
 - **"Open file" is a detour, not an exit:** a Circle file card offers Open only
   when a local copy with that SHA-256 is present; the chooser carries a valid
@@ -81,19 +81,19 @@ Working name. Rename is a 15-minute chore before Play listing (no trademark reus
   sharing intact. Sharing "desired" is persisted locally, so a cold launch
   restores it silently; only an explicit Stop turns it off. MIUI can still kill
   the process — restoration happens on the next open, not by MIUI restarting
-  us. Root cause, per-layer fix, and honest verification status live in
+  us. Root cause, per-layer fix, and verification status live in
   [Open file, sharing restoration and the MIUI limit](docs/open-file-and-sharing-restore.md).
 - Quick Settings tile + foreground service. Note: Android 15 rations `dataSync` background hours;
   when the budget is spent Flit runs engine-only while the app is open instead of crashing.
 
 ## Documentation
 
-Start at the [design index](docs/transport-bluetooth.md) for milestone status. Deep context:
+Milestone status is in the [design index](docs/transport-bluetooth.md). Engineering context:
 
 - [Architecture](docs/ARCHITECTURE.md) — module map, transport seam, state ownership, lifecycle, concurrency.
 - [Contracts](docs/CONTRACTS.md) — v2.2 wire, additive Flit routes, Link/ServerDelegate APIs, canonical signatures.
 - [Failure modes](docs/FAILURE-MODES.md) — what retries, concludes, keeps bytes, or drops, across every flow.
-- [Security](docs/SECURITY.md) — threat model, trust anchors, replay, invites, relay, panic, honest limits.
+- [Security](docs/SECURITY.md) — threat model, trust anchors, replay, invites, relay, panic, limits.
 - [Performance](docs/PERFORMANCE.md) — measured throughput, energy design, duty cycles, watermarks, caches.
 - [Testing](docs/TESTING.md) — rig command, evidence levels, device walks, reproduction recipes.
 - [Operations](docs/OPERATIONS.md) — CLI reference, box/phone setup, MIUI notes, logs, troubleshooting.
@@ -164,7 +164,7 @@ flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>   # accou
 Needs java 21 at run time — the installed launcher says so in one line if the
 ambient `java` is older (`JAVA_HOME` or PATH wins). Identity lives at
 `~/.config/flit/flit-harness` — stable across rebuilds and updates, so peers that
-trusted this machine keep trusting it. Honest edges, listed not silent: `serve`
+trusted this machine keep trusting it. Edges: `serve`
 auto-accepts incoming offers (the app's trusted-senders gate has no CLI counterpart
 yet), and a machine hidden with `--hidden` is invisible to multicast discovery —
 which is exactly the peer the phone app's rescue sweep exists to find. `relay` is

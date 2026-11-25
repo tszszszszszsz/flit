@@ -26,7 +26,7 @@ no cables, and nothing leaving your network in between.
   and the transfer does too once you opt in with **Transfer over Bluetooth** (off by
   default) — same list, same speed readout.
 
-**Honest, by design**
+**By design**
 - Transfers are end-to-end TLS with per-device identities; every incoming device is
   verified by its fingerprint, not by a name anyone could claim. Trust ("pin") the
   devices you know — by default other nearby v2.2 devices can also send, and
@@ -41,7 +41,7 @@ no cables, and nothing leaving your network in between.
   apps, so it interoperates across Windows, macOS, Linux and iOS — from the share
   sheet in one tap, with a letter-tile visual per peer.
 
-**What we ask, and when**
+**Permissions, and when they appear**
 - Nearby-devices permission and radio-power prompts appear exactly when a transfer needs
   them, as the system's own dialogs, each asked once per device. Nothing asks at launch.
 - No tracking, no analytics, no accounts, no ads, no telemetry, no cloud — no

@@ -2,12 +2,12 @@
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
 
-## Milestone D design — album mirror (written before code)
+## Milestone D design — album mirror
 
 The ladder line: trusted-peer forward-sync of new camera files, deduped,
 checkpointed, queue-flush driven. Read against the code, the shape is
-already there — **the mirror is a producer into the queue machinery that
-milestone C just made bulletproof, not a new pipeline.**
+already there — **the mirror is a producer into the queue machinery from
+milestone C.**
 
 - **One target, chosen and trusted.** Options gains a switch
   ("mirror new camera shots") and, when it is on, a target row that opens a
@@ -39,7 +39,7 @@ milestone C just made bulletproof, not a new pipeline.**
 - **Success marks the ledger** in the same `dropSent` door every sent batch
   leaves through — filtered to tokens that are files inside the camera
   folder, so manual sends never write it.
-- **Honest edges, listed:** mirroring runs only while sharing runs (the
+- **Edges, listed:** mirroring runs only while sharing runs (the
   flush needs the engine); the target must stay pinned — unpinning pauses
   the mirror rather than re-pointing it silently; files the user deletes
   from the phone after mirroring are not deleted on the peer (forward-sync
@@ -52,21 +52,19 @@ scan, and the flush are device truth — walked on hardware: a synthetic shot
 pushed into `DCIM/Camera` while the box's row is live, arriving on the box
 auto-accepted and hash-exact; a restart with nothing new re-sending nothing.
 
-The walk reshaped three load-bearing choices of this design — raw-path
-tokens died of an EACCES, the stat-only scan died of scoped storage, and the
-Files collection died of silence. The full story and the amended mechanics
-are recorded in the hardware section below; this design stands as written,
-as the record of what was believed before the device spoke.
+The walk reshaped three choices of this design — raw-path tokens failed with
+EACCES, the stat-only scan failed under scoped storage, and the Files
+collection returned nothing.
 
-### Milestone D on hardware (2026-11-15) — the walk that reshaped it
+### Milestone D on hardware (2026-11-15)
 
 Fixture: the box serves the freshly rebuilt `flit-cli` (`--hidden`, downloads
 into `/tmp/opencode/flit-cli-downs`); the phone runs the freshly installed
 0.2.0 release APK with the box pinned, trusted, and chosen as the mirror
 target. The device: the Redmi Note 10S (API 36) as always.
 
-**The first walk caught a real defect — exactly what walks are for.** The
-toggle went on, the seed ran (`mirror: baseline seeded — 1 existing camera
+**The first walk caught a defect.** The toggle went on, the seed ran
+(`mirror: baseline seeded — 1 existing camera
 file(s) stay put`), the watcher went live, a synthetic 3,000,000-byte shot
 (`IMG_20261115_141900.jpg`, sha256 `18c6ac31…`) was pushed into
 `DCIM/Camera` — and the queue's flush died on contact:
@@ -86,7 +84,7 @@ one walk, each fixed before the redo:
    read — `READ_MEDIA_IMAGES` + `READ_MEDIA_VIDEO` (plus
    `READ_EXTERNAL_STORAGE` capped at 32) — the mirror's **one system
    dialog**, fired when mirroring is switched on; a refusal leaves
-   mirroring off, honestly ("photo access is needed — mirroring stays
+   mirroring off ("photo access is needed — mirroring stays
    off"). Mirror rows are gated to API 29+ (`RELATIVE_PATH` is the query's
    spine). The ledger marks close through `dropSent` via the batch's
    *mirror duty* and the spooled names/sizes — no path sniffing.
@@ -98,13 +96,12 @@ one walk, each fixed before the redo:
    started*, and the original seed crashed inside a `runCatching` and said
    nothing — `mirrorSeed(ctx)` now takes the caller's context.
 3. **Never silent, enforced.** An empty query, a failed query, a grant
-   refused — each logs an honest line (`camera query answered nothing
+   refused — each logs a line (`camera query answered nothing
    (grant or folder empty?)`), because the walk also proved the app can sit
    there "watching" an album it cannot see, and that must be visible.
 
 Two device quirks the walk pinned down (both are walk-only artifacts; real
-use never sees them, but they cost real debugging time and belong in the
-record):
+use never sees them, but they cost real debugging time):
 
 - **adb-pushed files land `is_pending=1 owner_package_name=com.android.shell`.**
   The shell sees its own pending rows; the app — correctly — does not see
@@ -118,7 +115,7 @@ record):
   system ask never showed on this device; on a stock device the ask is the
   expected first step of the toggle.
 
-The redo, after the fixes — the D moment itself:
+The redo, after the fixes:
 
 1. Toggle on → `mirror: baseline seeded — 1 existing camera file(s) stay
    put` (the first shot had already been mirrored by the pre-fix walk; the
@@ -134,17 +131,17 @@ The redo, after the fixes — the D moment itself:
        sent 1/1 to Flit (szszszs): IMG_20261115_144400.jpg
 
    notice → queued → sent in under 200 ms (the flush nudge fired on a live
-   peer, as designed).
-4. **The verdict on the box:** `recv-ok IMG_20261115_144400.jpg →
+   peer).
+4. On the box: `recv-ok IMG_20261115_144400.jpg →
    … (2500000 bytes)`, and the landing is hash-exact —
    `3325c7abad2dc3bf163a1e5dd9a053184bf57cc346b759fdacf0e86b13a8874d` on
    the sender side and on the box.
 5. **The dedup proof:** force-stop, relaunch, sharing back on. The
    engine-start scan ran over the same folder and said nothing — no
    re-queue, no `scan found` line; the box holds exactly one copy, no
-   `(1)` rename. The ledger is the dedup, exactly as designed.
+   `(1)` rename. The ledger is the dedup.
 
-One more MediaStore honesty from the walk: a query of the **Files
+One more MediaStore finding from the walk: a query of the **Files
 collection answered nothing under the very same grant that made the Images
 collection answer** — so the shipped `cameraShots()` queries the **Images
 and Video collections** (the homes camera JPEG/MP4 rows live in), merged
@@ -158,12 +155,11 @@ assemblies and the CLI dist green. Screenshot of the configured mirror:
 `/tmp/opencode/ui-mirror.png`.
 
 What this milestone leaves open, listed: mirroring runs only while sharing
-runs (the design's own edge, unchanged); a device whose camera saves
+runs; a device whose camera saves
 elsewhere is not watched (only `DCIM/Camera` feeds MediaStore's
 `RELATIVE_PATH='DCIM/Camera/'` filter — pro modes and third-party cameras
 that write elsewhere stay out, and the empty-query log line makes that
 visible); deletions are never mirrored backwards; the ledger keys
 name∥size, so a same-name same-size re-save is considered already-mirrored
-(camera names are timestamped, which makes the collision a curiosity, not
-a gap).
+(camera names are timestamped).
 

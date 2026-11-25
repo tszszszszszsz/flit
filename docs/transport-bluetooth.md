@@ -1,28 +1,27 @@
 # Flit transport — ladder and design index
 
-Brief (user, 2026-10-27): "make it simplest and most complex at the same time."
 The original Bluetooth contract was **the UI never learns Bluetooth exists**.
-That contract was deliberately revised on 2026-11-24: an explicit opt-in
+That contract was revised on 2026-11-24: an explicit opt-in
 **Transfer over Bluetooth** option now exists, and **QR-only mode** lets a user
 refuse every device that did not enter their graph by QR. Everything else still
 holds: no accounts, no cloud, no telemetry, no silent carrier switches.
 
 > **Non-profit constraint (hard, everywhere):** no accounts, no cloud, no ads, no
-> telemetry, and no SDKs that phone home. Every design below is judged against it —
-> there is no server to register with and nothing to collect; peers connect directly.
+> telemetry, and no SDKs that phone home. There is no server to register with and
+> nothing to collect; peers connect directly.
 
 ## Focused design documents
 
 - [Bluetooth carrier — design and hardware walks](bluetooth-carrier.md) —
   the Link/LinkProvider seam, TLS over any pipe, BLE discovery/arbiter, RFCOMM
-  carrier, the one-phone walks, and the honest two-phone limitation.
+  carrier, the one-phone walks, and the two-phone limitation.
 - [QR-only mode, known devices and panic](qr-only-and-panic.md) —
   the free-will base: QR v2 pairing, per-device route policy, signed alerts,
   and the safety rule that nothing ever auto-acts on a recipient's device.
 - [Circle — accountless group coordination](circle.md) — **v1 built**:
   QR-founded groups with a signed (TLS-protected in transit, plaintext at rest)
   local event log, file drops and re-votable polls; host/role enforcement,
-  threat model, scope cuts, evidence and honest limitations.
+  threat model, scope cuts, evidence and limitations.
 - [Milestone C — process-death checkpoints](milestone-c.md) —
   queue rows before bytes, receiver sidecars, and the hardware walk.
 - [Milestone D — album mirror](milestone-d.md) —
@@ -32,7 +31,7 @@ holds: no accounts, no cloud, no telemetry, no silent carrier switches.
 - [Milestone E — self-hosted relay](milestone-e.md) —
   blind pairer, `flit-cli relay`, app surface, and the relay-kill walk.
 - [Play listing draft](play-listing.md) — store copy and the data-safety form
-  (zero collection), kept honest against the constraint above.
+  (zero collection), kept in line with the constraint above.
 
 ## Milestone ladder
 
@@ -50,7 +49,7 @@ holds: no accounts, no cloud, no telemetry, no silent carrier switches.
 Each milestone: full suite green, assembleRelease, device evidence where a radio is
 involved. Same discipline as the look rewrite.
 
-## Post-ship ladder (agreed 2026-10-30)
+## Post-ship ladder (2026-10-30)
 
 - **1 — subnet sweep** (rescue mode for multicast-blocked APs) — **done**: pure
   math + sweeper + keeper, rig green (76 tests), full hardware walk recorded above.
@@ -92,8 +91,8 @@ involved. Same discipline as the look rewrite.
   sidecar left. An earlier, late kill (~90% through an 800 MiB multi-socket
   send) also landed hash-exact but took the clean full-resend path — a
   sparse prefix near completion is not advertised as a resume base; that
-  limitation is listed, not hidden.
-- **B — Wi-Fi Aware fat pipe** — **parked, hardware absent**: the agreed
+  limitation is listed.
+- **B — Wi-Fi Aware fat pipe** — **parked, hardware absent**: the
   gate `adb shell pm has-feature android.software.wifi.aware` answered
   `false` on the rig phone (2026-11-21). BLE stays discovery; no Aware
   carrier was built for a device that does not have the feature. This is

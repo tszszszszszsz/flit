@@ -1,16 +1,8 @@
 # Flit wire and API contracts
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
-> This document owns the exact contracts: route strings, headers, DTO shapes,
-> canonical signing bytes, transport seams, relay hello, panic alert and Circle
-> request/response vocabulary. It describes **code reality** first; where an
-> existing focused doc states a simpler story, that simplification is named
-> explicitly rather than silently repeated. Failure conclusions, security
-> reasoning, throughput and evidence policy live in
-> [Failure modes](FAILURE-MODES.md), [Security](SECURITY.md),
-> [Performance](PERFORMANCE.md) and [Testing](TESTING.md).
 
-## 0. Sources and evidence policy
+## 0. Sources
 
 Sources, in order of authority for a contract question:
 
@@ -22,20 +14,6 @@ Sources, in order of authority for a contract question:
 3. The focused docs already in `docs/`: `transport-bluetooth.md`,
    `bluetooth-carrier.md`, `circle.md`, `qr-only-and-panic.md`, `milestone-e.md`,
    `milestone-{a,c,d}.md`, `open-file-and-sharing-restore.md`, `README.md`.
-
-Evidence tiers used below, never mixed:
-
-- **Code reality** — a constant, route string or shape read directly from the
-  source. Every contract in this document is code reality unless labelled.
-- **Pure-test evidence** — a JVM test pins the canonical bytes, a parser or a
-  decision function (`PanicTest`, `CircleCoreTest`, `CircleHardeningTest`,
-  `ResumeAndTurboTest`, `RelayCoreTest`, `DtoParityTest`, `LinkServerParityTest`).
-- **Harness/sim evidence** — the Linux CLI (`flit-cli`) and the in-process
-  `bt-sim`/pipe suites exercise the production client and `ServerCore` without
-  Android.
-- **On-device evidence** — only what the rig walks actually recorded. A
-  two-phone RFCOMM transfer and a ≥3-device Circle mesh did **not** happen;
-  they are stated as unverified where relevant.
 
 ## 1. Exact constants and route strings
 
@@ -327,7 +305,7 @@ with the code that enforces each:
    binder registers all of them, but a v2.2 sender simply never calls them
    (`ProtocolServer.kt:130-141`).
 2. **New request headers are sender-side only.** `X-Flit-Client: 1` is sent on
-   every prepare so a Flit receiver can answer honestly; `X-Flit-Multi: 1` is
+   every prepare so a Flit receiver can mark its refusal; `X-Flit-Multi: 1` is
    sent only for turbo; `X-Flit-Resume` and `X-Flit-Base` are sent only on a
    resume/chunk attempt. A v2.2 receiver ignores all four (`ProtocolClient.kt:699-702`).
 3. **New response fields are nullable and omitted when absent.**
@@ -690,7 +668,7 @@ trust and replay reasoning in [Security](SECURITY.md).
 
 | Claim tier | What is actually established |
 | --- | --- |
-| **Code reality** | Every constant, route string, header, DTO shape, canonical byte layout, pairing state machine and policy rule in this document. |
+| **Code reality** | Every constant, route string, header, DTO shape, canonical byte layout, pairing state machine and policy rule listed above. |
 | **Pure-test JVM** | Canonical/sign/verify for panic and Circle, forged-author rejection, replay and dedup windows, Lamport convergence, both `Content-Range` spellings, restart probe/attach, failed-chunk-then-resume, relay pairing/isolation/token, DTO and `LinkServer` parity over the in-memory duplex pipe through the real hand-HTTP + TLS stack. |
 | **Harness/sim** | `flit-cli relay` pairs a real 3 MB protocol send hash-exact with TLS inside the pipe; wrong token refused; unpaired subscription times out; dead dial surfaces `TransferUnreachable`. Two in-process TLS Circle nodes sync message, poll re-vote, file drop and kick/rekey; `bt-sim` runs the production client over the pipe carrier. |
 | **On-device** | Panic QR-v2 pairing and one-phone↔box banner exchange; relay dial/subscribe with a 200 MiB camera shot and a 300 MiB mid-body relay kill resuming hash-exact from the exact prefix; Circle two-node join/message/leave and phone-as-host; file-drop landing hash-exact; QR v3 tap-to-join. |
@@ -709,8 +687,6 @@ trust and replay reasoning in [Security](SECURITY.md).
 - Open-file action and FileProvider roots: [open-file-and-sharing-restore.md](open-file-and-sharing-restore.md).
 
 ## 12. Known simplifications in the existing docs
-
-Recorded here so this document never silently contradicts them:
 
 - `docs/circle.md` says every SYNC posts the full bounded log; code uses
   per-peer deltas on fan-out and the full log only on the repair tick (§7.6).

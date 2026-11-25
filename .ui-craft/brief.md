@@ -42,11 +42,9 @@ are readable within ~3 seconds without leaving the screen.
 ## 6. Learned constraints
 
 - **2026-10-27** — Visual language is M3 Expressive + Material You, built with ui-craft discipline —
-  native-Google feel, not stock-Material slop. *Why:* user picked "M3 Expressive / Material You …
-  but use ui craft and m3 expressive skill."
+  native-Google feel, not stock-Material slop.
 - **2026-10-27** — Accent and theme = "Google's one": dynamic color from wallpaper on API 31+;
   below that the static Google brand-blue scheme Google's own apps show; theme follows the system
-  (no in-app toggle). *Why:* user answered "googles one" to both questions.
+  (no in-app toggle).
 - **2026-10-27** — Motion is Expressive (springs, shape-morph press states), but zero behavior
-  change — the visual rewrite is a pure reskin. *Why:* user chose "Expressive" while the phase brief
-  is look-only.
+  change — the visual rewrite is a pure reskin; the phase is look-only.

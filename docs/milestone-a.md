@@ -2,7 +2,7 @@
 
 > Part of the Flit transport design. [Main ladder and index](transport-bluetooth.md).
 
-## Milestone A design — carrier migration (written before code)
+## Milestone A design — carrier migration
 
 The ladder line: the sender re-probes in priority order and re-attaches a
 running transfer onto whichever transport answers. Read against the code
@@ -15,8 +15,7 @@ manual prober, the retry chip), each with a gap: after a process restart
 the last-known address is thrown away and discovery must re-find the peer
 from zero; a stale typed row (manual@ rows never age out) suppresses the
 sweep forever; a peer that moved addresses leaves every old voice knocking
-on a dead door until the slow rounds re-find it. The design, in one
-sentence each:
+on a dead door until the slow rounds re-find it.
 
 - **One truth for reachability: the route that last answered.** A tiny
   persisted map `fingerprint → host:port(+tls)` in the roster, written on
@@ -32,7 +31,7 @@ sentence each:
   and accepted **only if the answering register's fingerprint matches the
   owed one**: a register answer carries the full identity, so the
   fingerprint is the trust anchor and a reassigned address can never hand
-  the batch to a stranger. Dedup keeps the list honest.
+  the batch to a stranger.
 - **The hunter: the sender looks for its owed peer instead of waiting.**
   One worker, ticked every couple of seconds, over the queue's owed
   fingerprints: a fingerprint mid-dispatch is skipped, a due one gets its
@@ -51,7 +50,7 @@ sentence each:
   the bytes that never landed fly again. The transfer's continuity is the
   owed row plus the receiver's disk, not a living socket — no socket
   hot-swap is designed, and none is needed for the phrase to be true.
-- **Honest edges, listed:** the hunter probes only routes it already
+- **Edges, listed:** the hunter probes only routes it already
   knows — a peer that moved to an address nobody remembers is caught by
   the discovery voices exactly as today, because the hunter never walks
   neighborhoods (that stays the sweep's restrained turf); a fingerprint
@@ -70,7 +69,7 @@ hunting, the route answering, and the landing resuming hash-exact from
 the receiver's prefix — plus the restart case where the remembered route
 answers within seconds of engine start, before any discovery round.
 
-### A's first hardware walk caught a C-era defect (2026-11-15) — and the fix is the contract
+### A's first hardware walk caught a C-era defect (2026-11-15)
 
 The design above was written against the code as it stood; the first walk
 was supposed to be a formality — hunt answers remembered route on a cold
@@ -79,8 +78,8 @@ queue (it did, 15:10:10, `hunt: 192.168.100.12:53317 answered as Flit
 800 MB camera shot and watch the row survive. The row did not survive.
 The box kept a 671,678,464-byte `.part`, the phone's queue held nothing,
 and the log's last word was a `FAIL … failed to connect … ECONNREFUSED`
-with no `kept` after it. C's promise — *the queue IS the checkpoint* —
-was only true on the fresh-dispatch path. Three defects, one root:
+with no `kept` after it. The queue-as-checkpoint guarantee held only on
+the fresh-dispatch path. Three defects, one root:
 
 1. **`dispatchTo` was fire-and-forget** (`scope.launch` inside a `fun`),
    so `flushQueueFor`'s `dropSent(batch, spools)` ran at send-**START**,
@@ -89,8 +88,8 @@ was only true on the fresh-dispatch path. Three defects, one root:
    owes-before-bytes, correct); D's mirror sends always succeeded
    instantly — that is why no earlier walk ever caught it.
 2. **`sendFiles` returned transport deaths as reports.** A connect
-   refused at the batch prepare threw (that one was honest), but a
-   mid-body carrier death after exhausted attempts came back as a
+   refused at the batch prepare threw, but a mid-body carrier death after
+   exhausted attempts came back as a
    `SendReport` with a failure reason — and the engine's tail read any
    returned report as "the far side spoke", concluding a story that never
    happened.
@@ -99,7 +98,7 @@ was only true on the fresh-dispatch path. Three defects, one root:
    = an 800 MB batch with no row, no spools, and a receiver holding 80%
    of a file nobody would ever resume.
 
-The fix is a contract, not a patch — **`TransferUnreachable`
+The fix is a contract — **`TransferUnreachable`
 (extends IOException)**, thrown by the protocol layer whenever the
 carrier dies (connect refused, reset mid-body, EOF, exhausted attempts,
 re-prepare IO failures — and the batch prepare's first handshake), and
@@ -135,5 +134,5 @@ the carrier for good → attempts exhaust, the sender **throws** (not
 reports), and the receiver's part + token sidecar survive the throw
 untouched — that on-disk prefix is what the next flush's resume rides.
 The receiver-alive half (death → sweep → hash-exact resume) stays
-`deathRun`'s, still green. Hardware walk (redo, post-fix) recorded below.
+`deathRun`'s, still green.
 

@@ -1,6 +1,6 @@
 # Flit architecture — the engineering map
 
-> Deep context document. Start at the [ladder and design index](transport-bluetooth.md) for status and focused docs. This file explains how the pieces fit, why they are split this way, which invariants hold the system together, and where state actually lives.
+Module map, transport seam, state ownership, invariants, lifecycle and concurrency. Milestone status and focused evidence are in the [design index](transport-bluetooth.md).
 
 ## 1. What Flit is
 
@@ -156,7 +156,7 @@ MIUI can still kill the process or refuse autostart; that cannot be fixed in cod
 
 ## 11. UI and surface contract
 
-The original Phase B contract said the UI would never learn Bluetooth exists. That was deliberately revised: an explicit **Transfer over Bluetooth** option, Known-devices route policies, QR-only mode and a Circle feed are now user-visible by request. The surface still never shows protocol mechanics, TLS state, relay tickets or carrier handshakes; it shows honest outcomes: sent, waiting, refused, landed here, not here yet.
+The original Phase B contract said the UI would never learn Bluetooth exists. The current surface adds an explicit **Transfer over Bluetooth** option, Known-devices route policies, QR-only mode and a Circle feed. It still never shows protocol mechanics, TLS state, relay tickets or carrier handshakes; it reports observable outcomes: sent, waiting, refused, landed here, not here yet.
 
 Circle is an M3 activity feed with WhatsApp-like structure (chronological rows, member bar, pinned composer) but no emoji, decorative backgrounds or chat-bubble tails. Poll and kick tallies are computed once per snapshot, not per card.
 
