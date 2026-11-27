@@ -17,9 +17,10 @@ Rules applied here:
   implying a green rig covers it. Current examples: phone-to-phone RFCOMM,
   a three-or-more-member Circle mesh, Wi-Fi Aware (feature absent on the rig
   phone), and outbound phone→host Circle fan-out as a device observation.
-- Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286) are
+- Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302) are
   snapshots of earlier commits, not the current inventory. The current figure
-  is 302, last green at commit `72225f8`; the commit before it is `2034fa6`.
+  is 356 after the 2026-11-27 courier layer; the 302-test baseline was last
+  green at `72225f8`.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -30,10 +31,10 @@ Rules applied here:
 
 | Module | Role | Test count | Test task | Where it runs |
 | --- | --- | --- | --- | --- |
-| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core | **82** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
+| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **136** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
 | `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **210** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
 | `harness/` | Desktop companion `flit-cli`; the rig for interop, relays and Circle bots | **10** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **302** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
+| **Total** | Three modules, three roles | **356** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -86,12 +87,12 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **82 protocol + 210 app + 10 harness = 302 tests,
+Result: `BUILD SUCCESSFUL`, **136 protocol + 210 app + 10 harness = 356 tests,
 0 failures, 0 errors, 0 skipped**, read from the XML result files under each
 module's `build/test-results/test/`. The `--rerun-tasks` flag was deliberate:
 an earlier invocation reported all test tasks `UP-TO-DATE` and left XML from an
-older class layout in place (see §8). The last green commit recorded in git is
-`72225f8` ("Fix Circle Open file crash and sharing restore (302 tests green)").
+older class layout in place (see §8). The 302-test baseline was green at
+`72225f8`; the 54 added courier cases are listed in §4.1 below.
 
 ## 4. Test inventory by module and class
 
@@ -103,7 +104,7 @@ and `TlsIdentityTest.kt` contains the class `PinCacheTest`
 (`.../TlsIdentityTest.kt:16`). Do not "fix" these by renaming without updating
 this table.
 
-### 4.1 Protocol — 82 tests
+### 4.1 Protocol — 136 tests (82 baseline + 54 courier)
 
 | Class | # | What it pins |
 | --- | --- | --- |
@@ -122,6 +123,21 @@ this table.
 | `ResumeAndTurboTest` | 5 | Both `Content-Range` spellings (`bytes s-e/total` and `bytes=s-e/total`), restart probe/attach from a dead run's part, failed chunk claim leaves the part intact for plain resume, 409 for a resume header with no held base, `multi=true` hash-exact landing. |
 | `StreamTlsTest` | 4 | `SSLEngine` shim handshake closes the loop both directions, multi-megabyte duplex round-trip byte-exact, half-open close yields a clean end, idempotent close and single bytes. |
 | `TurboProgressTest` | 1 | Multi-socket progress is non-decreasing, bounded by total and ends exactly at total. |
+
+#### Courier additions — counts recorded at integration
+
+The five classes below add 54 cases in
+`protocol/src/test/kotlin/app/flit/share/protocol/`. They are not part of the
+82-protocol / 302-total baseline in §2. Counts come from a fresh `--rerun-tasks`
+run. These classes carry no device evidence.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `CourierEnvelopeCodecTest` | 11 | Canonical bytes domain-tagged and length-prefixed with `sig`/`cert` excluded, and changed by a change to each covered field; `encode`/`decode` round-trip and refuse truncated, oversized or unknown-field bytes; `MAX_ENVELOPE_CHARS` bound; tampering detected. |
+| `CourierEnvelopeCryptoTest` | 13 | `seal`/`open` round-trip a signed event array through AES-GCM and RSA wrap byte-exact; wrong certificate, cert digest not equal to `fromFp`, forged signature and tampered ciphertext/IV/wrapped key fail `verify` without writing a pin; `createdMs` outside the replay/skew window refused by `open`. |
+| `CourierCarryCodecTest` | 10 | `CarryState` encode/decode round-trip; a corrupt blob decodes to an empty state; numeric expiry repaired; duplicate ids keep the first row; oversized bag trimmed to `MAX_PARCELS`. |
+| `CourierCarryDecisionTest` | 14 | `evaluate` precedence and bounded `MAX_PARCELS` quota, TTL derived only from `createdMs + MAX_PARCEL_TTL_MS`, and `ack`, `select`, `expire`, `merge` and `clear` on `CarryState`. |
+| `CourierIntegrationTest` | 6 | `seal` → `parcel` → carry fold → `open` → `CircleCore.verify` chain; `PARCEL` listed in `CircleEvent.TYPES` with existing verb values and DTO fields unchanged. |
 
 ### 4.2 App — 210 tests
 

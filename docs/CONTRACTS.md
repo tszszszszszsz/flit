@@ -533,7 +533,7 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 ### 7.3 Event kinds and closed body shapes (`circle/CircleEvent.kt`, `FlitCircleSync.kt:175-234`)
 
 `CircleEvent(id, circleId, authorFp, lamport, type, body, sig, createdMs, cert)`.
-`type` is one of exactly nine verbs; `body` is a small JSON object:
+`type` is one of ten verbs, including `parcel`; `body` is a small JSON object:
 
 | Verb | Body shape (exact keys) |
 | --- | --- |
@@ -703,3 +703,149 @@ trust and replay reasoning in [Security](SECURITY.md).
   pins that (`forward(hops = 2) == null`). Separately, `evaluate` flags
   `hops >= 3` as `HopLimit` and the route drops it without delivery. The
   precise rule is in §6.3.
+
+## 13. Courier contract — parcel, envelope and carry bag (2026-11-27)
+
+### 13.1 Files and layer
+
+The courier layer lives in `protocol/.../courier/` (`CourierEnvelope.kt`,
+`CourierCarryCore.kt`), package `app.flit.share.protocol.courier`. It is
+JVM-pure: no Android import, no socket, no file or preference persistence. The
+tenth Circle verb is added in `circle/CircleEvent.kt`; any shared change in
+`circle/CircleCore.kt` is additive only and leaves existing canonical bytes,
+validity and acceptance rules unchanged.
+
+A parcel travels as a `parcel` event inside `CircleRequest.events` over the
+existing `/circle/sync` route. There is no new route, header or request field.
+The carrier handles the `envelope` string as opaque bytes; the sender encrypts
+the events to the recipient's device certificate. No file bytes enter a parcel.
+
+### 13.2 Closed constants
+
+Each constant is declared once in its owning file; no file redeclares another
+file's constant. Values below apply to the 2026-11-27 layer.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `PARCEL` | `"parcel"` | Tenth Circle event verb, in `CircleEvent.TYPES` |
+| `PARCEL_BODY_KEYS` | `{"toFp","envelope"}` | Closed body key set |
+| `MAX_ENVELOPE_CHARS` | `12 * 1024` | Base64 cap; framed body stays under `CircleCore.MAX_BODY_CHARS` (16 KiB) |
+| `MAX_PARCELS` | `256` | Bounded carrier bag |
+| `MAX_SEEN` | `4096` | Bounded id reservation, shared by `evaluate` and `fresh` |
+| `REPLAY_WINDOW_MS` | `6 * 60 * 60 * 1000L` (6 h) | Open window for `open` and `evaluate` |
+| `CLOCK_SKEW_MS` | `5 * 60 * 1000L` (5 min) | Future tolerance |
+| `MAX_PARCEL_TTL_MS` | `24 * 60 * 60 * 1000L` (24 h) | Ceiling; `expiresMs = createdMs + MAX_PARCEL_TTL_MS` |
+| `MAX_FIELD_CHARS` | `256` | Reused from `CircleCore` for bounded string fields |
+| `MAX_SIG_CHARS` / `MAX_CERT_CHARS` | `1024` / `8 * 1024` | Reused from `CircleCore` for `sig`/`cert` |
+| `KEY_BYTES` / `IV_BYTES` | `32` / `12` | AES-256-GCM content key and IV |
+| `ALG` | `"AESGCM+RSAOAEP256"` | Only accepted algorithm value |
+| `FLITCOURIER1` | domain tag | Envelope signature canonical bytes |
+| `FLITCARRY1` | domain tag | Carry-state bag digest, not an envelope signature |
+
+`expiresMs` is never stored in the envelope: `parcelOf` derives it once as
+`createdMs + MAX_PARCEL_TTL_MS`, so two copies of one parcel cannot carry
+competing expiries. The only accepted `alg` value is `"AESGCM+RSAOAEP256"`;
+a different value is Invalid at `verify` and `open`.
+
+### 13.3 Parcel body
+
+`PARCEL = "parcel"` joins `CircleEvent.TYPES` as the tenth verb. Its body is
+exactly `{"toFp":"<UPPERCASE fingerprint>","envelope":"<Base64 envelope bytes>"}`:
+the key set is the closed `PARCEL_BODY_KEYS = {"toFp","envelope"}`.
+`validParcelBody` refuses an extra key (`token`, `path`, `spoolPath`, …), a
+blank or over-cap `toFp`, and a blank or over-cap `envelope` before any id is
+reserved. `parcelOf` uppercases `toFp` and also requires non-blank `cert`,
+`CircleCore.validShape` and an expiry inside the TTL bound. The Base64 cap of
+`MAX_ENVELOPE_CHARS` (about 9216 raw bytes) keeps the framed body under
+`CircleCore.MAX_BODY_CHARS` (16 KiB).
+
+`CourierParcel(id, toFp, fromFp, createdMs, expiresMs, event)` holds the signed
+event; `CarryState(parcels)` is the bag. The `Decision` sealed interface has
+exactly `Accept`, `Duplicate`, `Expired`, `OutsideWindow`, `Invalid` and
+`Full`.
+
+### 13.4 Envelope canonical bytes and verification
+
+```
+CourierEnvelope(
+    id, circleId, fromFp, toFp, createdMs: Long,
+    alg, ivB64, cipherB64, keyWrapB64, sig = "", cert = "")
+```
+
+`seal(events, circleId, fromFp, toFp, recipientCert, identity, nowMs)` mints a
+UUID id, generates a fresh 32-byte content key with `SecureRandom`, encrypts a
+`WireJson` array of `CircleEvent` with AES-256-GCM, wraps the key with
+RSA-OAEP/SHA-256 to the recipient certificate, and signs the canonical bytes
+with `TlsIdentity.sign`. The content key exists only inside `seal` and the
+wrapped blob. Without a recipient certificate, `seal` refuses.
+
+Canonical bytes use domain tag `FLITCOURIER1` and the local `field` helper: a
+4-byte big-endian UTF-8 byte length followed by the bytes. The order is
+`field(tag)`, `field(id)`, `field(circleId)`, `field(fromFp)`, `field(toFp)`,
+`writeLong(createdMs)`, `field(alg)`, `field(ivB64)`, `field(cipherB64)`,
+`field(keyWrapB64)`. `sig` and `cert` are excluded. `encode` appends
+`field(sig)` and `field(cert)`; `decode` reverses it and returns `null` on any
+malformed, missing or oversized field. The Base64 string placed in the parcel
+body is bounded by `MAX_ENVELOPE_CHARS`.
+
+`verify(e)` parses `cert`, compares the certificate's own SHA-256 DER to
+`fromFp`, checks the signature against that certificate before pinning, and
+pins only after the check, as `CircleCore.verify` does; a substituted
+certificate cannot poison the pin cache. It returns false for a tampered
+`cipherB64`, `ivB64`, `keyWrapB64`, `alg`, `circleId`, `toFp` or `createdMs`,
+and for a blank or malformed `sig` or `cert`.
+
+`open(e, identity, nowMs)` decrypts with the recipient's private key, parses
+the bounded event array and applies `REPLAY_WINDOW_MS`/`CLOCK_SKEW_MS` to
+`createdMs`. It owns no replay set and never calls `CircleCore.evaluate` or
+`accept` on an envelope id; authorship is checked by `CircleCore.verify` at
+fold time. The envelope carries no `expiresMs`.
+
+### 13.5 Carry digest tag and decisions
+
+`canonical(p)` uses the separate domain tag `FLITCARRY1`: tag, length-prefixed
+`id`, `toFp`, `fromFp`, `writeLong(createdMs)`, `writeLong(expiresMs)`, then the
+envelope string, with `event.sig` and `event.cert` excluded. It is a bag digest
+for carry state and later receipts, not an envelope signature; `FLITCARRY1` and
+`FLITCOURIER1` are distinct by design.
+
+The carry core exposes `validParcelBody`, `parcelOf`, `canonical`, `order`,
+`evaluate`, `fresh`, `fold`, `select`, `ack`, `expire`, `merge`, `clear` and
+`encode`/`decode` for `CarryState`. `evaluate` follows exactly
+`Invalid → Expired → OutsideWindow → Duplicate → Full → Accept`; only `Accept`
+reserves an id in the bounded `seen` set shared with `fresh`, so a `Full`
+refusal can be retried after space frees. The window compares two positive
+timestamps by subtraction, and `nowMs >= expiresMs` is never selected.
+`order` delegates to `CircleCore.order` on the underlying events; `fold` and
+`merge` dedup by id and trim to `MAX_PARCELS` by `order`, so arrival order does
+not change the bag. `select` returns live parcels for the normalised `toFp`,
+ordered and capped; `ack` and `expire` are inert on unknown ids. `decode` is
+total: a null, blank, truncated, wrongly typed or otherwise corrupt blob
+decodes to an empty bounded state. A parsed blob keeps the first row for a
+duplicate id, drops rows with blank or oversized id/`toFp` or non-positive
+`createdMs`, and repairs a numeric expiry that disagrees with `createdMs +
+MAX_PARCEL_TTL_MS`. Decode has no clock; `expire(state, nowMs)` and `select`
+apply wall-clock expiry.
+
+### 13.6 Compatibility and evidence boundary
+
+The addition is confined to a new verb, new JVM-pure files and the caller-owned
+bag. `CircleCore.validShape` stays type-agnostic bounds, so no existing event's
+signature or acceptance changes; `validParcelBody` is the type-specific gate,
+as `validFileBody` is for `file`. No v2.2 route, DTO, header or status code
+changes. The `/circle/sync` route keeps its signed `200` answers; a malformed
+parcel body is refused before an id is reserved. An older Flit build keeps
+parsing its existing events; the parcel bytes are framed by the single
+envelope codec that the later QR layer reuses unchanged. The durable bag is
+owned outside the protocol module: `courierBag` on `CircleState` in the app and
+`courier.bag` in the CLI. `TlsIdentity`'s pin cache stays bounded at 512 and
+gains the sender's certificate only after `verify` succeeds.
+
+CODE establishes the constants, the two domain tags, the canonical field
+order, the closed body keys and the decision precedence. PURE JVM tests cover
+canonical bytes, `encode`/`decode` bounds, tamper rejection, `seal`/`open`,
+recipient wrapping, certificate binding and bag decisions. Carrier (`SIM-HARN`)
+and three-node (`DEVICE`) handoffs are dated 2026-11-30 and 2026-12-02; no such
+evidence is claimed for this layer. See
+[courier-envelope.md](roadmap/courier-envelope.md) and
+[courier-carry.md](roadmap/courier-carry.md).

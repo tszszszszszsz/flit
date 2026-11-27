@@ -39,6 +39,7 @@ Boundaries where untrusted input crosses into a decision:
 | QR scan / paste / `flit://` link | a URI string from a camera, clipboard or saved invite | whoever crafted the code or photo |
 | Local storage | SharedPreferences, spool, ledger, event log | someone with device or backup access |
 | External viewer | a `FileProvider` content URI with a read grant | the chosen viewer is a separate app |
+| Courier parcel on `/circle/sync` | a `parcel` event body whose `envelope` field holds Base64 envelope bytes, offered by a carrier | any carrier that holds and forwards the bytes; it cannot decrypt them |
 
 ## Threat model
 
@@ -49,6 +50,7 @@ deliberately symmetric: every row states both the guarantee and the gap.
 | --- | --- | --- |
 | Passive LAN observer | file bytes, Circle events and the group key travel inside TLS; authorship is proven by signature over canonical bytes | IPs, MACs, timing and byte counts are visible; Circle event bodies are **plaintext JSON at rest** on each device, not encrypted |
 | On-path / rogue relay | TLS runs end-to-end inside the pipe; the relay never sees a protocol byte, a fingerprint in the log, or a finished hash; a signed host answer binds the key to the QR host | a relay can refuse, delay, drop or partition a pair; it is a single point of failure the user owns |
+| Malicious courier carrier | holds only AES-GCM ciphertext, an IV and an RSA-wrapped key; cannot decrypt, forge the sender signature, or redirect a blob to a different `toFp`/`circleId` without breaking the cipher or the signature | can refuse, delay, drop, duplicate or partition parcels; a held parcel stays a stored copy until TTL expiry; sees addressee fingerprint, timing and size |
 | Forged fingerprint | an attacker certificate lands under the attacker's own SHA-256 DER fingerprint; claiming a victim's `senderFp`/`memberFp`/`authorFp` fails the cert-binding check | nothing — this is a hard guarantee of the pin design, not a best effort |
 | Stolen QR photo (pairing) | pinning for an IP-bearing code happens only after a live `register` answers with the exact fingerprint in the code | the photo is a bearer hint: whoever shows it to a device that answers correctly gets trusted. A relay-only/MAC-only code has no probe and pins directly from the code — the human eyeball is the only check |
 | Stolen Circle invite (v3 QR) | the code carries no group key; the key arrives only inside a TLS session to the host named in the QR, and the answer is signed by that host | the invite token is a bearer credential: whoever holds the photo can complete a JOIN while it is valid. Retiring a suspicious code means starting a new Circle |
@@ -334,6 +336,106 @@ authority for Circle membership and key rotation:
   the feed; it cannot wipe or change another device, and earlier events on the
   departed device stay plaintext (`docs/circle.md:49-56`, `:127-129`).
 
+## Courier: recipient-cert encryption and carrier blindness
+
+The 2026-11-27 protocol layer adds a store-and-forward path for an absent Circle
+member. A member who cannot reach a peer seals events into a `CourierEnvelope`;
+a carrier holds the opaque bytes in a bounded bag until a later encounter. The
+work is pure JVM wire code in `protocol/.../courier/CourierEnvelope.kt` and
+`CourierCarryCore.kt`. No carrier loop, app state or device walk is part of this
+date; the CLI carrier is the 2026-11-30 layer and the app fold the 2026-12-01
+layer.
+
+### What the carrier holds
+
+A parcel is one `parcel` event on `/circle/sync` whose body is exactly
+`{"toFp":"<fingerprint>","envelope":"<Base64 bytes>"}`. The bytes hold
+AES-256-GCM ciphertext, an IV, an RSA-wrapped content key, and the sender's
+signature and certificate. The carrier forwards them without decrypting. The
+blindness is structural: the only private key that unwraps the content key is
+the addressee's, and it never reaches the carrier. This matches the relay rule
+in "Relay: blindness and per-device opt-in" — the carrier carries opaque bytes
+and cannot forge content or a fingerprint, but can refuse, delay, drop or
+partition parcels.
+
+`circleId` and `toFp` are inside the signed envelope, so redirecting a blob to
+another circle or recipient breaks the signature. `expiresMs` is deliberately
+absent from the envelope: the carry core derives it once as
+`createdMs + MAX_PARCEL_TTL_MS`, so two carrier copies cannot disagree on
+expiry. The clear `toFp` in the body is what lets a carrier select parcels for a
+peer it meets; the carrier therefore sees the addressee fingerprint and message
+size even though it cannot read the events.
+
+### Recipient-cert encryption and no escrow
+
+`seal` generates a fresh 32-byte content key with `SecureRandom`, encrypts the
+bounded `CircleEvent` array under AES-256-GCM with a 12-byte IV, wraps the key
+with RSA-OAEP/SHA-256 to the recipient certificate's public key, and signs the
+canonical envelope bytes with `TlsIdentity.sign`. The content key exists only
+inside `seal` and in the wrapped blob; no copy is written, logged or handed to a
+third party. There is no key escrow, no key server and no certificate authority:
+the recipient certificate comes from the signed Circle event log or a host
+roster answer, and `seal` refuses when it cannot find one. The only accepted
+algorithm tag is `ALG = "AESGCM+RSAOAEP256"`; another value is invalid. `open`
+decrypts with the recipient's own private key and returns the event array only
+when decryption, parsing and the `circleId`/`toFp` match pass; it refuses an
+unwrappable key or undecodable plaintext.
+
+### Sender signature and cert bind
+
+Canonical bytes carry the domain tag `FLITCOURIER1` and the same 4-byte
+big-endian length-prefixed UTF-8 field rule as `CircleCore.canonical`, over
+`id`, `circleId`, `fromFp`, `toFp`, `createdMs` (long), `alg`, `ivB64`,
+`cipherB64` and `keyWrapB64`. `sig` and `cert` are excluded; changing any covered
+field changes the signature input.
+
+`verify` binds the certificate's own SHA-256 DER to `fromFp` and checks the
+signature against that certificate *before* pinning it in `TlsIdentity`'s
+cache — the same pin-after-verify rule as "Signatures and cert-in-event". A
+certificate whose digest is not `fromFp` is refused and never pins. The envelope
+`cert` is the same signer named by the `parcel` event's `authorFp`, so no second
+trust anchor is introduced. Decrypted events keep their own author signatures
+and certs; courier does not assert their authorship, which is `CircleCore.verify`
+at fold time. A forged event is skipped there, not by the carrier.
+
+### Limits and failure modes
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `MAX_ENVELOPE_CHARS` | `12 * 1024` | Base64 cap; body stays under `CircleCore.MAX_BODY_CHARS` (16 KiB) |
+| `KEY_BYTES` / `IV_BYTES` | `32` / `12` | AES-256-GCM content key and IV |
+| `ALG` | `"AESGCM+RSAOAEP256"` | Closed algorithm value |
+| `MAX_PARCELS` | `256` | Bounded carrier bag |
+| `MAX_SEEN` | `4096` | Bounded id reservation in the carry core |
+| `REPLAY_WINDOW_MS` / `CLOCK_SKEW_MS` | `6 h` / `5 min` | `open` window on `createdMs` |
+| `MAX_PARCEL_TTL_MS` | `24 h` | `expiresMs = createdMs + MAX_PARCEL_TTL_MS` |
+| `MAX_FIELD_CHARS` / `MAX_SIG_CHARS` / `MAX_CERT_CHARS` | `256` / `1024` / `8 KiB` | Reused from `CircleCore` |
+
+- A body with any key besides `{toFp, envelope}` is Invalid and reserves no id.
+  `evaluate` follows Invalid → OutsideWindow → Expired → Duplicate → Full →
+  Accept; only Accept reserves an id, so a Full bag refuses the offer without
+  burning the id and can accept it once space frees.
+- `open` applies the six-hour window and five-minute future skew to `createdMs`
+  and owns no replay set; id dedup is the carry core's bounded `seen`. Both are
+  process memory, so a restart forgets them; the window and TTL are the
+  backstop. The window compares two positive timestamps by subtraction, so an
+  extreme clock cannot overflow into a false Accept.
+- `select` returns only live parcels addressed to the normalized `toFp` in
+  deterministic order; `ack` and `expire` remove by id or TTL. `merge` dedups and
+  trims deterministically, so two carriers holding the same parcels converge.
+- There is no revocation beyond expiry: a held parcel, or a copy an addressee
+  already decrypted, can be reopened after the sender leaves the Circle or a
+  rekey happens. Courier adds no content cipher for events already in the shared
+  Circle log; those stay plaintext JSON under the at-rest rule above.
+- The durable bag row is owned by the caller (`courierBag` on `CircleState` in
+  the app, `courier.bag` in the CLI), not by this layer. A carrier process death
+  before an ack therefore depends on that row being persisted by the later app
+  or CLI layer; no durable carrier state is claimed here.
+
+Evidence: CODE for the codec and carry core, PURE for the courier tests. The
+handoff rows are not claimed at this date — `SIM-HARN` belongs to the 2026-11-30
+CLI carrier and `DEVICE` to the 2026-12-02 three-node walk.
+
 ## Panic: authorization, hops, and informational-only delivery
 
 Panic is a signed, hop-counted Flit-only route (`/api/flit/v1/panic`); it adds no
@@ -535,6 +637,11 @@ The app asks for the minimum local capabilities and exposes almost nothing:
     (`docs/open-file-and-sharing-restore.md:198-217`).
 11. **File delivery is at-post-time.** No backfill for later joiners; delivery
     status is never gossiped, so no peer can see another's counts.
+12. **Courier delivery is best-effort and bounded.** A carrier can hold, delay,
+    drop or partition parcels; TTL expiry ends a held copy but not one an
+    addressee already decrypted, and a later rekey or departure cannot revoke it.
+    The carrier is blind to event content but sees the addressee fingerprint,
+    timing and size. The 2026-11-27 layer claims no carrier handoff walk.
 
 ## Evidence status at a glance
 
@@ -547,12 +654,14 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | Relay blindness / opt-in | `RelayCore.kt`, `RelayEndpoints.kt`, `FlitEngine.kt` | `RelayCoreTest` (11) | `RelayServerTest` over production endpoints | 200 MiB cross + 300 MiB kill/resume |
 | File no-path / local status | `CircleCore.validFileBody`, `FlitEngine` delivery loop | `CircleCoreTest`, `CircleHardeningTest`, `FlitSpoolTest` | `CircleHarnessTest` | 35 B drop landed hash-exact; Open-file walk |
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
+| Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | not run (2026-11-30 CLI layer) | not walked (2026-12-02 layer) |
 
 Device walks that did **not** happen and are not claimed here: a genuine
 three-or-more-device Circle mesh; a real phone-to-phone RFCOMM transfer;
 phone→host Circle fan-out with a clean peer-side confirmation (still
 test-evidenced only — `docs/circle.md:310-319`, `:343-361`); Wi-Fi Aware on this
-rig; any multi-member panic-hop walk beyond the one-phone-plus-box case.
+rig; any multi-member panic-hop walk beyond the one-phone-plus-box case; a
+courier parcel handoff through a carrier to an absent member (2026-12-02 layer).
 
 ## Inconsistencies
 

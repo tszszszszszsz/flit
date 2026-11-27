@@ -72,7 +72,7 @@ For a keyed drop the receipt `sha256` is the value in the `file` event body — 
 6. A receipt for an unknown sha, a departed fingerprint or a non-member author produces no confirmation.
 7. A duplicate id or a `createdMs` outside the replay window leaves the confirmed count and the delivery row unchanged.
 8. No receipt is minted for a digest mismatch, `Error`, a carrier throw or a plaintext drop without `keyGen` or `wraps`.
-9. The app's `circleBodyValid` branch and the host's SYNC filter both route receipts through `CircleCore.validReceiptBody`; the nine existing verbs keep their bodies and canonical bytes.
+9. The app's `circleBodyValid` branch and the host's SYNC filter both route receipts through `CircleCore.validReceiptBody`; the existing verbs keep their bodies and canonical bytes.
 10. Receipts use only `/api/flit/v1/circle/sync` or an existing parcel/courier payload; the v2.2 route set and response shapes stay byte-for-byte unchanged.
 11. No schema field is added to `CircleDelivery`; the 500-event log cap and 1024-event per-request cap still bound receipt state.
 

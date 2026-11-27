@@ -39,7 +39,7 @@ Both are earlier protocol layers. The core uses only shipped seams: `CircleCore`
 
 ## Invariants
 
-1. The gate accepts exactly `FILE_BODY_KEYS` or `KEYED_FILE_BODY_KEYS`; the nine existing event verbs keep byte-identical canonical bytes and signatures, and no v2.2 route or DTO changes.
+1. The gate accepts exactly `FILE_BODY_KEYS` or `KEYED_FILE_BODY_KEYS`; the existing event verbs keep byte-identical canonical bytes and signatures, and no v2.2 route or DTO changes.
 2. `mint()` produces a fresh 32-byte key and 12-byte IV; two mints differ, and neither value derives from the group key, invite or file hash.
 3. `seal`/`open` round-trip byte-exactly for empty, one-byte, 8 KiB and multi-megabyte inputs; the output is exactly `IV || ciphertext || tag` with `TAG_BYTES = 16`; flipping one IV, ciphertext or tag byte, using another key or changing the AAD yields null.
 4. `wrap` produces one Base64 entry per uppercase fingerprint with a usable certificate, at most `MAX_WRAPS`; each value is within `MAX_WRAPPED_CHARS` and opens only under that member's identity.
@@ -67,7 +67,7 @@ Both are earlier protocol layers. The core uses only shipped seams: `CircleCore`
 
 ## Tests
 
-Pure tests come first and are the only tests added on this date. `DropKeyCoreTest.kt` in `protocol/src/test/kotlin/app/flit/share/protocol/` covers: seeded mint uniqueness, key and IV lengths, and independence from group key and invite; wrap/unwrap round-trip, wrong-identity failure, absent fingerprint, junk and tampered blobs, with no pin writes; `MAX_WRAPS` and `MAX_WRAPPED_CHARS` bounds; `seal`/`open` byte-exact round-trips at 0, 1, 8192 and 3 MiB with seeded data; IV, ciphertext, tag and AAD tampering; plaintext digest gate; `keyedFileBody` output, exact keyed and legacy key sets, partial and extra keys refused, and `parseFileKeyBody` null on every refused body; `keyId` derivation and stability; canonical vectors for the nine existing event verbs unchanged; and a keyed `file` event create/sign/verify, dedup, replay window and oversized-body id accounting through `CircleCore`, plus `rekey` independence. Figure counts are read from the JUnit XML after `--rerun-tasks`, as required by `TESTING.md` §3 and §8.
+Pure tests come first and are the only tests added on this date. `DropKeyCoreTest.kt` in `protocol/src/test/kotlin/app/flit/share/protocol/` covers: seeded mint uniqueness, key and IV lengths, and independence from group key and invite; wrap/unwrap round-trip, wrong-identity failure, absent fingerprint, junk and tampered blobs, with no pin writes; `MAX_WRAPS` and `MAX_WRAPPED_CHARS` bounds; `seal`/`open` byte-exact round-trips at 0, 1, 8192 and 3 MiB with seeded data; IV, ciphertext, tag and AAD tampering; plaintext digest gate; `keyedFileBody` output, exact keyed and legacy key sets, partial and extra keys refused, and `parseFileKeyBody` null on every refused body; `keyId` derivation and stability; canonical vectors for the existing event verbs unchanged; and a keyed `file` event create/sign/verify, dedup, replay window and oversized-body id accounting through `CircleCore`, plus `rekey` independence. Figure counts are read from the JUnit XML after `--rerun-tasks`, as required by `TESTING.md` §3 and §8.
 
 Harness coverage is not added on this date. The protocol layer adds no production endpoint, so no `flit-cli` path or in-process TLS node exercises a keyed drop on 2026-12-09. The two-node harness walk is part of the 2026-12-10 integration.
 

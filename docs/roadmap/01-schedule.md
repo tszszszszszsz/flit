@@ -5,6 +5,10 @@ contains a complete layer: code, tests, a completion note under
 `docs/completions/`, and docs updates. Nothing is committed halfway through a
 layer.
 
+Build-ahead: code may be written ahead of the dates below. The dates govern
+commits, not when work happens. Commits stay spoon-sized and land on the
+scheduled weekdays; work finished early is held until its assigned date.
+
 ## Dates
 
 | Date | Layer | Commit scope |

@@ -4,6 +4,10 @@ Every wave uses 16 agents on the same model and with the same effort as the
 orchestrator: `opencode/hy4-flash-free#high`. All agents in a wave work on one
 layer. Files are disjoint. No agent commits.
 
+Build-ahead: implementation may run ahead of the wave dates below. The dates
+govern commits, not when work happens. Commits stay spoon-sized and land on the
+scheduled weekdays; finished work is held until its wave date.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator

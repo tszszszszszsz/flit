@@ -76,6 +76,11 @@ shape.
 | part aging | 24 h | `ServerCore.kt:1206-1223` | stale `.part` / `.part.token` sweep |
 | Circle event cap / replay window / skew / seen | 500 / 6 h / 5 min / 4096 | `FlitCircleStore.kt:72`, `CircleCore.kt:23-29` | bounded log and replay gate |
 | panic hops / replay / skew / seen | 3 / 6 h / 5 min / 1024 | `PanicCore.kt:18-27` | forward budget and dedup |
+| `MAX_ENVELOPE_CHARS` | 12 288 (12 KiB) | `CourierEnvelope.kt` | Base64 envelope cap; the framed `parcel` body stays under `MAX_BODY_CHARS` |
+| `MAX_PARCELS` | 256 | `CourierCarryCore.kt` | Bag cap; a Full refusal reserves no id |
+| `MAX_PARCEL_TTL_MS` | 86 400 000 (24 h) | `CourierCarryCore.kt` | `expiresMs = createdMs + MAX_PARCEL_TTL_MS`; the only expiry |
+| bag `MAX_SEEN` | 4096 | `CourierCarryCore.kt` | Bag id reservation shared by `evaluate` and `fresh`, separate from the Circle set |
+| courier `open` window / skew | 6 h / 5 min | `CourierEnvelope.kt` | Reuses the Circle replay bounds by subtraction; no second replay set |
 
 ---
 
@@ -104,6 +109,13 @@ Read this first; the sections below unfold each row.
 | Circle drop: spool file gone | no | record dropped | nothing | delivery record + card status | CODE |
 | Circle log: replay / wrong circle / forged cert | no | event skipped | log unchanged | event | CODE / PURE / SIM |
 | Circle leave/kick | no | membership removed, generation bumped, key rotated | local earlier log stays plaintext | roster entry + old key material | CODE / PURE / SIM / DEVICE |
+| Courier: no recipient cert in log or roster | yes — a later roster answer | no — `seal` refuses | events stay in the sender's own log | nothing | CODE / PURE |
+| Courier: bad body keys, oversized envelope, malformed bytes | no | `Invalid` / `decode` null | existing bag unchanged | incoming event or bad row | CODE / PURE |
+| Courier: verify fails or cert binding breaks | no | verify false; no pin written | held bytes until `ack` / `expire` | envelope on removal | CODE / PURE |
+| Courier: duplicate id or bag at 256 | a Full refusal can be offered again after space frees | `Duplicate` / `Full`; Full reserves nothing | held copy, or all 256 held parcels | incoming copy / offer | CODE / PURE |
+| Courier: outside window, expired, wrong `circleId` / `toFp` | no | `OutsideWindow` / `Expired` / `open` refused | existing bag unchanged | incoming or expired parcel | CODE / PURE |
+| Courier: pending until encounter, then ack | yes until the addressee is met | Delivered at `ack` | parcel until TTL; nothing after ack | acknowledged parcels | CODE / PURE |
+| Courier: corrupt bag row or carrier death | yes — persisted bag is re-offered | empty bounded state / no conclusion | unrelated Circle state; persisted `CarryState` | corrupt row / in-memory-only state | CODE / PURE |
 | Panic alert | per-device, one attempt per fan-out | `reached/N` confirmed only | banner in memory (max 20) | nothing remote | CODE / PURE / DEVICE |
 | Panic forward at hop limit | no | toast, no send | alert stays dismissed locally | forwarded copy | CODE / PURE |
 | FGS refused by ROM | no FGS | engine-only while foreground | engine state intact | notification only | CODE |
@@ -411,6 +423,37 @@ the box's poll and two bot messages (`:302-308`).
   blind relay requiring a manual Known-device entry with `relayFor` — all listed
   in the same section.
 
+### 3.4 Courier parcels — the store-and-forward conclusion table
+
+A carrier holds opaque `parcel` events in a bounded `CarryState`. The bag and its
+reducers are JVM-pure (`CourierCarryCore.kt`); the signed, recipient-encrypted
+blob is `CourierEnvelope.kt`. The caller persists the encoded bag — `courierBag`
+in the app, `courier.bag` in the CLI — so process death leaves the signed events
+on disk and only the in-memory `seen` set is lost. Every refusal below is logged
+by the caller; none is a silent fallback.
+
+| Condition | Retries? | Concludes? | Keeps bytes? | Drops? | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| Recipient certificate absent from log and roster | yes — a later roster answer | no — `seal` refuses and logs | events stay in the sender's own log | nothing | CODE `CourierEnvelope.seal`; PURE `CourierEnvelopeCryptoTest` |
+| Extra parcel body key, blank `toFp`, or `envelope` over `MAX_ENVELOPE_CHARS` | no | `Invalid`; no id reserved | existing bag unchanged | incoming event | CODE `CourierCarryCore.validParcelBody`; PURE `CourierCarryCodecTest` |
+| `decode` sees truncated, oversized or unknown-field envelope bytes | no | `decode` returns null | existing bag unchanged | malformed body | CODE `CourierEnvelope.decode`; PURE `CourierEnvelopeCodecTest` |
+| Tampered `cipherB64`, `ivB64`, `keyWrapB64`, `alg`, `circleId`, `toFp` or `createdMs` | no | `verify` false | held bytes until explicit `ack` / `expire` | envelope on removal | CODE `CourierEnvelope.verify`; PURE `CourierEnvelopeCryptoTest` |
+| `cert` digest is not `fromFp`, or cert differs from the `parcel` signer | no | `verify` false; no pin written | existing pin cache unchanged | envelope | CODE `CourierEnvelope.verify`; PURE `CourierEnvelopeCryptoTest` |
+| `createdMs` older than 6 h or more than 5 min ahead | no | `OutsideWindow` / `open` refused | existing bag unchanged | incoming event | CODE `CourierCarryCore.evaluate`, `CourierEnvelope.open`; PURE `CourierCarryDecisionTest`, `CourierEnvelopeCryptoTest` |
+| `nowMs >= expiresMs` | no | `Expired`; `expire` removes and logs | existing bag unchanged | incoming or held parcel | CODE `CourierCarryCore.expire`; PURE `CourierCarryDecisionTest` |
+| Envelope id already reserved by `evaluate` | no | `Duplicate` | first copy | incoming copy | CODE `CourierCarryCore.evaluate`; PURE `CourierCarryDecisionTest` |
+| Bag at `MAX_PARCELS` | yes — Full reserves nothing, so a later offer can succeed | `Full` | all 256 held parcels | incoming offer | CODE `CourierCarryCore.evaluate`; PURE `CourierCarryDecisionTest` |
+| Corrupt wrapped key or undecodable plaintext after decrypt | no — any re-offer is a carrier concern | `open` returns null and logs | envelope bytes remain for retry or explicit removal | parsed array only | CODE `CourierEnvelope.open`; PURE `CourierEnvelopeCryptoTest` |
+| Event signature invalid after decrypt | no | event skipped by `CircleCore.verify` at fold time | envelope and the rest of the array | that event | CODE `CircleCore.verify`; PURE `CourierIntegrationTest` |
+| Parcel pending until the addressee is met | yes — next encounter / handoff | no — Pending | parcel in bag until TTL | nothing | CODE `CourierCarryCore.select`, `CourierCarryCore.expire`; PURE `CourierCarryDecisionTest` |
+| Addressee acknowledged the handoff | no | Delivered by `ack` | nothing for those parcels | acknowledged parcels | CODE `CourierCarryCore.ack`; PURE `CourierCarryDecisionTest` |
+| Carrier restarts before an ack | yes — persisted bag is re-offered | no — addressee dedups by id | persisted `CarryState` | in-memory-only state | CODE `CourierCarryCore.encode`/`decode`; PURE `CourierCarryCodecTest` |
+| Corrupt `courier.bag` or `courierBag` row | no | empty bounded state at decode | unrelated Circle state | corrupt row | CODE `CourierCarryCore.decode`; PURE `CourierCarryCodecTest` |
+
+The rows above are CODE and PURE only. The CLI carrier handoff is dated
+2026-11-30 and the three-node courier walk 2026-12-02; harness and device
+evidence for those flows is not claimed here.
+
 ---
 
 ## 4. Panic fan-out — conclusion and hop accounting
@@ -569,6 +612,15 @@ account, a server, or a settings change beyond the opt-ins already documented.
     `hops >= 3` the toast says so and nothing is sent. The `id` is deduped, so a
     looped alert is not re-shown. Acknowledge/Dismiss/Forward change only local
     state.
+11. **A courier parcel has no route to its addressee.** Automatic: the parcel
+    stays in the bounded bag until `nowMs >= createdMs + MAX_PARCEL_TTL_MS`;
+    `select` offers it on a later encounter and `ack` removes acknowledged ids.
+    A Full refusal reserves nothing, so the same offer can succeed after space
+    frees. A malformed body is Invalid and an `open` refusal leaves the envelope
+    in the bag. The encoded `CarryState` survives a carrier restart at the
+    app/CLI layer, so the signed event is re-offered and the addressee dedups by
+    id. A corrupt bag row decodes to an empty bounded state. Harness and device
+    handoff rows belong to the 2026-11-30 and 2026-12-02 walks.
 
 ---
 
@@ -587,6 +639,10 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | Panic fan-out | `FlitEngine.kt:403-505`, `ServerCore.kt:925-944` | `PanicTest` | — | one phone + CLI box banner/hops |
 | FGS / sharing restore | `FlitService.kt`, `FlitRoster.kt:65-117`, `MainActivity.kt` | `SharingRestoreTest`, `FlitRosterTest` | — | force-stop → relaunch restore walk |
 | MIUI / dataSync cap | `FlitService.kt:161-184` | — | — | idle soak; cap behaviour is **not device-walked** |
+| Courier envelope / carry bag | `CourierEnvelope.kt`, `CourierCarryCore.kt` | `CourierEnvelopeCodecTest`, `CourierEnvelopeCryptoTest`, `CourierCarryCodecTest`, `CourierCarryDecisionTest`, `CourierIntegrationTest` | — | — |
+
+Courier handoff has no SIM/HARN or DEVICE entry at this date. Those rows are
+dated 2026-11-30 and 2026-12-02.
 
 ---
 
@@ -627,3 +683,7 @@ None changes a shipped contract.
    a resumed base is impossible without the Flit extension. The final SHA-256
    gate verifies every landing regardless. Cross-carrier resume is refused by
    origin binding, producing a clean full resend.
+9. **Courier carrier handoff is not walked here.** The courier conclusion rows
+   above are CODE and PURE only. The CLI carrier handoff is a 2026-11-30 harness
+   layer and the three-node courier walk is 2026-12-02; neither yields a claim
+   in this document.

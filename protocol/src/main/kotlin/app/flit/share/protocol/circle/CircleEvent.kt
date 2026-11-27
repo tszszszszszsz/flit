@@ -9,7 +9,7 @@ import kotlinx.serialization.Serializable
  * `CircleCore.canonical`). [cert] is safe to leave out because its own SHA-256
  * DER must equal [authorFp] before `CircleCore.verify` accepts it: a swapped
  * or stripped certificate cannot borrow another device's signature. [type]
- * is one of the nine
+ * is one of the ten
  * verbs below; [body] is a small JSON object whose shape depends on [type]:
  *
  * ```
@@ -22,6 +22,7 @@ import kotlinx.serialization.Serializable
  * kick     {"kickId":"...","targetFp":"...","mode":"admin"|"vote","approve":true}
  * role     {"targetFp":"...","role":"ADMIN"|"MEMBER"}
  * rekey    {"keyB64":"...","gen":1}
+ * parcel   {"toFp":"...","envelope":"<base64 envelope bytes>"}
  * ```
  *
  * The event never carries file bytes — the sender delivers them separately
@@ -60,8 +61,9 @@ data class CircleEvent(
         const val KICK = "kick"
         const val ROLE = "role"
         const val REKEY = "rekey"
+        const val PARCEL = "parcel"
 
         /** The only types a well-formed log may contain. */
-        val TYPES: Set<String> = setOf(MESSAGE, FILE, POLL, VOTE, JOIN, LEAVE, KICK, ROLE, REKEY)
+        val TYPES: Set<String> = setOf(MESSAGE, FILE, POLL, VOTE, JOIN, LEAVE, KICK, ROLE, REKEY, PARCEL)
     }
 }

@@ -38,7 +38,7 @@ Three additive protocol-layer items:
 
 No new route, header, DTO field, frame, crypto path or persisted store is
 introduced. `CircleRequest`, `CircleResponse`, `Link` and `CircleWire.canonical`
-keep their current shapes. The existing nine event verbs keep byte-identical
+keep their current shapes. The existing event verbs keep byte-identical
 canonical forms.
 
 ## Design
@@ -118,7 +118,7 @@ the `FlitCircleSync.circleBodyValid` branch for the new verb (its current
 ## Invariants
 
 1. Adding `RECEIPT` to `TYPES` leaves the canonical bytes, validity and
-   acceptance of all nine existing verbs unchanged; `validShape` stays
+   acceptance of all existing verbs unchanged; `validShape` stays
    type-agnostic bounds only.
 2. A receipt body has exactly `RECEIPT_BODY_KEYS`; `validReceiptBody` refuses a
    missing key, an extra key, a non-string value, a blank value and a value
@@ -174,7 +174,7 @@ clock sleep:
   delivery orders;
 - roll-up ignores wrong `dropId`, wrong `sha256`, malformed bodies and
   non-members, and ignores `keyId` changes for the same content;
-- canonical vectors for all nine existing verbs are unchanged after `RECEIPT`
+- canonical vectors for all existing verbs are unchanged after `RECEIPT`
   joins `TYPES`.
 
 Harness: none on 2026-12-11. The two-node receipt exchange, host filter and

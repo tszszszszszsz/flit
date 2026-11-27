@@ -84,11 +84,14 @@ data class CarryState(val parcels: List<CourierParcel> = emptyList())
 ```
 
 `encode(state): String` and `decode(raw: String?): CarryState?` use `WireJson`.
-Decode is tolerant and normalising: rows with a blank id or `toFp` are dropped,
-duplicate ids keep the first occurrence, a malformed expiry is floored to
-`createdMs + MAX_PARCEL_TTL_MS`, expired rows are dropped, and the list is
-trimmed to `MAX_PARCELS` by `order`. A corrupt blob decodes to an empty state,
-never an exception.
+Decode is total and normalising: a null, blank, truncated, wrongly typed or
+otherwise corrupt blob decodes to an empty state, never an exception. A parsed
+blob keeps the first row for a duplicate id; it drops rows with a blank or
+oversized id or `toFp` and rows with a non-positive or overflowing `createdMs`;
+it repairs a numeric expiry that disagrees with `createdMs +
+MAX_PARCEL_TTL_MS`; and it trims to the latest `MAX_PARCELS` rows by `order`.
+Decode has no clock, so wall-clock expiry is applied by `expire(state, nowMs)`
+and by `select`, not by decode.
 
 ### Decision and precedence
 
@@ -103,8 +106,10 @@ sealed interface Decision {
 }
 ```
 
-Exact precedence for `evaluate`: `Invalid → OutsideWindow → Expired →
-Duplicate → Full → Accept`. Every non-Accept decision leaves the bounded `seen`
+Exact precedence for `evaluate`: `Invalid → Expired → OutsideWindow →
+Duplicate → Full → Accept`. Expiry is checked before the replay window so a
+TTL-elapsed parcel is reported as Expired rather than shadowed by the shorter
+window. Every non-Accept decision leaves the bounded `seen`
 set untouched, so a parcel refused as Full can be offered again once space
 frees. The window compares two positive timestamps by subtraction, never
 `nowMs ± window`, so an extreme clock cannot overflow into a false Accept.
@@ -174,7 +179,7 @@ route returns a normal signed `CircleResponse`; no new header, route or
    SHA-256 DER.
 2. A parcel body's key set is exactly `{"toFp","envelope"}`; an unknown key is
    refused before any id is reserved.
-3. `evaluate` follows `Invalid → OutsideWindow → Expired → Duplicate → Full →
+3. `evaluate` follows `Invalid → Expired → OutsideWindow → Duplicate → Full →
    Accept` and only Accept reserves an id.
 4. `seen` is bounded at 4096 and is shared by `evaluate` and `fresh`.
 5. `expiresMs` is exactly `createdMs + MAX_PARCEL_TTL_MS`; a parcel with
