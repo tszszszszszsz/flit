@@ -838,7 +838,7 @@ parcel body is refused before an id is reserved. An older Flit build keeps
 parsing its existing events; the parcel bytes are framed by the single
 envelope codec that the later QR layer reuses unchanged. The durable bag is
 owned outside the protocol module: `courierBag` on `CircleState` in the app and
-`courier.bag` in the CLI. `TlsIdentity`'s pin cache stays bounded at 512 and
+`courier-bag/` in the CLI. `TlsIdentity`'s pin cache stays bounded at 512 and
 gains the sender's certificate only after `verify` succeeds.
 
 CODE establishes the constants, the two domain tags, the canonical field
@@ -849,3 +849,128 @@ and three-node (`DEVICE`) handoffs are dated 2026-11-30 and 2026-12-02; no such
 evidence is claimed for this layer. See
 [courier-envelope.md](roadmap/courier-envelope.md) and
 [courier-carry.md](roadmap/courier-carry.md).
+
+## 14. CLI courier contract — bag directory and local state (2026-11-30)
+
+### 14.1 Files and layer
+
+The CLI carrier is `harness/src/main/kotlin/app/flit/share/harness/CourierCli.kt`,
+object `CourierCli` in package `app.flit.share.harness`. It owns only storage,
+state transitions, status output and the one-shot command. Encryption stays in
+`protocol/.../courier/CourierEnvelope.kt`; the parcel codec, expiry and quota
+stay in `protocol/.../courier/CourierCarryCore.kt` (§13). The CLI imports no
+Android class and adds no route, header, DTO field or status code. It parses its
+arguments only through `ParsedArgs` from `Harness.kt`, loads identity through
+`loadOrCreateIdentity()`, and roots every path in `harnessHome()`, so
+`FLIT_HARNESS_HOME` isolates two nodes on one box as it does for `circle`.
+
+`run(args: ParsedArgs): Int` does one operation — load state, act, save state —
+and returns a process code: `0` on success, `EXIT_BAD_ARGS = 2` for a bad
+argument or a missing bag, `EXIT_OPEN_REFUSED = 3` when a parcel fails `open`.
+`usage(): String` is the single source of the `courier` help text; `Harness.kt`
+adds one dispatch line and extends `ParsedArgs.VALUE_FLAGS` with `--bag`, `--to`,
+`--cert` and `--ttl` (`--text`, `--file` and `--circle` already exist). There is
+no second parser.
+
+### 14.2 Command surface
+
+```
+courier drop   --to FP --text NOTE | --file PATH [--circle ID] [--cert B64] [--ttl MS] [--bag DIR]
+courier carry  [--bag DIR]
+courier receive --bag DIR
+courier status [--bag DIR]
+courier sweep  [--bag DIR]
+```
+
+| Subcommand | Operation |
+| --- | --- |
+| `drop` | Seal a signed Circle event into a new parcel for `--to` and write `<id>.parcel` into the bag. Refuses before writing when the certificate fingerprint differs from `--to` or when the bag is at the courier-carry.md quota. |
+| `carry` | Verify the local bag and move verified rows `pending → carried`; it does not open or forward anything. |
+| `receive` | Open each parcel addressed to the local identity, fold a returned event into `circle.state` through `CircleCore.order`/`dedup`, and move the row to `delivered`. Parcels for another fingerprint stay `pending` in the bag. |
+| `status` | Print one line per row with a padded state value and a closing count by state. No parcel content and no fingerprint beyond the short form is printed. |
+| `sweep` | Drop parcels whose `nowMs >= expiresMs`, enforce quota, and remove envelope files whose row is `expired` or `refused`. |
+
+`drop` takes the recipient certificate from the `cert` field of a signed event by
+that fingerprint in `circle.state`, or from `--cert B64` for a member whose event
+has not arrived. Both paths check `TlsIdentity.fingerprintOf(cert)` against
+`--to` before sealing, so a parcel cannot be addressed to one fingerprint and
+encrypted to another. `--ttl` is an optional ceiling input; the stored expiry is
+still derived by `CourierCarry.parcelOf`, never read from the envelope.
+
+### 14.3 On-disk layout
+
+All paths are relative to `harnessHome()`; `--bag` overrides only the bag path.
+
+| Path | Contents |
+| --- | --- |
+| `courier.state` (`STATE_FILE`) | Local-only bookkeeping, one JSON row per parcel. Never written into a Circle event. |
+| `courier-bag/` (`BAG_DIR`) | One `<envelope-id>.parcel` file per parcel. This directory is the portable handoff unit. |
+| `courier-received/` (`RECEIVED_DIR`) | Opened event JSON after a successful handoff; a local record, never re-sent. |
+| `courier-rejected/` (`REJECTED_DIR`) | Parcels that failed `open`; quarantined, not folded and not re-exported. |
+
+`bagDir(args: ParsedArgs)` resolves `--bag` when present and otherwise
+`harnessHome()/courier-bag`; `statePath(args: ParsedArgs)` is
+`harnessHome()/courier.state`. State writes are one-shot and whole-file, as
+`saveCircleState` is; no command holds a load→modify→save transaction open
+across another CLI process on the same home.
+
+### 14.4 State row schema and transitions
+
+`Row` is `encodeRows(rows)` / `decodeRows(raw)` JSON, one object per line,
+decoded with `WireJson.json` under `ignoreUnknownKeys = true`. A null, blank,
+short or corrupt file decodes to an empty list, the same tolerance `circle.state`
+uses for a broken blob. Each row is:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | String | Envelope id from `CourierEnvelope.seal`; also the `<id>.parcel` file stem. |
+| `recipientFp` | String | Normalised uppercase-hex addressee (`--to`). |
+| `senderFp` | String | Normalised uppercase-hex signer (the local identity). |
+| `circleId` | String | Circle the envelope is bound to (`--circle`). |
+| `state` | String | One of `pending`, `carried`, `delivered`, `expired`, `refused`. |
+| `createdMs` | Long | Seal time. |
+| `expiresMs` | Long | `createdMs + MAX_PARCEL_TTL_MS` (24 h), derived once by `parcelOf`; the envelope carries no expiry. |
+
+Fingerprints are normalised uppercase hex as in `normalized()` in `Harness.kt`.
+`nextState(row, kind, nowMs)` applies exactly these transitions:
+
+| `Kind` | From | To | Condition |
+| --- | --- | --- | --- |
+| `CARRY` | `pending` | `carried` | Bag verified by `carry`. |
+| `RECEIVE_OK` | `pending`, `carried` | `delivered` | `open` returned the event for the local identity. |
+| `RECEIVE_REFUSED` | any | `refused` | `open` reported a refusal. |
+| `SWEEP` | any | `expired` | `nowMs >= expiresMs`. |
+
+A thrown `open` is not a conclusion: `receive` records no transition, leaving
+the row at `pending` and the envelope file in `courier-bag/` for a later attempt.
+This matches the carrier-death rule used for Circle file delivery. A duplicate
+envelope id produces no second fold: `CircleCore.dedup` drops it and the row
+moves straight to `delivered`.
+
+### 14.5 Bag directory as portable unit
+
+`drop` stores `CourierCarry.encode(CourierCarry.parcelOf(envelope))` byte-for-byte
+in `<id>.parcel`; the CLI never parses, re-signs or rewrites the envelope or the
+parcel, so encode→decode→encode of an unopened parcel is identical (§13.5). One
+`.parcel` file corresponds to one row id in `courier.state`; a file with no row
+is ignored by `receive` and `sweep`, never folded.
+
+The operator copies `courier-bag/` to the next machine by USB or any file copy;
+the carrier implements no transport of its own and adds no `LinkProvider`. A
+node that is not the addressee holds a parcel for the next courier and re-exports
+it unchanged. `receive` folds a file only after `CourierEnvelope.open` returns
+its event for the local fingerprint; governance and replay stay with the
+protocol layer, and the CLI fold adds no reducer and no second signature path.
+`open` failure moves the file to `courier-rejected/` and sets `refused`; a throw
+leaves the file in the bag.
+
+### 14.6 Wire boundary
+
+Every `.parcel` byte is produced and consumed by the 2026-11-27 codecs in §13:
+the `parcel` verb, its closed `{"toFp","envelope"}` body, the `FLITCOURIER1`
+envelope signature and the `FLITCARRY1` bag digest. The CLI adds no v2.2 route,
+header, request field, status code or QR key parameter. Rows in `courier.state`
+are local-only; no fingerprint, row, state value or parcel content is extracted
+from the bag into a Circle event, and no parcel content is printed or logged.
+This layer claims no device evidence: the bag moves between directories on one
+box only. See [courier-cli.md](roadmap/courier-cli.md).

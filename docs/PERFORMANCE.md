@@ -229,6 +229,12 @@ Resume is deliberately narrower than "continue anywhere":
 
 On the receive side, API 29+ non-crushed wires stream straight into a pending `Downloads/Flit` row or a chosen SAF tree with a 256 KiB buffer — no temp file, no second copy (`openIncomingSink`/`sinkIntoTree`, `FlitEngine.kt:2958-3036`). Crushed (gzip) wires and old devices take the classic two-step part-file path because the whole body must be assembled before a one-shot decode.
 
+### 8.4 Courier CLI: one-shot cost and bag copy
+
+The `courier` command is one-shot, as `circle` is: each invocation loads `courier.state`, performs one operation, saves the whole state file and exits. There is no worker, timer or carrier loop behind it, so an idle courier node does no repeated work. `status` is read-only; `drop`, `carry`, `receive` and `sweep` each rewrite the whole state file once per invocation. The cost of an invocation is therefore one state read, one whole-file write and the operation itself; the write grows with the number of state rows, not with any parcel payload. That ledger is small JSON, one line per parcel, and admission to the bag is bounded by the `MAX_PARCELS` quota from courier-carry.md. No wall-clock or byte figure has been captured for any invocation.
+
+The portable unit is the `courier-bag/` directory, copied by the operator with USB or any ordinary file copy; the CLI implements no transport of its own. A handoff costs a directory listing plus one read of each `<id>.parcel` at the source and one write at the destination. Parcel bytes are persisted verbatim as `CourierCarry.encode(CourierCarry.parcelOf(envelope))`, so the copy does no decode, re-encode, re-encryption or re-signing: its cost scales with the number and size of the parcel files, not with cryptographic work. Those sizes are structural caps only — `MAX_ENVELOPE_CHARS` (`12 * 1024`) from courier-envelope.md and `MAX_PARCELS` (`256`) from courier-carry.md — not measured sizes. `receive` then pays one `CourierCarry.decode` plus one `CourierEnvelope.open` (AES-GCM decrypt, RSA key unwrap, signature verification) per parcel addressed to the local fingerprint; a parcel for another fingerprint stays `pending` and is not opened. No timing, throughput or byte count has been measured for the copy or the open pass.
+
 ---
 
 ## 9. Tradeoffs, stated
@@ -261,6 +267,7 @@ On the receive side, API 29+ non-crushed wires stream straight into a pending `D
 - **Cross-ROM/RAM behaviour**: MIUI autostart/battery rules and the Android 15 `dataSync` ~6 h cap are ROM/OS limits; no other device was available.
 - **Sweep beyond one subnet**: the hardware walk was a `/24`; the 1024-host cap is a pure admission rule, not a measured worst case.
 - **Wire-byte totals** for Circle repair beyond the structural caps (1024 events/request, 8 MiB request body, 16 KiB event body); no traffic capture was published.
+- **Courier CLI one-shot and bag copy**: no wall-clock timing, invocation count or byte count was captured. The one-shot read / whole-file-write shape and the directory-copy handoff in §8.4 are structural descriptions, not measured costs.
 
 ---
 

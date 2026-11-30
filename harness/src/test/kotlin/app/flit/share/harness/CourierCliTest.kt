@@ -1,0 +1,218 @@
+package app.flit.share.harness
+
+import app.flit.share.protocol.tls.TlsIdentity
+import java.io.ByteArrayInputStream
+import java.nio.file.Path
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.util.Base64
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+
+/**
+ * Pure seams of [CourierCli]: the local state codec, the state transition map,
+ * the recipient-certificate gate and the on-disk path contract. No sockets, no
+ * endpoints, no identity file and no parcel crypto are touched here — the
+ * envelope and carry codecs have their own protocol tests.
+ */
+class CourierCliTest {
+
+    private fun row(
+        state: String = "pending",
+        id: String = "env-1",
+        createdMs: Long = 1_000L,
+        expiresMs: Long = 9_000L,
+    ) = CourierCli.Row(
+        id = id,
+        recipientFp = "A1B2C3",
+        senderFp = "D4E5F6",
+        circleId = "circle-1",
+        state = state,
+        createdMs = createdMs,
+        expiresMs = expiresMs,
+    )
+
+    /** Same root rule as harnessHome(), kept local so this test needs no fixture. */
+    private fun expectedHome(): Path =
+        System.getenv("FLIT_HARNESS_HOME")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { Path.of(it) }
+            ?: Path.of(System.getProperty("user.home"), ".config", "flit", "flit-harness")
+
+    private fun certB64(identity: TlsIdentity): String =
+        Base64.getEncoder().encodeToString(identity.certificate.encoded)
+
+    private fun certificateOf(certB64: String): X509Certificate? = runCatching {
+        CertificateFactory.getInstance("X.509")
+            .generateCertificate(ByteArrayInputStream(Base64.getDecoder().decode(certB64))) as X509Certificate
+    }.getOrNull()
+
+    /**
+     * The gate the CLI applies before sealing: the Base64 DER certificate's own
+     * SHA-256 fingerprint, as returned by TlsIdentity.fingerprintOf, must equal
+     * the normalised --to value. A malformed certificate or a blank --to is a
+     * refusal, never a seal.
+     */
+    private fun certMatchesTo(certB64: String?, toFp: String?): Boolean {
+        val fp = certB64?.let(::certificateOf)?.let(TlsIdentity::fingerprintOf) ?: return false
+        val to = toFp?.trim()?.takeIf { it.isNotBlank() } ?: return false
+        return fp.equals(to, ignoreCase = true)
+    }
+
+    // ---- state codec --------------------------------------------------------
+
+    @Test
+    fun `row codec round-trips exact fields for several rows`() {
+        val rows = listOf(
+            CourierCli.Row(
+                id = "env-a", recipientFp = "AAAA", senderFp = "BBBB",
+                circleId = "circle-a", state = "pending",
+                createdMs = 1_700_000_000_000L, expiresMs = 1_700_086_400_000L,
+            ),
+            CourierCli.Row(
+                id = "env-b", recipientFp = "CCCC", senderFp = "DDDD",
+                circleId = "circle-b", state = "carried",
+                createdMs = 0L, expiresMs = Long.MAX_VALUE / 4,
+            ),
+            CourierCli.Row(
+                id = "env-c", recipientFp = "EEEE", senderFp = "FFFF",
+                circleId = "circle-c", state = "refused",
+                createdMs = -5L, expiresMs = -1L,
+            ),
+        )
+        assertEquals(rows, CourierCli.decodeRows(CourierCli.encodeRows(rows)))
+    }
+
+    @Test
+    fun `row codec output is deterministic with one line per row`() {
+        val rows = listOf(row(id = "env-1"), row(state = "carried", id = "env-2"))
+        val raw = CourierCli.encodeRows(rows)
+        assertEquals(raw, CourierCli.encodeRows(rows), "re-encoding the same rows must be stable")
+        assertEquals(rows.size, raw.lines().size, "one state line per parcel row")
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows(CourierCli.encodeRows(emptyList())))
+    }
+
+    @Test
+    fun `row decode tolerates absent blank short and corrupt state files`() {
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows(null))
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows(""))
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows("   \n  "))
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows("""{"id":"env-1"}"""), "short row")
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows("{not json"), "corrupt row")
+        assertEquals(emptyList<CourierCli.Row>(), CourierCli.decodeRows("[]"), "wrong shape is empty, not an exception")
+    }
+
+    @Test
+    fun `row decode ignores unknown keys like circle state`() {
+        val raw = """{"id":"env-x","recipientFp":"A1","senderFp":"B2","circleId":"c","state":"carried","createdMs":10,"expiresMs":99,"extra":"not-a-row-field"}"""
+        assertEquals(listOf(CourierCli.Row("env-x", "A1", "B2", "c", "carried", 10, 99)), CourierCli.decodeRows(raw))
+    }
+
+    // ---- transition map -----------------------------------------------------
+
+    @Test
+    fun `carry moves only pending rows to carried`() {
+        assertEquals("carried", CourierCli.nextState(row("pending"), CourierCli.Kind.CARRY, 5_000L))
+        for (state in listOf("carried", "delivered", "expired", "refused")) {
+            assertEquals(state, CourierCli.nextState(row(state), CourierCli.Kind.CARRY, 5_000L), "carry must not move $state")
+        }
+    }
+
+    @Test
+    fun `receive ok moves pending and carried rows to delivered`() {
+        for (state in listOf("pending", "carried")) {
+            assertEquals("delivered", CourierCli.nextState(row(state), CourierCli.Kind.RECEIVE_OK, 5_000L))
+        }
+        for (state in listOf("delivered", "expired", "refused")) {
+            assertEquals(state, CourierCli.nextState(row(state), CourierCli.Kind.RECEIVE_OK, 5_000L), "receive must not move $state")
+        }
+    }
+
+    @Test
+    fun `receive refusal moves every state to refused`() {
+        for (state in listOf("pending", "carried", "delivered", "expired", "refused")) {
+            assertEquals("refused", CourierCli.nextState(row(state), CourierCli.Kind.RECEIVE_REFUSED, 5_000L))
+        }
+    }
+
+    @Test
+    fun `sweep expires every state at the TTL boundary and not before`() {
+        for (state in listOf("pending", "carried", "delivered", "expired", "refused")) {
+            assertEquals(state, CourierCli.nextState(row(state), CourierCli.Kind.SWEEP, 8_999L), "nowMs < expiresMs keeps $state")
+            assertEquals("expired", CourierCli.nextState(row(state), CourierCli.Kind.SWEEP, 9_000L), "nowMs == expiresMs expires $state")
+            assertEquals("expired", CourierCli.nextState(row(state), CourierCli.Kind.SWEEP, 9_001L), "nowMs > expiresMs expires $state")
+        }
+    }
+
+    @Test
+    fun `non sweep kinds do not infer expiry from an injected clock`() {
+        val past = row("pending", createdMs = 1L, expiresMs = 2L)
+        assertEquals("carried", CourierCli.nextState(past, CourierCli.Kind.CARRY, 10_000L))
+        assertEquals("delivered", CourierCli.nextState(past, CourierCli.Kind.RECEIVE_OK, 10_000L))
+        assertEquals("refused", CourierCli.nextState(past, CourierCli.Kind.RECEIVE_REFUSED, 10_000L))
+    }
+
+    // ---- recipient certificate gate ----------------------------------------
+
+    @Test
+    fun `recipient cert gate binds the certificate fingerprint to the to flag`() {
+        val addressee = TlsIdentity.generate()
+        val other = TlsIdentity.generate()
+        val cert = certB64(addressee)
+
+        assertTrue(certMatchesTo(cert, addressee.fingerprint))
+        assertTrue(certMatchesTo(cert, addressee.fingerprint.lowercase()), "--to is case-insensitive")
+        assertTrue(certMatchesTo(cert, "  ${addressee.fingerprint}  "), "--to is trimmed")
+        assertFalse(certMatchesTo(cert, other.fingerprint), "a certificate for another fingerprint is refused")
+        assertFalse(certMatchesTo(cert, ""), "blank --to is refused")
+        assertFalse(certMatchesTo(cert, null), "missing --to is refused")
+        assertFalse(certMatchesTo("not-base64", addressee.fingerprint), "a malformed certificate is refused")
+    }
+
+    // ---- paths and naming ---------------------------------------------------
+
+    @Test
+    fun `courier constants pin the on-disk and exit-code contract`() {
+        assertEquals("courier-bag", CourierCli.BAG_DIR)
+        assertEquals("courier-received", CourierCli.RECEIVED_DIR)
+        assertEquals("courier-rejected", CourierCli.REJECTED_DIR)
+        assertEquals("courier.state", CourierCli.STATE_FILE)
+        assertEquals(2, CourierCli.EXIT_BAD_ARGS)
+        assertEquals(3, CourierCli.EXIT_OPEN_REFUSED)
+    }
+
+    @Test
+    fun `bag and state paths root at harness home with the fixed names`() {
+        val args = ParsedArgs(emptyArray())
+        assertEquals(expectedHome().resolve(CourierCli.BAG_DIR), CourierCli.bagDir(args))
+        assertEquals(expectedHome().resolve(CourierCli.STATE_FILE), CourierCli.statePath(args))
+    }
+
+    @Test
+    fun `explicit bag flag overrides only the bag path`() {
+        val override = expectedHome().resolve("other-bag")
+        val args = ParsedArgs(emptyArray())
+        args.flags["--bag"] = override.toString()
+        assertEquals(override, CourierCli.bagDir(args))
+        assertEquals(expectedHome().resolve(CourierCli.STATE_FILE), CourierCli.statePath(args), "state rows stay local")
+    }
+
+    @Test
+    fun `parcel file name is the envelope id plus the fixed suffix under the bag`() {
+        val bag = CourierCli.bagDir(ParsedArgs(emptyArray()))
+        val id = "8b1f0c2e-9a44-4d0c-b7d6-2e5f8a1c3b70"
+        val parcel = bag.resolve("$id.parcel")
+        assertEquals("$id.parcel", parcel.fileName.toString())
+        assertEquals(bag, parcel.parent, "the bag directory is the portable handoff unit")
+    }
+
+    @Test
+    fun `usage names every courier subcommand`() {
+        val text = CourierCli.usage()
+        for (command in listOf("courier", "drop", "carry", "receive", "status", "sweep")) {
+            assertTrue(text.contains(command), "usage omits $command")
+        }
+    }
+}

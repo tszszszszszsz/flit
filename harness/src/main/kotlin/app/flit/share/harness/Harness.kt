@@ -74,6 +74,7 @@ internal class ParsedArgs(argv: Array<String>) {
             "--alias", "--port", "--dir", "--dest", "--udp-port", "--wait", "--pin",
             "--parallel", "--announce-to", "--bytes", "--sender", "--token", "--park-timeout",
             "--relay", "--text", "--circle", "--invite", "--file", "--target", "--option", "--host", "--role",
+            "--bag", "--to", "--cert", "--ttl",
         )
     }
 }
@@ -84,13 +85,13 @@ internal class ParsedArgs(argv: Array<String>) {
  * any identity tracked inside the build tree (proven 2026-10-25 — the flit‑
  * harness identity vanished, and serve minted a fresh fingerprint).
  */
-private fun harnessHome(): Path =
+internal fun harnessHome(): Path =
     System.getenv("FLIT_HARNESS_HOME")
         ?.takeIf { it.isNotBlank() }
         ?.let { Path.of(it) }
         ?: Path.of(System.getProperty("user.home"), ".config", "flit", "flit-harness")
 
-private fun loadOrCreateIdentity(): TlsIdentity {
+internal fun loadOrCreateIdentity(): TlsIdentity {
     val base = harnessHome()
     Files.createDirectories(base)
     val file = base.resolve("identity.p12")
@@ -123,6 +124,10 @@ fun main(argv: Array<String>) {
             "panic" -> kotlinx.coroutines.runBlocking { panicCmd(args) }
             "parse-qr" -> parseQr(args)
             "circle" -> kotlinx.coroutines.runBlocking { circle(args) }
+            "courier" -> {
+                val code = CourierCli.run(args)
+                if (code != 0) exitProcess(code)
+            }
             else -> usage()
         }
     } catch (e: Exception) {
@@ -151,6 +156,7 @@ circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--i
        [--host ip[:port]] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
+courier <drop|carry|receive|status|sweep> [--bag DIR] [--to FP] [--cert B64] [--ttl MS] -- carry sealed events in a copyable bag
 """
     )
 }
@@ -172,6 +178,21 @@ private fun circleUsage() {
                   The key rotates only when the member actually departs.
   leave           publish a leave event, then discard the local key
   sync            pull the shared log and print the feed + poll tally
+"""
+    )
+}
+
+/** Detailed courier help. Kept internal so CourierCli can reuse it if needed. */
+internal fun courierUsage() {
+    println(
+        """courier <drop|carry|receive|status|sweep>
+  drop            --to FP --text NOTE | --file PATH [--circle ID] [--cert B64] [--ttl MS] [--bag DIR]
+                  seal one signed Circle event into a parcel for an absent member
+  carry           [--bag DIR] — verify the local bag, mark rows carried
+  receive         --bag DIR — open parcels for this identity, fold events into circle.state
+  status          [--bag DIR] — list rows: id, to, state, expires
+  sweep           [--bag DIR] — drop expired parcels and enforce quota
+  Parcels move by copying courier-bag/ between machines; the carrier adds no route.
 """
     )
 }
@@ -790,7 +811,7 @@ private fun loadCircleState(): CircleCliState? {
     }.getOrNull()
 }
 
-private fun saveCircleState(st: CircleCliState) {
+internal fun saveCircleState(st: CircleCliState) {
     val f = circleStatePath()
     Files.createDirectories(f.parent)
     val lines = listOf(

@@ -62,7 +62,7 @@ Constants:
 
 Window and replay. `open` refuses `createdMs` older than `REPLAY_WINDOW_MS` or more than `CLOCK_SKEW_MS` ahead. Id dedup on the Circle path is the carry core's `evaluate` over its bounded `seen` set after `parcelOf` and `CircleCore.verify`; the envelope codec adds no second set and never calls `CircleCore.evaluate`/`accept` on an envelope id.
 
-State ownership. The sender owns the content key during `seal` only. The carrier holds the opaque bytes in `CarryState`, whose durable row is owned by the caller (`courierBag` on `CircleState` in the app, `courier.bag` in the CLI). `TlsIdentity`'s pin cache, bounded at `MAX_PINS = 512`, gains the sender's certificate only after `verify` succeeds. The envelope codec is stateless; the carry core owns the bounded `seen` set, as `CircleCore` owns its replay set.
+State ownership. The sender owns the content key during `seal` only. The carrier holds the opaque bytes in `CarryState`, whose durable row is owned by the caller (`courierBag` on `CircleState` in the app, `courier-bag/` in the CLI). `TlsIdentity`'s pin cache, bounded at `MAX_PINS = 512`, gains the sender's certificate only after `verify` succeeds. The envelope codec is stateless; the carry core owns the bounded `seen` set, as `CircleCore` owns its replay set.
 
 Seams to later layers: the CLI carrier on 2026-11-30 drives `select`/`ack` over `Link` and persists the bag; the app on 2026-12-01 folds decrypted events through `FlitCircleStore.merge` and drives file-card states; the QR codec on 2026-12-03 frames `encode` bytes unchanged, so there is one envelope codec; per-drop content keys on 2026-12-09 change file-drop semantics but not this transport wrap.
 
@@ -117,7 +117,7 @@ Harness tests (2026-11-30): the CLI carrier moves `parcel` events between three 
 
 ## Out of scope
 
-The bounded bag, `parcelOf`, `validParcelBody`, `evaluate`, `CarryState` and `select`/`ack`/`fold`/`merge` (same-day carry core); the carrier loop, `Link` handoff and `courier.bag` persistence; app state, `FlitCircleStore` folding and file-card states; QR framing and camera decode; per-drop content keys, delivery receipts and Circle pad events; encryption of events already in the shared Circle log; any change to the v2.2 wire, routes or status codes; multi-hop relay routing, Wi-Fi Aware and offline `.flitpack` bundles.
+The bounded bag, `parcelOf`, `validParcelBody`, `evaluate`, `CarryState` and `select`/`ack`/`fold`/`merge` (same-day carry core); the carrier loop, `Link` handoff and `courier-bag/` persistence; app state, `FlitCircleStore` folding and file-card states; QR framing and camera decode; per-drop content keys, delivery receipts and Circle pad events; encryption of events already in the shared Circle log; any change to the v2.2 wire, routes or status codes; multi-hop relay routing, Wi-Fi Aware and offline `.flitpack` bundles.
 
 ## Commit
 

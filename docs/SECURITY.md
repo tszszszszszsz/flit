@@ -428,13 +428,58 @@ at fold time. A forged event is skipped there, not by the carrier.
   rekey happens. Courier adds no content cipher for events already in the shared
   Circle log; those stay plaintext JSON under the at-rest rule above.
 - The durable bag row is owned by the caller (`courierBag` on `CircleState` in
-  the app, `courier.bag` in the CLI), not by this layer. A carrier process death
+  the app, `courier-bag/` in the CLI), not by this layer. A carrier process death
   before an ack therefore depends on that row being persisted by the later app
   or CLI layer; no durable carrier state is claimed here.
 
 Evidence: CODE for the codec and carry core, PURE for the courier tests. The
 handoff rows are not claimed at this date — `SIM-HARN` belongs to the 2026-11-30
 CLI carrier and `DEVICE` to the 2026-12-02 three-node walk.
+
+### CLI carrier storage (2026-11-30)
+
+The CLI carrier adds a durable, portable bag on disk but introduces no new key
+material and no new wire surface. Every path is rooted in `harnessHome()`, and
+each invocation is one-shot: load state, do one operation, save state. The
+carry-core paragraph above names `courier-bag/` as the caller-owned CLI row; the
+CLI layer implements that storage as `courier-bag/` plus `courier.state`.
+
+- **The copied bag is blind.** `courier-bag/` holds one `<envelope-id>.parcel`
+  file per parcel. Each file is `CourierCarry.encode` of a `parcel` event whose
+  body is exactly `{toFp, envelope}`: AES-256-GCM ciphertext, an IV, an
+  RSA-OAEP-wrapped content key and the sender's signature and certificate. No
+  private key, content key or plaintext event is written into the bag, and the
+  CLI never parses, re-signs or rewrites the bytes. Copying the directory to
+  another machine by USB or any file copy hands over ciphertext only — the
+  receiver cannot decrypt, forge or redirect a parcel. The carrier still sees
+  the clear `toFp`, message size and timing, and can refuse, delay, drop or
+  partition parcels.
+- **State rows stay local.** `courier.state` holds one JSON line per parcel
+  `{id, recipientFp, senderFp, circleId, state, createdMs, expiresMs}` and is
+  read with the same tolerant codec as `circle.state`: a missing, short or
+  corrupt file decodes as empty. Rows are local bookkeeping only; they are never
+  written into a Circle event, never published on `/circle/sync` and never
+  copied with the bag. A bag file with no matching row is ignored by `receive`
+  and `sweep`, never folded.
+- **A parcel for another fingerprint stays pending.** `receive` opens only
+  parcels addressed to the local identity from `loadOrCreateIdentity()`. A
+  parcel whose recipient fingerprint differs stays `pending` and remains in
+  `courier-bag/` for the next courier: that node is a carrier for it, not its
+  addressee. The row moves to `delivered` only after `CourierEnvelope.open`
+  succeeds and the event is folded into local Circle state. A thrown `open` is
+  not a conclusion and also leaves the row `pending` for a later attempt.
+- **A quarantined parcel is refused.** An `open` that returns a refusal — a
+  forged or tampered envelope, a certificate whose digest is not `fromFp`, a
+  wrong `circleId`/`toFp` or a `createdMs` outside the window — moves the row to
+  `refused`, moves the file to `courier-rejected/`, and folds nothing into
+  Circle state. A refused parcel is not re-exported as a live handoff. `sweep`
+  deletes files whose rows are `expired` or `refused`; a `delivered` file is
+  kept in `courier-received/` as a local record and is never re-sent.
+
+This layer implements no physical transport, adds no route, header, DTO field
+or key parameter to the v2.2 wire, and makes no device claim: the handoff is a
+directory copy on the bench box. Event authorship remains `CircleCore.verify`
+at fold time, not a decision of the carrier.
 
 ## Panic: authorization, hops, and informational-only delivery
 

@@ -9,6 +9,9 @@ Build-ahead: code may be written ahead of the dates below. The dates govern
 commits, not when work happens. Commits stay spoon-sized and land on the
 scheduled weekdays; work finished early is held until its assigned date.
 
+The 2026-11-30 CLI layer is built ahead of its scheduled day. The code is
+written now, but the commit stays on 2026-11-30; no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

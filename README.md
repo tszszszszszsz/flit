@@ -162,6 +162,8 @@ flit-cli parse-qr <image...>                                # decode pairing cod
 flit-cli circle <create|join|post|poll|vote|role|kick|leave|sync|file>   # accountless group coordination
 ```
 
+- `courier` moves signed Circle events between machines as sealed parcels in a portable bag directory: `drop` seals an event for a recipient fingerprint, `carry` verifies the bag and marks parcels carried, `receive` opens parcels addressed to the local identity and folds them into local Circle state, and `status`/`sweep` report rows and expire or refuse undeliverable parcels. The bag is moved by directory copy (USB or any file copy); the CLI adds no transport of its own and no route to the v2.2 wire.
+
 Needs java 21 at run time — the installed launcher says so in one line if the
 ambient `java` is older (`JAVA_HOME` or PATH wins). Identity lives at
 `~/.config/flit/flit-harness` — stable across rebuilds and updates, so peers that

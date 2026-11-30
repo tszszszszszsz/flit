@@ -17,10 +17,9 @@ Rules applied here:
   implying a green rig covers it. Current examples: phone-to-phone RFCOMM,
   a three-or-more-member Circle mesh, Wi-Fi Aware (feature absent on the rig
   phone), and outbound phone→host Circle fan-out as a device observation.
-- Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302) are
-  snapshots of earlier commits, not the current inventory. The current figure
-  is 356 after the 2026-11-27 courier layer; the 302-test baseline was last
-  green at `72225f8`.
+- Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302, 356)
+  are snapshots of earlier commits, not the current inventory. The current
+  figure is 378 after the 2026-11-30 courier CLI layer.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -33,8 +32,8 @@ Rules applied here:
 | --- | --- | --- | --- | --- |
 | `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **136** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
 | `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **210** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
-| `harness/` | Desktop companion `flit-cli`; the rig for interop, relays and Circle bots | **10** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **356** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
+| `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **32** | `:harness:test` | JVM, in-process with real endpoints |
+| **Total** | Three modules, three roles | **378** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -87,12 +86,12 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **136 protocol + 210 app + 10 harness = 356 tests,
+Result: `BUILD SUCCESSFUL`, **136 protocol + 210 app + 32 harness = 378 tests,
 0 failures, 0 errors, 0 skipped**, read from the XML result files under each
 module's `build/test-results/test/`. The `--rerun-tasks` flag was deliberate:
 an earlier invocation reported all test tasks `UP-TO-DATE` and left XML from an
 older class layout in place (see §8). The 302-test baseline was green at
-`72225f8`; the 54 added courier cases are listed in §4.1 below.
+`72225f8`; the added cases are listed in §4.1 and §4.3.
 
 ## 4. Test inventory by module and class
 
@@ -165,9 +164,9 @@ radio.
 | `SharingRestoreTest` | 11 | Fresh row not desired, absent/blank/corrupt decode safe, `with` flips and stamps, envelope can grow, idempotent encode/decode, old bare-word rows, restore only after process death and not when already up/starting. |
 | `SheetUiTest` | 3 | Initials from first two words, stable in-range hue per fingerprint, count phrasing rule of one. |
 
-### 4.3 Harness — 10 tests
+### 4.3 Harness — 32 tests (10 baseline + 22 courier)
 
-Both classes run the **production** endpoints in one JVM. `CircleHarnessTest`
+The two baseline classes run the **production** endpoints in one JVM. `CircleHarnessTest`
 hosts through `ConsoleDelegate.circleHost` behind a real TLS `ProtocolServer`
 and dials with a real `ProtocolClient` (`harness/src/test/kotlin/app/flit/share/harness/CircleHarnessTest.kt:32-38`);
 `RelayServerTest` uses `RelayLinkProvider` and `RelaySubscriber` against the
@@ -178,6 +177,18 @@ same `RelayServer` the CLI runs, with TLS inside the blind pipe
 | --- | --- | --- |
 | `CircleHarnessTest` | 5 | Two-node walk: bad invite refused, JOIN returns key, owner appoints admin, admin kick removes third member and rekeys, departed member refused, poll re-vote keeps both votes, file announcement is name/size/sha256 only, file bytes land hash-exact with local status moving pending→sent. Plus: stale signed ROLE event refused by replay guard, CLI errors distinguish host-refused from no-answer, and delivery outcome maps a returned report but never a throw (a thrown carrier stays pending). |
 | `RelayServerTest` | 5 | Real 3 MiB TLS send lands hash-exact through the pairer; an 8 MiB carrier death throws `TransferUnreachable`, keeps the receiver prefix and resumes hash-exact after the stale window; wrong token refused on the wire; unpaired subscription times out cleanly; dead relay dial reports unreachable, not a send report. |
+
+#### Courier CLI additions — 22 cases
+
+The two classes below cover the 2026-11-30 courier CLI layer. They are not part
+of the 10-test harness baseline above. Counts come from a fresh `--rerun-tasks`
+run. Neither class carries device evidence — the bag moves between directories
+on one box.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `CourierCliTest` | 15 | Pure seams in `harness/src/test/kotlin/app/flit/share/harness/CourierCliTest.kt`: `courier.state` encode/decode round-trip and tolerant decode of absent, short and corrupt files; the `nextState` transition map (`pending → carried` on CARRY, `pending|carried → delivered` on RECEIVE_OK, anything → `refused` on RECEIVE_REFUSED, expiry on SWEEP at `nowMs >= expiresMs`) including a thrown `open` leaving the row `pending`; the recipient-cert fingerprint gate against `--to`; TTL and quota decisions with an injected `nowMs`; deterministic `<id>.parcel` naming and the state-count line. No sockets and no endpoints. |
+| `CourierCarrierHarnessTest` | 7 | In-process CLI handoff with two CLI-state nodes on distinct `FLIT_HARNESS_HOME` values and fresh temp roots: `drop` seals a signed event into a bag, `carry` marks rows carried, `receive --bag` opens the parcel and folds the event into `circle.state`; a third-fingerprint parcel stays `pending` and is re-exported; a tampered parcel is refused and quarantined; an expired parcel is swept; a duplicate id does not double-fold; a bad `--to` cert writes no file. Decoding goes through `CourierCarry` and opening through `CourierEnvelope`, never a lookalike cipher; payloads are seeded and rows asserted by exact value. |
 
 ## 5. What the suites establish, by flow
 

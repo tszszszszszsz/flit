@@ -41,7 +41,7 @@ courierBag: String = ""   // CourierCarry.encode(CarryState)
 
 A blank string is an empty bag, so old rows and existing named-argument constructors keep working. `decode()` calls `CourierCarry.decode` and tolerates a corrupt row as an empty bag; no exception reaches a caller. The bag holds at most `MAX_PARCELS = 256` rows, trimmed by `CourierCarry.order` rather than arrival order.
 
-Every bag write goes through `FlitCircleStore.update`, which holds `ioLock` for the whole decode → fold → encode → persist sequence. A bag write cannot interleave with a sync `upsert` or clobber the event log, roster or delivery statuses. The reducers are the protocol ones: `fold` on acceptance, `ack` on a concluded handoff, `expire` on a sweep, `merge` when two local views are combined. Expiry is decided by `CourierCarry.expired` against the envelope's own `expiresMs`; the app never extends a TTL.
+Every bag write goes through `FlitCircleStore.update`, which holds `ioLock` for the whole decode → fold → encode → persist sequence. A bag write cannot interleave with a sync `upsert` or clobber the event log, roster or delivery statuses. The reducers are the protocol ones: `fold` on acceptance, `ack` on a concluded handoff, `expire` on a sweep, `merge` when two local views are combined. Expiry is decided by `CourierCarry.expire` against the envelope's own `expiresMs`; the app never extends a TTL.
 
 ### Sync and handoff path
 
@@ -73,7 +73,7 @@ State ownership follows `ARCHITECTURE.md`: circle id/key/roster/events in `FlitC
 6. `ack` runs only after an OK answer. A refusal or a throw keeps the bag and sets `failed`.
 7. `CourierEnvelope.open` runs only when `toFp` matches this device; inner events are verified by `CircleCore` and folded once by `FlitCircleStore.merge`.
 8. `courierHandoffs` is local only: never signed, never persisted, never placed in a `CircleRequest`.
-9. Expiry comes from `CourierCarry.expired` on the envelope's own `expiresMs`; the app does not extend it.
+9. Expiry comes from `CourierCarry.expire` on the envelope's own `expiresMs`; the app does not extend it.
 10. The added verb is additive to a Flit-only route. No v2.2 route, DTO shape or status code changes.
 
 ## Failure modes

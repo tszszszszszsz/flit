@@ -156,8 +156,8 @@ replay set. The bag is durable state owned by the caller:
 - App: an additive `courierBag: String = ""` field on `CircleState`, holding the
   encoded `CarryState`. Writes go through `FlitCircleStore.update`, so a bag
   write cannot interleave with a sync `upsert` or clobber the event log.
-- CLI: `harnessHome()/courier.bag`, holding the encoded `CarryState`, beside the
-  existing `circle.state` file.
+- CLI: `harnessHome()/courier-bag/<id>.parcel` holding the encoded parcel bytes,
+  with local row state in `harnessHome()/courier.state` beside `circle.state`.
 
 No carrier, dial loop or timer lives in the protocol module. The app sync worker
 and the CLI carrier pass the current bag into each reducer and persist the
@@ -210,7 +210,7 @@ route returns a normal signed `CircleResponse`; no new header, route or
 | Addressee not met; no route to `toFp` | Pending | Parcel stays in the bag for a later encounter | Nothing | `SIM-HARN` carrier test; `courier: holding for <fp>` |
 | Peer acknowledged the handoff | Delivered | Nothing | Acknowledged parcels after `ack` | `SIM-HARN` handoff test; `courier: handed off N parcel(s) to <fp>` |
 | Carrier restarts before an ack | Re-offer | Persisted bag and signed event survive | Nothing until addressee dedups by id | `SIM-HARN` restart test; `courier: re-offered, recipient deduped` |
-| Corrupt `courier.bag` or `courierBag` row | Empty bounded state | Unrelated Circle state | Corrupt row | `PURE` tolerant-decode test; `courier: bag row unreadable, starting empty` |
+| Corrupt `courier-bag/` or `courierBag` row | Empty bounded state | Unrelated Circle state | Corrupt row | `PURE` tolerant-decode test; `courier: bag row unreadable, starting empty` |
 
 ## Tests
 

@@ -123,7 +123,7 @@ device rows stay unclaimed until their dated walks run.
 
 ## Limitations
 
-- No carrier loop, `Link` handoff or persisted bag (`courier.bag`, `courierBag`)
+- No carrier loop, `Link` handoff or persisted bag (`courier-bag/`, `courierBag`)
   is part of this layer; `CarryState` durability belongs to the caller.
 - The content key exists only inside `seal` and the wrapped blob. No plaintext
   event, content key or private material is written to disk or logged; logs

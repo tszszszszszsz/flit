@@ -68,15 +68,17 @@ circle <create|join|post|poll|vote|role|kick|leave|sync|file> [--circle ID] [--i
        [--host ip[:port]] -- accountless group coordination over the production Circle routes
        post --file publishes a signed name/size/sha256 reference only;
        file --file publishes it AND sends the real bytes to every current member via sendFiles
+courier <drop|carry|receive|status|sweep> [--bag DIR] -- sealed parcels in a portable bag (see §2.4)
 ```
 
 Value-taking flags, from `ParsedArgs.VALUE_FLAGS` (Harness.kt:72-78):
 `--alias --port --dir --dest --udp-port --wait --pin --parallel --announce-to
 --bytes --sender --token --park-timeout --relay --text --circle --invite --file
---target --option --host --role`. Everything else is a presence flag. Defaults
-come from `Protocol.DEFAULT_PORT = 53317` and `MULTICAST_PORT = 53317`
-(protocol/…/Protocol.kt:17,20); the relay default is `DEFAULT_PORT + 1 = 53318`
-(Harness.kt:675).
+--target --option --host --role --bag --to --cert --ttl`. Everything else is a
+presence flag. Defaults come from `Protocol.DEFAULT_PORT = 53317` and
+`MULTICAST_PORT = 53317` (protocol/…/Protocol.kt:17,20); the relay default is
+`DEFAULT_PORT + 1 = 53318` (Harness.kt:675). The last four flags belong to
+`courier` (§2.4); with no `--bag` the bag is `<identity home>/courier-bag`.
 
 ### 2.1 Commands, flags and observable output
 
@@ -203,8 +205,10 @@ semantics and evidence live in [Circle](circle.md#file-delivery-as-built).
   `!! <message> (set FLIT_TRACE=1 for a stack trace)`.
 - Exit codes, consolidated: **1** = generic top-level exception / no files found
   / bt-sim needs input; **2** = bad `--relay` address, `discover` found nobody,
-  `info` got no answer, bt-sim `/info` got no answer; **3** = at least one file
-  failed to send. Normal `exitProcess(0)` is implicit.
+  `info` got no answer, bt-sim `/info` got no answer, bad courier argument or
+  missing `--bag`; **3** = at least one file failed to send, or a courier parcel
+  failed `open`. Normal `exitProcess(0)` is implicit. The courier-specific codes
+  are `EXIT_BAD_ARGS = 2` and `EXIT_OPEN_REFUSED = 3` (§2.4).
 
 ### 2.3 Differences from the README summary
 
@@ -219,6 +223,85 @@ semantics and evidence live in [Circle](circle.md#file-delivery-as-built).
 3. The README documents `relay --port 53318` as if it were a literal default in
    the help text; the code computes it as `Protocol.DEFAULT_PORT + 1` and the
    help string shows `--port P`. The effective default is still 53318.
+
+### 2.4 Courier command reference
+
+`courier` is the CLI carrier for sealed parcels. It holds opaque envelopes on
+disk and moves them between machines as a directory copy; it adds no route,
+header or wire field to the v2.2 surface and implements no transport of its own.
+Encryption and the parcel codec stay in `protocol/`; the CLI owns storage,
+state transitions and status output in `CourierCli.kt`. This layer has no device
+walk — a bag moves by file copy on one box, and its commands are one-shot like
+`circle` (load state, do one operation, save state). The subcommand list comes
+from `courierUsage()`.
+
+| Subcommand | Flags | Effect |
+| --- | --- | --- |
+| `drop` | `--to FP` plus `--text NOTE` **or** `--file PATH`; optional `--circle ID`, `--cert B64`, `--ttl MS`, `--bag DIR` | seal a signed Circle event into an `<id>.parcel` in the bag for an absent member; add a `pending` row |
+| `carry` | `[--bag DIR]` | verify the local bag, then mark its rows `carried` |
+| `receive` | `--bag DIR` | open parcels addressed to this identity and fold opened events into local Circle state |
+| `status` | `[--bag DIR]` | list rows (id, recipient, state, expires) with a closing count by state; no parcel content |
+| `sweep` | `[--bag DIR]` | drop expired parcels and enforce the bag quota |
+
+Flags taking a value, added to `ParsedArgs.VALUE_FLAGS`: `--bag`, `--to`,
+`--cert`, `--ttl`. `--text`, `--file` and `--circle` are the existing Circle
+flags reused by `drop`. `--to FP` is the recipient fingerprint; the sender is
+the CLI identity supplied by `loadOrCreateIdentity()`, the same fingerprint
+`serve` prints and `circle` uses. `--cert B64` supplies the recipient's Base64
+DER out of band when its signed event has not reached `circle.state`; the
+certificate fingerprint is checked against `--to` before sealing, so a parcel
+cannot be addressed to one fingerprint and encrypted to another. `--ttl MS`
+sets the parcel lifetime in milliseconds; without it the carry layer's
+`MAX_PARCEL_TTL_MS` (24 h) applies, and expiry is derived once as
+`expiresMs = createdMs + TTL` inside the carry limit. `--bag DIR` overrides the
+bag directory; with no `--bag` it is `<identity home>/courier-bag`. `receive`
+takes the bag copied in from another machine.
+
+On-disk layout, all under the identity home (`harnessHome()`, overridable with
+`FLIT_HARNESS_HOME` to separate nodes on one box):
+
+| Path | Contents |
+| --- | --- |
+| `courier.state` | local-only bookkeeping, one JSON line per parcel; decoded like `circle.state`, so an absent, short or corrupt file yields an empty list |
+| `courier-bag/` | one `<envelope-id>.parcel` file per parcel; the portable handoff unit an operator copies to the next machine |
+| `courier-received/` | opened event JSON written after a successful handoff; evidence of what landed, never re-sent |
+| `courier-rejected/` | parcels whose `open` returned a refusal; quarantined, not folded and not re-exported |
+
+A state row is `{id, recipientFp, senderFp, circleId, state, createdMs,
+expiresMs}`. `id` is the envelope id, fingerprints are normalised uppercase
+hex, and `state` is one of `pending`, `carried`, `delivered`, `expired`,
+`refused`. Rows are local-only and are never written into a Circle event.
+Every `.parcel` file id matches a row in `courier.state`; a file with no row is
+ignored by `receive` and `sweep`. The carrier stores
+`CourierCarry.encode(CourierCarry.parcelOf(envelope))` byte-for-byte, so
+encode→decode→encode of an unopened parcel is identical.
+
+Transitions (`CourierCli.Kind`):
+
+| Event | From → To |
+| --- | --- |
+| `CARRY` (after the bag verifies) | `pending` → `carried` |
+| `RECEIVE_OK` | `pending` or `carried` → `delivered` |
+| `RECEIVE_REFUSED` (`open` returns a refusal) | any state → `refused`; file moved to `courier-rejected/` |
+| `SWEEP` when `nowMs >= expiresMs` | any state → `expired` |
+
+A thrown `open` is not a conclusion: the row stays `pending` and the file stays
+in the bag for a later attempt, the same carrier-death rule Circle file delivery
+uses. A duplicate envelope id folds once through `CircleCore.dedup` and moves
+straight to `delivered`. A parcel addressed to another fingerprint stays
+`pending` and remains in the bag for the next courier: that node carries it but
+is not its recipient. `sweep` deletes a file only when its row is `expired` or
+`refused`; a `delivered` row keeps its file in `courier-received/` as a local
+record. State writes are one-shot and whole-file, as `saveCircleState` does.
+
+`status` reuses the `circle` one-line style with `${ts()}`: one row per parcel
+with a padded state value and a closing count by state. No fingerprint beyond
+the short form and no parcel content is printed.
+
+Courier exit codes: `EXIT_BAD_ARGS = 2` for a bad argument or a missing or
+unreadable `--bag` (no state change), and `EXIT_OPEN_REFUSED = 3` when a parcel
+fails `open` (row `refused`, file moved to `courier-rejected/`). Otherwise the
+consolidated codes in §2.2 apply and a normal run exits 0.
 
 ## 3. Box setup
 
@@ -642,8 +725,10 @@ answer** (keep the row and bytes). Every landing is verified by sha256
   `kill -9` skips this hook and leaves any in-flight `.part` + `.part.token` on
   disk; that is deliberate for the death walks, because the restart sweep
   repopulates the prefix from the sidecar. For normal operation, use Ctrl+C.
-- `bt-sim`, `discover`, `send`, `info`, `circle`, `panic`, `parse-qr`: one-shot;
-  they exit on their own. `discover` with no peers exits 2 by design.
+- `bt-sim`, `discover`, `send`, `info`, `circle`, `courier`, `panic`,
+  `parse-qr`: one-shot; they exit on their own. `discover` with no peers exits 2
+  by design; so does `courier` with a bad argument or missing `--bag`, and
+  `courier receive` exits 3 when a parcel fails `open`.
 - Phone: tap **Stop** in the app (or the Quick Settings tile, which calls
   `stopService` and reaches the same path). The documented intent is that this
   is the only path that clears `sharingDesired`, so a later relaunch stays
@@ -671,6 +756,10 @@ kill -9 <pid>                                  # only for a deliberate death wal
 | `flit-downloads/` (cwd, default `serve --dir`) | CLI receive | contains received files (and `.part`/`.part.token` after a kill); remove the ones you no longer need; gitignored |
 | `<--dir>` custom path | CLI receive / `bt-sim` (`flit-sim-received/`) | same; `bt-sim` synthetic bodies are random test data |
 | `flit-tmp-discover/`, `flit-tmp-circle-file/` | `discover`/alias resolution, Circle route sweep | scratch receive dirs, safe to delete when no process is running |
+| `<identity home>/courier-bag/` | `courier drop` | the portable bag (`<id>.parcel` files); copy it wholesale to hand off, or let `sweep` remove expired/refused files |
+| `<identity home>/courier-received/` | `courier receive` | opened event JSON, a local record of what landed; never re-sent |
+| `<identity home>/courier-rejected/` | `courier receive` | quarantined parcels that failed `open`; kept locally, not folded or re-exported |
+| `<identity home>/courier.state` | `courier` subcommands | local-only row bookkeeping; delete to drop all local rows, leaving bag files untouched |
 | `~/.config/flit/flit-harness/identity.p12` | first CLI run | **keep**: deleting it mints a new fingerprint, and peers that pinned the old one stop trusting the box |
 | `~/.config/flit/flit-harness/circle.state` | `circle create/join` | deleting it is a local leave (key discarded); the host still lists you until a leave event is accepted |
 | build dirs (`build/`, `.gradle/`, `.kotlin/`) | Gradle | generated; `git clean` or targeted `rm -rf` when rebuilding from scratch |
@@ -724,6 +813,9 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
 
 ## 10. Known limits
 
+- The `courier` CLI carrier has no device walk at this layer: a bag moves by
+  directory copy on one box, and the handoff is covered by harness tests only
+  (§2.4).
 - Two-phone RFCOMM transfer and a multi-member Circle mesh were not walked —
   no second phone on the rig, no Bluetooth adapter on the box. `bt-sim` and the
   harness two-node tests cover those paths in process only.

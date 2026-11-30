@@ -8,6 +8,9 @@ Build-ahead: implementation may run ahead of the wave dates below. The dates
 govern commits, not when work happens. Commits stay spoon-sized and land on the
 scheduled weekdays; finished work is held until its wave date.
 
+The 2026-11-30 CLI wave is built ahead. Implementation runs now, but the commit
+stays on 2026-11-30; no earlier wave carries it.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator

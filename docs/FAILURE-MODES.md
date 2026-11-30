@@ -10,7 +10,7 @@
 | --- | --- |
 | **CODE** | Read from the source at the `file:line` cited. States what the program does, not what was observed running. |
 | **PURE** | Deterministic JVM unit test in `protocol/src/test` or `app/src/test` (no Android, no socket, no device). |
-| **SIM/HARN** | Harness test or `bt-sim` run against the production client/server over in-process pipes or loopback TLS. |
+| **SIM/HARN** | Harness test or `bt-sim` run against the production client/server over in-process pipes or loopback TLS. The dated roadmap and CLI tables write this tag as SIM-HARN. |
 | **DEVICE** | Observed on the Redmi Note 10S (API 36) and/or the `flit-cli` box on the rig. The dated walks are cited; nothing else is claimed as walked. |
 
 Rig at the last green commit `72225f8`: **82 protocol + 210 app + 10 harness =
@@ -116,6 +116,12 @@ Read this first; the sections below unfold each row.
 | Courier: outside window, expired, wrong `circleId` / `toFp` | no | `OutsideWindow` / `Expired` / `open` refused | existing bag unchanged | incoming or expired parcel | CODE / PURE |
 | Courier: pending until encounter, then ack | yes until the addressee is met | Delivered at `ack` | parcel until TTL; nothing after ack | acknowledged parcels | CODE / PURE |
 | Courier: corrupt bag row or carrier death | yes — persisted bag is re-offered | empty bounded state / no conclusion | unrelated Circle state; persisted `CarryState` | corrupt row / in-memory-only state | CODE / PURE |
+| Courier CLI: `--bag` missing or unreadable | no | exit `2`, no state change | nothing moved | nothing | CODE |
+| Courier CLI: cert fingerprint differs from `--to`, or bag at quota | no | drop refused, row not added | existing parcels kept | nothing | CODE / PURE |
+| Courier CLI: past TTL at `sweep` | no | row `expired` | opened records in `courier-received/` | envelope and row on next sweep | PURE / SIM-HARN |
+| Courier CLI: parcel for another fingerprint, or `open` throws | yes — re-export or retry | stays `pending` | envelope kept in `courier-bag/` | nothing | CODE / SIM-HARN |
+| Courier CLI: `open` refusal or duplicate id on `receive` | no | row `refused` or `delivered`, no second fold | nothing in Circle state / first folded event | envelope to `courier-rejected/` / duplicate event | SIM-HARN |
+| Courier CLI: corrupt `courier.state` or vanished envelope file | no | empty decode with count, or skip with warning | bag files / remaining envelopes | stale local rows / nothing | CODE |
 | Panic alert | per-device, one attempt per fan-out | `reached/N` confirmed only | banner in memory (max 20) | nothing remote | CODE / PURE / DEVICE |
 | Panic forward at hop limit | no | toast, no send | alert stays dismissed locally | forwarded copy | CODE / PURE |
 | FGS refused by ROM | no FGS | engine-only while foreground | engine state intact | notification only | CODE |
@@ -428,8 +434,9 @@ the box's poll and two bot messages (`:302-308`).
 A carrier holds opaque `parcel` events in a bounded `CarryState`. The bag and its
 reducers are JVM-pure (`CourierCarryCore.kt`); the signed, recipient-encrypted
 blob is `CourierEnvelope.kt`. The caller persists the encoded bag — `courierBag`
-in the app, `courier.bag` in the CLI — so process death leaves the signed events
-on disk and only the in-memory `seen` set is lost. Every refusal below is logged
+in the app; the CLI keeps `<id>.parcel` files in `courier-bag/` with local-only
+rows in `courier.state` — so process death leaves the signed events on disk and
+only the in-memory `seen` set is lost. Every refusal below is logged
 by the caller; none is a silent fallback.
 
 | Condition | Retries? | Concludes? | Keeps bytes? | Drops? | Evidence |
@@ -448,11 +455,36 @@ by the caller; none is a silent fallback.
 | Parcel pending until the addressee is met | yes — next encounter / handoff | no — Pending | parcel in bag until TTL | nothing | CODE `CourierCarryCore.select`, `CourierCarryCore.expire`; PURE `CourierCarryDecisionTest` |
 | Addressee acknowledged the handoff | no | Delivered by `ack` | nothing for those parcels | acknowledged parcels | CODE `CourierCarryCore.ack`; PURE `CourierCarryDecisionTest` |
 | Carrier restarts before an ack | yes — persisted bag is re-offered | no — addressee dedups by id | persisted `CarryState` | in-memory-only state | CODE `CourierCarryCore.encode`/`decode`; PURE `CourierCarryCodecTest` |
-| Corrupt `courier.bag` or `courierBag` row | no | empty bounded state at decode | unrelated Circle state | corrupt row | CODE `CourierCarryCore.decode`; PURE `CourierCarryCodecTest` |
+| Corrupt `courier-bag/` or `courierBag` row | no | empty bounded state at decode | unrelated Circle state | corrupt row | CODE `CourierCarryCore.decode`; PURE `CourierCarryCodecTest` |
 
-The rows above are CODE and PURE only. The CLI carrier handoff is dated
-2026-11-30 and the three-node courier walk 2026-12-02; harness and device
-evidence for those flows is not claimed here.
+The rows above are CODE and PURE only.
+
+### 3.5 Courier CLI carrier — the one-shot conclusion table
+
+The 2026-11-30 CLI layer adds a `courier` command with five one-shot
+subcommands: `drop`, `carry`, `receive`, `status` and `sweep`. Each invocation
+loads `courier.state`, does one operation and saves it. `courier-bag/` is a
+portable directory copied between machines by the operator; the CLI adds no
+transport, route or header. Envelope bytes and parcel encoding are the
+2026-11-27 layers, unchanged.
+
+The conditions below come from the CLI carrier roadmap. Evidence labels are
+CODE from `CourierCli.kt`, PURE from `CourierCliTest` and SIM-HARN from
+`CourierCarrierHarnessTest`. No row claims DEVICE: the bag moved between
+directories on one box, and the three-node courier walk is 2026-12-02.
+
+| Condition | Conclusion | Keeps bytes | Drops | Evidence |
+| --- | --- | --- | --- | --- |
+| `--bag` path missing or unreadable | exit `2`, no state change | nothing moved | nothing | CODE `CourierCli.run` |
+| Recipient cert fingerprint differs from `--to` | drop refused before seal | nothing written | nothing | CODE / PURE `CourierCliTest` |
+| Bag at the courier-carry.md quota | drop refused, row not added | existing parcels kept | nothing | CODE / PURE `CourierCliTest` |
+| Parcel past TTL at `sweep` | row `expired` | opened records in `courier-received/` | envelope and row on the next sweep | PURE / SIM-HARN `CourierCarrierHarnessTest` |
+| Parcel addressed to another fingerprint | stays `pending`, re-exported | envelope kept in `courier-bag/` | nothing | CODE / SIM-HARN `CourierCarrierHarnessTest` |
+| `open` returns a refusal (forged or tampered envelope) | row `refused` | nothing in Circle state | envelope moved to `courier-rejected/`, payload dropped | SIM-HARN `CourierCarrierHarnessTest` |
+| `open` throws (carrier / IO fault) | stays `pending`, retried | envelope kept | nothing | CODE / SIM-HARN `CourierCarrierHarnessTest` |
+| Duplicate envelope id on `receive` | row `delivered`, no second fold | first folded event | duplicate event | SIM-HARN `CourierCarrierHarnessTest` |
+| `courier.state` corrupt or short | decode as empty, report the count | bag files untouched | stale local rows only | CODE `CourierCli.decodeRows` |
+| Envelope file vanished between `status` and `receive` | skip with a warning, row stays `pending` | remaining envelopes | nothing | CODE `CourierCli.run` |
 
 ---
 
@@ -619,8 +651,10 @@ account, a server, or a settings change beyond the opt-ins already documented.
     frees. A malformed body is Invalid and an `open` refusal leaves the envelope
     in the bag. The encoded `CarryState` survives a carrier restart at the
     app/CLI layer, so the signed event is re-offered and the addressee dedups by
-    id. A corrupt bag row decodes to an empty bounded state. Harness and device
-    handoff rows belong to the 2026-11-30 and 2026-12-02 walks.
+    id. A corrupt bag row decodes to an empty bounded state. The CLI carrier's
+    one-shot `drop`/`carry`/`receive`/`status`/`sweep` conclusions are in §3.5;
+    that handoff is harness-evidenced at 2026-11-30 and has no DEVICE row. The
+    three-node courier walk is 2026-12-02.
 
 ---
 
@@ -640,9 +674,11 @@ account, a server, or a settings change beyond the opt-ins already documented.
 | FGS / sharing restore | `FlitService.kt`, `FlitRoster.kt:65-117`, `MainActivity.kt` | `SharingRestoreTest`, `FlitRosterTest` | — | force-stop → relaunch restore walk |
 | MIUI / dataSync cap | `FlitService.kt:161-184` | — | — | idle soak; cap behaviour is **not device-walked** |
 | Courier envelope / carry bag | `CourierEnvelope.kt`, `CourierCarryCore.kt` | `CourierEnvelopeCodecTest`, `CourierEnvelopeCryptoTest`, `CourierCarryCodecTest`, `CourierCarryDecisionTest`, `CourierIntegrationTest` | — | — |
+| Courier CLI carrier | `CourierCli.kt` | `CourierCliTest` | `CourierCarrierHarnessTest` | — |
 
-Courier handoff has no SIM/HARN or DEVICE entry at this date. Those rows are
-dated 2026-11-30 and 2026-12-02.
+The CLI carrier handoff has SIM-HARN evidence at 2026-11-30 but no DEVICE
+entry: the bag moved between directories on one box. The three-node courier
+walk is dated 2026-12-02 and is not claimed here.
 
 ---
 
@@ -683,7 +719,8 @@ None changes a shipped contract.
    a resumed base is impossible without the Flit extension. The final SHA-256
    gate verifies every landing regardless. Cross-carrier resume is refused by
    origin binding, producing a clean full resend.
-9. **Courier carrier handoff is not walked here.** The courier conclusion rows
-   above are CODE and PURE only. The CLI carrier handoff is a 2026-11-30 harness
-   layer and the three-node courier walk is 2026-12-02; neither yields a claim
-   in this document.
+9. **Courier carrier handoff has no DEVICE walk here.** The §3.4 courier rows
+   are CODE and PURE; the §3.5 CLI carrier rows add CODE, PURE and SIM-HARN
+   from the 2026-11-30 one-shot command and its harness pair. The bag moved
+   between directories on the bench box only. The three-node courier walk is
+   2026-12-02 and yields no claim in this document.

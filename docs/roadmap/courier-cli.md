@@ -22,7 +22,7 @@ No new protocol route, no new HTTP header and no change to the v2.2 surface. No 
 
 ## Design
 
-**Command surface in `Harness.kt`.** `main` gains `"courier" -> kotlinx.coroutines.runBlocking { courier(args) }`. `usage()` gains one line; `courierUsage()` lists the subcommands. `ParsedArgs.VALUE_FLAGS` gains `--bag`, `--to`, `--cert`, `--ttl` (`--text`/`--file` already exist). All flags and the subcommand are parsed by the existing `ParsedArgs`; no second parser. Each invocation is one-shot: load state, do one operation, save state, as the `circle` command does.
+**Command surface.** `main` gains one `courier` dispatch; the harness's `usage()` gains one line and `courierUsage()` lists the subcommands. `ParsedArgs.VALUE_FLAGS` gains `--bag`, `--to`, `--cert`, `--ttl` (`--text`/`--file` already exist). Every flag and the subcommand are read through the existing `ParsedArgs`; there is no second parser. The command itself is not in `Harness.kt`: `run(args: ParsedArgs): Int` lives in the `CourierCli` object described below. Each invocation is one-shot: load state, do one operation, save state, as the `circle` command does.
 
 ```
 courier drop   --to FP --text NOTE | --file PATH [--circle ID] [--cert B64] [--ttl MS] [--bag DIR]
@@ -31,6 +31,45 @@ courier receive --bag DIR                          # open parcels for this ident
 courier status [--bag DIR]                         # list rows: id, to, state, expires
 courier sweep  [--bag DIR]                         # drop expired parcels and enforce quota
 ```
+
+### `CourierCli` object
+
+`harness/src/main/kotlin/app/flit/share/harness/CourierCli.kt`, package
+`app.flit.share.harness`, owns only storage, transitions, status output and this
+one-shot command. It has no Android import, no route and no header; encryption
+and the parcel bag codec stay in `protocol/`. The harness makes `harnessHome()`,
+`loadOrCreateIdentity()` and `saveCircleState()` internal so the object can use
+them. The frozen surface is:
+
+```kotlin
+object CourierCli {
+  const val BAG_DIR = "courier-bag"
+  const val RECEIVED_DIR = "courier-received"
+  const val REJECTED_DIR = "courier-rejected"
+  const val STATE_FILE = "courier.state"
+  const val EXIT_BAD_ARGS = 2
+  const val EXIT_OPEN_REFUSED = 3
+
+  data class Row(val id: String, val recipientFp: String, val senderFp: String,
+                 val circleId: String, val state: String,
+                 val createdMs: Long, val expiresMs: Long)
+
+  enum class Kind { CARRY, RECEIVE_OK, RECEIVE_REFUSED, SWEEP }
+
+  fun encodeRows(rows: List<Row>): String
+  fun decodeRows(raw: String?): List<Row>
+  fun nextState(row: Row, kind: Kind, nowMs: Long): String
+  fun bagDir(args: ParsedArgs): java.nio.file.Path
+  fun statePath(args: ParsedArgs): java.nio.file.Path
+  fun usage(): String
+  fun run(args: ParsedArgs): Int
+}
+```
+
+`run` implements `drop`, `carry`, `receive`, `status` and `sweep` with the flags
+above; `usage()` prints the synopsis. `bagDir` and `statePath` root every path in
+`harnessHome()` and apply the `--bag` override. `decodeRows` is tolerant like
+`circle.state`.
 
 **Identity and home.** `loadOrCreateIdentity()` supplies the signing/opening identity, so the courier's fingerprint is the one printed by `serve` and used by `circle`. `harnessHome()` roots every courier path; `FLIT_HARNESS_HOME` separates two nodes on one box, the same isolation `CircleHarnessTest` uses for Circle bots.
 
@@ -45,15 +84,15 @@ courier sweep  [--bag DIR]                         # drop expired parcels and en
 
 `--bag DIR` overrides the bag path for `carry` and `receive`; `drop`, `status` and `sweep` default to `harnessHome()/courier-bag`. The operator copies `courier-bag/` to the next machine by USB or any file copy; the carrier implements no transport of its own.
 
-**State row.** `courier.state` mirrors the tolerant `circle.state` codec: a list of lines, each decoded with `WireJson.json` under `ignoreUnknownKeys = true`, and a corrupt or short file decodes as empty. One row is `{id, recipientFp, senderFp, circleId, state, createdMs, expiresMs}`. `id` is the envelope id from courier-envelope.md and `expiresMs` comes from `CourierCarry.parcelOf` as `createdMs + MAX_PARCEL_TTL_MS`. `state` is one of `pending`, `carried`, `delivered`, `expired`, `refused`. `senderFp` and `recipientFp` are normalised uppercase hex as in `normalized()` in `Harness.kt`. Rows are local-only and are never written into a Circle event.
+**State schema.** `courier.state` mirrors the tolerant `circle.state` codec: a list of lines, `encodeRows` writing one `Row` per line with `WireJson.json` under `ignoreUnknownKeys = true`, and `decodeRows` returning an empty list for an absent, short or corrupt file. The row type is exactly `Row(id, recipientFp, senderFp, circleId, state, createdMs: Long, expiresMs: Long)`. `id` is the envelope id from courier-envelope.md and `expiresMs` comes from `CourierCarry.parcelOf` as `createdMs + MAX_PARCEL_TTL_MS`. `state` is one of `pending`, `carried`, `delivered`, `expired`, `refused`. `senderFp` and `recipientFp` are normalised uppercase hex as in `normalized()` in `Harness.kt`. Rows are local-only and are never written into a Circle event.
 
 **Envelope bytes.** `drop` calls `CourierEnvelope.seal` with the recipient's certificate; `seal` carries no expiry field; `parcelOf` derives it after sealing. The envelope goes through `CourierCarry.parcelOf`, and `CourierCarry.encode(parcel)` is written verbatim to `<id>.parcel`. The CLI never parses, re-signs or rewrites the envelope or the parcel. The recipient certificate comes from the `cert` field of a signed event by that fingerprint in `circle.state`; `--cert B64` supplies it out of band for a member whose event has not arrived. Both paths check `TlsIdentity.fingerprintOf(cert)` against `--to` before sealing, so a parcel cannot be addressed to one fingerprint and encrypted to another.
 
-**Fold path.** `receive` decodes each `<id>.parcel` file with `CourierCarry.decode` and opens it with `CourierEnvelope.open`. A `Delivered(event)` result is folded into `CircleCliState` with `CircleCore.order(CircleCore.dedup(st.events + event))`, the same reducer `mergeCircleAnswer` uses, and saved through `saveCircleState`. Governance and replay remain the protocol layer's job; the CLI member-side fold adds no reducer. A parcel addressed to a different fingerprint stays `pending` and remains in the bag for the next courier: that node is a carrier for it, not its recipient.
+**Fold path.** `receive` decodes each `<id>.parcel` file with `CourierCarry.decode` and opens it with `CourierEnvelope.open`. Events returned by `open` for this identity are folded into `CircleCliState` with `CircleCore.order(CircleCore.dedup(st.events + event))`, the same reducer `mergeCircleAnswer` uses, and saved through `saveCircleState`; a returned refusal maps to `RECEIVE_REFUSED`, while a throw leaves the row pending. Governance and replay remain the protocol layer's job; the CLI member-side fold adds no reducer. A parcel addressed to a different fingerprint stays `pending` and remains in the bag for the next courier: that node is a carrier for it, not its recipient.
 
-**Transitions.** `pending → carried` on `carry` (after the bag verifies), `pending|carried → delivered` on `receive`, anything → `expired` on `sweep` when `CourierCarry.expired` is true at the current time, and → `refused` on a failed `open`. A thrown `open` is not a conclusion: the parcel stays `pending` for a later attempt, matching the carrier-death contract used by Circle file delivery. `drop` refuses a new parcel when the current `CarryState` plus the parcel would exceed the quota constants from courier-carry.md.
+**Transitions.** `nextState(row, kind, nowMs)` is the single reducer; `Kind` is exactly `CARRY`, `RECEIVE_OK`, `RECEIVE_REFUSED`, `SWEEP`. `pending → carried` on `CARRY` (after `carry` verifies the bag), `pending|carried → delivered` on `RECEIVE_OK` (a returned `open` with events for this identity), anything → `refused` on `RECEIVE_REFUSED` (a returned refusal), and anything → `expired` on `SWEEP` when `nowMs >= expiresMs`. A thrown `open` is not a conclusion and does not reach `nextState`: the row stays `pending` and the parcel stays in the bag for a later attempt, matching the carrier-death contract used by Circle file delivery. `drop` refuses a new parcel when the current `CarryState` plus the parcel would exceed the quota constants from courier-carry.md.
 
-**Constants owned here:** directory names `courier-bag`, `courier-received`, `courier-rejected`, state file `courier.state`, envelope suffix `.parcel`, exit codes `2` for a bad argument or missing bag and `3` for a parcel that fails `open`. TTL is derived by `CourierCarry.parcelOf` as `createdMs + MAX_PARCEL_TTL_MS`; quota constants and maximum parcel bytes come from courier-carry.md. Neither is duplicated in the harness.
+**Constants owned here:** `BAG_DIR = "courier-bag"`, `RECEIVED_DIR = "courier-received"`, `REJECTED_DIR = "courier-rejected"`, `STATE_FILE = "courier.state"`, envelope suffix `.parcel`, `EXIT_BAD_ARGS = 2` for a bad argument or missing bag and `EXIT_OPEN_REFUSED = 3` for a parcel that fails `open`, both returned by `run`. TTL is derived by `CourierCarry.parcelOf` as `createdMs + MAX_PARCEL_TTL_MS`; quota constants and maximum parcel bytes come from courier-carry.md. Neither is duplicated in the harness.
 
 **Status output** reuses `${ts()}` and the one-line style of `circle`: one row per parcel with a padded state value, and a closing count by state. No fingerprint beyond the short form is printed, and no parcel content is printed.
 
@@ -87,7 +126,7 @@ courier sweep  [--bag DIR]                         # drop expired parcels and en
 
 ## Tests
 
-Pure tests first, in `harness/src/test/kotlin/app/flit/share/harness/CourierCliTest.kt` with no sockets and no endpoints: `courier.state` encode/decode round-trip and tolerant decode of absent, short and corrupt files; the `OpenResult → state` mapping including a throw staying `pending`; the cert-fingerprint gate against `--to`; TTL and quota decisions with an injected `nowMs` and a stub quota answer; deterministic `<id>.parcel` naming; the state-count line. These test the carrier's own seams, not the envelope crypto or the carry codec, which are covered by the 2026-11-27 protocol tests.
+Pure tests first, in `harness/src/test/kotlin/app/flit/share/harness/CourierCliTest.kt` with no sockets and no endpoints: `encodeRows`/`decodeRows` round-trip and tolerant decode of absent, short and corrupt files; the `Kind → nextState` mapping for all four kinds, plus the thrown-`open` path that leaves the row `pending`; `bagDir`/`statePath` path resolution including the `--bag` override; the cert-fingerprint gate against `--to`; the `SWEEP` expiry boundary at `nowMs >= expiresMs` with an injected clock and a stub quota answer; deterministic `<id>.parcel` naming; the state-count line. These test the carrier's own seams, not the envelope crypto or the carry codec, which are covered by the 2026-11-27 protocol tests.
 
 Harness tests, extending the one-JVM production-endpoint pattern of `CircleHarnessTest`: two CLI-state nodes with distinct `FLIT_HARNESS_HOME` values and fresh `Files.createTempDirectory` roots; node A `drop` seals a signed event into a bag, `carry` marks it `carried`, node B `receive --bag` opens it and folds it into `circle.state`; a third-fingerprint parcel stays `pending` and is re-exported; a tampered parcel is refused and quarantined; an expired parcel is swept; a duplicate id does not double-fold; a bad `--to` cert never writes a file. Payloads are seeded, temp roots are per test, and state is asserted by exact row values, not just a count. `decode` goes through `CourierCarry` and `open` through `CourierEnvelope` from 2026-11-27, never a lookalike cipher.
 
