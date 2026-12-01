@@ -5,7 +5,7 @@
 > [Open-file / sharing restore](open-file-and-sharing-restore.md) ·
 > [README](../README.md).
 
-Current rig state: **82 protocol + 210 app + 10 harness = 302 tests, 0 failures**; last commit `72225f8`. Older docs quote older counts (76, 86, 115) from the era in which they were written — those are historical, not current, figures.
+Current rig state: **136 protocol + 228 app + 32 harness = 396 tests, 0 failures** after a green `--rerun-tasks` run. Older docs quote older counts (76, 86, 115, 302) from the era in which they were written — those are historical, not current, figures.
 
 There is **no power monitor, battery-current sample, profiler trace or frame-time capture anywhere in this repo**. Every energy statement below is duty-cycle arithmetic plus design intent, or an on-device observation (an idle soak, a log line), never a measured mAh or watt figure.
 
@@ -233,7 +233,21 @@ On the receive side, API 29+ non-crushed wires stream straight into a pending `D
 
 The `courier` command is one-shot, as `circle` is: each invocation loads `courier.state`, performs one operation, saves the whole state file and exits. There is no worker, timer or carrier loop behind it, so an idle courier node does no repeated work. `status` is read-only; `drop`, `carry`, `receive` and `sweep` each rewrite the whole state file once per invocation. The cost of an invocation is therefore one state read, one whole-file write and the operation itself; the write grows with the number of state rows, not with any parcel payload. That ledger is small JSON, one line per parcel, and admission to the bag is bounded by the `MAX_PARCELS` quota from courier-carry.md. No wall-clock or byte figure has been captured for any invocation.
 
-The portable unit is the `courier-bag/` directory, copied by the operator with USB or any ordinary file copy; the CLI implements no transport of its own. A handoff costs a directory listing plus one read of each `<id>.parcel` at the source and one write at the destination. Parcel bytes are persisted verbatim as `CourierCarry.encode(CourierCarry.parcelOf(envelope))`, so the copy does no decode, re-encode, re-encryption or re-signing: its cost scales with the number and size of the parcel files, not with cryptographic work. Those sizes are structural caps only — `MAX_ENVELOPE_CHARS` (`12 * 1024`) from courier-envelope.md and `MAX_PARCELS` (`256`) from courier-carry.md — not measured sizes. `receive` then pays one `CourierCarry.decode` plus one `CourierEnvelope.open` (AES-GCM decrypt, RSA key unwrap, signature verification) per parcel addressed to the local fingerprint; a parcel for another fingerprint stays `pending` and is not opened. No timing, throughput or byte count has been measured for the copy or the open pass.
+The portable unit is the `courier-bag/` directory, copied by the operator with USB or any ordinary file copy; the CLI implements no transport of its own. A handoff costs a directory listing plus one read of each `<id>.parcel` at the source and one write at the destination. Parcel bytes are persisted verbatim as `CourierCarryCore.encode(CourierCarryCore.parcelOf(envelope))`, so the copy does no decode, re-encode, re-encryption or re-signing: its cost scales with the number and size of the parcel files, not with cryptographic work. Those sizes are structural caps only — `MAX_ENVELOPE_CHARS` (`12 * 1024`) from courier-envelope.md and `MAX_PARCELS` (`256`) from courier-carry.md — not measured sizes. `receive` then pays one `CourierCarryCore.decode` plus one `CourierEnvelope.open` (AES-GCM decrypt, RSA key unwrap, signature verification) per parcel addressed to the local fingerprint; a parcel for another fingerprint stays `pending` and is not opened. No timing, throughput or byte count has been measured for the copy or the open pass.
+
+### 8.5 QR parcel frames: structural byte and frame caps
+
+The 2026-12-03 Protocol layer ([qr-parcel-codec.md](roadmap/qr-parcel-codec.md)) defines the air-gap frame grammar: one opaque UTF-8 `String` per QR frame, EC level M and margin 2 in both CLI and app so both render the same bytes. It carries no camera, socket, persistence or clock dependency. Its limits are structural caps — bounds on how much can be framed and held — not measured sizes or timings:
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `MAX_FRAMES` | 64 | Wire cap and app display cap on the number of frames in one parcel; `seq` space 1..64. |
+| `MAX_CHUNK_BYTES` | 512 | Largest raw payload byte count in a single frame. |
+| `MAX_AIR_GAP_PARCEL_BYTES` | 131072 | Defensive frame-layer cap (128 KiB), named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`. |
+
+At `MAX_CHUNK_BYTES = 512` and `MAX_FRAMES = 64`, the largest frameable byte string is `64 × 512 = 32768` bytes (32 KiB). That is a reachable ceiling derived from the two caps, not a measured working set or a captured byte count. The `MAX_AIR_GAP_PARCEL_BYTES = 131072` ceiling sits above that reachable maximum, so it is a defensive guard: it bounds an oversized `total` field during `parse` before any reassembly, but with the shipped chunk and frame caps it never binds on honestly encoded output. `MAX_FRAMES = 64` is the same number as the app's `MAX_PARCEL_FRAMES = 64`, so every sequence the CLI emits is one the app will display; the two caps are kept equal by design.
+
+Each frame repeats the parcel id, its `seq`, `count` and `totalBytes`, and carries a CRC32 over canonical bytes, so a captured frame can be checked on its own before the set is complete. `complete` verifies sequence, count, digest and recipient before decrypting through `CourierEnvelope.open`; it adds no second crypto path. None of this has a captured wall-clock, throughput or device byte measurement: frame rendering, camera decode and per-frame cost are unverified at this layer, and real-camera decode belongs to a later air-gap walk.
 
 ---
 
@@ -262,18 +276,20 @@ The portable unit is the `courier-bag/` directory, copied by the operator with U
 - **CPU, memory, allocation and frame time**: no profiler traces, no heap dumps, no jank figures. The memoization and content-diff sections describe complexity changes, not measured frame budgets.
 - **Storage write amplification**: the spool path adds one cache copy; direct receive removes one. Neither was quantified on device.
 - **Wi-Fi Aware**: feature absent on the rig phone (`adb shell pm has-feature android.software.wifi.aware` → false, 2026-11-21); no Aware carrier exists to benchmark.
-- **Multi-member mesh**: only the two-node walk (phone + box CLI) has been on hardware; three-or-more-device fan-out cost is not observed ([circle.md](circle.md)).
-- **Phone→host Circle fan-out on device**: behaviour is test-evidenced with an injected carrier; the 2026-11-25 walk could not produce a clean peer-side confirmation, so its live wire cost is not measured ([circle.md](circle.md)).
+- **Multi-member mesh**: the 2026-11-26 three-node baseline walk ([2026-11-26-three-node-baseline.md](completions/2026-11-26-three-node-baseline.md)) ran a real 3-identity Circle on device (phone + two box CLIs), so this is no longer two-node-only evidence; the fan-out *cost* at three or more identities is still not measured ([circle.md](circle.md)).
+- **Phone→host Circle fan-out on device**: behaviour is test-evidenced only, with an injected carrier; the 2026-11-25 walk could not produce a clean peer-side confirmation, so no device evidence exists and its live wire cost is not measured ([circle.md](circle.md)).
 - **Cross-ROM/RAM behaviour**: MIUI autostart/battery rules and the Android 15 `dataSync` ~6 h cap are ROM/OS limits; no other device was available.
 - **Sweep beyond one subnet**: the hardware walk was a `/24`; the 1024-host cap is a pure admission rule, not a measured worst case.
 - **Wire-byte totals** for Circle repair beyond the structural caps (1024 events/request, 8 MiB request body, 16 KiB event body); no traffic capture was published.
 - **Courier CLI one-shot and bag copy**: no wall-clock timing, invocation count or byte count was captured. The one-shot read / whole-file-write shape and the directory-copy handoff in §8.4 are structural descriptions, not measured costs.
+- **QR air-gap frames**: the `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512` and `MAX_AIR_GAP_PARCEL_BYTES = 131072` limits in §8.5 are structural caps, not measured sizes or costs. The 32 KiB reachable maximum is arithmetic from the first two caps. No frame-render, camera-scan, CRC or reassembly timing, throughput or device byte count has been captured, and real-camera decode is not verified by this layer.
 
 ---
 
 ## 11. Consistency notes
 
 1. **circle.md "every SYNC posts the full bounded log"** conflicts with `FlitCircleSync.fanout`, which posts per-peer watermark deltas; only the calm `sync()` repair tick posts the full bounded log. Documented in §4.4.
-2. **Historical test counts** in the milestone docs (76 / 86 / 115) are from their respective eras and do not match the current 302-test rig; they are not contradictions, but a docs index that states a single current number should say which era each older figure belongs to.
+2. **Historical test counts** in the milestone docs (76 / 86 / 115 / 302) are from their respective eras and do not match the current 396-test rig; they are not contradictions, but a docs index that states a single current number should say which era each older figure belongs to.
 3. **README/Play "four parallel streams"** matches the client (`TURBO_MAX_STREAMS = 4`); the server's `MAX_TURBO_STREAMS = 6` is unused headroom from the shipped client's perspective.
 4. **Circle delivery backoff** in `FlitEngine` starts at an effective 20 s (`10s << attempt`, attempt = 1), not 10 s; the Circle *sync* backoff starts at 10 s (`5s << 1`). The two schedules are different by design and are both stated exactly in §3/§4.3.
+5. **QR frame cap vs app display cap**: the wire `MAX_FRAMES = 64` and the app's `MAX_PARCEL_FRAMES = 64` are the same number by design (§8.5). The frame-layer `MAX_AIR_GAP_PARCEL_BYTES = 131072` is named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`, so the air-gap byte ceiling and the envelope character ceiling are not conflated.

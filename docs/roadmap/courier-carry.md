@@ -261,12 +261,14 @@ Device walk at the 2026-12-02 layer (`DEVICE`, evidence note only):
 
 ## Evidence for this day
 
-A new `docs/completions/2026-11-27-courier-carry.md` records the fresh pure-test
+A new `docs/completions/2026-11-27-courier-core.md` records the fresh pure-test
 run (`source env.sh && ./gradlew --no-daemon --rerun-tasks :protocol:test`) with
-the exact number of added `CourierCarryCoreTest` cases and the module count
-moving from 82 protocol tests to 82 plus that number, against the 302 baseline
-(82 protocol + 210 app + 10 harness). No `SIM-HARN` or `DEVICE` evidence is
-claimed at this layer; those rows stay planned until their dated walks run.
+the exact number of added `CourierCarryDecisionTest` cases and the protocol count
+moving from 82 to 136, against the current rig of
+396 = 136 protocol + 228 app + 32 harness after a green `--rerun-tasks` run.
+The 302 baseline (82 protocol + 210 app + 10 harness) is historical. No
+`SIM-HARN` or `DEVICE` evidence is claimed at this layer; those rows stay
+planned until their dated walks run.
 
 ## Out of scope
 

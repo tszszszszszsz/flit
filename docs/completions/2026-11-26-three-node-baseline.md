@@ -68,13 +68,13 @@ No `key` parameter is present. `flit-cli parse-qr` decoded it at scale 1/1.
 
 - CODE: route shapes, closed file-body keys, replay bounds, roster gate and
   rekey semantics read from `protocol/` and `app/` sources.
-- PURE: the shipped 302-test rig was last green at `72225f8`
-  (82 protocol + 210 app + 10 harness, 0 failures). The courier layer was
-  built ahead of this note; its fresh rig result is recorded in
-  [2026-11-27-courier-core.md](2026-11-27-courier-core.md) at integration.
+- PURE: the rig is green at 396 tests (136 protocol + 228 app + 32 harness,
+  0 failures) after a `--rerun-tasks` run. The earlier 302-test snapshot
+  (82 protocol + 210 app + 10 harness) is historical.
 - SIM-HARN: no new three-node harness case was added for this layer.
-- DEVICE: the observations above were taken from phone logcat, UI dumps,
-  `flit-cli` output and the two `circle.state` files on 2026-11-25 local time.
+- DEVICE: Yes — this walk is device evidence for a 3-identity Circle, taken
+  from phone logcat, UI dumps, `flit-cli` output and the two `circle.state`
+  files on 2026-11-25 local time.
 
 ## Limitations
 
@@ -85,6 +85,7 @@ No `key` parameter is present. `flit-cli parse-qr` decoded it at scale 1/1.
   phone tally were confirmed for that single option.
 - One-shot box members have no listener or mailbox, so delay tolerance remains
   test-evidenced only.
-- Outbound phone→host fan-out is not exercised when the phone is the host.
+- Outbound phone→host fan-out remains test-evidenced only; the phone-host path
+  was not exercised in this walk.
 - No second physical phone, no phone-to-phone RFCOMM and no live multi-phone
   mesh were available. Wi-Fi Aware is absent on this device.

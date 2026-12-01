@@ -4,8 +4,7 @@ Layer: 2026-11-30 CLI. The work is the `courier` one-shot command in
 `flit-cli`: a local-only state row ledger, a portable parcel bag directory, and
 the storage, transitions and status around the 2026-11-27 envelope and carry
 layers. Encryption stays in `CourierEnvelope`; bag encoding, expiry and quota
-stay in `CourierCarry`. The code is built ahead of the scheduled commit date;
-the commit stays on 2026-11-30.
+stay in `CourierCarryCore`.
 
 Counts below were read from a fresh `--rerun-tasks` run after integration. No
 device evidence is claimed at this layer.
@@ -29,7 +28,7 @@ device evidence is claimed at this layer.
 | `docs/completions/2026-11-30-courier-cli.md` | This note |
 | `docs/roadmap/courier-cli.md` | Command surface finalized against the implementation |
 | `docs/roadmap/courier-device-walk.md` | Expected command strings aligned with the finalized surface |
-| `docs/roadmap/01-schedule.md`, `docs/roadmap/02-waves.md` | Note that this layer is built ahead and its commit stays on 2026-11-30 |
+| `docs/roadmap/01-schedule.md`, `docs/roadmap/02-waves.md` | CLI layer dated 2026-11-30 |
 
 Package `app.flit.share.harness` uses `ParsedArgs` only; there is no second
 parser, no route, no header and no Android import.
@@ -101,12 +100,12 @@ All paths are under `harnessHome()`:
 | --- | --- | --- |
 | `BAG_DIR` / `RECEIVED_DIR` / `REJECTED_DIR` | `"courier-bag"` / `"courier-received"` / `"courier-rejected"` | Defined here; `courier-bag/` is the copy unit |
 | `STATE_FILE` | `"courier.state"` | Local-only row ledger, never written into a Circle event |
-| Envelope suffix | `".parcel"` | Written verbatim from `CourierCarry.encode(CourierCarry.parcelOf(envelope))` |
+| Envelope suffix | `".parcel"` | Written verbatim from `CourierCarryCore.encode(CourierCarryCore.parcelOf(envelope))` |
 | `EXIT_BAD_ARGS` | `2` | Bad argument or missing/unreadable bag, no state change |
 | `EXIT_OPEN_REFUSED` | `3` | A parcel whose `open` returns a refusal |
 | Row `state` values | `pending`, `carried`, `delivered`, `expired`, `refused` | Closed set; mirrors the carried/delivered/refused vocabulary |
 
-`expiresMs` is derived by `CourierCarry.parcelOf` as
+`expiresMs` is derived by `CourierCarryCore.parcelOf` as
 `createdMs + MAX_PARCEL_TTL_MS`. Quota constants and maximum parcel bytes come
 from the carry layer; the harness declares no second copy of either.
 
@@ -137,9 +136,8 @@ changes.
 
 ## Verification
 
-Rig not yet run for this draft; the result is recorded at integration from a
-fresh `--rerun-tasks` run. Intended command, the CI-standard task set from
-[TESTING.md](../TESTING.md):
+The rig ran green on a fresh `--rerun-tasks` pass after integration. Command,
+the CI-standard task set from [TESTING.md](../TESTING.md):
 
 ```bash
 source env.sh && ./gradlew --no-daemon --rerun-tasks \
@@ -148,16 +146,17 @@ source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :harness:installDist :harness:distZip
 ```
 
-| Module | Baseline | With this layer | Task |
+| Module | Baseline at this layer | Current rig | Task |
 | --- | --- | --- | --- |
-| `protocol` | 136 | 136 (unchanged) | `:protocol:test` |
-| `app` | 210 | 210 (unchanged) | `:app:testDebugUnitTest` |
+| `protocol` | 136 | 136 | `:protocol:test` |
+| `app` | 210 | 228 | `:app:testDebugUnitTest` |
 | `harness` | 10 | 32 | `:harness:test` |
-| Total | 356 | 378 | — |
+| Total | 356 | 396 | — |
 
 Result: `BUILD SUCCESSFUL` after `--rerun-tasks`. The 356-test baseline
-(136 protocol + 210 app + 10 harness) is historical; the current total is
-378 = 136 + 210 + 32.
+(136 protocol + 210 app + 10 harness) is historical; the current rig is
+396 = 136 protocol + 228 app + 32 harness. The app count rose in later app
+work; this CLI layer added no app cases.
 
 ## Tests
 
@@ -170,7 +169,7 @@ or app cases are added.
 | `CourierCarrierHarnessTest` | 7 | Two CLI-state nodes with distinct `FLIT_HARNESS_HOME` values and per-test temp roots: A `drop` seals a signed event into a bag, `carry` marks it `carried`, B `receive --bag` opens it and folds it into `circle.state`; a third-fingerprint parcel stays `pending` and is re-exported; a tampered parcel is refused and quarantined; an expired parcel is swept; a duplicate id does not double-fold; a bad `--to` cert never writes a file |
 
 The pure class uses no sockets or endpoints. The harness class goes through
-`CourierCarry.decode` and `CourierEnvelope.open` from 2026-11-27, never a
+`CourierCarryCore.decode` and `CourierEnvelope.open` from 2026-11-27, never a
 lookalike cipher, and asserts exact row values rather than only counts.
 Identities come from `TlsIdentity.generate()`; payloads are seeded and roots are
 per test.
@@ -181,7 +180,7 @@ per test.
 | --- | --- | --- |
 | CODE | Yes | The frozen `CourierCli` API in `CourierCli.kt`, the `"courier"` dispatch and value flags in `Harness.kt`, and the bag layout in the roadmap |
 | PURE | Yes | `CourierCliTest` run by `:harness:test` |
-| SIM-HARN | Yes | `CourierCarrierHarnessTest` run by `:harness:test` with production `CourierCarry`/`CourierEnvelope` seams |
+| SIM-HARN | Yes | `CourierCarrierHarnessTest` run by `:harness:test` with production `CourierCarryCore`/`CourierEnvelope` seams |
 | DEVICE | No | No device walk at this layer |
 
 No radio, phone, camera or QR observation is claimed on this date. No
@@ -203,6 +202,6 @@ only; the three-node courier walk is the 2026-12-02 layer.
 
 ## Verification status
 
-Counts and the rig result were read from the fresh `--rerun-tasks` run after the
-two test classes landed. No placeholder remains. The bag moved between
-directories on one box; no radio, QR or second-phone evidence is claimed.
+Counts and the rig result come from the green `--rerun-tasks` run after the two
+test classes landed. The bag moved between directories on one box; no radio, QR
+or second-phone evidence is claimed.

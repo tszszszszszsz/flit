@@ -39,7 +39,7 @@ data class CourierParcel(
 @Serializable
 data class CarryState(val parcels: List<CourierParcel> = emptyList())
 
-/** Exact precedence: Invalid → OutsideWindow → Expired → Duplicate → Full → Accept. */
+/** Exact precedence: Invalid → Expired → OutsideWindow → Duplicate → Full → Accept. */
 sealed interface Decision {
     /** Id reserved; the parcel may enter the bag. */
     data object Accept : Decision

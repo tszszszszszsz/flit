@@ -64,7 +64,7 @@ Window and replay. `open` refuses `createdMs` older than `REPLAY_WINDOW_MS` or m
 
 State ownership. The sender owns the content key during `seal` only. The carrier holds the opaque bytes in `CarryState`, whose durable row is owned by the caller (`courierBag` on `CircleState` in the app, `courier-bag/` in the CLI). `TlsIdentity`'s pin cache, bounded at `MAX_PINS = 512`, gains the sender's certificate only after `verify` succeeds. The envelope codec is stateless; the carry core owns the bounded `seen` set, as `CircleCore` owns its replay set.
 
-Seams to later layers: the CLI carrier on 2026-11-30 drives `select`/`ack` over `Link` and persists the bag; the app on 2026-12-01 folds decrypted events through `FlitCircleStore.merge` and drives file-card states; the QR codec on 2026-12-03 frames `encode` bytes unchanged, so there is one envelope codec; per-drop content keys on 2026-12-09 change file-drop semantics but not this transport wrap.
+Seams to later layers: the CLI carrier on 2026-11-30 drives `select`/`ack` over `Link` and persists the bag; the app on 2026-12-01 folds decrypted events through `FlitCircleSync.fresh()` → `persistEvents()` → `FlitCircleStore.upsert` and drives file-card states; the QR codec on 2026-12-03 frames `encode` bytes unchanged, so there is one envelope codec; per-drop content keys on 2026-12-09 change file-drop semantics but not this transport wrap.
 
 ## Invariants
 
@@ -113,7 +113,7 @@ Harness tests (2026-11-30): the CLI carrier moves `parcel` events between three 
 
 ## Evidence for this day
 
-`docs/completions/2026-11-27-courier-envelope.md` is written when the layer lands. It records the fresh pure-test run, the protocol test count moving from the 82 baseline by the number of added `CourierEnvelopeTest` cases, CODE references to `CourierEnvelope.kt`, and that only PURE evidence is claimed. Harness and device rows stay unclaimed; the three-node mesh remains unverified until the 2026-12-02 walk.
+`docs/completions/2026-11-27-courier-core.md` is written when the layer lands. It records the fresh pure-test run, the protocol test count moving from the 82 baseline to 136, CODE references to `CourierEnvelope.kt`, and that only PURE evidence is claimed. The current rig is 396 = 136 protocol + 228 app + 32 harness after a green `--rerun-tasks` run; the 302 inventory is historical. Harness and device rows stay unclaimed; the three-node mesh remains unverified until the 2026-12-02 walk.
 
 ## Out of scope
 

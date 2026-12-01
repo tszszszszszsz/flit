@@ -2,6 +2,11 @@ package app.flit.share
 
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.courier.CarryState
+import app.flit.share.protocol.courier.CourierCarryCore
+import app.flit.share.protocol.courier.CourierEnvelope
+import app.flit.share.protocol.courier.CourierParcel
+import app.flit.share.protocol.courier.Decision
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
 import app.flit.share.protocol.tls.TlsIdentity
@@ -163,6 +168,10 @@ internal fun circleBodyValid(type: String, body: String): Boolean {
             } == true || flag("admin") != null)
         CircleEvent.REKEY -> (text("keyB64") != null || text("key") != null) &&
             (number("gen") ?: number("rekeyGen")) != null
+        // The tenth verb carries ONLY {toFp, envelope}. The closed key set,
+        // field bounds and envelope cap belong to the protocol carry core;
+        // this gate delegates to it and never restates those rules.
+        CircleEvent.PARCEL -> CourierCarryCore.validParcelBody(body)
         else -> false
     }
 }
@@ -188,6 +197,16 @@ internal fun circleFileBody(name: String, size: Long, sha: String): String = bui
     put("name", name)
     put("size", size)
     put("sha256", sha)
+}.toString()
+
+/**
+ * Wire body for a courier parcel: exactly `toFp` and the Base64 envelope.
+ * No sha, name, size, spool path or queue token is ever added here — the inner
+ * events are sealed inside the envelope and this carrier cannot read them.
+ */
+internal fun circleParcelBody(toFp: String, envelopeB64: String): String = buildJsonObject {
+    put("toFp", circleFp(toFp))
+    put("envelope", envelopeB64)
 }.toString()
 
 internal fun circleKickOpenBody(kickId: String, targetFp: String): String = buildJsonObject {
@@ -278,6 +297,13 @@ object FlitCircleSync {
     @Volatile private var nextSyncAt = 0L
     @Volatile private var cachedIdentity: TlsIdentity? = null
 
+    /** Parcel event id → file shas learned when this device sealed the events. */
+    private val parcelShas = ConcurrentHashMap<String, List<String>>()
+
+    private const val COURIER_WAITING = "waiting"
+    private const val COURIER_HANDED = "handed"
+    private const val COURIER_FAILED = "failed"
+
     // ==== injectable seams (internal, null in production) ========================
 
     /**
@@ -304,6 +330,17 @@ object FlitCircleSync {
      */
     internal var joinPersistHook: ((CircleState) -> Unit)? = null
 
+    /** Signing identity for pure tests; production reads the persisted keystore. */
+    internal var identityHook: (() -> TlsIdentity?)? = null
+    /** Observes events that would be upserted into the signed log (pure tests). */
+    internal var upsertHook: ((List<CircleEvent>) -> Unit)? = null
+    /** Receives the encoded bag on every write; null in production uses the store. */
+    internal var bagPersistHook: ((String) -> Unit)? = null
+    /** Receives a normalised sha and one of waiting/handed/failed. The engine owns the map. */
+    internal var handoffHook: ((String, String) -> Unit)? = null
+    /** Receives a typed handoff built from an opened file event (pure tests). */
+    internal var handoffPublishHook: ((CourierCardUi.CourierHandoff) -> Unit)? = null
+
     /** Test-only: drop fakes and rate-limit state so tests cannot leak into each other. */
     internal fun resetForTest() {
         dialHook = null
@@ -312,6 +349,12 @@ object FlitCircleSync {
         clockHook = null
         logHook = null
         joinPersistHook = null
+        identityHook = null
+        upsertHook = null
+        bagPersistHook = null
+        handoffHook = null
+        handoffPublishHook = null
+        parcelShas.clear()
         nextDialAt.clear()
         misses.clear()
         watermarks.clear()
@@ -420,7 +463,9 @@ object FlitCircleSync {
         // Local-only bookkeeping is NOT part of the host's answer. Rejoining
         // replaces the authoritative circle fields (id/key/roster/events/gen)
         // but must keep delivery rows keyed by sha, so a byte push that already
-        // landed is not forgotten. selfFp is this device's identity, set below.
+        // landed is not forgotten, and the carried parcel bag, so undelivered
+        // parcels survive the rejoin. selfFp is this device's identity, set below.
+        val local = storedState()
         val joined = CircleState(
             id = circleId,
             keyB64 = response.key,
@@ -431,7 +476,8 @@ object FlitCircleSync {
             // Exact identity, not the store's legacy uniqueness inference: the
             // owner's role changes must track this device unambiguously.
             selfFp = me,
-            deliveries = storedState()?.deliveries.orEmpty(),
+            deliveries = local?.deliveries.orEmpty(),
+            courierBag = local?.courierBag.orEmpty(),
         )
         // Fold seed events through the store's reducers so the roster and the
         // rekey generation agree with what the host's log actually says.
@@ -443,10 +489,10 @@ object FlitCircleSync {
         }
         val ctx = context() ?: return
         // Atomic commit: re-read local-only state under the store lock so a
-        // delivery write landing between the host answer and this commit is
-        // not clobbered. First join has no row to update, so fall back to save.
+        // delivery or bag write landing between the host answer and this commit
+        // is not clobbered. First join has no row to update, so fall back to save.
         val committed = FlitCircleStore.update(ctx) { current ->
-            seeded.copy(deliveries = current.deliveries)
+            seeded.copy(deliveries = current.deliveries, courierBag = current.courierBag)
         }
         if (committed == null) FlitCircleStore.save(ctx, seeded)
     }
@@ -482,33 +528,38 @@ object FlitCircleSync {
             // (or a departure) that the next peer is entitled to see.
             val state = storedState(seed) ?: seed
             val full = circleRepairBatch(state.events)
+            val selected = parcelEventsFor(state, fp, now)
+            val offered = (full + selected.map { it.event }).distinctBy { it.id }
+                .take(CircleCore.MAX_EVENTS_PER_REQUEST)
             val request = CircleRequest(
                 action = CircleRequest.ACTION_SYNC,
                 circleId = state.id,
                 invite = "",
                 memberFp = me,
-                events = full,
+                events = offered,
                 body = "",
             )
             val route = dial(fp)
             if (route == null) {
                 log("circle sync: no route to ${fp.take(12)}")
+                concludeHandoff(selected, ok = false)
                 noteFailure(fp, now)
                 return@dialBounded
             }
             val response = runCatching { route.sync(request) }.getOrNull()
             if (response == null || !response.ok) {
                 log("circle sync: ${fp.take(12)} refused ${response?.reason ?: "no answer"}")
+                concludeHandoff(selected, ok = false)
                 noteFailure(fp, now)
                 return@dialBounded
             }
             noteSuccess(fp)
             // The repair was accepted in full, so later posts may go delta-only.
             circleAckOf(full)?.let { watermarks[fp] = it }
-            val incoming = fresh(state, response.events)
-            if (incoming.isNotEmpty()) {
-                log("circle sync: +${incoming.size} event(s) from ${fp.take(12)}")
-                context()?.let { FlitCircleStore.upsert(it, incoming) }
+            concludeHandoff(selected, ok = true)
+            courierReceive(state, response.events)
+            if (response.events.isNotEmpty()) {
+                log("circle sync: +${response.events.size} event(s) from ${fp.take(12)}")
             }
         }
         pruneBackoff(circlePeers(storedState(seed) ?: seed, me).toSet())
@@ -544,6 +595,65 @@ object FlitCircleSync {
      */
     internal suspend fun postFile(name: String, size: Long, sha: String) {
         post(CircleEvent.FILE, circleFileBody(name, size, sha))
+    }
+
+    // ==== courier handoff path ===================================================
+
+    /**
+     * Publish one signed `parcel` over the existing `/circle/sync` route. No new
+     * route, header or DTO: the body is exactly `toFp` + `envelope`, gated by the
+     * protocol carry core. Returns the emitted event so the caller that sealed
+     * the envelope can associate its file shas with this parcel's id.
+     */
+    internal suspend fun postParcel(toFp: String, envelopeB64: String): CircleEvent? {
+        val target = circleFp(toFp)
+        val body = circleParcelBody(target, envelopeB64)
+        if (!circleBodyValid(CircleEvent.PARCEL, body)) {
+            log("courier: invalid parcel body")
+            return null
+        }
+        val state = storedState() ?: return null
+        val event = emit(context(), state, CircleEvent.PARCEL, body) ?: return null
+        fanout(state, listOf(event))
+        return event
+    }
+
+    /**
+     * Remember the file shas learned while sealing a parcel, keyed by the
+     * emitted `parcel` event id — the same id the bag row and the engine's local
+     * map use. Process-local only: never signed, persisted or sent on the wire.
+     * A carrier holding only ciphertext registers nothing and publishes no sha.
+     */
+    internal fun courierTrack(parcelId: String, shas: List<String>) {
+        if (parcelId.isBlank()) return
+        val keys = shas.map { it.trim().lowercase(Locale.ROOT) }
+            .filter { it.isNotBlank() }.distinct()
+        if (keys.isEmpty()) return
+        parcelShas[parcelId.trim()] = keys
+    }
+
+    /**
+     * Fold verified incoming events: signed parcels enter the bounded bag only
+     * on an `Accept` decision; when the parcel is addressed to this device its
+     * envelope is opened and the decrypted events enter the signed log through
+     * the same verify-and-merge path as any other member's events.
+     */
+    internal suspend fun courierReceive(state: CircleState, events: List<CircleEvent>) {
+        val (parcels, others) = events.partition {
+            it.type.equals(CircleEvent.PARCEL, ignoreCase = true)
+        }
+        val accepted = fresh(state, others)
+        if (accepted.isNotEmpty()) persistEvents(accepted)
+        // A parcel lives in the durable bag, not behind fresh()'s log-id dedup:
+        // a peer may re-offer one whose event is already in the signed log after
+        // a bag loss. Carry's evaluate dedups by id, so re-folding is inert while
+        // a missing bag row is restored.
+        parcels.forEach { event ->
+            if (event.circleId != state.id) return@forEach
+            if (!circleBodyValid(CircleEvent.PARCEL, event.body)) return@forEach
+            if (!CircleCore.verify(event)) return@forEach
+            CourierCarryCore.parcelOf(event)?.let { foldParcel(it) }
+        }
     }
 
     /** Owner-only appointment/removal of an ADMIN (the store enforces authority). */
@@ -613,7 +723,7 @@ object FlitCircleSync {
      * it locally would make our own fan-out look like a replay.
      */
     private fun emit(
-        ctx: android.content.Context,
+        ctx: android.content.Context?,
         state: CircleState,
         type: String,
         body: String,
@@ -621,7 +731,7 @@ object FlitCircleSync {
         if (type.trim().lowercase(Locale.ROOT) !in CircleEvent.TYPES) return null
         if (!circleBodyValid(type, body)) return null
         val identity = identity() ?: return null
-        val current = FlitCircleStore.load(ctx) ?: state
+        val current = ctx?.let { FlitCircleStore.load(it) } ?: state
         val event = CircleCore.create(
             circleId = current.id,
             authorFp = circleFp(identity.fingerprint),
@@ -632,8 +742,177 @@ object FlitCircleSync {
             createdMs = System.currentTimeMillis(),
         )
         if (!CircleCore.verify(event)) return null
-        FlitCircleStore.upsert(ctx, listOf(event))
+        persistEvents(listOf(event))
         return event
+    }
+
+    /** One commit of verified events to the signed log, with a pure-test seam. */
+    private fun persistEvents(events: List<CircleEvent>) {
+        if (events.isEmpty()) return
+        val hook = upsertHook
+        if (hook != null) {
+            hook(events)
+            return
+        }
+        context()?.let { FlitCircleStore.upsert(it, events) }
+    }
+
+    // ==== courier internals =====================================================
+
+    private fun bagFromRaw(raw: String?): CarryState {
+        val decoded = CourierCarryCore.decode(raw) ?: CarryState()
+        if (!raw.isNullOrBlank() && decoded.parcels.isEmpty()) {
+            log("courier: bag row unreadable, starting empty")
+        }
+        return decoded
+    }
+
+    private fun bagOf(state: CircleState?): CarryState =
+        bagFromRaw(state?.courierBag)
+
+    /** Atomic bag write: decode → fold → encode → persist under one store lock. */
+    private fun updateBag(transform: (CarryState) -> CarryState): CarryState? {
+        val hook = bagPersistHook
+        if (hook != null) {
+            val next = transform(bagFromRaw(stateHook?.invoke()?.courierBag))
+            hook(CourierCarryCore.encode(next))
+            return next
+        }
+        val ctx = context() ?: return null
+        val updated = FlitCircleStore.update(ctx) { state ->
+            val next = transform(bagFromRaw(state.courierBag))
+            state.copy(courierBag = CourierCarryCore.encode(next))
+        } ?: return null
+        return bagFromRaw(updated.courierBag)
+    }
+
+    /**
+     * Publish a process-local outcome change for an already published sha. The
+     * engine owns the map and wires this seam while it is live; a pure test
+     * observes through [handoffHook]. With no hook there is no publication, so
+     * a stopped engine or a left circle cannot publish stale outcomes.
+     */
+    private fun publish(sha: String, outcome: String) {
+        val key = sha.trim().lowercase(Locale.ROOT)
+        if (key.isBlank()) return
+        handoffHook?.invoke(key, outcome)
+    }
+
+    /** Publish a newly learned file event through the engine's typed seam. */
+    private fun publishTyped(handoff: CourierCardUi.CourierHandoff) {
+        handoffPublishHook?.invoke(handoff)
+    }
+
+    /** Verify → evaluate → fold, with expiry decided only by the carry core. */
+    private fun foldParcel(parcel: CourierParcel) {
+        var decision: Decision? = null
+        updateBag { current ->
+            decision = CourierCarryCore.evaluate(parcel, current.parcels.size, nowMs())
+            if (decision == Decision.Accept) CourierCarryCore.fold(current, parcel) else current
+        }
+        when (decision) {
+            Decision.Accept -> {
+                log("courier: holding for ${parcel.toFp.take(12)}")
+                if (parcel.toFp.equals(meFp().orEmpty(), ignoreCase = true)) openAtMe(parcel)
+            }
+            Decision.Duplicate -> log("courier: duplicate parcel id")
+            Decision.Expired -> log("courier: parcel expired")
+            Decision.OutsideWindow -> log("courier: parcel outside window")
+            Decision.Full -> log(
+                "courier: bag full, ${CourierCarryCore.MAX_PARCELS} parcel(s) held",
+            )
+            Decision.Invalid -> log("courier: invalid parcel body")
+            null -> Unit // no store row to update; no decision to report
+        }
+    }
+
+    /** Open only a parcel addressed to us; a refusal keeps the bag row. */
+    private fun openAtMe(parcel: CourierParcel) {
+        val body = runCatching {
+            Json.parseToJsonElement(parcel.event.body).jsonObject
+        }.getOrNull() ?: return
+        val raw = (body["envelope"] as? JsonPrimitive)?.content
+        val envelope = raw?.let { CourierEnvelope.decode(it) }
+        val identity = identity()
+        if (envelope == null || identity == null) {
+            log("courier parcel unreadable — rejected")
+            return
+        }
+        val inner = CourierEnvelope.open(envelope, identity, nowMs())
+        if (inner.isNullOrEmpty()) {
+            log("courier parcel unreadable — rejected")
+            return
+        }
+        val state = storedState() ?: return
+        // The envelope is ciphertext to every carrier but us, yet its author is
+        // still untrusted once opened: a member could seal self-signed JOIN or
+        // REKEY events and rewrite our roster or group key. Only a current
+        // member may mint a foldable inner event, and never those two verbs.
+        // fresh() still verifies every signature before anything is persisted.
+        val authors = state.members.map { circleFp(it.fp) }.toSet()
+        val rejected = inner.filterTo(HashSet()) { event ->
+            event.circleId != state.id ||
+                circleFp(event.authorFp) !in authors ||
+                event.type.equals(CircleEvent.JOIN, ignoreCase = true) ||
+                event.type.equals(CircleEvent.REKEY, ignoreCase = true)
+        }
+        if (rejected.isNotEmpty()) {
+            log("courier: rejected ${rejected.size} opened event(s) — foreign circle, " +
+                "non-member author or privileged verb")
+        }
+        val accepted = fresh(state, inner.filterNot { it in rejected })
+        if (accepted.isEmpty()) return
+        persistEvents(accepted)
+        accepted.forEach { event ->
+            if (event.type != CircleEvent.FILE) return@forEach
+            val obj = runCatching {
+                Json.parseToJsonElement(event.body).jsonObject
+            }.getOrNull() ?: return@forEach
+            val sha = (obj["sha256"] as? JsonPrimitive)?.content?.trim()
+                ?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() } ?: return@forEach
+            val name = (obj["name"] as? JsonPrimitive)?.content.orEmpty()
+            val size = (obj["size"] as? JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+            publishTyped(
+                CourierCardUi.CourierHandoff(
+                    sha256 = sha,
+                    name = name,
+                    size = size,
+                    toFp = parcel.toFp,
+                    courierFp = parcel.fromFp,
+                    fromFp = envelope.fromFp,
+                    outcome = COURIER_WAITING,
+                ),
+            )
+        }
+        log("courier: opened ${accepted.size} event(s) from ${parcel.toFp.take(12)}")
+    }
+
+    /** Parcels addressed to [peer] and still live, deterministically ordered. */
+    private fun parcelEventsFor(
+        state: CircleState,
+        peer: String,
+        now: Long,
+    ): List<CourierParcel> = CourierCarryCore.select(bagOf(state), peer, now)
+
+    /**
+     * Conclude offered parcels only after an OK answer: `ack` drops the bag
+     * rows and the local outcome becomes `handed`; a refusal or a throw leaves
+     * every bag row untouched and the outcome `failed`. Parcels this process
+     * never sealed have no sha, so they publish nothing.
+     */
+    private fun concludeHandoff(selected: List<CourierParcel>, ok: Boolean) {
+        if (selected.isEmpty()) return
+        val outcome = if (ok) COURIER_HANDED else COURIER_FAILED
+        if (ok) updateBag { CourierCarryCore.ack(it, selected.map { it.id }) }
+        selected.forEach { parcel ->
+            if (ok) {
+                parcelShas.remove(parcel.id)?.forEach { sha -> publish(sha, outcome) }
+            } else {
+                parcelShas[parcel.id]?.forEach { sha -> publish(sha, outcome) }
+            }
+        }
+        log("courier: ${if (ok) "handed off" else "handoff failed for"} " +
+            "${selected.size} parcel(s)")
     }
 
     /**
@@ -644,10 +923,11 @@ object FlitCircleSync {
      * silently drop an event whose persistence failed on an earlier tick.
      * Bodies must parse as one bounded JSON object before a reducer sees them.
      */
-    private fun fresh(state: CircleState, events: List<CircleEvent>): List<CircleEvent> =
+    internal fun fresh(state: CircleState, events: List<CircleEvent>): List<CircleEvent> =
         CircleCore.dedup(CircleCore.order(events.filter { event ->
             event.circleId == state.id &&
                 (event.type != CircleEvent.FILE || CircleCore.validFileBody(event.body)) &&
+                (event.type != CircleEvent.PARCEL || CourierCarryCore.validParcelBody(event.body)) &&
                 circleBodyReadable(event.body) &&
                 CircleCore.verify(event) &&
                 state.events.none { it.id == event.id }
@@ -688,28 +968,37 @@ object FlitCircleSync {
 
         dialBounded(targets) { fp ->
             // Per-peer delta: two members can be at different points in the log.
-            val delta = circleDelta(current.events, watermarks[fp])
+            // Re-read so an earlier answer's bag write is visible to this peer.
+            val state = storedState(current) ?: current
+            val delta = circleDelta(state.events, watermarks[fp])
+            val selected = parcelEventsFor(state, fp, now)
+            val offered = (delta + selected.map { it.event }).distinctBy { it.id }
+                .take(CircleCore.MAX_EVENTS_PER_REQUEST)
             val request = CircleRequest(
                 action = CircleRequest.ACTION_SYNC,
-                circleId = current.id,
+                circleId = state.id,
                 invite = "",
                 memberFp = me,
-                events = delta,
+                events = offered,
                 body = "",
             )
             val route = dial(fp)
             if (route == null) {
                 log("circle fan-out: no route to ${fp.take(12)}")
+                concludeHandoff(selected, ok = false)
                 noteFailure(fp, now)
                 return@dialBounded
             }
             val resp = runCatching { route.sync(request) }.getOrNull()
             if (resp == null || !resp.ok) {
                 log("circle fan-out: ${fp.take(12)} refused ${resp?.reason ?: "no answer"}")
+                concludeHandoff(selected, ok = false)
                 noteFailure(fp, now)
             } else {
-                log("circle fan-out: ok to ${fp.take(12)} (${delta.size} event(s) offered)")
+                log("circle fan-out: ok to ${fp.take(12)} (${offered.size} event(s) offered)")
                 circleAckOf(delta)?.let { watermarks[fp] = it }
+                concludeHandoff(selected, ok = true)
+                courierReceive(state, resp.events)
                 noteSuccess(fp)
             }
         }
@@ -746,8 +1035,10 @@ object FlitCircleSync {
      * is invented when the engine already loaded one.
      */
     private fun identity(): TlsIdentity? {
+        identityHook?.invoke()?.let { return it }
         cachedIdentity?.let { return it }
         return synchronized(this) {
+            identityHook?.invoke()?.let { return@synchronized it }
             cachedIdentity?.let { return@synchronized it }
             val dir = context()?.filesDir ?: return@synchronized null
             val file = File(dir, "flit-identity.p12")

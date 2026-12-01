@@ -15,11 +15,27 @@ Rules applied here:
   test is written "test-evidenced only" and named in the limitations list.
 - Where hardware was absent, the text says **not verified** rather than
   implying a green rig covers it. Current examples: phone-to-phone RFCOMM,
-  a three-or-more-member Circle mesh, Wi-Fi Aware (feature absent on the rig
-  phone), and outbound phone→host Circle fan-out as a device observation.
-- Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302, 356)
-  are snapshots of earlier commits, not the current inventory. The current
-  figure is 378 after the 2026-11-30 courier CLI layer.
+  a Circle mesh beyond the three-identity baseline (two physical phones or
+  more than three members), Wi-Fi Aware (feature absent on the rig phone),
+  and outbound phone→host Circle fan-out as a device observation. The
+  2026-11-26 three-node walk **is** on-device evidence for a three-identity
+  Circle; it does not prove a larger mesh (§6).
+- Historical counts (30, 76, 86, 115, 121, 126, 145, 183, 231, 286, 302, 356,
+  378, 396) are snapshots of earlier layers, not the current inventory: 356
+  after the 2026-11-27 protocol layer, 378 after the 2026-11-30 CLI layer and
+  396 after the 2026-12-01 App layer. The current figure is 416 after the app QA
+  fixes (138 protocol + 239 app + 39 harness).
+- The 2026-12-01 App layer added 18 courier cases in `app/src/test` (11 in
+  `CourierCardUiTest`, 4 added to `FlitCircleStoreTest`, 3 added to
+  `FlitCircleSyncTest`), recorded from a green `--rerun-tasks` run (§4.2).
+  The counts come from the JUnit XML, not from a target figure.
+- The app QA fixes after the 2026-12-01 App layer added 20 cases on top of that
+  396 inventory: 2 in the new `CourierAuthorizationTest` (protocol), 11 in the
+  app (10 more in `FlitCircleSyncTest`, 1 more in `CourierCardUiTest`) and 7 in
+  the harness (5 more in `CourierCliTest`, 2 more in
+  `CourierCarrierHarnessTest`). They take the rig from 396 to 416, recorded from
+  the JUnit XML, not from a target figure. The two QR parcel protocol classes
+  in §4.1 are added on top of this 416 baseline with counts still TBD.
 - The protocol module is JVM-pure by hard rule. The app module's unit tests are
   JVM tests of Android-free seams; they import no Android framework class and
   use no Robolectric (the note at `app/src/test/kotlin/app/flit/share/FlitSpoolTest.kt:11`
@@ -30,10 +46,10 @@ Rules applied here:
 
 | Module | Role | Test count | Test task | Where it runs |
 | --- | --- | --- | --- | --- |
-| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **136** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
-| `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **210** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
-| `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **32** | `:harness:test` | JVM, in-process with real endpoints |
-| **Total** | Three modules, three roles | **378** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
+| `protocol/` | Wire engine: JSON DTOs, UDP discovery, TLS/mTLS, HTTP server/client, relay core, Circle core, courier codec | **138** | `:protocol:test` | JVM only (JDK 21 toolchain, `protocol/build.gradle.kts:6-8`) |
+| `app/` | Android shell (Compose), `app.flit.share`, version 0.2.0, minSdk 26, compile/targetSdk 36 | **239** | `:app:testDebugUnitTest` | JVM unit tests of pure seams; no emulator, no device |
+| `harness/` | Desktop companion `flit-cli`; the rig for interop, relays, Circle bots and the courier carrier | **39** | `:harness:test` | JVM, in-process with real endpoints |
+| **Total** | Three modules, three roles | **416** | see §3 | 0 failures, 0 errors, 0 skipped at last green |
 
 Each module declares `testImplementation(kotlin("test"))` plus the JUnit
 Platform launcher (`protocol/build.gradle.kts:23-24`,
@@ -70,28 +86,34 @@ zip, with `--no-daemon --stacktrace` (`.github/workflows/rig.yml:35-43`):
 Two notes about these commands:
 
 1. The README command does **not** include `:harness:test`. The 302-test figure
-   (which includes the 10 harness tests) is realized by the CI command, or by
-   adding `:harness:test` locally. A local run of exactly the README line
-   executes 292 tests (82 + 210) and still assembles the CLI.
+   (which includes the 10 harness tests) was realized by the CI command, or by
+   adding `:harness:test` locally; that baseline's README line ran 292 tests
+   (82 + 210). On the current tree the same README line runs 377 tests
+   (138 + 239) and the CI command runs 416 (138 + 239 + 39).
 2. `assembleRelease` falls back to the debug key when the local-only, gitignored
    `keystore.properties` is absent (`.github/workflows/rig.yml:36-38`,
    `app/build.gradle.kts:15-33`). That is a build-integrity check, not a
    release-signing verification.
 
-**Verification record.** The three test tasks were run fresh
-on 2026-11-25 in `/home/szszszs/flit` (JDK 21.0.13, Gradle 8.14.3):
+**Verification record.** The three test tasks were run fresh with
+`--rerun-tasks` in `/home/szszszs/flit` (JDK 21.0.13, Gradle 8.14.3):
 
 ```bash
 source env.sh && ./gradlew --no-daemon --rerun-tasks \
   :protocol:test :app:testDebugUnitTest :harness:test
 ```
 
-Result: `BUILD SUCCESSFUL`, **136 protocol + 210 app + 32 harness = 378 tests,
+Result: `BUILD SUCCESSFUL`, **138 protocol + 239 app + 39 harness = 416 tests,
 0 failures, 0 errors, 0 skipped**, read from the XML result files under each
-module's `build/test-results/test/`. The `--rerun-tasks` flag was deliberate:
-an earlier invocation reported all test tasks `UP-TO-DATE` and left XML from an
-older class layout in place (see §8). The 302-test baseline was green at
-`72225f8`; the added cases are listed in §4.1 and §4.3.
+module's `build/test-results/test/`. Provenance: the 2026-11-25 date belongs to
+the earlier 302-test baseline and the stale-XML incident in §8, not to the
+courier counts. The fresh run after the 2026-11-30 CLI layer recorded
+136 + 210 + 32 = 378; the run after the 2026-12-01 App layer recorded 396; the
+latest fresh run, after the app QA fixes, recorded 416. The `--rerun-tasks`
+flag was deliberate: an earlier invocation
+reported all test tasks `UP-TO-DATE` and left XML from an older class layout in
+place (see §8). The 302-test baseline was green at `72225f8`; the added cases
+are listed in §4.1, §4.2 and §4.3.
 
 ## 4. Test inventory by module and class
 
@@ -103,7 +125,7 @@ and `TlsIdentityTest.kt` contains the class `PinCacheTest`
 (`.../TlsIdentityTest.kt:16`). Do not "fix" these by renaming without updating
 this table.
 
-### 4.1 Protocol — 136 tests (82 baseline + 54 courier)
+### 4.1 Protocol — 138 tests (82 baseline + 54 courier + 2 QA)
 
 | Class | # | What it pins |
 | --- | --- | --- |
@@ -138,7 +160,31 @@ run. These classes carry no device evidence.
 | `CourierCarryDecisionTest` | 14 | `evaluate` precedence and bounded `MAX_PARCELS` quota, TTL derived only from `createdMs + MAX_PARCEL_TTL_MS`, and `ack`, `select`, `expire`, `merge` and `clear` on `CarryState`. |
 | `CourierIntegrationTest` | 6 | `seal` → `parcel` → carry fold → `open` → `CircleCore.verify` chain; `PARCEL` listed in `CircleEvent.TYPES` with existing verb values and DTO fields unchanged. |
 
-### 4.2 App — 210 tests
+#### Protocol QA addition — 2 cases
+
+The case below is part of the 416 baseline, not of the 82-protocol / 302-total
+baseline. It comes from the same fresh `--rerun-tasks` run as the app and harness
+QA additions below. It carries no device evidence.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `CourierAuthorizationTest` (new) | 2 | `seal` refuses a recipient certificate whose fingerprint differs from `toFp`; `open` yields signature-valid non-member JOIN and REKEY events that the app and CLI gates must refuse. |
+
+#### QR parcel additions — counts TBD
+
+The two classes below belong to the 2026-12-03 QR parcel codec layer. Both are
+JVM-pure, live in `app.flit.share.protocol.parcel` and carry no device evidence.
+Their counts are **TBD** until the classes land and a fresh `--rerun-tasks` run
+records them; they are added on top of the 138 protocol / 416 rig baseline
+above, so §2, §3 and §10 move up by their combined count once known. No camera,
+Android, socket or persistence claim is made here.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `ParcelCodecTest` (new) | TBD | Frame grammar of one opaque UTF-8 `String` per QR frame with `FRAME_MAGIC = "FLITPARCEL1"`, CRC32 per frame and caps `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, `MAX_AIR_GAP_PARCEL_BYTES = 131072`; `parse` yields a `FrameDescriptor(parcelId, seq, count, totalBytes, crc)` on framed input and `null` on malformed input; `encodeParcel` uses `CourierEnvelope.seal`, `complete` verifies frames/CRC/sequence/count/digest/recipient and opens through `CourierEnvelope.open`, returning the exact `ParcelPayload(parcelId, recipientFp, signerFp, sha256, bytes)`; round-trips over single-frame and multi-frame payloads with scrambled frame order. |
+| `ParcelCodecTamperTest` (new) | TBD | Refusals at the frame seam: a changed byte under the per-frame CRC, bad magic or scheme, out-of-range `seq`/`count`/chunk and byte caps, a missing frame, a whole-parcel digest mismatch, a forged envelope signature and a wrong recipient fingerprint all return `null` from `parse`/`complete` with no bytes released; a pairing-code string is never accepted as a parcel. |
+
+### 4.2 App — 239 tests (210 baseline + 18 courier + 11 QA)
 
 All are JVM tests of Android-free seams: codecs, reducers, pure policy math and
 rendered QR pixels. They never start the Android framework, an engine or a
@@ -164,7 +210,38 @@ radio.
 | `SharingRestoreTest` | 11 | Fresh row not desired, absent/blank/corrupt decode safe, `with` flips and stamps, envelope can grow, idempotent encode/decode, old bare-word rows, restore only after process death and not when already up/starting. |
 | `SheetUiTest` | 3 | Initials from first two words, stable in-range hue per fingerprint, count phrasing rule of one. |
 
-### 4.3 Harness — 32 tests (10 baseline + 22 courier)
+#### Courier app additions — 18 cases
+
+The three app test files below belong to the 2026-12-01 App layer. Per-class
+counts come from the JUnit XML after a green `--rerun-tasks` run: 11 + 4 + 3 =
+18 cases, taking the app module from 210 to 228 and the rig from 378 to 396 in
+§2. No row below carries device evidence.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `CourierCardUiTest` (new) | 11 | Android-free JVM class: `carryOutcome` maps `waiting`/`handed`/`failed` exactly and reads blank, mixed-case and unknown values as `WAITING`; `courierLine` returns the five exact copy rows (courier waiting, courier failed, courier handed, recipient, third member) and never applies a non-courier device's `HANDED` outcome; `aliasOf` bounds a label at `MAX_ALIAS_CHARS = 64` with an `fp.take(8)` fallback; a long Base64-like `name` and `fromFp` stay out of the copy; `courierLine(null, …)` and a blank SHA-256 draw no line; `openAffordance` covers `RESOLVING`/`LANDED`/`ABSENT`, case-folds hashes and gives `ABSENT` for a blank or unmatched SHA; landed precedence holds while a carry line exists. No Android imports, no Robolectric, no `parcel` event or envelope constructed. |
+| `FlitCircleStoreTest` (added cases) | 4 | `courierBag` absent on old rows via the blank default, `encode`/`decode` roundtrip, tolerant decode of a corrupt bag row to an empty bag, and a bag write through `update` leaving events, roster and deliveries intact. |
+| `FlitCircleSyncTest` (added cases) | 3 | `circleBodyValid` accepts only the closed `{"toFp","envelope"}` key set for `PARCEL` and refuses blank, oversized and wrong-typed fields; `circleParcelBody` mints a two-key body that passes that gate and carries the envelope verbatim, with no `sha256`, path or token key. |
+
+These three sync cases pin the gate and the minted body; they do not claim a
+runtime fold. The app fold path is `FlitCircleSync.fresh() → persistEvents() →
+FlitCircleStore.upsert`, not `merge`.
+
+The additive `CircleScreen(...)` `courierHandoffs` parameter is a CODE check, not
+a counted runtime case: an old-style call without it must still resolve.
+
+#### App QA additions — 11 cases
+
+The cases below are part of the current 239 app / 416 rig baseline, added after
+the 2026-12-01 App layer. They are counted from the JUnit XML, not from a target
+figure, and carry no device evidence.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `FlitCircleSyncTest` (added cases) | +10 | `postParcel` signs a closed two-key body and offers the emitted event to peers; an invalid envelope is refused without signing or fanning out; `courierTrack` keys normalised shas by the emitted parcel event id and publishes each handoff once; `concludeHandoff` publishes `failed` on refusal or throw and keeps the sha for a later handoff; blank ids/shas publish nothing; `courierReceive` folds a parcel already in the local log, opens one addressed to me into a `waiting` handoff, refuses a forged parcel while folding ordinary verified events and rejects opened events from a non-member author or privileged verb; rejoin keeps the courier bag alongside delivery rows. |
+| `CourierCardUiTest` (added cases) | +1 | Courier copy rows match fingerprints case-insensitively after trimming. |
+
+### 4.3 Harness — 39 tests (10 baseline + 22 courier + 7 QA)
 
 The two baseline classes run the **production** endpoints in one JVM. `CircleHarnessTest`
 hosts through `ConsoleDelegate.circleHost` behind a real TLS `ProtocolServer`
@@ -188,7 +265,18 @@ on one box.
 | Class | # | What it pins |
 | --- | --- | --- |
 | `CourierCliTest` | 15 | Pure seams in `harness/src/test/kotlin/app/flit/share/harness/CourierCliTest.kt`: `courier.state` encode/decode round-trip and tolerant decode of absent, short and corrupt files; the `nextState` transition map (`pending → carried` on CARRY, `pending|carried → delivered` on RECEIVE_OK, anything → `refused` on RECEIVE_REFUSED, expiry on SWEEP at `nowMs >= expiresMs`) including a thrown `open` leaving the row `pending`; the recipient-cert fingerprint gate against `--to`; TTL and quota decisions with an injected `nowMs`; deterministic `<id>.parcel` naming and the state-count line. No sockets and no endpoints. |
-| `CourierCarrierHarnessTest` | 7 | In-process CLI handoff with two CLI-state nodes on distinct `FLIT_HARNESS_HOME` values and fresh temp roots: `drop` seals a signed event into a bag, `carry` marks rows carried, `receive --bag` opens the parcel and folds the event into `circle.state`; a third-fingerprint parcel stays `pending` and is re-exported; a tampered parcel is refused and quarantined; an expired parcel is swept; a duplicate id does not double-fold; a bad `--to` cert writes no file. Decoding goes through `CourierCarry` and opening through `CourierEnvelope`, never a lookalike cipher; payloads are seeded and rows asserted by exact value. |
+| `CourierCarrierHarnessTest` | 7 | In-process CLI handoff with two CLI-state nodes on distinct `FLIT_HARNESS_HOME` values and fresh temp roots: `drop` seals a signed event into a bag, `carry` marks rows carried, `receive --bag` opens the parcel and folds the event into `circle.state`; a third-fingerprint parcel stays `pending` and is re-exported; a tampered parcel is refused and quarantined; an expired parcel is swept; a duplicate id does not double-fold; a bad `--to` cert writes no file. Decoding goes through `CourierCarryCore` and opening through `CourierEnvelope`, never a lookalike cipher; payloads are seeded and rows asserted by exact value. |
+
+#### Harness QA additions — 7 cases
+
+The cases below are part of the current 39 harness / 416 rig baseline, added
+after the 2026-11-30 CLI layer. They are counted from the JUnit XML and carry no
+device evidence — the bag moves between directories on one box.
+
+| Class | # | What it pins |
+| --- | --- | --- |
+| `CourierCliTest` (added cases) | +5 | Courier constants pin the on-disk and exit-code contract; bag and state paths root at `FLIT_HARNESS_HOME` with the fixed names; an explicit `--bag` overrides only the bag path, a relative one roots under the harness home and an absolute one is kept; the parcel file is the envelope id plus the fixed suffix under the bag. |
+| `CourierCarrierHarnessTest` (added cases) | +2 | An unopened parcel survives production encode → decode → encode byte-for-byte; a parcel whose open cannot conclude stays `pending` and returns success. |
 
 ## 5. What the suites establish, by flow
 
@@ -252,8 +340,9 @@ the level column is the strongest level actually available. A row marked
 | Interop with a real v2.2 peer | **Harness/sim** (loopback CLI) + **on-device** (wireless day 2) | `localsend-cli` v1.18.2 both directions: our receive `recv-ok`, our send `sent 1/1` byte-identical. Day 1's multicast row was later corrected: day 2 proved phone↔box multicast both directions once the app's announce TX was wired; it was not a permanent kernel failure. | `interop/README.md` T0/T1, W0-W5 and "Corrects day-1 T0-m" |
 | BLE permission/radio/hotspot UX on one phone | **On-device** | 2026-10-29/30 walks: system permission sheet and enable dialog presented once each, radio flip lines, hotspot classifier in three parts, 8-minute idle soak with empty crash buffer. | `docs/bluetooth-carrier.md:192-262` |
 | Phone-to-phone RFCOMM transfer | **Not verified** | No second phone; bench box has no Bluetooth adapter (`bluetoothctl list` empty). Only the toggle → `bluetooth link: listening` smoke and the pipe parity/`bt-sim` sim were run. | `docs/bluetooth-carrier.md:266-278` |
-| Three-or-more-member Circle mesh | **Not verified** | Only the two-node phone+CLI walk exists; a real multi-member mesh needs hardware not on this rig. | `docs/circle.md:326-327,360-361` |
-| Outbound phone→host Circle fan-out as a device observation | **Test-evidenced only** | Behavioural fan-out tests pass with an injected carrier; device walk could not produce a clean peer-side confirmation because demo bots' CLI state and their `serve` process shared identities. | `docs/circle.md:312-319,357-361` |
+| Three-identity Circle coordination on hardware | **On-device** | 2026-11-26 baseline walk: phone host A (`992AD6C9…`) plus CLI bots B (`2A61BF69…`) and C (`49182145…`) in one circle, 3 members, gen=0; B's message reached C, C and the phone voted on a poll with latest-per-member tally, a 25-byte file drop from B landed hash-exact on the phone with `Landed here`, and B was promoted admin then kicked C with rekey and C refused as a non-member. | `docs/completions/2026-11-26-three-node-baseline.md` |
+| Mesh beyond three identities / two physical phones | **Not verified** | The baseline has three identities — one phone and two one-shot CLI bots on one box. No second physical phone, no phone-to-phone RFCOMM and no larger mesh were on the rig; the older `docs/circle.md` limitation is superseded only for the exact three-identity case. | `docs/completions/2026-11-26-three-node-baseline.md:79-90` |
+| Outbound phone→host Circle fan-out as a device observation | **Test-evidenced only** | Behavioural fan-out tests pass with an injected carrier; the 2026-11-24 walk could not produce a clean peer-side confirmation because demo bots' CLI state and their `serve` process shared identities. The 2026-11-26 walk repeated the gap: a phone-composer event rendered in the phone feed and logged `full-log repair to 2 peer(s)` with two `refused no answer` lines, but neither one-shot CLI puller's `circle.state` showed it. | `docs/circle.md:312-319,357-361`; `docs/completions/2026-11-26-three-node-baseline.md:35-41` |
 | Wi-Fi Aware carrier | **Not verified (hardware absent)** | `adb shell pm has-feature android.software.wifi.aware` answered `false` on the rig phone (2026-11-21); no Aware carrier built. | `docs/transport-bluetooth.md:96-100` |
 | MIUI autostart/battery and Android 15 `dataSync` 6 h cap | **ROM/OS limit** | MIUI can still kill the process; the persisted row restores sharing on the *next* open, not autonomously. At the `dataSync` cap `onTimeout()` drops the notification to avoid a system crash while a Flit screen is open; no background guarantee after the last surface closes. | `docs/open-file-and-sharing-restore.md:198-217`, README:86-87 |
 
@@ -464,5 +553,11 @@ the mitigation each test uses.
 
 Historical counts in those docs describe the suite at the time they were
 written: 30 at B0, 76 at milestone 1, 86 at milestone D, 115 at milestone E,
-then 121, 126, 145, 183, 231, 286 and 302 at `72225f8`. The CI workflow header
-(`.github/workflows/rig.yml:1-3`) still quotes 36/67/4; that line is stale.
+then 121, 126, 145, 183, 231, 286 and 302 at `72225f8`, 356 after the
+2026-11-27 protocol layer (136 + 210 + 10), 378 after the 2026-11-30 CLI layer
+(136 + 210 + 32), 396 after the 2026-12-01 App layer (136 + 228 + 32) and 416
+after the app QA fixes (138 + 239 + 39). The two QR parcel protocol classes in
+§4.1 are pending with TBD counts on top of that 416 baseline; no figure is
+claimed for them until a fresh `--rerun-tasks` run records one. The CI workflow
+header (`.github/workflows/rig.yml:1-3`) still quotes 36/67/4; that line is
+stale.

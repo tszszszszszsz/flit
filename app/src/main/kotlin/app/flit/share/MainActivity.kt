@@ -1,5 +1,7 @@
 package app.flit.share
 
+import app.flit.share.protocol.circle.CircleCore
+import app.flit.share.protocol.circle.CircleEvent
 import android.Manifest
 import android.content.ClipData
 import android.content.Context
@@ -155,6 +157,11 @@ private const val FILE_PROVIDER_AUTHORITY = "app.flit.share.fileprovider"
 
 /** Saved-instance key: the share-sheet SEND was already consumed by this task. */
 private const val KEY_SHARE_CONSUMED = "shareIntentConsumed"
+
+/** Newest signed file announcements one courier parcel carries. Each event
+ *  carries a cert and signature, so the envelope's plaintext cap fits only a
+ *  few; the engine re-verifies and refuses on any oversized seal. */
+private const val COURIER_DROP_MAX_FILE_EVENTS = 4
 
 /** QrAdd is not Parcelable; its own URI is the canonical, round-trippable form.
  *  Compose's MutableState overload wants Saver<T, …> where T is the VALUE type. */
@@ -526,6 +533,8 @@ class MainActivity : ComponentActivity() {
         val circleEvents by FlitEngine.circleEvents.collectAsState()
         // Only shas with a copy actually openable on THIS device get an Open action.
         val landedShas by FlitEngine.circleLandedShas.collectAsState()
+        // Process-local courier outcomes keyed by SHA-256; the file card reads its carry line from this.
+        val courierHandoffs by FlitEngine.courierHandoffs.collectAsState()
         // Full fingerprint (not the short hero form) is what event authors are
         // compared against in the feed; identity loads async, so track it.
         val meFp by remember(circleState) {
@@ -1387,6 +1396,19 @@ class MainActivity : ComponentActivity() {
                                         meFp = meFp,
                                         onPost = { text -> FlitEngine.circlePost(text) },
                                         onFile = { pickCircleFile.launch(arrayOf("*/*")) },
+                                        onCourierDrop = { fp ->
+                                            // The member sheet hands us the absent member's
+                                            // fingerprint. Carry the newest signed file
+                                            // announcements they may have missed; the engine
+                                            // re-verifies and refuses without their cert.
+                                            val files = circleEvents
+                                                .filter {
+                                                    it.type.equals(CircleEvent.FILE, ignoreCase = true) &&
+                                                        CircleCore.verify(it)
+                                                }
+                                                .takeLast(COURIER_DROP_MAX_FILE_EVENTS)
+                                            FlitEngine.circleCourierDrop(files, fp)
+                                        },
                                         onOpenFile = { sha ->
                                             val key = sha.trim().lowercase(Locale.ROOT)
                                             openingSha256 = key
@@ -1430,6 +1452,7 @@ class MainActivity : ComponentActivity() {
                                         onBack = { showCircle = false },
                                         landedSha256 = landedShas,
                                         openingSha256 = openingSha256,
+                                        courierHandoffs = courierHandoffs,
                                     )
                                     snackbarHost(
                                         Modifier

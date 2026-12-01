@@ -142,8 +142,9 @@ data class CourierEnvelope(
          * Seals [events] to [recipientCert] with a fresh content key, signs the
          * canonical bytes with [identity] and returns null when any input is
          * refused: a missing recipient certificate, a sender fingerprint that
-         * is not the signer's own, an oversized plaintext or an oversized
-         * resulting envelope. No envelope is created on refusal.
+         * is not the signer's own, a recipient certificate whose fingerprint is
+         * not [toFp], an oversized plaintext or an oversized resulting envelope.
+         * No envelope is created on refusal.
          */
         fun seal(
             events: List<CircleEvent>,
@@ -163,6 +164,10 @@ data class CourierEnvelope(
             if (targetFp.isBlank() || targetFp.length > CircleCore.MAX_FIELD_CHARS) return null
             if (nowMs <= 0L) return null
             if (!identity.fingerprint.equals(senderFp, ignoreCase = true)) return null
+            // Bind the wrapping key to the claimed recipient in the codec too:
+            // callers already check this, but seal must not seal to a cert that
+            // does not match targetFp even if a caller skips that check.
+            if (!TlsIdentity.fingerprintOf(recipientCert).equals(targetFp, ignoreCase = true)) return null
             if (events.any { !CircleCore.validShape(it) }) return null
 
             val plaintext = runCatching { WireJson.encode(events) }.getOrNull() ?: return null

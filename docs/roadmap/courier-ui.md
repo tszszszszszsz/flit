@@ -12,7 +12,7 @@ File-card presentation for Circle file drops delivered through a courier, driven
 - 2026-11-26 — Device: the three-node baseline walk. It records that the M3 feed and the file card already work with the phone and two CLI identities before a carrier is added.
 - 2026-11-27 — Protocol: the courier envelope and carry core. The `parcel` event body is exactly `{"toFp","envelope"}`, gated by `parcelOf`, with `MAX_ENVELOPE_CHARS = 12 * 1024`; the envelope carries signed Circle events, not card fields. This file consumes none of those bytes directly.
 - 2026-11-30 — CLI: the courier carrier. It supplies the box-side carry loop used to generate handoffs during development.
-- Same-day boundary: `courier-sync.md` opens the envelope at the addressee, folds the decrypted events through `FlitCircleStore.merge` and publishes `FlitEngine.courierHandoffs`. The screen declares its `courierHandoffs` parameter with an empty-map default, so the feed compiles and renders when that flow is not yet supplied.
+- Same-day boundary: `courier-sync.md` opens the envelope at the addressee, folds the decrypted events through `FlitCircleSync.fresh()` → `persistEvents()` → `FlitCircleStore.upsert` and publishes `FlitEngine.courierHandoffs`. The screen declares its `courierHandoffs` parameter with an empty-map default, so the feed compiles and renders when that flow is not yet supplied.
 
 ## Scope
 
@@ -58,7 +58,7 @@ Constants: `HANDOFF_WAITING = "waiting"`, `HANDOFF_HANDED = "handed"`, `HANDOFF_
 
 **Compose seams — edited file.** `app/src/main/kotlin/app/flit/share/CircleUi.kt`:
 
-- `computeFeedData(events, members, meFp)` filters out events whose type is `parcel` before parsing bodies and tallies. No `CircleCard.PARCEL` value and no `parcel` branch are added to `parseBody`; an envelope is transport metadata, not a chat row. Decrypted `file` events are already in `st.events` through `FlitCircleStore.merge` and keep rendering through the existing `"file"` branch with its exact `{name,size,sha256}` body.
+- `computeFeedData(events, members, meFp)` filters out events whose type is `parcel` before parsing bodies and tallies. No `CircleCard.PARCEL` value and no `parcel` branch are added to `parseBody`; an envelope is transport metadata, not a chat row. Decrypted `file` events are already in `st.events` through `FlitCircleSync.fresh()` → `persistEvents()` → `FlitCircleStore.upsert` and keep rendering through the existing `"file"` branch with its exact `{name,size,sha256}` body.
 - `FileCard` takes one additive private parameter, `carryLine: String? = null`, rendered above the existing status line. `FeedRow` passes `carryLine = courierLine(handoffs[body.sha256], meFp, members)`. The current local-count line and the three Open states stay as they are.
 - `CircleScreen` gains one additive parameter, `courierHandoffs: Map<String, CourierCardUi.CourierHandoff> = emptyMap()`. Old callers keep compiling. `MainActivity.kt:1383-1433` passes `FlitEngine.courierHandoffs.collectAsState()` at the new argument; the existing `landedSha256` and `openingSha256` arguments are untouched.
 - `FlitEngine.refreshCircle()` includes the handoff map in the content-diff signature at `FlitEngine.kt:387-395`. Parcel events need no new signature term because they are already part of `events`.
@@ -140,7 +140,7 @@ A leave clears the local handoff map and the signed log; a rekey does not clear 
 
 ## Evidence for this day
 
-Recorded in `docs/completions/2026-12-01.md` when the work is done:
+Recorded in `docs/completions/2026-12-01-courier-app.md` when the work is done:
 
 - PURE: the `CourierCardUiTest` case count and the app module count read from the JUnit XML after `--rerun-tasks`; the exact set of states and copy rows pinned by those tests.
 - CODE: the new `CourierCardUi.kt` with `CourierHandoff`, `CarryOutcome` and `openAffordance`; the `parcel` filter in `computeFeedData`; the additive `carryLine` seam in `CircleUi.kt`; the additive `courierHandoffs` argument and the `MainActivity` call-site change.

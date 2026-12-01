@@ -12,6 +12,10 @@ scheduled weekdays; work finished early is held until its assigned date.
 The 2026-11-30 CLI layer is built ahead of its scheduled day. The code is
 written now, but the commit stays on 2026-11-30; no earlier date carries it.
 
+The 2026-12-03 Protocol layer is built ahead of its scheduled day. The QR
+parcel frame codec code and tests are written now, but the commit stays on
+2026-12-03; no earlier date carries it.
+
 ## Dates
 
 | Date | Layer | Commit scope |

@@ -125,6 +125,20 @@ fun CircleScreen(
     landedSha256: Set<String> = emptySet(),
     /** sha256 currently being resolved/opened; drives the disabled/loading card state. */
     openingSha256: String? = null,
+    /**
+     * SHA-256 → courier-local handoff projection supplied by FlitEngine. It is
+     * process-local: never signed, persisted or gossiped. A file card reads one
+     * entry by its sha to draw a carry line; no entry means no line. Defaults to
+     * empty so callers written before courier support keep compiling and the
+     * feed renders unchanged until the flow is supplied.
+     */
+    courierHandoffs: Map<String, CourierCardUi.CourierHandoff> = emptyMap(),
+    /**
+     * Additive courier entry point. The member sheet calls this with a member
+     * fingerprint; the caller decides which signed FILE events to seal for it.
+     * The no-op default keeps older call sites compiling and rendering.
+     */
+    onCourierDrop: (String) -> Unit = {},
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
@@ -153,6 +167,11 @@ fun CircleScreen(
     }
     val openingHash = remember(openingSha256) {
         openingSha256?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
+    }
+    // Handoff keys are SHA-256 values from the sync layer. Normalise them like
+    // the landed set so a case or whitespace difference cannot hide a carry line.
+    val handoffs = remember(courierHandoffs) {
+        courierHandoffs.mapKeys { (sha, _) -> sha.trim().lowercase(Locale.ROOT) }
     }
     // Every poll and kick card used to walk the whole log once per member and
     // re-parse each vote body on the main thread. Do the work once here for the
@@ -240,33 +259,33 @@ fun CircleScreen(
             }
         }
         var seenIds by remember { mutableStateOf(emptySet<String>()) }
-        LaunchedEffect(state?.id, events) {
-            if (events.isEmpty()) {
+        LaunchedEffect(state?.id, feedData.events) {
+            if (feedData.events.isEmpty()) {
                 seenIds = emptySet()
                 return@LaunchedEffect
             }
             // Look at everything newly appended, not just the last event: a
             // batch may place another member's event after our own send.
-            val fresh = events.filterNot { it.id in seenIds }
-            seenIds = events.mapTo(HashSet(events.size)) { it.id }
+            val fresh = feedData.events.filterNot { it.id in seenIds }
+            seenIds = feedData.events.mapTo(HashSet(feedData.events.size)) { it.id }
             if (fresh.isEmpty()) return@LaunchedEffect
             // Follow our own send unconditionally; follow someone else only
             // when the reader was already at the bottom, so reading history
             // is never yanked away by an incoming message.
             if ((selfFp.isNotBlank() && fresh.any { it.authorFp == selfFp }) || atBottom) {
-                feedState.animateScrollToItem(events.lastIndex)
+                feedState.animateScrollToItem(feedData.events.lastIndex)
             }
         }
         when {
             state == null -> PendingFeed(Modifier.weight(1f))
-            events.isEmpty() -> EmptyFeed(Modifier.weight(1f))
+            feedData.events.isEmpty() -> EmptyFeed(Modifier.weight(1f))
             else -> LazyColumn(
                 state = feedState,
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                itemsIndexed(events, key = { _, event -> event.id }) { index, event ->
+                itemsIndexed(feedData.events, key = { _, event -> event.id }) { index, event ->
                     val body = feedData.parsed[index].body
                     FeedRow(
                         event = event,
@@ -275,15 +294,19 @@ fun CircleScreen(
                         author = members.firstOrNull { it.fp == event.authorFp }?.alias
                             ?: event.authorFp.take(8),
                         members = members,
+                        meFp = selfFp,
+                        handoffs = handoffs,
                         tallies = feedData.tallies,
                         deliveries = deliveries,
-                        // Resolve per card from one normalised set: only a
-                        // landed sha gets an actionable Open; a resolving sha
-                        // gets the disabled/loading state while it opens.
-                        landed = body.sha256.isNotBlank() &&
-                            body.sha256.trim().lowercase(Locale.ROOT) in landedHashes,
-                        opening = body.sha256.isNotBlank() &&
-                            body.sha256.trim().lowercase(Locale.ROOT) == openingHash,
+                        // Resolve the three-state affordance through the shared
+                        // Android-free helper. It folds case and space exactly
+                        // as the old inline checks did, so the card renders the
+                        // same three states from the same normalised inputs.
+                        affordance = CourierCardUi.openAffordance(
+                            body.sha256,
+                            landedHashes,
+                            openingHash,
+                        ),
                         onVote = onVote,
                         onVoteKick = onVoteKick,
                         onOpenFile = onOpenFile,
@@ -400,6 +423,7 @@ fun CircleScreen(
             onStartKick = { fp -> onStartKick(fp); showMembers = false },
             onQr = { onQr(); showMembers = false },
             onLeave = { onLeave(); showMembers = false },
+            onCourierDrop = onCourierDrop,
         )
     }
 }
@@ -468,10 +492,11 @@ private fun FeedRow(
     mine: Boolean,
     author: String,
     members: List<FlitCircleStore.Member>,
+    meFp: String,
+    handoffs: Map<String, CourierCardUi.CourierHandoff>,
     tallies: CircleTallies,
     deliveries: Map<String, FlitCircleStore.CircleDelivery>,
-    landed: Boolean,
-    opening: Boolean,
+    affordance: CourierCardUi.OpenAffordance,
     onVote: (String, Int) -> Unit,
     onVoteKick: (String, Boolean) -> Unit,
     onOpenFile: (String) -> Unit,
@@ -499,8 +524,12 @@ private fun FeedRow(
                     size = body.size,
                     sha256 = body.sha256,
                     delivery = body.sha256.takeIf { it.isNotBlank() }?.let { deliveries[it] },
-                    landed = landed,
-                    opening = opening,
+                    carryLine = CourierCardUi.courierLine(
+                        handoffs[body.sha256.trim().lowercase(Locale.ROOT)],
+                        meFp,
+                        members,
+                    ),
+                    affordance = affordance,
                     onOpenFile = onOpenFile,
                 )
                 CircleCard.POLL -> PollCard(
@@ -547,10 +576,10 @@ private fun FileCard(
     size: Long,
     sha256: String,
     delivery: FlitCircleStore.CircleDelivery?,
-    /** True only when this device actually holds an openable copy of the file. */
-    landed: Boolean,
-    /** True while the caller is resolving/opening this sha; suppresses the action. */
-    opening: Boolean,
+    /** Courier-local carry line, drawn above the status line; null means no handoff. */
+    carryLine: String? = null,
+    /** Three-state Open affordance resolved by [CourierCardUi.openAffordance]. */
+    affordance: CourierCardUi.OpenAffordance,
     onOpenFile: (String) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -592,6 +621,15 @@ private fun FileCard(
                 style = typ.labelMedium,
                 color = cs.onSurfaceVariant,
             )
+            if (carryLine != null) {
+                Text(
+                    text = carryLine,
+                    style = typ.labelSmall,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             if (delivery == null) {
                 // Delivery status is local to the sender and never gossiped.
                 // A recipient has no record even when the bytes already landed
@@ -626,8 +664,8 @@ private fun FileCard(
             //  - otherwise: a plain status line, because an Open here could
             //    only dead-end in a toast ("hasn't landed here yet").
             if (sha256.isNotBlank()) {
-                when {
-                    opening -> TextButton(
+                when (affordance) {
+                    CourierCardUi.OpenAffordance.RESOLVING -> TextButton(
                         enabled = false,
                         onClick = { /* disabled: nothing to do until it resolves */ },
                         modifier = Modifier
@@ -648,7 +686,7 @@ private fun FileCard(
                             Text("Opening…", style = typ.labelMedium)
                         }
                     }
-                    landed -> {
+                    CourierCardUi.OpenAffordance.LANDED -> {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -680,7 +718,7 @@ private fun FileCard(
                             Text("Open file", style = typ.labelMedium, fontWeight = FontWeight.Bold)
                         }
                     }
-                    else -> Text(
+                    CourierCardUi.OpenAffordance.ABSENT -> Text(
                         text = "Not here yet · no local copy to open",
                         style = typ.labelSmall,
                         color = cs.onSurfaceVariant,
@@ -907,6 +945,7 @@ private fun MemberSheet(
     onStartKick: (String) -> Unit,
     onQr: () -> Unit,
     onLeave: () -> Unit,
+    onCourierDrop: (String) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val typ = MaterialTheme.typography
@@ -997,6 +1036,16 @@ private fun MemberSheet(
                                 }
                             }
                         }
+                        // Courier drop targets another member's fingerprint;
+                        // the callback owner selects the signed FILE events.
+                        if (!self) {
+                            TextButton(
+                                onClick = { onCourierDrop(m.fp) },
+                                modifier = Modifier.heightIn(min = 48.dp),
+                            ) {
+                                Text("Courier drop", fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                 }
             }
@@ -1069,6 +1118,7 @@ private data class CircleTallies(
 private val EmptyPollTally = PollTally(emptyMap(), null, 0)
 
 private data class CircleFeedData(
+    val events: List<CircleEvent>,
     val parsed: Array<ParsedEvent>,
     val tallies: CircleTallies,
 )
@@ -1150,6 +1200,12 @@ private fun parseBody(
     }
 }
 
+/** Parcel rows are transport metadata. The signed file events sealed inside an
+ *  envelope are folded into the log by the sync layer and render as ordinary
+ *  cards here; the envelope itself never becomes a chat row. */
+private fun isParcel(event: CircleEvent): Boolean =
+    event.type.trim().lowercase(Locale.ROOT) == CircleEvent.PARCEL
+
 /**
  * Parses each body once, then derives *every* poll and kick tally in one pass.
  * The old path had each card tally independently, which re-walked the log once
@@ -1165,7 +1221,11 @@ private fun computeFeedData(
     members: List<FlitCircleStore.Member>,
     meFp: String,
 ): CircleFeedData {
-    val parsed = Array(events.size) { index -> parseEvent(events[index]) }
+    // Filter before parsing and tallying so parcel bodies are never read and
+    // no "Unsupported circle event · parcel" row is produced. The filtered
+    // list is returned so the LazyColumn indices stay aligned with parsed.
+    val visible = events.filterNot(::isParcel)
+    val parsed = Array(visible.size) { index -> parseEvent(visible[index]) }
 
     // Latest vote per subject per author. Maps keep insertion order irrelevant:
     // only the highest lamport for an author is kept, ties going to the later
@@ -1248,7 +1308,7 @@ private fun computeFeedData(
         kickResults[kickId] = yes to no
     }
 
-    return CircleFeedData(parsed, CircleTallies(pollResults, kickResults))
+    return CircleFeedData(visible, parsed, CircleTallies(pollResults, kickResults))
 }
 
 private fun timeOf(atMs: Long): String =

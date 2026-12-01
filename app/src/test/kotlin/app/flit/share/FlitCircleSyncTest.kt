@@ -2,8 +2,16 @@ package app.flit.share
 
 import app.flit.share.protocol.circle.CircleCore
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.courier.CarryState
+import app.flit.share.protocol.courier.CourierCarryCore
+import app.flit.share.protocol.courier.CourierEnvelope
+import app.flit.share.protocol.courier.CourierParcel
+import app.flit.share.protocol.courier.MAX_ENVELOPE_CHARS
+import app.flit.share.protocol.courier.PARCEL
+import app.flit.share.protocol.courier.PARCEL_BODY_KEYS
 import app.flit.share.protocol.model.CircleRequest
 import app.flit.share.protocol.model.CircleResponse
+import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -677,5 +685,563 @@ class FlitCircleSyncTest {
         assertEquals(0, stillActive, "every permit must be released")
         assertTrue(peak <= CIRCLE_PEER_DIALS, "peak $peak exceeded the dial cap")
         assertEquals(CIRCLE_PEER_DIALS, peak, "the repair tick must also stay bounded")
+    }
+
+    // ==== courier parcel body: closed key set and the body postParcel mints =====
+
+    @Test
+    fun `parcel body gate accepts only the closed toFp envelope key set`() {
+        val good = """{"toFp":"AABB","envelope":"ZW52ZWxvcGU="}"""
+        assertTrue(circleBodyValid(PARCEL, good))
+        assertTrue(circleBodyValid(PARCEL, """{"toFp":"aabb","envelope":"AA=="}"""))
+
+        // The carrier sees only the two keys. Anything that would let a sender
+        // smuggle card fields, a queue token or a parcel phase into a signed
+        // event is refused before an id is reserved.
+        listOf(
+            """"token":"spool"""",
+            """"path":"/cache/circle/a"""",
+            """"spoolPath":"/cache/circle/a"""",
+            """"sha256":"sha"""",
+            """"parcelId":"p"""",
+            """"phase":"carried"""",
+            """"name":"a.gflit","size":12""",
+            """"data":"AA==","bytes":12""",
+        ).forEach { extra ->
+            assertFalse(
+                circleBodyValid(PARCEL, """{"toFp":"AABB","envelope":"AA==",$extra}"""),
+                "extra parcel body key(s) must be refused: $extra",
+            )
+        }
+        assertFalse(circleBodyValid(PARCEL, """{"toFp":"AABB"}"""), "envelope is required")
+        assertFalse(circleBodyValid(PARCEL, """{"envelope":"AA=="}"""), "toFp is required")
+        assertFalse(
+            circleBodyValid("unknown", good),
+            "the gate is per verb; a generic object is not a parcel",
+        )
+    }
+
+    @Test
+    fun `parcel body gate refuses blank oversized and wrong typed fields`() {
+        assertFalse(circleBodyValid(PARCEL, ""))
+        assertFalse(circleBodyValid(PARCEL, "not json"))
+        assertFalse(circleBodyValid(PARCEL, """["toFp","envelope"]"""))
+        assertFalse(circleBodyValid(PARCEL, "x".repeat(CircleCore.MAX_BODY_CHARS + 1)))
+        assertFalse(circleBodyValid(PARCEL, """{"toFp":"","envelope":"AA=="}"""))
+        assertFalse(circleBodyValid(PARCEL, """{"toFp":"AABB","envelope":""}"""))
+        assertFalse(
+            circleBodyValid(
+                PARCEL,
+                """{"toFp":"${"x".repeat(CircleCore.MAX_FIELD_CHARS + 1)}","envelope":"AA=="}""",
+            ),
+            "toFp is bounded by the shared field cap",
+        )
+        assertFalse(
+            circleBodyValid(
+                PARCEL,
+                """{"toFp":"AABB","envelope":"${"x".repeat(MAX_ENVELOPE_CHARS + 1)}"}""",
+            ),
+            "the envelope is bounded so the framed body stays under MAX_BODY_CHARS",
+        )
+        assertFalse(circleBodyValid(PARCEL, """{"toFp":42,"envelope":"AA=="}"""))
+        assertFalse(circleBodyValid(PARCEL, """{"toFp":"AABB","envelope":42}"""))
+    }
+
+    @Test
+    fun `postParcel mints a two-key body that carries the envelope verbatim`() {
+        val envelope = "AAECAw==" // opaque to the carrier: never parsed, re-signed or rewritten
+        val body = circleParcelBody("AABB", envelope)
+        val b = obj(body)
+
+        assertEquals(PARCEL_BODY_KEYS, b.keys)
+        assertEquals("AABB", b.getValue("toFp").jsonPrimitive.content)
+        assertEquals(envelope, b.getValue("envelope").jsonPrimitive.content)
+        assertTrue(circleBodyValid(PARCEL, body), "the body we mint must pass the parcel gate")
+        assertFalse(b.keys.any { it.contains("sha", ignoreCase = true) }, "no file digest on the wire")
+        assertFalse(
+            b.keys.any { it.contains("path", ignoreCase = true) || it.contains("token", ignoreCase = true) },
+            "no local spool path or queue token on the wire",
+        )
+        assertFalse(b.keys.any { it.contains("name", ignoreCase = true) || it.contains("size", ignoreCase = true) })
+    }
+
+    // ==== courier path over the same pure seams =================================
+
+    private companion object {
+        const val COURIER_NOW = 1_800_000_000_000L
+    }
+
+    private fun courierFileEvent(
+        sender: TlsIdentity,
+        sha: String,
+        name: String = "carry.gflit",
+        size: Long = 12L,
+        lamport: Long = 1L,
+    ): CircleEvent = CircleCore.create(
+        "c1", sender.fingerprint, sender, CircleEvent.FILE,
+        circleFileBody(name, size, sha), lamport, COURIER_NOW,
+    )
+
+    private fun courierMessageEvent(sender: TlsIdentity, text: String = "hello"): CircleEvent =
+        CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.MESSAGE,
+            """{"text":"$text"}""", 2L, COURIER_NOW,
+        )
+
+    /** A real sealed envelope so the envelope-id lookup in concludeHandoff works. */
+    private fun sealedParcel(
+        sender: TlsIdentity,
+        recipient: TlsIdentity,
+        inner: List<CircleEvent>,
+        toFp: String = recipient.fingerprint,
+        lamport: Long = 0L,
+    ): Pair<CircleEvent, CourierEnvelope> {
+        val envelope = CourierEnvelope.seal(
+            inner, "c1", sender.fingerprint, toFp, recipient.certificate, sender, COURIER_NOW,
+        ) ?: error("seal refused a well-formed recipient certificate")
+        val event = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.PARCEL,
+            circleParcelBody(toFp, CourierEnvelope.encode(envelope)), lamport, COURIER_NOW,
+        )
+        return event to envelope
+    }
+
+    private fun courierState(
+        me: String,
+        peer: String,
+        vararg parcels: CourierParcel,
+        events: List<CircleEvent> = emptyList(),
+    ): CircleState = state(me, peer).copy(
+        events = events,
+        courierBag = CourierCarryCore.encode(CarryState(parcels.toList())),
+    )
+
+    @Test
+    fun `postParcel signs a closed parcel body and offers the emitted event to peers`() = runBlocking {
+        val id = TlsIdentity.generate()
+        val envelope = "AAECAw=="
+        var current = state("ME", "AABB").copy(events = listOf(event("old", 1L)))
+        val upserted = mutableListOf<CircleEvent>()
+        val sent = mutableListOf<CircleRequest>()
+        installSeam(current, dial = { fp ->
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        FlitCircleSync.identityHook = { id }
+        FlitCircleSync.upsertHook = { evs ->
+            upserted += evs
+            current = current.copy(events = current.events + evs)
+        }
+        FlitCircleSync.stateHook = { current }
+        try {
+            val emitted = FlitCircleSync.postParcel("aabb", envelope)
+            val parcelEvent = assertNotNull(emitted, "postParcel must return the signed event")
+            assertEquals(CircleEvent.PARCEL, parcelEvent.type)
+            assertEquals("c1", parcelEvent.circleId)
+            assertTrue(parcelEvent.authorFp.equals(id.fingerprint, ignoreCase = true))
+            assertTrue(CircleCore.verify(parcelEvent), "the emitted parcel verifies against its own cert")
+            val body = obj(parcelEvent.body)
+            assertEquals(PARCEL_BODY_KEYS, body.keys)
+            assertEquals("AABB", body.getValue("toFp").jsonPrimitive.content)
+            assertEquals(envelope, body.getValue("envelope").jsonPrimitive.content)
+            assertEquals(listOf(parcelEvent), upserted, "the parcel is committed before fan-out")
+            assertEquals(1, sent.size)
+            assertTrue(parcelEvent in sent.first().events, "the peer is offered the newly emitted parcel")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `postParcel refuses an invalid envelope without signing or fanning out`() = runBlocking {
+        val id = TlsIdentity.generate()
+        val upserted = mutableListOf<CircleEvent>()
+        val sent = mutableListOf<CircleRequest>()
+        val logs = mutableListOf<String>()
+        installSeam(state("ME", "AABB"), logs = logs, dial = { fp ->
+            route(fp) { req -> sent += req; CircleResponse(true) }
+        })
+        FlitCircleSync.identityHook = { id }
+        FlitCircleSync.upsertHook = { upserted += it }
+        try {
+            assertNull(FlitCircleSync.postParcel("AABB", ""))
+            assertNull(FlitCircleSync.postParcel("AABB", "x".repeat(MAX_ENVELOPE_CHARS + 1)))
+            assertTrue(upserted.isEmpty(), "no id is reserved and no event is signed")
+            assertTrue(sent.isEmpty(), "a refused parcel never reaches a peer")
+            assertTrue(logs.any { it.contains("invalid parcel body") }, logs.toString())
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierTrack keys normalised shas by the emitted parcel event id and a handoff publishes each once`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val inner = courierFileEvent(sender, "tracked-sha")
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(inner), toFp = recipient.fingerprint)
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
+        var clock = COURIER_NOW
+        var current = courierState("ME", recipient.fingerprint, parcel)
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        installSeam(current, now = { clock }, dial = { fp ->
+            route(fp) { CircleResponse(true) }
+        })
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { sha, outcome -> outcomes += sha to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.courierTrack(" ${parcelEvent.id} ", listOf(" AbC123 ", "abc123", "", "DEF456"))
+        try {
+            FlitCircleSync.sync()
+
+            assertEquals(
+                listOf("abc123" to "handed", "def456" to "handed"),
+                outcomes,
+                "shas are trimmed, lowercased and deduplicated; each is published once",
+            )
+            assertTrue(bagWrites.isNotEmpty(), "an answered handoff must ack the bag")
+            assertTrue(
+                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().isEmpty(),
+                "the handed parcel is removed from the bag",
+            )
+
+            clock += CIRCLE_SYNC_MIN_INTERVAL_MS
+            outcomes.clear()
+            FlitCircleSync.sync()
+            assertTrue(outcomes.isEmpty(), "a second tick must not republish a cleared handoff")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `concludeHandoff publishes failed on refusal or throw and keeps the sha for a later handoff`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val inner = courierFileEvent(sender, "retry-sha")
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(inner), toFp = recipient.fingerprint)
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
+        var clock = COURIER_NOW
+        var current = courierState("ME", recipient.fingerprint, parcel)
+        val outcomes = mutableListOf<Pair<String, String>>()
+        val bagWrites = mutableListOf<String>()
+        var answer = 0
+        installSeam(current, now = { clock }, dial = { fp ->
+            route(fp) {
+                answer += 1
+                when (answer) {
+                    1 -> CircleResponse(false, reason = "offline")
+                    2 -> throw IllegalStateException("socket closed")
+                    else -> CircleResponse(true)
+                }
+            }
+        })
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { sha, outcome -> outcomes += sha to outcome }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.courierTrack(parcelEvent.id, listOf("retry-sha"))
+        try {
+            FlitCircleSync.sync()
+            assertEquals(listOf("retry-sha" to "failed"), outcomes)
+
+            clock += 40_000L
+            FlitCircleSync.sync()
+            assertEquals(
+                listOf("retry-sha" to "failed", "retry-sha" to "failed"),
+                outcomes,
+                "a thrown answer is also a failed handoff",
+            )
+            assertTrue(bagWrites.isEmpty(), "a refusal never acks the bag")
+
+            clock += 40_000L
+            FlitCircleSync.sync()
+            assertEquals(
+                listOf("retry-sha" to "failed", "retry-sha" to "failed", "retry-sha" to "handed"),
+                outcomes,
+                "the retained sha is published as handed once the peer answers",
+            )
+            assertEquals(1, bagWrites.size)
+            assertTrue(CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().isEmpty())
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierTrack ignores blank ids and blank shas and an unopened parcel publishes nothing`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val meFp = recipient.fingerprint
+        val inner = courierFileEvent(sender, "unopened-sha")
+        val (first, _) = sealedParcel(sender, recipient, listOf(inner), toFp = meFp, lamport = 0L)
+        val (second, _) = sealedParcel(sender, recipient, listOf(inner), toFp = meFp, lamport = 1L)
+        var current = courierState(
+            meFp, "AABB",
+            CourierCarryCore.parcelOf(first)!!,
+            CourierCarryCore.parcelOf(second)!!,
+        )
+        val outcomes = mutableListOf<Pair<String, String>>()
+        installSeam(
+            current, now = { COURIER_NOW }, me = meFp,
+            dial = { fp -> route(fp) { CircleResponse(true) } },
+        )
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.handoffHook = { sha, outcome -> outcomes += sha to outcome }
+        FlitCircleSync.courierTrack("  ", listOf("sha"))
+        FlitCircleSync.courierTrack(first.id, listOf("  ", "", " "))
+        try {
+            FlitCircleSync.sync()
+            assertTrue(outcomes.isEmpty(), "only a carrier that opened an envelope knows a sha to publish")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierReceive folds a verified parcel already present in the local log into the bag`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val meFp = recipient.fingerprint
+        val inner = courierFileEvent(sender, "replay-sha")
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(inner), toFp = meFp)
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
+        // The parcel event was persisted on an earlier pass. Its log id must not
+        // stop the carry core from folding the row — carry.evaluate dedups ids.
+        var current = courierState(meFp, "AABB", events = listOf(parcelEvent))
+        val bagWrites = mutableListOf<String>()
+        val published = mutableListOf<CourierCardUi.CourierHandoff>()
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.meHook = { meFp }
+        FlitCircleSync.clockHook = { COURIER_NOW }
+        FlitCircleSync.logHook = { }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.handoffPublishHook = { published += it }
+        try {
+            FlitCircleSync.courierReceive(current, listOf(parcelEvent))
+            assertTrue(bagWrites.isNotEmpty(), "a parcel already in the log must still be folded")
+            assertEquals(
+                listOf(parcel.id),
+                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().map { it.id },
+            )
+            assertTrue(published.isEmpty(), "with no identity hook the opened copy is refused; only the bag row is kept")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierReceive opens a parcel addressed to me and publishes a typed waiting handoff`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val inner = courierFileEvent(sender, "landed-sha", name = "carry.gflit", size = 42L)
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(inner))
+        val parcel = CourierCarryCore.parcelOf(parcelEvent)!!
+        // The opened file event is authored by sender, so sender must be a
+        // current member for openAtMe to fold it into the signed log.
+        var current = courierState(recipient.fingerprint, "AABB").copy(
+            members = listOf(
+                Member(recipient.fingerprint, "", Role.MEMBER),
+                Member("AABB", "", Role.MEMBER),
+                Member(sender.fingerprint, "", Role.MEMBER),
+            ),
+        )
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        val published = mutableListOf<CourierCardUi.CourierHandoff>()
+        val logs = mutableListOf<String>()
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.meHook = { recipient.fingerprint }
+        FlitCircleSync.identityHook = { recipient }
+        FlitCircleSync.clockHook = { COURIER_NOW }
+        FlitCircleSync.logHook = { logs += it }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.handoffPublishHook = { published += it }
+        try {
+            FlitCircleSync.courierReceive(current, listOf(parcelEvent))
+
+            assertTrue(bagWrites.isNotEmpty())
+            assertEquals(
+                listOf(parcel.id),
+                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().map { it.id },
+            )
+            assertEquals(listOf(inner), upserted, "the decrypted file event enters the signed log")
+            assertEquals(1, published.size)
+            val handoff = published.single()
+            assertEquals("landed-sha", handoff.sha256)
+            assertEquals("carry.gflit", handoff.name)
+            assertEquals(42L, handoff.size)
+            assertTrue(handoff.toFp.equals(recipient.fingerprint, ignoreCase = true))
+            assertTrue(handoff.courierFp.equals(sender.fingerprint, ignoreCase = true))
+            assertTrue(handoff.fromFp.equals(sender.fingerprint, ignoreCase = true))
+            assertEquals(CourierCardUi.HANDOFF_WAITING, handoff.outcome)
+            assertTrue(logs.any { it.contains("opened 1 event(s)") }, logs.toString())
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierReceive refuses a forged parcel but still folds ordinary verified events`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val meFp = recipient.fingerprint
+        val inner = courierFileEvent(sender, "forged-sha")
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(inner), toFp = meFp)
+        val forged = parcelEvent.copy(sig = "not-a-signature")
+        val message = courierMessageEvent(sender)
+        var current = courierState(meFp, "AABB")
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        val published = mutableListOf<CourierCardUi.CourierHandoff>()
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.meHook = { meFp }
+        FlitCircleSync.clockHook = { COURIER_NOW }
+        FlitCircleSync.logHook = { }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.handoffPublishHook = { published += it }
+        try {
+            FlitCircleSync.courierReceive(current, listOf(forged, message))
+            assertTrue(bagWrites.isEmpty(), "a forged signature must not reserve a bag row")
+            assertTrue(published.isEmpty())
+            assertEquals(listOf(message), upserted, "ordinary events keep the fresh() → persistEvents path")
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `courierReceive rejects opened events from a non-member author or a privileged verb`() = runBlocking {
+        CourierCarryCore.clear()
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val file = courierFileEvent(sender, "foreign-sha")
+        val join = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.JOIN,
+            """{"alias":"ghost"}""", 2L, COURIER_NOW,
+        )
+        val rekey = CircleCore.create(
+            "c1", sender.fingerprint, sender, CircleEvent.REKEY,
+            """{"keyB64":"newkey","gen":9}""", 3L, COURIER_NOW,
+        )
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(file, join, rekey))
+        // The roster deliberately omits sender. A validly sealed and signed
+        // parcel still may not rewrite our roster or group key once opened.
+        var current = courierState(recipient.fingerprint, "AABB")
+        val bagWrites = mutableListOf<String>()
+        val upserted = mutableListOf<CircleEvent>()
+        val published = mutableListOf<CourierCardUi.CourierHandoff>()
+        val logs = mutableListOf<String>()
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { current }
+        FlitCircleSync.meHook = { recipient.fingerprint }
+        FlitCircleSync.identityHook = { recipient }
+        FlitCircleSync.clockHook = { COURIER_NOW }
+        FlitCircleSync.logHook = { logs += it }
+        FlitCircleSync.bagPersistHook = { raw ->
+            bagWrites += raw
+            current = current.copy(courierBag = raw)
+        }
+        FlitCircleSync.upsertHook = { upserted += it }
+        FlitCircleSync.handoffPublishHook = { published += it }
+        try {
+            FlitCircleSync.courierReceive(current, listOf(parcelEvent))
+
+            assertTrue(
+                logs.any { it.contains("rejected 3 opened event(s)") },
+                logs.toString(),
+            )
+            assertTrue(upserted.isEmpty(), "no opened event from a non-member author may be folded")
+            assertTrue(published.isEmpty(), "a rejected file event publishes no Open affordance")
+            assertTrue(bagWrites.isNotEmpty())
+            assertEquals(
+                listOf(parcelEvent.id),
+                CourierCarryCore.decode(bagWrites.last())?.parcels.orEmpty().map { it.id },
+                "the parcel row is held for a later legitimate handoff",
+            )
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
+    }
+
+    @Test
+    fun `rejoin keeps the courier bag alongside locally recorded delivery rows`() = runBlocking {
+        val sender = TlsIdentity.generate()
+        val recipient = TlsIdentity.generate()
+        val inner = courierFileEvent(sender, "bag-sha")
+        val (parcelEvent, _) = sealedParcel(sender, recipient, listOf(inner), toFp = recipient.fingerprint)
+        val bagRaw = CourierCarryCore.encode(CarryState(listOf(CourierCarryCore.parcelOf(parcelEvent)!!)))
+        val delivery = CircleDelivery(
+            id = "d-bag", name = "carry.gflit", size = 12L, sha256 = "bag-sha",
+            spoolPath = "/cache/circle/carry.gflit",
+            statuses = mapOf("HOSTFP" to CircleDelivery.SENT),
+            createdMs = 5L,
+        )
+        val prior = state("ME", "HOSTFP").copy(
+            keyB64 = "old-key",
+            events = listOf(event("old-event")),
+            deliveries = mapOf(delivery.sha256 to delivery),
+            courierBag = bagRaw,
+        )
+        var persisted: CircleState? = null
+        FlitCircleSync.resetForTest()
+        FlitCircleSync.stateHook = { prior }
+        FlitCircleSync.meHook = { "ME" }
+        FlitCircleSync.dialHook = { fp ->
+            FlitCircleSync.Route(
+                peer = fp,
+                sync = { CircleResponse(false, reason = "unused") },
+                join = { req ->
+                    assertEquals("c1", req.circleId)
+                    assertEquals("ME", req.memberFp)
+                    CircleResponse(true, key = "new-key", members = listOf("hostfp", "ME"))
+                },
+            )
+        }
+        FlitCircleSync.joinPersistHook = { persisted = it }
+        try {
+            FlitCircleSync.join(QrAdd(fingerprint = "hostfp", circle = "c1", invite = "invite"))
+            val joined = assertNotNull(persisted, "join must persist a joined state")
+            assertEquals(bagRaw, joined.courierBag, "rejoining must not wipe the carrier's local bag")
+            assertEquals(mapOf(delivery.sha256 to delivery), joined.deliveries)
+            assertEquals("new-key", joined.keyB64)
+        } finally {
+            FlitCircleSync.resetForTest()
+        }
+        Unit
     }
 }

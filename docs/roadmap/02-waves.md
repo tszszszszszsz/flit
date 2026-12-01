@@ -11,6 +11,10 @@ scheduled weekdays; finished work is held until its wave date.
 The 2026-11-30 CLI wave is built ahead. Implementation runs now, but the commit
 stays on 2026-11-30; no earlier wave carries it.
 
+The 2026-12-03 Protocol wave is built ahead. QR parcel frame codec
+implementation runs now, but the commit stays on 2026-12-03; no earlier wave
+carries it.
+
 ## Wave 0 — planning (2026-11-25)
 
 Each agent writes one specification under `docs/roadmap/`. The orchestrator

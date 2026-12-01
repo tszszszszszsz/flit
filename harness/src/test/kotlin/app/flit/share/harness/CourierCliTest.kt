@@ -1,11 +1,20 @@
 package app.flit.share.harness
 
+import app.flit.share.protocol.circle.CircleCore
+import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.courier.CarryState
+import app.flit.share.protocol.courier.CourierCarryCore
+import app.flit.share.protocol.courier.CourierEnvelope
+import app.flit.share.protocol.courier.PARCEL
 import app.flit.share.protocol.tls.TlsIdentity
 import java.io.ByteArrayInputStream
+import java.nio.file.Files
 import java.nio.file.Path
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -13,9 +22,11 @@ import kotlin.test.assertTrue
 
 /**
  * Pure seams of [CourierCli]: the local state codec, the state transition map,
- * the recipient-certificate gate and the on-disk path contract. No sockets, no
- * endpoints, no identity file and no parcel crypto are touched here — the
- * envelope and carry codecs have their own protocol tests.
+ * the recipient-certificate gate, the on-disk path contract and the exit codes
+ * returned by [CourierCli.run]. No sockets, no endpoints, no identity file and
+ * no parcel crypto of its own are touched here — the envelope and carry codecs
+ * have their own protocol tests. The one refusal case that drives `run` uses
+ * those production codecs to build a tampered parcel, not a lookalike.
  */
 class CourierCliTest {
 
@@ -41,6 +52,26 @@ class CourierCliTest {
             ?.let { Path.of(it) }
             ?: Path.of(System.getProperty("user.home"), ".config", "flit", "flit-harness")
 
+    /**
+     * [harnessHome] reads FLIT_HARNESS_HOME before `user.home`, and that env
+     * var cannot be redirected inside a JDK 21 JVM. When the runner set it, the
+     * home is already the caller's sandbox, so we leave `user.home` alone;
+     * otherwise we point `user.home` at a private temp root for the block.
+     * Every command below that touches a ledger or identity is wrapped here.
+     */
+    private fun <T> inIsolatedHome(block: () -> T): T {
+        if (!System.getenv("FLIT_HARNESS_HOME").isNullOrBlank()) return block()
+        val previous = System.getProperty("user.home")
+        val root = Files.createTempDirectory("courier-cli-test-")
+        System.setProperty("user.home", root.toString())
+        try {
+            return block()
+        } finally {
+            if (previous == null) System.clearProperty("user.home")
+            else System.setProperty("user.home", previous)
+        }
+    }
+
     private fun certB64(identity: TlsIdentity): String =
         Base64.getEncoder().encodeToString(identity.certificate.encoded)
 
@@ -49,16 +80,9 @@ class CourierCliTest {
             .generateCertificate(ByteArrayInputStream(Base64.getDecoder().decode(certB64))) as X509Certificate
     }.getOrNull()
 
-    /**
-     * The gate the CLI applies before sealing: the Base64 DER certificate's own
-     * SHA-256 fingerprint, as returned by TlsIdentity.fingerprintOf, must equal
-     * the normalised --to value. A malformed certificate or a blank --to is a
-     * refusal, never a seal.
-     */
-    private fun certMatchesTo(certB64: String?, toFp: String?): Boolean {
-        val fp = certB64?.let(::certificateOf)?.let(TlsIdentity::fingerprintOf) ?: return false
-        val to = toFp?.trim()?.takeIf { it.isNotBlank() } ?: return false
-        return fp.equals(to, ignoreCase = true)
+    private fun flipFirst(s: String): String {
+        require(s.isNotEmpty())
+        return (if (s[0] == 'A') 'B' else 'A') + s.substring(1)
     }
 
     // ---- state codec --------------------------------------------------------
@@ -154,21 +178,48 @@ class CourierCliTest {
         assertEquals("refused", CourierCli.nextState(past, CourierCli.Kind.RECEIVE_REFUSED, 10_000L))
     }
 
+    @Test
+    fun `a thrown open has no kind so the pending row survives for a later attempt`() {
+        val pending = row("pending")
+        assertEquals(
+            setOf("carried", "delivered", "refused", "expired"),
+            CourierCli.Kind.entries.map { CourierCli.nextState(pending, it, 9_000L) }.toSet(),
+            "every Kind is a returned conclusion; a thrown open maps to none",
+        )
+        assertFalse(
+            CourierCli.Kind.entries.any {
+                it.name.contains("THROW", ignoreCase = true) || it.name.contains("OPEN", ignoreCase = true)
+            },
+            "there is no thrown-open Kind that could conclude the row",
+        )
+        // receive's throw branch applies no Kind: the row keeps its state, the
+        // parcel keeps its file, and a later attempt may retry it.
+        val noKind: CourierCli.Kind? = null
+        val afterThrow = noKind?.let { CourierCli.nextState(pending, it, 9_000L) } ?: pending.state
+        assertEquals("pending", afterThrow)
+    }
+
     // ---- recipient certificate gate ----------------------------------------
 
     @Test
     fun `recipient cert gate binds the certificate fingerprint to the to flag`() {
         val addressee = TlsIdentity.generate()
         val other = TlsIdentity.generate()
-        val cert = certB64(addressee)
+        val cert = certificateOf(certB64(addressee))!!
 
-        assertTrue(certMatchesTo(cert, addressee.fingerprint))
-        assertTrue(certMatchesTo(cert, addressee.fingerprint.lowercase()), "--to is case-insensitive")
-        assertTrue(certMatchesTo(cert, "  ${addressee.fingerprint}  "), "--to is trimmed")
-        assertFalse(certMatchesTo(cert, other.fingerprint), "a certificate for another fingerprint is refused")
-        assertFalse(certMatchesTo(cert, ""), "blank --to is refused")
-        assertFalse(certMatchesTo(cert, null), "missing --to is refused")
-        assertFalse(certMatchesTo("not-base64", addressee.fingerprint), "a malformed certificate is refused")
+        assertTrue(CourierCli.certMatchesTo(cert, addressee.fingerprint))
+        assertTrue(CourierCli.certMatchesTo(cert, addressee.fingerprint.lowercase()), "--to is case-insensitive")
+        assertTrue(CourierCli.certMatchesTo(cert, "  ${addressee.fingerprint}  "), "--to is trimmed")
+        assertFalse(CourierCli.certMatchesTo(cert, other.fingerprint), "a certificate for another fingerprint is refused")
+        assertFalse(CourierCli.certMatchesTo(cert, ""), "blank --to is refused")
+        assertFalse(
+            CourierCli.certMatchesTo(null, addressee.fingerprint),
+            "a malformed explicit --cert is refused, never a fallback to event certs",
+        )
+        assertFalse(
+            CourierCli.certMatchesTo(certificateOf("not-base64"), addressee.fingerprint),
+            "an unparsable certificate cannot pass the gate",
+        )
     }
 
     // ---- paths and naming ---------------------------------------------------
@@ -200,6 +251,18 @@ class CourierCliTest {
     }
 
     @Test
+    fun `relative bag flag roots under harness home while an absolute flag is kept`() {
+        val args = ParsedArgs(emptyArray())
+        args.flags["--bag"] = "portable-bag"
+        assertEquals(expectedHome().resolve("portable-bag"), CourierCli.bagDir(args))
+        args.flags["--bag"] = "nested/portable-bag"
+        assertEquals(expectedHome().resolve("nested/portable-bag"), CourierCli.bagDir(args))
+        val absolute = expectedHome().resolve("absolute-bag")
+        args.flags["--bag"] = absolute.toString()
+        assertEquals(absolute, CourierCli.bagDir(args), "an absolute --bag is not re-rooted")
+    }
+
+    @Test
     fun `parcel file name is the envelope id plus the fixed suffix under the bag`() {
         val bag = CourierCli.bagDir(ParsedArgs(emptyArray()))
         val id = "8b1f0c2e-9a44-4d0c-b7d6-2e5f8a1c3b70"
@@ -214,5 +277,87 @@ class CourierCliTest {
         for (command in listOf("courier", "drop", "carry", "receive", "status", "sweep")) {
             assertTrue(text.contains(command), "usage omits $command")
         }
+    }
+
+    // ---- run() exit codes ---------------------------------------------------
+
+    @Test
+    fun `run returns bad args for malformed invocations before touching state`() {
+        assertEquals(CourierCli.EXIT_BAD_ARGS, CourierCli.run(ParsedArgs(emptyArray())))
+        assertEquals(CourierCli.EXIT_BAD_ARGS, CourierCli.run(ParsedArgs(arrayOf("courier", "bogus"))))
+        assertEquals(CourierCli.EXIT_BAD_ARGS, CourierCli.run(ParsedArgs(arrayOf("courier", "status", "--ttl", "oops"))))
+        assertEquals(CourierCli.EXIT_BAD_ARGS, CourierCli.run(ParsedArgs(arrayOf("courier", "status", "--ttl", "0"))))
+        assertEquals(CourierCli.EXIT_BAD_ARGS, CourierCli.run(ParsedArgs(arrayOf("courier", "drop"))))
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            CourierCli.run(ParsedArgs(arrayOf("courier", "drop", "--to", "A1B2"))),
+            "drop needs a --text or --file payload",
+        )
+    }
+
+    @Test
+    fun `run reports status success and bad args for a missing bag`() = inIsolatedHome {
+        assertEquals(0, CourierCli.run(ParsedArgs(arrayOf("courier", "status"))))
+        val absent = expectedHome().resolve("no-such-bag").toString()
+        for (command in listOf("carry", "receive", "sweep")) {
+            assertEquals(
+                CourierCli.EXIT_BAD_ARGS,
+                CourierCli.run(ParsedArgs(arrayOf("courier", command, "--bag", absent))),
+                "$command must refuse a missing bag",
+            )
+        }
+    }
+
+    @Test
+    fun `run reports a refused open with the dedicated exit code`() = inIsolatedHome {
+        val identity = loadOrCreateIdentity()
+        val home = expectedHome()
+        val circleId = "cli-refused-open"
+        val now = System.currentTimeMillis()
+        val inner = CircleCore.create(
+            circleId, identity.fingerprint, identity, CircleEvent.MESSAGE,
+            """{"text":"never folded"}""", lamport = 0L, createdMs = now,
+        )
+        val envelope = CourierEnvelope.seal(
+            listOf(inner), circleId, identity.fingerprint, identity.fingerprint,
+            identity.certificate, identity, now,
+        ) ?: error("production seal refused a small, valid event")
+        // Tampering with the ciphertext invalidates the signature over the
+        // canonical envelope: decode still succeeds, open returns a refusal.
+        val broken = envelope.copy(cipherB64 = flipFirst(envelope.cipherB64))
+        val body = buildJsonObject {
+            put("toFp", JsonPrimitive(identity.fingerprint))
+            put("envelope", JsonPrimitive(CourierEnvelope.encode(broken)))
+        }.toString()
+        val event = CircleCore.create(
+            circleId, identity.fingerprint, identity, PARCEL, body,
+            lamport = 1L, createdMs = now,
+        )
+        val parcel = CourierCarryCore.parcelOf(event) ?: error("production parcelOf refused a valid parcel")
+        val bag = Files.createTempDirectory("courier-cli-refused-")
+        Files.writeString(
+            bag.resolve("${parcel.id}.parcel"),
+            CourierCarryCore.encode(CarryState(listOf(parcel))),
+            Charsets.UTF_8,
+        )
+        Files.createDirectories(home)
+        Files.writeString(
+            home.resolve(CourierCli.STATE_FILE),
+            CourierCli.encodeRows(
+                listOf(
+                    CourierCli.Row(
+                        parcel.id, identity.fingerprint, identity.fingerprint, circleId,
+                        "pending", parcel.createdMs, parcel.expiresMs,
+                    ),
+                ),
+            ),
+            Charsets.UTF_8,
+        )
+        assertEquals(
+            CourierCli.EXIT_OPEN_REFUSED,
+            CourierCli.run(
+                ParsedArgs(arrayOf("courier", "receive", "--bag", bag.toString(), "--ttl", now.toString())),
+            ),
+        )
     }
 }

@@ -11,6 +11,7 @@ import app.flit.share.protocol.tls.TlsIdentity
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
@@ -37,8 +38,35 @@ import kotlin.test.assertTrue
  * [Node.inHome], so the two nodes never share identity, rows or circles. The
  * bag is an explicit per-node `--bag` path, moved by plain file copy — the
  * carrier implements no transport.
+ *
+ * That isolation depends on `user.home`, so every test runs through
+ * [isolatedHome]: it aborts when `FLIT_HARNESS_HOME` pins one home for the JVM
+ * and holds one global lock while `user.home` is switched, so two tests cannot
+ * observe each other's node home.
  */
 class CourierCarrierHarnessTest {
+
+    companion object {
+        /**
+         * [harnessHome] reads this env var before `user.home`. With it set the
+         * per-node switch cannot produce two homes, so the walk is skipped
+         * instead of sharing (and corrupting) a real harness home.
+         */
+        private val fixedHarnessHome: String? =
+            System.getenv("FLIT_HARNESS_HOME")?.takeIf { it.isNotBlank() }
+
+        /** `user.home` is JVM-global: only one test may switch it at a time. */
+        private val homeLock = Any()
+
+        private fun <T> isolatedHome(block: () -> T): T {
+            assumeTrue(
+                fixedHarnessHome == null,
+                "CourierCarrierHarnessTest switches user.home per node, but " +
+                    "harnessHome() prefers FLIT_HARNESS_HOME=$fixedHarnessHome.",
+            )
+            return synchronized(homeLock, block)
+        }
+    }
 
     private class Node(tag: String) {
         val root: Path = Files.createTempDirectory("courier-$tag-")
@@ -103,6 +131,26 @@ class CourierCarrierHarnessTest {
         }
     }
 
+    /**
+     * `receive` folds only events authored by a current member of the receiver's
+     * own `circle.state`. Seed that roster before the handoff: the addressee
+     * needs the sender in it, while a carrier holding a parcel for a different
+     * fingerprint deliberately does not.
+     */
+    private fun Node.seedRoster(circleId: String, vararg fingerprints: String) = inHome {
+        saveCircleState(
+            CircleCliState(
+                circleId = circleId,
+                invite = "harness-invite",
+                key = "harness-key",
+                host = "",
+                members = fingerprints.distinct().toMutableList(),
+                events = mutableListOf(),
+                rekeyGen = 0,
+            ),
+        )
+    }
+
     private fun certB64(identity: TlsIdentity): String =
         Base64.getEncoder().encodeToString(identity.certificate.encoded)
 
@@ -142,7 +190,7 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `drop carry then receive folds one event and marks exact rows across two homes`() {
+    fun `drop carry then receive folds one event and marks exact rows across two homes`() = isolatedHome {
         val a = Node("a-drop")
         val b = Node("b-recv")
         val circleId = "courier-harness-circle"
@@ -179,9 +227,11 @@ class CourierCarrierHarnessTest {
         assertEquals(0, a.cli("carry"))
         assertEquals("carried", a.readRows().single().state)
 
-        // Plain directory copy is the handoff; B also needs the local row bookkeeping.
+        // Plain directory copy is the handoff; B also needs the local row bookkeeping
+        // and A in its roster before receive's member gate will fold A's event.
         copyBag(a, b)
         b.writeRows(a.readRows())
+        b.seedRoster(circleId, bId.fingerprint, aId.fingerprint)
 
         // receive: production open returns the event, which is folded into circle.state.
         assertEquals(0, b.cli("receive"))
@@ -205,7 +255,7 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `a parcel for a third fingerprint stays pending at the carrier and is re-exported`() {
+    fun `a parcel for a third fingerprint stays pending at the carrier and is re-exported`() = isolatedHome {
         val a = Node("a-third")
         val b = Node("b-carrier")
         val c = Node("c-third")
@@ -224,6 +274,8 @@ class CourierCarrierHarnessTest {
         assertEquals(cFp, row.recipientFp)
 
         // B is a carrier, not the recipient: open never concludes this parcel.
+        // B's roster stays untouched, so the wrong-fingerprint case is still
+        // held pending rather than folded.
         copyBag(a, b)
         b.writeRows(a.readRows())
         assertEquals(0, b.cli("receive"))
@@ -231,9 +283,11 @@ class CourierCarrierHarnessTest {
         assertEquals(1, b.bagFiles().size, "the parcel stays in the bag for the next carrier")
         assertTrue(b.circleEvents().isEmpty(), "a carrier folds nothing it cannot open")
 
-        // The next carrier is the addressee: the very same bytes now fold once.
+        // The next carrier is the addressee: the very same bytes now fold once,
+        // with A on C's roster so receive's member gate admits the event.
         copyBag(b, c)
         c.writeRows(a.readRows())
+        c.seedRoster(circleId, cFp, aId.fingerprint)
         assertEquals(0, c.cli("receive"))
         val delivered = c.readRows().single()
         assertEquals("delivered", delivered.state)
@@ -244,7 +298,7 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `a tampered parcel is refused quarantined and never folded`() {
+    fun `a tampered parcel is refused quarantined and never folded`() = isolatedHome {
         val a = Node("a-tamper")
         val b = Node("b-tamper")
         val circleId = "courier-tampered"
@@ -296,7 +350,7 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `sweep expires an old parcel and deletes its file`() {
+    fun `sweep expires an old parcel and deletes its file`() = isolatedHome {
         val a = Node("a-sweep")
         val circleId = "courier-swept"
         val aId = a.inHome { loadOrCreateIdentity() }
@@ -328,7 +382,7 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `a duplicate envelope id does not double fold`() {
+    fun `a duplicate envelope id does not double fold`() = isolatedHome {
         val a = Node("a-dup")
         val b = Node("b-dup")
         val circleId = "courier-dup"
@@ -347,6 +401,7 @@ class CourierCarrierHarnessTest {
 
         copyBag(a, b)
         b.writeRows(a.readRows())
+        b.seedRoster(circleId, bId.fingerprint, aId.fingerprint)
         assertEquals(0, b.cli("receive"))
         assertEquals(1, b.circleEvents().size)
         assertEquals("delivered", b.readRows().single().state)
@@ -369,14 +424,17 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `a certificate that does not match --to writes no parcel`() {
+    fun `a certificate that does not match --to writes no parcel`() = isolatedHome {
         val a = Node("a-badcert")
         val aId = a.inHome { loadOrCreateIdentity() }
         val stranger = TlsIdentity.generate()
 
-        a.cli(
-            "drop", "--to", aId.fingerprint, "--cert", certB64(stranger),
-            "--text", "never sealed", "--circle", "courier-badcert",
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.cli(
+                "drop", "--to", aId.fingerprint, "--cert", certB64(stranger),
+                "--text", "never sealed", "--circle", "courier-badcert",
+            ),
         )
 
         assertTrue(a.bagFiles().isEmpty(), "no envelope is written on a certificate/--to mismatch")
@@ -384,7 +442,7 @@ class CourierCarrierHarnessTest {
     }
 
     @Test
-    fun `an unopened parcel survives production encode decode encode byte for byte`() {
+    fun `an unopened parcel survives production encode decode encode byte for byte`() = isolatedHome {
         val a = Node("a-roundtrip")
         val aId = a.inHome { loadOrCreateIdentity() }
         val parcel = makeParcel(
@@ -396,5 +454,95 @@ class CourierCarrierHarnessTest {
         val reloaded = CourierCarryCore.decode(once)!!.parcels.single()
         assertEquals(once, CourierCarryCore.encode(CarryState(listOf(reloaded))))
         assertTrue(CircleCore.verify(reloaded.event))
+    }
+
+    @Test
+    fun `bad arguments return EXIT_BAD_ARGS and write no state`() = isolatedHome {
+        val a = Node("a-badargs")
+        val aId = a.inHome { loadOrCreateIdentity() }
+        val to = aId.fingerprint
+
+        assertEquals(CourierCli.EXIT_BAD_ARGS, CourierCli.run(ParsedArgs(arrayOf("courier"))))
+        assertEquals(CourierCli.EXIT_BAD_ARGS, a.cli("bogus"))
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.cli("drop", "--text", "no recipient", "--circle", "courier-badargs"),
+        )
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.cli("drop", "--to", to, "--circle", "courier-badargs"),
+        )
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.cli("drop", "--to", to, "--text", "bad ttl", "--ttl", "nope"),
+        )
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.cli("drop", "--to", to, "--text", "zero ttl", "--ttl", "0"),
+        )
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.cli(
+                "drop", "--to", to, "--cert", "not-base64",
+                "--text", "bad cert", "--circle", "courier-badargs",
+            ),
+        )
+        for (cmd in listOf("carry", "receive", "sweep")) {
+            assertEquals(
+                CourierCli.EXIT_BAD_ARGS,
+                a.inHome {
+                    CourierCli.run(
+                        ParsedArgs(
+                            arrayOf(
+                                "courier", cmd,
+                                "--bag", a.root.resolve("absent-$cmd").toString(),
+                            ),
+                        ),
+                    )
+                },
+                "$cmd with a missing bag must be a bad argument",
+            )
+        }
+        assertEquals(
+            CourierCli.EXIT_BAD_ARGS,
+            a.inHome {
+                CourierCli.run(ParsedArgs(arrayOf("courier", "carry", "--bag", "bad\u0000path")))
+            },
+            "a thrown path error is a bad argument, never a success",
+        )
+
+        assertTrue(a.readRows().isEmpty(), "bad arguments must not add a row")
+        assertTrue(a.bagFiles().isEmpty(), "bad arguments must not write a parcel")
+    }
+
+    @Test
+    fun `a parcel open cannot conclude stays pending and returns success`() = isolatedHome {
+        val a = Node("a-held")
+        val b = Node("b-held")
+        val bId = b.inHome { loadOrCreateIdentity() }
+
+        // Drop a real parcel for B, then damage only the handoff copy so the
+        // decode before open fails. receive keeps the row pending for a later
+        // attempt — the same keep-and-retry branch a thrown open takes — and
+        // must not report EXIT_OPEN_REFUSED, which is reserved for a refusal.
+        assertEquals(
+            0,
+            a.cli(
+                "drop", "--to", bId.fingerprint, "--cert", certB64(bId),
+                "--text", "held for retry", "--circle", "courier-held",
+            ),
+        )
+        val row = a.readRows().single()
+        Files.writeString(a.bag.resolve("${row.id}.parcel"), "{not a parcel", StandardCharsets.UTF_8)
+        copyBag(a, b)
+        b.writeRows(a.readRows())
+
+        assertEquals(0, b.cli("receive"))
+        val held = b.readRows().single()
+        assertEquals("pending", held.state)
+        assertEquals(row.id, held.id)
+        assertEquals(1, b.bagFiles().size, "the unopenable parcel stays in the bag for retry")
+        assertEquals(0L, b.rejectedFiles(), "nothing is quarantined when open is not concluded")
+        assertTrue(b.circleEvents().isEmpty(), "nothing is folded when open is not concluded")
     }
 }

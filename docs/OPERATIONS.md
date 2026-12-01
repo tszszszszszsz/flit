@@ -3,11 +3,11 @@
 > Part of the Flit design set. [Transport ladder and index](transport-bluetooth.md) ·
 > [README](../README.md).
 
-The rig's last green standard is **302 tests, 0 failures** (82 protocol + 210 app
-+ 10 harness). Earlier design docs quote smaller counts (76, 115) and the CI
-workflow comment quotes 36/67/4; those are historical snapshots of the same
-suite at earlier commits, not the current inventory. The current inventory is in
-[TESTING.md](TESTING.md).
+The rig's last green standard is **396 tests, 0 failures** (136 protocol + 228
+app + 32 harness), from a green `--rerun-tasks` run. Earlier docs quote older
+counts (76, 115, 302) and the CI workflow comment quotes 36/67/4; those are
+historical snapshots of the same suite at earlier commits, not the current
+inventory. The current inventory is in [TESTING.md](TESTING.md).
 The last commit is `72225f8` (Open-file crash + sharing restore), preceded by
 `2034fa6` (Circle file delivery + quality pass).
 
@@ -273,7 +273,7 @@ hex, and `state` is one of `pending`, `carried`, `delivered`, `expired`,
 `refused`. Rows are local-only and are never written into a Circle event.
 Every `.parcel` file id matches a row in `courier.state`; a file with no row is
 ignored by `receive` and `sweep`. The carrier stores
-`CourierCarry.encode(CourierCarry.parcelOf(envelope))` byte-for-byte, so
+`CourierCarryCore.encode(CourierCarryCore.parcelOf(envelope))` byte-for-byte, so
 encode→decode→encode of an unopened parcel is identical.
 
 Transitions (`CourierCli.Kind`):
@@ -479,6 +479,73 @@ The meaning of `recv-resume`, `kept` and the hash gate as *failure conclusions*
 is detailed in [FAILURE-MODES.md](FAILURE-MODES.md); the relay's blindness is a
 security property in [SECURITY.md](SECURITY.md).
 
+### 5.3 Courier carry lines and handoff outcomes (app)
+
+`parcel` rows are filtered out of the Circle feed; a verified `PARCEL` is folded
+on the path `FlitCircleSync.fresh() → persistEvents() → FlitCircleStore.upsert`
+and the decrypted `file` event then renders as an ordinary file card — there is
+no separate `merge` at this layer. When a handoff entry exists for that SHA-256,
+`FileCard` adds one carry line above its status line. The entry is read from
+`FlitEngine.courierHandoffs` (process-local, keyed by SHA-256), never parsed from
+a `parcel` body or envelope text; a blank SHA-256 draws no line. Outcomes update
+on the 30 s courier tick and publish through the content-diff signature without
+a log change.
+
+The line depends on the viewer and the courier-local outcome:
+
+| Viewer | Outcome | Line |
+| --- | --- | --- |
+| Courier (`meFp == courierFp`) | waiting | `Carrying for <to> · waiting for a handoff` |
+| Courier | failed | `Carrying for <to> · handoff will retry` |
+| Courier | handed | `Handed off to <to>` |
+| Recipient (`meFp == toFp`) | any | `A courier carried a copy for you` |
+| Other member | any | `<courier> is carrying a copy for <to>` |
+
+`<to>` and `<courier>` resolve to aliases bounded at `MAX_ALIAS_CHARS = 64`.
+Blank or unknown outcomes read as `waiting`. Only the exact `handed` string,
+read on the courier's own device, produces `Handed off to …`; a refusal or a
+thrown carrier produces `failed`, never that line, and no other device sees it
+because the outcome is not gossiped.
+
+Scope of the line:
+
+- It reports custody, not delivery. A carry line never means bytes landed.
+  The Open affordance is separate and keyed to the landed-SHA set: `LANDED`
+  shows `Landed here` with an enabled `Open file`; `RESOLVING` shows a disabled
+  `Opening…` button; `ABSENT` shows `Not here yet · no local copy to open`.
+  A landed SHA keeps `LANDED` even while a carry line is present.
+- It does not move delivery counts. Counts come only from
+  `CircleDelivery.statuses`; a handoff never increments a sent count.
+- It carries no file name, size, path, envelope text, `fromFp` or recipient key
+  — only recipient and courier aliases and the outcome.
+- It is process-local: not persisted, not signed and never placed in a
+  `CircleRequest`. A restart clears the map; a card with no entry keeps its
+  ordinary status line (`local · N sent · M pending · …`, or
+  `file drop · open to view if it arrived` with no delivery record).
+- A courier that cannot open an envelope has no SHA-256 to key a row with, so it
+  publishes nothing and the card reads `waiting`; ciphertext stays opaque to
+  the carrier.
+
+App log lines under the `FlitSend` tag that accompany these states:
+
+| Line | Meaning |
+| --- | --- |
+| `courier drop: no certificate for <fp>` | drop refused; source events stay in the sender's log |
+| `courier: invalid parcel body` | body gate refused the event before fold; bag unchanged |
+| `courier: parcel signature refused` | verify failed; bag unchanged |
+| `courier: parcel expired` | outside window or past TTL; no bag fold |
+| `courier: duplicate parcel id` | duplicate envelope id; held copy stays |
+| `courier: bag full, 256 parcel(s) held` | quota reached; incoming offer dropped |
+| `courier: holding for <fp>` | addressee not met on this pass; held for later |
+| `courier: handed off N parcel(s) to <fp>` | OK answer; offered ids acked, outcome `handed` |
+| `courier: handoff failed to <fp>` | refusal or carrier throw; bag kept, outcome `failed` |
+| `courier parcel unreadable — rejected` | open failed or expired at the addressee; no fold |
+| `courier: bag row unreadable, starting empty` | corrupt `courierBag` row decoded as empty |
+
+The three states and their copy are pinned by pure card tests (CODE/PURE only).
+No phone-to-phone courier walk is recorded on 2026-12-01; the three-node walk
+is dated 2026-12-02.
+
 ## 6. Walkthrough recipes
 
 Each recipe states what is proved and what is not. Commands are the ones the
@@ -491,9 +558,10 @@ source env.sh && ./gradlew :protocol:test :app:testDebugUnitTest :app:assembleDe
     :app:assembleRelease :harness:installDist
 ```
 
-Expected: 302 tests, 0 failures at the last green standard; debug and release
-APKs plus the CLI distribution produced. CI runs the superset at
-.github/workflows/rig.yml:35-49 and uploads the CLI zip as artifact `flit-cli`.
+Expected: 396 tests, 0 failures (136 protocol + 228 app + 32 harness) at the
+last green `--rerun-tasks` run; debug and release APKs plus the CLI distribution
+produced. CI runs the superset at .github/workflows/rig.yml:35-49 and uploads the
+CLI zip as artifact `flit-cli`.
 
 ### 6.2 Box serve + discover + send (interop baseline, harness evidence)
 
@@ -631,13 +699,19 @@ full host (`FlitCircleHost` behind `onCircleRequest`): it verifies each event,
 gates the roster, admits JOIN only with the right invite, rotates the key on
 departure and refuses later syncs from departed fingerprints.
 
+The 2026-11-26 three-node baseline walk **is** device evidence for a 3-identity
+Circle (phone host plus two box CLI members on separate harness homes): join,
+posts, poll/vote, a hash-exact file drop and kick/rekey were recorded from
+logcat, UI dumps, CLI output and both `circle.state` files
+([three-node baseline](completions/2026-11-26-three-node-baseline.md)).
+
 **Not device-proven:** outbound phone→host fan-out from the app. The behavioural
-tests pass with an injected carrier, but the device walk could not get a clean
-peer-side confirmation because the demo bots' CLI state and their `serve`
-process shared identities ([circle.md](circle.md#known-limitations)).
-A genuine three-or-more-device mesh, and phone→host fan-out, stay listed as
-limitations. A file drop from the CLI uses `circle file --file PATH` (bytes via
-`sendFiles`); `circle post --file PATH` announces only.
+tests pass with an injected carrier, and in the three-node walk a phone-authored
+message reached the phone feed and local log but no one-shot CLI puller saw it,
+so the direction remains test-evidenced only
+([circle.md](circle.md#known-limitations)). A file drop from the CLI uses
+`circle file --file PATH` (bytes via `sendFiles`); `circle post --file PATH`
+announces only.
 
 ### 6.9 Panic alert (on-device evidence)
 
@@ -816,14 +890,148 @@ progress: the prefix is the only progress the sender re-learns via `/partial`.
 - The `courier` CLI carrier has no device walk at this layer: a bag moves by
   directory copy on one box, and the handoff is covered by harness tests only
   (§2.4).
-- Two-phone RFCOMM transfer and a multi-member Circle mesh were not walked —
-  no second phone on the rig, no Bluetooth adapter on the box. `bt-sim` and the
-  harness two-node tests cover those paths in process only.
+- The app's courier carry lines (§5.3) have no device walk on 2026-12-01: the
+  `waiting`/`handed`/`failed` states and their copy are pinned by pure card
+  tests (CODE/PURE). A carry line reports custody, not delivery, and the
+  `handed` outcome is read only on the courier's own device. The three-node
+  courier walk is dated 2026-12-02.
+- Two-phone RFCOMM transfer was not walked — no second phone on the rig, no
+  Bluetooth adapter on the box; `bt-sim` covers the exchange over a pipe. The
+  2026-11-26 three-node baseline **was** walked as device evidence for a
+  3-identity Circle (phone host plus two box CLI members); no live multi-phone
+  mesh was available.
 - Wi‑Fi Aware is absent on the rig phone; milestone B is parked by a hardware
   gate.
-- The phone→host Circle fan-out direction remains test-evidenced only.
+- The phone→host Circle fan-out direction remains test-evidenced only: the
+  three-node walk saw a phone-authored message stay in the phone feed and local
+  log, with no one-shot CLI puller returning it.
 - Grant release on delivered SAF batches is code-verified, not device-walked.
 - MIUI autostart/battery behavior and Android 15's ~6 h `dataSync` cap are ROM/OS
   limits outside the app; no background guarantee is claimed.
 - Where the README CLI summary and the actual `flit-cli` help/arg parser disagree
   (§2.3), the help text and parser decide.
+- Manual air-gap carry by QR frames is an operator procedure with its own size,
+  acknowledgement and evidence limits (§11). No device walk is asserted here.
+
+## 11. Manual air-gap carry (QR parcel)
+
+A parcel moves one small named payload between two identities as an ordered
+sequence of QR frames, with no network, Bluetooth, relay or Wi‑Fi Aware carrier
+in the path. The frames are the only thing carried; the payload bytes never go
+over a socket. This section is the operator procedure for that carry. It uses
+the CLI `parcel` commands and the app's parcel display/scan surface; the frame
+grammar, per-frame CRC and size caps belong to the protocol codec and are not
+restated or edited here (see [CONTRACTS.md](CONTRACTS.md) for the grammar and
+[FAILURE-MODES.md](FAILURE-MODES.md) for refusals).
+
+### 11.1 Before you start
+
+- Use the built `flit-cli` described in §3 and a phone with the parcel surface
+  installed as described in §4. The two `parcel` commands come from the CLI
+  layer (`docs/roadmap/qr-parcel-cli.md`) and the app surfaces from the app
+  layer (`docs/roadmap/qr-parcel-app.md`); this procedure adds no build step.
+- Have the recipient's X.509 certificate as a file and the recipient's
+  fingerprint. The fingerprint is the value the receiver prints (`serve`
+  prints `fingerprint <fp>`; the app shows its own identity), and `--cert` must
+  match `--to`: the CLI checks the certificate's own SHA‑256 DER fingerprint
+  before it renders any frame. The certificate is pinned in memory for that one
+  encode call and is not copied into the frame directory.
+- Pick a fresh, empty frame directory. `parcel encode` refuses a directory that
+  already holds a `frame-*.png`.
+- For a true air gap, turn Wi‑Fi and Bluetooth off on the phone and stop any
+  `flit-cli serve` or `flit-cli relay` process on the box. ADB over USB is a
+  control channel for fixture placement, screen capture and log reads; it never
+  carries the payload bytes. Record the radio and process state before starting.
+- Record the source hash with `sha256sum <file>`. The file name is bound into
+  the frames as the display name, and this SHA‑256 is the payload hash to
+  compare at the far end.
+
+### 11.2 Box → phone (display and scan)
+
+1. Encode on the box:
+
+   ```bash
+   flit-cli parcel encode <file> --dir <frames-dir> --to <FP> --cert <cert-path>
+   ```
+
+   The command prints the signer fingerprint, name, size, payload SHA‑256 and
+   frame count, then writes `frame-0001.png`, `frame-0002.png`, … in frame
+   order. Each frame is one opaque UTF‑8 string rendered at error correction M
+   with a 2‑module margin; the CLI round-trips every frame before writing it.
+2. Move the PNG directory to the display by physical copy, or show it on the
+   rig monitor. No network path is involved.
+3. Show the frames in file-name order and open the parcel scan surface on the
+   phone. There is no acknowledgement channel, so run several full loops; the
+   receiver deduplicates by frame index and finalizes once. If camera
+   permission is denied, paste newline-separated frame strings into the paste
+   field instead.
+4. On completion the phone lands a normal received file with a ledger row. Read
+   its hash (`adb shell sha256sum <landed path>`) and compare it with the source
+   hash. No `/partial`, `queued`, `.part` or resume line belongs to this path.
+
+### 11.3 Phone → box (capture and decode)
+
+1. Place the fixture on the phone once with `adb push` into its Download folder
+   and read its hash without moving bytes:
+   `adb shell sha256sum <phone path>`.
+2. Open the phone's parcel display surface and note the frame count. Capture
+   three loops into a fresh directory, one PNG per frame:
+
+   ```bash
+   for i in $(seq 1 $((3*N))); do
+     adb exec-out screencap -p > <dir>/frame-$i.png
+     sleep 0.5
+   done
+   ```
+
+   `N` is the displayed frame count. This capture rate is a walk convention,
+   not a product display cadence.
+3. Decode on the box with only the captured PNGs as input:
+
+   ```bash
+   flit-cli parcel decode --dir <dir> --out <output>
+   ```
+
+   It prints seen, duplicate and rejected counts, missing indices, signer
+   fingerprint and payload hash. Exit 0 means verified, 2 incomplete or
+   unverified, 1 usage or I/O.
+4. Compare the printed hash with the phone hash, then `cmp` the output against
+   the fixture still on the box. The fixture is never an input to the decoder.
+   If no monitor or print surface can be placed in front of a camera, this
+   direction cannot be run; record it as not verified rather than as a pass.
+
+### 11.4 Limits of this procedure
+
+- One payload per sequence, bounded by 64 frames of at most 512 bytes each —
+  32768 framed bytes. The sealed envelope is itself bounded by
+  `CourierEnvelope.MAX_ENVELOPE_CHARS` (12*1024 Base64 characters, about 9216
+  raw bytes), so the practical ceiling is lower than the frame layer's
+  defensive `MAX_AIR_GAP_PARCEL_BYTES = 131072`, which is never reached at these
+  settings. An over-cap input is refused before any frame is written.
+- Each frame carries a single opaque string (`FRAME_MAGIC = "FLITPARCEL1"`,
+  `MAX_FRAMES = 64`, `MAX_CHUNK_BYTES = 512`, CRC32 per frame). The grammar is
+  owned by the codec; an operator never edits a frame string, because an edit
+  invalidates the CRC and the whole-payload digest.
+- There is no acknowledgement, delivery receipt or retry coordination. The
+  sender loops blindly and only the receiver knows which indices it has seen.
+  A carry is verified by hash equality, not by a returned status, and no
+  delivery count moves because of it.
+- No partial state is durable. A killed encode or decode leaves no output and
+  no progress record; a missed frame means starting the scan again. There is
+  no `.part`, queue row, resume sidecar or `/partial` exchange in this path.
+- Gate failures are refusals, not repairs. A CRC mismatch, missing index,
+  digest mismatch, bad envelope signature or a recipient fingerprint other
+  than the receiver's yields no output and no landed file; held frames stay in
+  memory until the caller drops them. See [FAILURE-MODES.md](FAILURE-MODES.md).
+- The parcel is sealed to one recipient fingerprint. A node that is not that
+  recipient cannot open it and the carrier cannot read the contents; the
+  certificate must arrive out of band and is not part of the frame directory.
+- No device result is asserted here. This section is operator prose derived
+  from the CLI and app seams and the frozen codec constants. No camera walk, no
+  phone-to-phone air gap, no real capture timing and no throughput figure is
+  claimed by it. The separate air-gap walk layer
+  (`docs/roadmap/qr-parcel-device-walk.md`) records its own dated observation
+  and is not summarized as a passed result in this document; the underlying
+  facets carry CODE, PURE and SIM‑HARN evidence only.
+- Frame and capture directories are scratch and may be deleted after hash
+  verification; keep the identity files as described in §8.3.

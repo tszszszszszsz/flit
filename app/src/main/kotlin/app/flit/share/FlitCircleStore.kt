@@ -2,6 +2,7 @@ package app.flit.share
 
 import android.content.Context
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.courier.CourierCarryCore
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -143,6 +144,15 @@ object FlitCircleStore {
          * argument constructors keep working; the codec normalises it on read.
          */
         val deliveries: Map<String, CircleDelivery> = emptyMap(),
+        /**
+         * The carrier's durable parcel bag, encoded by `CourierCarry.encode`
+         * (a `CarryState`). A blank value is an empty bag. Additive with a
+         * default, so old rows and existing named-argument constructors keep
+         * working; [decode] repairs a corrupt value back to blank. Local-only:
+         * never signed or gossiped. Every write goes through [update], which
+         * holds [ioLock] for the whole decode → fold → encode → persist sequence.
+         */
+        val courierBag: String = "",
     )
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -162,7 +172,9 @@ object FlitCircleStore {
      * exactly one founder). Delivery rows with a blank key or sha are dropped
      * and blank status fingerprints are stripped. This makes old and
      * hand-edited rows safe to fold; a missing `deliveries` key becomes an
-     * empty map.
+     * empty map. A missing `courierBag` key becomes blank, and a corrupt bag
+     * value is repaired to blank through the tolerant carry codec, so no
+     * exception reaches a caller.
      */
     fun decode(raw: String?): CircleState? {
         if (raw.isNullOrBlank()) return null
@@ -198,11 +210,24 @@ object FlitCircleStore {
             deliveries[k] = if (delivery.statuses.keys.all { it.isNotBlank() }) delivery
             else delivery.copy(statuses = delivery.statuses.filterKeys { it.isNotBlank() })
         }
+        // A corrupt `courierBag` must not break the whole Circle row. The carry
+        // codec is tolerant (corrupt → empty CarryState), so use it as the gate
+        // and store a corrupt or empty value back as blank — the canonical empty
+        // bag. A valid, non-empty blob is kept verbatim; the app never rewrites
+        // envelope bytes held inside it.
+        val bagRaw = state.courierBag
+        val safeBag = if (bagRaw.isBlank()) {
+            ""
+        } else {
+            val decoded = runCatching { CourierCarryCore.decode(bagRaw) }.getOrNull()
+            if (decoded == null || decoded.parcels.isEmpty()) "" else bagRaw
+        }
         return state.copy(
             members = safeMembers,
             events = events.values.toList().takeLast(EVENT_CAP),
             rekeyGen = maxOf(0, state.rekeyGen),
             deliveries = deliveries,
+            courierBag = safeBag,
         )
     }
 

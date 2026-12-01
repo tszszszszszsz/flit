@@ -119,9 +119,12 @@ object CourierCli {
 
     // ==== paths ===============================================================
 
-    /** `--bag DIR` overrides the portable handoff directory for every command. */
-    internal fun bagDir(args: ParsedArgs): Path =
-        args.opt("--bag")?.let { Path.of(it) } ?: harnessHome().resolve(BAG_DIR)
+    /** `--bag DIR` overrides the handoff directory; a relative path is rooted at harness home. */
+    internal fun bagDir(args: ParsedArgs): Path {
+        val override = args.opt("--bag") ?: return harnessHome().resolve(BAG_DIR)
+        val p = Path.of(override)
+        return if (p.isAbsolute) p else harnessHome().resolve(p)
+    }
 
     internal fun statePath(args: ParsedArgs): Path = harnessHome().resolve(STATE_FILE)
 
@@ -212,15 +215,23 @@ object CourierCli {
                 lamport = nextLamport(events), createdMs = nowMs)
         }
 
-        // The certificate is the signer's own event cert, or an out-of-band B64.
+        // An explicit --cert is authoritative: a malformed value is a refusal,
+        // never a silent fallback to a certificate found in the event log.
         // Both paths are gated on the fingerprint named by --to before seal.
-        val cert = args.opt("--cert")?.let { parseCert(it) }
-            ?: events.firstOrNull {
+        val cert = if (args.has("--cert")) {
+            val explicit = args.opt("--cert")?.let { parseCert(it) }
+            if (explicit == null) {
+                println("!! bad --cert — expected Base64 X.509, nothing sealed")
+                return EXIT_BAD_ARGS
+            }
+            explicit
+        } else {
+            events.firstOrNull {
                 norm(it.authorFp) == toFp && it.cert.isNotBlank() && CircleCore.verify(it)
-            }?.let { parseCert(it.cert) }
-        if (cert == null) {
-            println("!! no certificate for ${toFp.take(12)} — pass --cert B64")
-            return EXIT_BAD_ARGS
+            }?.let { parseCert(it.cert) } ?: run {
+                println("!! no certificate for ${toFp.take(12)} — pass --cert B64")
+                return EXIT_BAD_ARGS
+            }
         }
         if (!certMatchesTo(cert, toFp)) {
             val certFp = runCatching { TlsIdentity.fingerprintOf(cert) }.getOrNull()
@@ -283,7 +294,13 @@ object CourierCli {
         }
 
         val row = Row(parcel.id, toFp, me, circleId, PENDING, parcel.createdMs, parcel.expiresMs)
-        saveRows(args, rows + row)
+        if (!saveRows(args, rows + row)) {
+            // The parcel file is already on disk; remove it so a failed state
+            // commit never leaves an orphan with no row to track it.
+            runCatching { Files.deleteIfExists(dir.resolve(parcelFileName(parcel.id))) }
+            println("!! could not save courier state — parcel ${parcel.id.take(8)} rolled back")
+            return EXIT_BAD_ARGS
+        }
         println("${ts()} courier drop ${parcel.id.take(8)} -> ${toFp.take(12)} exp=${parcel.expiresMs}")
         return 0
     }
@@ -304,7 +321,11 @@ object CourierCli {
             val verified = Files.isRegularFile(f) && runCatching {
                 val parcel = CourierCarryCore.decode(Files.readString(f, Charsets.UTF_8))
                     ?.parcels?.firstOrNull()
-                parcel != null && parcel.id == row.id && CourierCarryCore.parcelOf(parcel.event) != null
+                if (parcel == null || parcel.id != row.id) return@runCatching false
+                val envelope = envelopeOf(parcel.event) ?: return@runCatching false
+                CourierCarryCore.parcelOf(parcel.event) != null &&
+                    CircleCore.verify(parcel.event) &&
+                    CourierEnvelope.verify(envelope)
             }.getOrDefault(false)
             if (verified) {
                 val next = nextState(row, Kind.CARRY, nowMs)
@@ -315,7 +336,10 @@ object CourierCli {
                 row
             }
         }
-        if (changed) saveRows(args, updated)
+        if (changed && !saveRows(args, updated)) {
+            println("!! could not save courier state — nothing marked carried")
+            return EXIT_BAD_ARGS
+        }
         println("${ts()} courier carry ${countLine(updated)}")
         return 0
     }
@@ -323,8 +347,10 @@ object CourierCli {
     // ==== receive =============================================================
 
     /**
-     * Opens parcels addressed to the local identity, folds returned events into
-     * `circle.state`, quarantines refusals and leaves thrown opens pending.
+     * Opens parcels addressed to the local identity, folds only events authored
+     * by a current local member (never JOIN or REKEY) into `circle.state`,
+     * quarantines refused opens, and keeps a thrown open or a parcel with no
+     * allowed event at its prior state.
      */
     private fun receive(args: ParsedArgs, nowMs: Long): Int {
         val dir = bagDir(args)
@@ -386,7 +412,25 @@ object CourierCli {
             }
 
             val st = loadCliCircleState() ?: CircleCliState()
-            st.events = CircleCore.order(CircleCore.dedup(st.events + opened)).toMutableList()
+            // Only a current local member may contribute an event through a courier.
+            // JOIN and REKEY are governance events: a carrier never folds them.
+            val members = st.members.mapNotNull { norm(it) }.toSet()
+            val allowed = opened.filter { event ->
+                event.type != CircleEvent.JOIN &&
+                    event.type != CircleEvent.REKEY &&
+                    norm(event.authorFp) in members
+            }
+            if (allowed.isEmpty()) {
+                // Nothing authorised to fold: log it and leave the row and
+                // parcel as-is, so the carrier can retry or be inspected.
+                println("${ts()}   ${id.take(8)} no allowed event(s), kept ${row.state}")
+                continue
+            }
+            val refusedCount = opened.size - allowed.size
+            if (refusedCount > 0) {
+                println("${ts()}   ${id.take(8)} refused $refusedCount event(s) outside the local roster")
+            }
+            st.events = CircleCore.order(CircleCore.dedup(st.events + allowed)).toMutableList()
             saveCircleState(st)
             val moved = runCatching {
                 Files.createDirectories(receivedDir)
@@ -395,9 +439,12 @@ object CourierCli {
             if (!moved) println("${ts()}   ${id.take(8)} folded but could not archive the envelope")
             val idx = rows.indexOfFirst { it.id == row.id }
             if (idx >= 0) rows[idx] = row.copy(state = nextState(row, Kind.RECEIVE_OK, nowMs))
-            println("${ts()}   ${id.take(8)} delivered ${opened.size} event(s)")
+            println("${ts()}   ${id.take(8)} delivered ${allowed.size} event(s)")
         }
-        saveRows(args, rows)
+        if (!saveRows(args, rows)) {
+            println("!! could not save courier state — nothing delivered")
+            return EXIT_BAD_ARGS
+        }
         println("${ts()} courier receive ${countLine(rows)}")
         return if (refused) EXIT_OPEN_REFUSED else 0
     }
@@ -455,7 +502,10 @@ object CourierCli {
             updated.remove(oldest)
             runCatching { Files.deleteIfExists(dir.resolve(parcelFileName(oldest.id))) }
         }
-        saveRows(args, updated)
+        if (!saveRows(args, updated)) {
+            println("!! could not save courier state — nothing swept")
+            return EXIT_BAD_ARGS
+        }
         println("${ts()} courier sweep ${countLine(updated)}")
         return 0
     }
@@ -493,12 +543,18 @@ object CourierCli {
         return decodeRows(raw)
     }
 
-    private fun saveRows(args: ParsedArgs, rows: List<Row>) {
+    /**
+     * Persists the rows. Returns false only when the write itself failed; every
+     * caller treats that as fatal (non-zero exit, no success line). In [drop]
+     * the parcel file is rolled back so a failed commit leaves no orphan.
+     */
+    private fun saveRows(args: ParsedArgs, rows: List<Row>): Boolean {
         val f = statePath(args)
-        runCatching {
+        return runCatching {
             Files.createDirectories(f.parent)
             Files.write(f, encodeRows(rows).toByteArray(Charsets.UTF_8))
-        }
+            true
+        }.getOrDefault(false)
     }
 
     private fun parcelFiles(dir: Path): List<Path> =
@@ -541,6 +597,14 @@ object CourierCli {
             CertificateFactory.getInstance("X.509")
                 .generateCertificate(Base64.getDecoder().decode(b64).inputStream()) as? X509Certificate
         }.getOrNull()
+    }
+
+    /** The signed envelope inside a parcel body, decoded but not opened. */
+    private fun envelopeOf(event: CircleEvent): CourierEnvelope? {
+        val blob = runCatching {
+            (WireJson.json.parseToJsonElement(event.body) as? JsonObject)?.get("envelope")
+        }.getOrNull() as? JsonPrimitive ?: return null
+        return CourierEnvelope.decode(blob.content)
     }
 
     private fun norm(fp: String?): String? =

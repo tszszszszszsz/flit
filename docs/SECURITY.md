@@ -18,8 +18,8 @@
   box, as recorded in the focused docs. No walk is claimed here unless those docs
   record it.
 
-Rig status at the time of writing: 82 protocol + 210 app + 10 harness = 302
-tests, 0 failures (last green commit `72225f8`). Properties asserted only by a
+Rig status at the time of writing: 136 protocol + 228 app + 32 harness = 396
+tests, 0 failures (last green `--rerun-tasks` run). Properties asserted only by a
 code comment or an unrun path are marked "not verified".
 
 ## Assets and trust boundaries
@@ -40,6 +40,7 @@ Boundaries where untrusted input crosses into a decision:
 | Local storage | SharedPreferences, spool, ledger, event log | someone with device or backup access |
 | External viewer | a `FileProvider` content URI with a read grant | the chosen viewer is a separate app |
 | Courier parcel on `/circle/sync` | a `parcel` event body whose `envelope` field holds Base64 envelope bytes, offered by a carrier | any carrier that holds and forwards the bytes; it cannot decrypt them |
+| QR parcel frames (air gap) | a sequence of opaque frame strings shown, photographed or pasted by a person | whoever crafted, altered or photographed a frame; the carrier holds every frame but no key |
 
 ## Threat model
 
@@ -51,6 +52,7 @@ deliberately symmetric: every row states both the guarantee and the gap.
 | Passive LAN observer | file bytes, Circle events and the group key travel inside TLS; authorship is proven by signature over canonical bytes | IPs, MACs, timing and byte counts are visible; Circle event bodies are **plaintext JSON at rest** on each device, not encrypted |
 | On-path / rogue relay | TLS runs end-to-end inside the pipe; the relay never sees a protocol byte, a fingerprint in the log, or a finished hash; a signed host answer binds the key to the QR host | a relay can refuse, delay, drop or partition a pair; it is a single point of failure the user owns |
 | Malicious courier carrier | holds only AES-GCM ciphertext, an IV and an RSA-wrapped key; cannot decrypt, forge the sender signature, or redirect a blob to a different `toFp`/`circleId` without breaking the cipher or the signature | can refuse, delay, drop, duplicate or partition parcels; a held parcel stays a stored copy until TTL expiry; sees addressee fingerprint, timing and size |
+| Air-gap frame carrier | a sealed parcel is released only when `complete` checks the recipient and the frames, CRC, sequence, count and digest; the bytes are AES-GCM ciphertext behind an RSA-OAEP-wrapped key, signed with the sender's cert-bound key | can copy, delay, reorder, drop, duplicate or photograph frames and can alter one, but a bad frame fails CRC and a bad parcel fails signature, digest or recipient check; sees frame metadata and ciphertext, not plaintext |
 | Forged fingerprint | an attacker certificate lands under the attacker's own SHA-256 DER fingerprint; claiming a victim's `senderFp`/`memberFp`/`authorFp` fails the cert-binding check | nothing — this is a hard guarantee of the pin design, not a best effort |
 | Stolen QR photo (pairing) | pinning for an IP-bearing code happens only after a live `register` answers with the exact fingerprint in the code | the photo is a bearer hint: whoever shows it to a device that answers correctly gets trusted. A relay-only/MAC-only code has no probe and pins directly from the code — the human eyeball is the only check |
 | Stolen Circle invite (v3 QR) | the code carries no group key; the key arrives only inside a TLS session to the host named in the QR, and the answer is signed by that host | the invite token is a bearer credential: whoever holds the photo can complete a JOIN while it is valid. Retiring a suspicious code means starting a new Circle |
@@ -445,7 +447,7 @@ carry-core paragraph above names `courier-bag/` as the caller-owned CLI row; the
 CLI layer implements that storage as `courier-bag/` plus `courier.state`.
 
 - **The copied bag is blind.** `courier-bag/` holds one `<envelope-id>.parcel`
-  file per parcel. Each file is `CourierCarry.encode` of a `parcel` event whose
+  file per parcel. Each file is `CourierCarryCore.encode` of a `parcel` event whose
   body is exactly `{toFp, envelope}`: AES-256-GCM ciphertext, an IV, an
   RSA-OAEP-wrapped content key and the sender's signature and certificate. No
   private key, content key or plaintext event is written into the bag, and the
@@ -480,6 +482,143 @@ This layer implements no physical transport, adds no route, header, DTO field
 or key parameter to the v2.2 wire, and makes no device claim: the handoff is a
 directory copy on the bench box. Event authorship remains `CircleCore.verify`
 at fold time, not a decision of the carrier.
+
+### App handoff projection (2026-12-01)
+
+The app layer adds a local-only projection for the file card. It introduces no
+new wire surface and no new authority. `FlitEngine.courierHandoffs` is a
+`StateFlow<Map<String, CourierCardUi.CourierHandoff>>` keyed by the SHA-256 of a file event learned by
+sealing or opening an envelope, with the local values `waiting`, `handed` and
+`failed`; an unknown or blank value reads as `waiting`. A 30 s sweep applies
+`CourierCarryCore.expire` and publishes outcomes, and `refreshCircle()` folds the
+map into its content-diff signature so a new outcome republishes without a log
+change. `MainActivity` collects the flow and passes it to `CircleScreen` as the
+additive `courierHandoffs: Map<String, CourierCardUi.CourierHandoff> = emptyMap()`
+argument. Sealing stays `circleCourierDrop(events, toFp)`: the recipient
+certificate is taken from a signed event or the host roster, and with no
+certificate the drop is refused and the source events stay in the sender's own
+log. `FlitCircleSync.postParcel` posts the envelope as the single `PARCEL` kind
+with the closed `{toFp, envelope}` body; `circleBodyValid` accepts no other key
+set. Opened inner events take the same app fold path as any accepted sync event —
+`FlitCircleSync.fresh() → persistEvents() → FlitCircleStore.upsert` — not the pure
+`FlitCircleStore.merge` reducer.
+
+The handoff map is process-local. It is never signed — no canonical byte or
+Circle event covers it — never persisted, and never gossiped: it never enters a
+`CircleRequest`, so no peer can read another device's outcome. A restart clears
+it; unlike the encoded `courierBag` on `CircleState`, there is no durable row to
+restore. The bag and the signed `parcel` events remain the only durable courier
+state. The projection is built from decrypted events that passed
+`CircleCore.verify` plus the courier's local outcome; it carries no `envelope`
+field and is not a trust anchor or a delivery proof. A carrier that cannot open
+an envelope has no SHA-256 to key a row with and publishes nothing, so the card
+reads `waiting` rather than inventing a key from ciphertext.
+
+No envelope text reaches the UI. `CourierCardUi.kt` is Android-free and holds a
+typed `CourierHandoff(sha256, name, size, toFp, courierFp, fromFp, outcome)`; it
+never parses a `parcel` body, never reads `envelope`, and never calls
+`parcelOf`. `courierLine(...)` renders from `toFp`, `courierFp` and `outcome`
+only: no `name`, `size`, `fromFp` or Base64 envelope string is copied into carry
+copy. Hashes and fingerprints are compared after
+`trim().lowercase(Locale.ROOT)`, the rule `CircleScreen` already applies.
+`computeFeedData` filters `parcel` rows out of the feed, so no raw envelope
+Base64 appears in the conversation; the decrypted `file` event with its exact
+`{name,size,sha256}` body renders as an ordinary card. The Open affordance is
+unchanged: `openAffordance(...)` yields `RESOLVING`, `LANDED` or `ABSENT` from
+the landed-SHA set, and a carry line never claims bytes landed. The courier's
+local outcome is consumed only when `meFp == courierFp`; a recipient or third
+member sees a generic line, never another device's `handed` claim.
+
+Evidence for this layer is CODE and PURE: `CourierCardUi.kt`, the `parcel`
+filter, the additive card/screen seams and `postParcel` are traced in code, and
+`CourierCardUiTest` pins the outcome-to-copy mapping and the absence of
+body/envelope text in rendered copy. No device claim is made on 2026-12-01; a
+parcel handoff walked through a carrier to an absent member belongs to the
+2026-12-02 layer.
+
+## Air gap: QR parcel frames
+
+The 2026-12-03 protocol layer adds a manual, no-radio path for one small
+payload. `ParcelCodec` in the new JVM-pure `app.flit.share.protocol.parcel`
+package turns a sealed payload into an ordered `List<String>` of QR frames and
+turns captured strings back into the same bytes. A person carries the frames
+across an air gap by showing, photographing or pasting them. This layer has no
+socket, no radio carrier, no camera, no Android and no persistence; `parse`,
+`encodeParcel` and `complete` are the whole surface.
+
+### Signed and encrypted through one crypto path
+
+`encodeParcel(payload, parcelId, recipientFp, signerFp, identity)` does not
+invent a second cipher. It passes the payload through `CourierEnvelope.seal`
+(`protocol/.../courier/CourierEnvelope.kt:149-207`), so the bytes framed into
+QRs are the signed envelope: AES-256-GCM ciphertext under a fresh 32-byte
+content key, that key wrapped with RSA-OAEP/SHA-256 to the recipient
+certificate, and a `SHA256withRSA` signature over the canonical envelope bytes
+with the signer certificate's digest bound to `signerFp`. `complete(frames,
+recipientFp)` checks the frames, each frame's CRC32, the sequence and count,
+the whole-parcel digest and the recipient before decrypting through
+`CourierEnvelope.verify` and `open` (`CourierEnvelope.kt:215-261`). One failure
+returns `null` and no bytes. Frame-layer caps are `MAX_FRAMES = 64`,
+`MAX_AIR_GAP_PARCEL_BYTES = 131072`, `MAX_CHUNK_BYTES = 512` and the domain tag
+`FRAME_MAGIC = "FLITPARCEL1"`; the byte cap is named apart from
+`CourierEnvelope.MAX_ENVELOPE_CHARS` so the two limits are not confused.
+
+### No key on a frame
+
+A frame carries encrypted material only: a chunk of the sealed envelope's
+encoded bytes plus the metadata needed to order and check it. No private key,
+content key, plaintext payload or shared secret is emitted on any QR frame, and
+the frame grammar has no `key` parameter. A `ParcelPayload` is produced only by
+`complete` after verification; nothing on the carrying side can turn a frame
+into key material. The frame format is separate from the `flit://add` and
+`flit://pair` pairing codes in "QR codes: pairing authority and invite bearer
+semantics": a pairing code is not a parcel frame and a frame is not a pairing
+credential, so carrying a parcel never pins a network peer and never supplies
+an address to contact.
+
+### The carrier sees frames
+
+The carrier holds the frame strings and can read what `parse` exposes without
+decoding the payload — `parcelId`, `seq`, `count`, `totalBytes` and `crc` — and
+can see the opaque envelope bytes inside them. It can copy, delay, reorder,
+drop, duplicate or photograph every frame, and it knows how many frames exist
+and how large the declared parcel is. It cannot decrypt the payload, forge the
+sender signature, unwrap the content key or redirect a blob to another
+recipient: those need the recipient's private key or the sender's private key,
+neither of which is on a frame. This is the same blindness rule as the courier
+carrier above, moved to a human-carried medium. The guarantee is
+confidentiality and integrity of the bytes, not availability of the carry.
+
+### Wrong recipient refused
+
+`complete(frames, recipientFp)` releases bytes only when the checked recipient
+fingerprint matches the parcel addressed by the frames. It verifies frames,
+CRC, sequence, count and digest first, then decrypts through
+`CourierEnvelope.open`, which independently requires the envelope's `toFp` to
+equal the opening identity's own fingerprint (`CourierEnvelope.kt:235-261`). A
+parcel addressed to a different fingerprint is refused even with intact
+frames, a passing CRC and a valid signature; opened bytes naming another
+recipient are never returned as `ParcelPayload`. A failed digest, a failed
+signature or a recipient mismatch returns `null`, writes no file and releases
+no partial bytes; held frames stay with the caller until it drops them.
+
+### No remote action
+
+Nothing in this layer acts at a distance. There is no camera capture, no QR
+rendering, no socket, no Android component, no file write and no persistence in
+the parcel package; the codec only maps `String` to `ByteArray` and back.
+Capturing or scanning a frame is a local verification step, not a command: it
+does not dial a peer, join a Circle, open a file, acknowledge delivery or change
+another device. The signer pin written by `CourierEnvelope.verify` is the same
+bounded, in-memory pin described in "Signatures and cert-in-event"; it is local
+state, not a trust decision about a network peer. Whether a scanned frame lands
+a file or triggers any app behavior belongs to later layers and is not part of
+this codec.
+
+Evidence for this layer is CODE for the frame layout, constants and crypto
+seam, and PURE for round-trip, CRC, cap and refusal tests. No real-camera
+decode, carrier walk or device claim is made here: camera rendering, scanning
+and the air-gap walk are later layers.
 
 ## Panic: authorization, hops, and informational-only delivery
 
@@ -686,7 +825,15 @@ The app asks for the minimum local capabilities and exposes almost nothing:
     drop or partition parcels; TTL expiry ends a held copy but not one an
     addressee already decrypted, and a later rekey or departure cannot revoke it.
     The carrier is blind to event content but sees the addressee fingerprint,
-    timing and size. The 2026-11-27 layer claims no carrier handoff walk.
+    timing and size. The 2026-11-27 layer claims no carrier handoff walk. The
+    app handoff projection is process-local: never signed, persisted or
+    gossiped, cleared on restart, and no envelope text is rendered on the card.
+13. **Air-gap carry is manual and best-effort.** Every frame must be carried and
+    fully captured; a missing or altered frame leaves `complete` with nothing to
+    release. A carrier sees frame metadata and ciphertext and can delay or drop
+    the carry. The codec is pure and local — it opens no file, sends no message
+    and takes no remote action. Real-camera capture and the air-gap walk are
+    later layers and are not verified here.
 
 ## Evidence status at a glance
 
@@ -700,9 +847,17 @@ The app asks for the minimum local capabilities and exposes almost nothing:
 | File no-path / local status | `CircleCore.validFileBody`, `FlitEngine` delivery loop | `CircleCoreTest`, `CircleHardeningTest`, `FlitSpoolTest` | `CircleHarnessTest` | 35 B drop landed hash-exact; Open-file walk |
 | Storage / permissions | `AndroidManifest.xml`, `file_paths.xml`, prefs codecs | `FlitRosterTest`, `SharingRestoreTest`, `FlitKnownTest` | not applicable | force-stop → silent sharing restore |
 | Courier envelope / carry | `CourierEnvelope.kt`, `CourierCarryCore.kt` | courier pure tests (counts recorded at integration) | not run (2026-11-30 CLI layer) | not walked (2026-12-02 layer) |
+| App courier handoff UI | `CourierCardUi.kt`, `FlitEngine.courierHandoffs`, `FlitCircleSync.postParcel` | `CourierCardUiTest` (counts recorded at integration) | consumed CLI carrier outcomes | not walked (2026-12-02 layer) |
+| Air-gap QR parcel frames | `ParcelCodec.kt` (parcel package) | parcel pure tests (counts recorded at integration) | not run (CLI capture is 2026-12-04) | not walked (camera 2026-12-07, air gap 2026-12-08) |
 
-Device walks that did **not** happen and are not claimed here: a genuine
-three-or-more-device Circle mesh; a real phone-to-phone RFCOMM transfer;
+The 2026-11-26 three-node baseline walk is DEVICE evidence for a 3-identity
+Circle: the phone plus two CLI identities joined one Circle, and event sync, a
+poll, a hash-exact file drop and a kick/rekey were observed
+(`docs/completions/2026-11-26-three-node-baseline.md`). The phone was host in
+that walk, so outbound phone→host fan-out was not exercised.
+
+Device walks that did **not** happen and are not claimed here: a Circle mesh
+beyond those three identities; a real phone-to-phone RFCOMM transfer;
 phone→host Circle fan-out with a clean peer-side confirmation (still
 test-evidenced only — `docs/circle.md:310-319`, `:343-361`); Wi-Fi Aware on this
 rig; any multi-member panic-hop walk beyond the one-phone-plus-box case; a

@@ -546,6 +546,7 @@ this verification before persisting the invite (`FlitCircleSync.kt:390-403`).
 | `kick` | `{"kickId":"...","targetFp":"...","mode":"admin"|"vote","approve":<bool>}` (field set varies by phase) |
 | `role` | `{"targetFp":"...","role":"OWNER"|"ADMIN"|"MEMBER"}` |
 | `rekey` | `{"keyB64":"...","gen":<int>}` (app adds a `members` array; host-authority only) |
+| `parcel` | `{"toFp":"...","envelope":"..."}` — **exactly** `PARCEL_BODY_KEYS`, no extra key; closed gate and envelope in §13.3 |
 
 `validFileBody()` enforces the exact key set and types: `name`/`sha256` non-blank
 bounded strings, `size` a JSON number (the string `"12"` is refused). That is
@@ -671,8 +672,13 @@ trust and replay reasoning in [Security](SECURITY.md).
 | **Code reality** | Every constant, route string, header, DTO shape, canonical byte layout, pairing state machine and policy rule listed above. |
 | **Pure-test JVM** | Canonical/sign/verify for panic and Circle, forged-author rejection, replay and dedup windows, Lamport convergence, both `Content-Range` spellings, restart probe/attach, failed-chunk-then-resume, relay pairing/isolation/token, DTO and `LinkServer` parity over the in-memory duplex pipe through the real hand-HTTP + TLS stack. |
 | **Harness/sim** | `flit-cli relay` pairs a real 3 MB protocol send hash-exact with TLS inside the pipe; wrong token refused; unpaired subscription times out; dead dial surfaces `TransferUnreachable`. Two in-process TLS Circle nodes sync message, poll re-vote, file drop and kick/rekey; `bt-sim` runs the production client over the pipe carrier. |
-| **On-device** | Panic QR-v2 pairing and one-phone↔box banner exchange; relay dial/subscribe with a 200 MiB camera shot and a 300 MiB mid-body relay kill resuming hash-exact from the exact prefix; Circle two-node join/message/leave and phone-as-host; file-drop landing hash-exact; QR v3 tap-to-join. |
-| **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a ≥3-device Circle mesh; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. |
+| **On-device** | Panic QR-v2 pairing and one-phone↔box banner exchange; relay dial/subscribe with a 200 MiB camera shot and a 300 MiB mid-body relay kill resuming hash-exact from the exact prefix; Circle two-node join/message/leave and phone-as-host; the 2026-11-26 three-node baseline walk, which is DEVICE evidence for a 3-identity Circle (phone plus two CLI identities); file-drop landing hash-exact; QR v3 tap-to-join. |
+| **Not verified** | A real phone-to-phone RFCOMM transfer (no second phone; bench box has no Bluetooth adapter); a Circle mesh larger than three identities; multi-hop panic forwarding on real devices; Wi-Fi Aware (feature absent on the rig phone). Outbound phone→host Circle fan-out is test-evidenced with an injected carrier but was not cleanly device-confirmed. |
+
+The current rig baseline is 396 tests = 136 protocol + 228 app + 32 harness,
+read from a green `--rerun-tasks` run of `:protocol:test`,
+`:app:testDebugUnitTest` and `:harness:test`. That is a test count, not a
+device claim for the UI or CLI layers.
 
 ## 11. Cross-links
 
@@ -722,8 +728,14 @@ the events to the recipient's device certificate. No file bytes enter a parcel.
 
 ### 13.2 Closed constants
 
-Each constant is declared once in its owning file; no file redeclares another
-file's constant. Values below apply to the 2026-11-27 layer.
+Protocol-owned constants are read from `CircleEvent` / `CircleCore`; the courier
+object facade repeats values for callers. `PARCEL` is declared in
+`CircleEvent.TYPES`, while `REPLAY_WINDOW_MS`, `CLOCK_SKEW_MS`, `MAX_FIELD_CHARS`,
+`MAX_SIG_CHARS` and `MAX_CERT_CHARS` are reused from `CircleCore`, not declared in
+the courier package. The `CourierCarryCore` object repeats the top-level
+`MAX_PARCELS`, `MAX_SEEN` and `MAX_PARCEL_TTL_MS` values for callers that name the
+core explicitly — a facade, not a second source of truth. Values below apply to
+the 2026-11-27 layer.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
@@ -886,7 +898,7 @@ courier sweep  [--bag DIR]
 | --- | --- |
 | `drop` | Seal a signed Circle event into a new parcel for `--to` and write `<id>.parcel` into the bag. Refuses before writing when the certificate fingerprint differs from `--to` or when the bag is at the courier-carry.md quota. |
 | `carry` | Verify the local bag and move verified rows `pending → carried`; it does not open or forward anything. |
-| `receive` | Open each parcel addressed to the local identity, fold a returned event into `circle.state` through `CircleCore.order`/`dedup`, and move the row to `delivered`. Parcels for another fingerprint stay `pending` in the bag. |
+| `receive` | Open each parcel addressed to the local identity, fold a returned event into `circle.state` through `CircleCore.order`/`dedup`, and move the row to `delivered`. Parcels for another fingerprint keep their prior state in the bag. |
 | `status` | Print one line per row with a padded state value and a closing count by state. No parcel content and no fingerprint beyond the short form is printed. |
 | `sweep` | Drop parcels whose `nowMs >= expiresMs`, enforce quota, and remove envelope files whose row is `expired` or `refused`. |
 
@@ -894,8 +906,10 @@ courier sweep  [--bag DIR]
 that fingerprint in `circle.state`, or from `--cert B64` for a member whose event
 has not arrived. Both paths check `TlsIdentity.fingerprintOf(cert)` against
 `--to` before sealing, so a parcel cannot be addressed to one fingerprint and
-encrypted to another. `--ttl` is an optional ceiling input; the stored expiry is
-still derived by `CourierCarry.parcelOf`, never read from the envelope.
+encrypted to another. `--ttl` injects `nowMs` for sealing and expiry checks; it
+is not a new TTL ceiling. The stored expiry is still derived by
+`CourierCarryCore.parcelOf` as `createdMs + MAX_PARCEL_TTL_MS`, never read from
+the envelope.
 
 ### 14.3 On-disk layout
 
@@ -942,18 +956,21 @@ Fingerprints are normalised uppercase hex as in `normalized()` in `Harness.kt`.
 | `SWEEP` | any | `expired` | `nowMs >= expiresMs`. |
 
 A thrown `open` is not a conclusion: `receive` records no transition, leaving
-the row at `pending` and the envelope file in `courier-bag/` for a later attempt.
+the row at its prior state (`pending` or `carried`) and the envelope file in
+`courier-bag/` for a later attempt.
 This matches the carrier-death rule used for Circle file delivery. A duplicate
 envelope id produces no second fold: `CircleCore.dedup` drops it and the row
 moves straight to `delivered`.
 
 ### 14.5 Bag directory as portable unit
 
-`drop` stores `CourierCarry.encode(CourierCarry.parcelOf(envelope))` byte-for-byte
-in `<id>.parcel`; the CLI never parses, re-signs or rewrites the envelope or the
-parcel, so encode→decode→encode of an unopened parcel is identical (§13.5). One
-`.parcel` file corresponds to one row id in `courier.state`; a file with no row
-is ignored by `receive` and `sweep`, never folded.
+`drop` stores `CourierCarryCore.encode(CourierCarryCore.parcelOf(envelope))` byte-for-byte
+in `<id>.parcel`; `carry` and `receive` do decode parcels (`CourierEnvelope.decode`,
+`CourierCarryCore.parcelOf`) to verify, open and fold them, but the CLI never
+rewrites or re-signs sealed bytes, so encode→decode→encode of an unopened parcel
+is identical (§13.5). One `.parcel` file corresponds to one row id in
+`courier.state`; a file with no row is ignored by `receive` and `sweep`, never
+folded.
 
 The operator copies `courier-bag/` to the next machine by USB or any file copy;
 the carrier implements no transport of its own and adds no `LinkProvider`. A
@@ -974,3 +991,194 @@ are local-only; no fingerprint, row, state value or parcel content is extracted
 from the bag into a Circle event, and no parcel content is printed or logged.
 This layer claims no device evidence: the bag moves between directories on one
 box only. See [courier-cli.md](roadmap/courier-cli.md).
+
+## 15. App courier contract — postParcel, courierBag and the route boundary (2026-12-01)
+
+### 15.1 Layer and ownership
+
+This is the App layer over §13 (protocol) and after §14 (CLI). It lives in
+`app/src/main/kotlin/app/flit/share/`: `FlitCircleSync.kt` owns the wire post and
+the worker handoff path, `FlitCircleStore.kt` owns the durable bag field,
+`FlitEngine.kt` owns `courierHandoffs`, `circleCourierDrop` and the sweep, and
+`CourierCardUi.kt` / `CircleUi.kt` / `MainActivity.kt` own the read-only
+projection. No protocol constant, canonical byte layout or envelope codec is
+redefined here; the app calls `CourierEnvelope.seal` / `verify` / `open` and the
+`CourierCarryCore` reducers with the current bag and current time.
+
+### 15.2 `postParcel` and the closed body gate
+
+`FlitCircleSync.postParcel(toFp, envelopeB64)` publishes one `parcel` event on
+the existing `post` path. It writes a body with exactly two keys — `toFp`
+normalised by `circleFp()` (uppercase) and `envelope` set to the Base64
+`CourierEnvelope.encode` text — then signs, upserts and fans out through
+`emit` and `fanout`. `PARCEL = "parcel"` is the tenth verb already in
+`CircleEvent.TYPES` (§13.3); there is no new verb table, phase field or body
+builder outside this path.
+
+| Gate | Contract |
+| --- | --- |
+| Mint check | `circleBodyValid(CircleEvent.PARCEL, body)` gains one `PARCEL` case that delegates to `CourierCarryCore.validParcelBody(body)`; it does not reimplement the key set. |
+| Closed keys | `PARCEL_BODY_KEYS = {"toFp","envelope"}` only. An extra key (`token`, `path`, `spoolPath`, `parcelId`, `sha256`, `name`, `size`, phase or any other) is refused. No handoff event and no `parcelId` exist. |
+| Bounds | Body non-blank and at most `CircleCore.MAX_BODY_CHARS` (16 KiB); `toFp` a non-blank string at most `MAX_FIELD_CHARS` (256); `envelope` a non-blank string at most `MAX_ENVELOPE_CHARS` (12 * 1024). The cap keeps the framed body under the Circle body limit. |
+| Refusal | A failed gate returns before `CircleCore.create`, `FlitCircleStore.upsert` and `fanout`: no signed event, no wire byte, no bag row. The caller's source events are unchanged. |
+| Inbound | `fresh()` applies `CourierCarryCore.validParcelBody` in the same position as `validFileBody`, before `CircleCore.verify`. `CourierCarryCore.evaluate` runs only after verification; only `Accept` calls `fold` and persists a bag row. `Invalid`, `Expired`, `OutsideWindow`, `Duplicate` and `Full` leave the bag unchanged. |
+
+`FlitEngine.circleCourierDrop(events, toFp)` obtains the recipient certificate
+from a signed event by that fingerprint or the host roster answer, calls
+`CourierEnvelope.seal`, then posts the returned envelope through `postParcel`.
+With no certificate the drop is refused before any post and the source events
+stay in the sender's own log.
+
+### 15.3 `CircleState.courierBag`
+
+`FlitCircleStore.CircleState` gains one additive, defaulted field:
+
+```
+courierBag: String = ""   // CourierCarryCore.encode(CarryState)
+```
+
+| Aspect | Contract |
+| --- | --- |
+| Default | `""` is an empty bag. Older rows and existing named-argument constructors decode without the key (`WireJson.ignoreUnknownKeys = true`); no migration is required. |
+| Codec | `FlitCircleStore.encode` keeps the string verbatim; `decode` runs `CourierCarryCore.decode` and normalises it. A null, blank, truncated or otherwise corrupt blob becomes an empty bounded bag and no exception reaches a caller. |
+| Atomicity | Every bag write goes through `FlitCircleStore.update(ctx) { ... }`, which holds `ioLock` across the whole decode → fold → encode → persist sequence. A bag write cannot interleave with a sync `upsert`, a delivery write or another bag write, and cannot clobber the event log, roster or delivery statuses. |
+| Reducers | Protocol ones only: `fold` on `Accept`, `ack` after an OK answer, `expire` on the sweep. The app has no `merge` step: verified incoming events reach the signed log through `FlitCircleSync.fresh() → persistEvents() → FlitCircleStore.upsert`, which dedups by id. `CourierCarryCore.fold` dedups by id and trims to `MAX_PARCELS = 256` by `CourierCarryCore.order`, not arrival order. |
+| Selection and TTL | `CourierCarryCore.select(bag, fp, nowMs)` returns live parcels for the normalised addressee, deduped by id and capped at `CircleCore.MAX_EVENTS_PER_REQUEST` (1024). `expiresMs` is derived only as `createdMs + MAX_PARCEL_TTL_MS` (24 h) by `parcelOf`; the app never extends a TTL. |
+| Sweep | `COURIER_TICK_MS = 30_000L` drives `CourierCarryCore.expire` and the publication of local outcomes. A refusal or a thrown carrier leaves the bag intact and re-offers the parcel on a later pass. |
+
+### 15.4 No-new-route boundary
+
+1. **`PARCEL` rides in `CircleRequest.events`.** Its wire home is the existing
+   `POST /api/flit/v1/circle/sync` (`Protocol.PATH_CIRCLE_SYNC`, §1, §7.5). No
+   `PATH_*` constant, Ktor route, `LinkProvider`, byte-transfer route or
+   `CircleRequest.body` repurposing is added. The envelope is text inside the
+   event's `body`; it is not a new request field.
+2. **No header, DTO or status-code change.** `CircleRequest` keeps exactly
+   `action`, `circleId`, `invite`, `memberFp`, `events`, `body`; `CircleResponse`
+   keeps its seven fields. There is no `ParcelDto`, no courier header and no
+   response field. The signed `200` decision answer and the `400` / `403` /
+   `500` refusal codes of §7.5 and §9 are unchanged.
+3. **No second signature path.** `CourierEnvelope` uses `TlsIdentity.sign` and
+   `FLITCOURIER1`; event authorship stays a `CircleCore.verify` check and the
+   `FLITCARRY1` digest is a bag tag, not an envelope signature (§13.4, §13.5).
+4. **Handoff state never goes on the wire.** `FlitEngine.courierHandoffs` is a
+   process-local `StateFlow<Map<String, CourierCardUi.CourierHandoff>>` keyed by
+   a normalised SHA-256. Each value is a typed `CourierCardUi.CourierHandoff`
+   (`sha256`, `name`, `size`, `toFp`, `courierFp`, `fromFp`, `outcome`), published
+   by `publishCourierHandoff` and updated by `setCourierHandoffOutcome`; its
+   `outcome` is one of `waiting` / `handed` / `failed`, and no fourth value is
+   ever written. It is never signed, never persisted and never placed in a
+   `CircleRequest` or an event; a carrier cannot name a SHA key from an envelope
+   it cannot open. `refreshCircle()` includes the map in its content-diff
+   signature so a new outcome publishes without a log change.
+5. **Numbers reuse existing seams.** `COURIER_TICK_MS = 30_000L` is app-owned;
+   dial concurrency stays at `CIRCLE_PEER_DIALS = 4` and backoff at
+   `CIRCLE_BACKOFF_BASE_MS = 5_000L` / `CIRCLE_BACKOFF_MAX_MS = 120_000L`. All
+   protocol constants (§13.2) are read, never redefined.
+6. **v2.2 is untouched.** `/info`, `/register`, `/prepare-upload`, `/upload`
+   and `/cancel`, their DTO shapes and their status behaviour stay as in §2. A
+   stock LocalSend v2.2 peer never calls the Flit-only route (§4).
+
+### 15.5 Compatibility and evidence boundary
+
+The additions are one already-defined verb used by one new app method, one
+defaulted store field and one local flow. No existing parameter, route, DTO
+shape or signed canonical byte changes. CODE establishes the `postParcel` gate,
+the `courierBag` field and the route boundary; PURE JVM tests pin the closed
+body keys, tolerant bag decode and the three local outcome values; the 2026-11-30
+carrier supplies the SIM-HARN observations of a held parcel, an ack after an OK
+answer and a throw that keeps the bag. No DEVICE claim is made for this layer.
+See [courier-sync.md](roadmap/courier-sync.md) and
+[courier-ui.md](roadmap/courier-ui.md).
+
+## 16. QR parcel frame contract — frame grammar and closed caps (2026-12-03)
+
+### 16.1 Layer and ownership
+
+This is the Protocol layer over §13 (courier envelope). It lives in the
+JVM-pure package `app.flit.share.protocol.parcel`, object `ParcelCodec`. The
+module gains no Android import, zxing class, camera, socket, file write or
+wall-clock read; it deals only in `String` and `ByteArray`. A frame string is
+opaque to its callers: the CLI renders it and the app displays or scans it, but
+neither edits, reorders or reinterprets its bytes. The one crypto path is
+`CourierEnvelope`: `encodeParcel` seals through `CourierEnvelope.seal` and
+`complete` verifies and decrypts through `CourierEnvelope.verify` / `open`. No
+second signature, key wrap or digest path is introduced.
+
+### 16.2 Frame grammar
+
+One QR code carries one frame. The wire item is a single opaque UTF-8 `String`
+per frame; the CLI and the app render that same string at error-correction
+level `M` with a quiet zone of `2` modules, so both sides encode identical
+bytes. The string carries the frame descriptor — `parcelId`, `seq`, `count`,
+`totalBytes` — and one CRC32 value. `seq` is the 1-based frame index and `count`
+the number of frames; `seq == count` marks the final frame. All frames of one
+parcel repeat the same `parcelId`, so a single lost frame removes no metadata.
+
+The CRC covers canonical bytes: a domain-tagged, length-prefixed stream keyed by
+`FRAME_MAGIC = "FLITPARCEL1"`, written with `DataOutputStream` as in
+`CircleCore.canonical`. A field is a 4-byte big-endian UTF-8 byte length followed
+by the bytes, so no delimiter can be smuggled through a field. CRC32 is computed
+over those bytes and stored only in `crc`; it is excluded from its own input.
+`parse` rebuilds the canonical bytes from the parsed fields and compares, so a
+changed byte in any field — not just the payload — is caught. The exact field
+order and string encoding are defined by `ParcelCodec.kt`, the wire truth for
+this layer (§0); this contract fixes the grammar's shape, not a second copy of
+the byte layout.
+
+`complete` accepts frames in any order, keeps one frame per `(parcelId, seq)`,
+requires a single common `count` and every `seq` in `1..count`, checks the frame
+CRC and the whole-parcel digest, then requires `CourierEnvelope.verify` to pass
+and `CourierEnvelope.open` to yield a payload whose recipient fingerprint equals
+the one passed to `complete`. Only then does it release bytes. A digest mismatch,
+a failed envelope signature or a recipient mismatch releases no bytes and writes
+no file.
+
+### 16.3 Closed caps
+
+These are fixed, closed values in `ParcelCodec`; a caller cannot raise them.
+The frame-layer parcel cap is named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS`
+so the two limits are never confused.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `MAX_FRAMES` | `64` | Largest `count`; `seq` space is `1..64`. Same as the app's `MAX_PARCEL_FRAMES = 64`, so the codec emits no sequence the app refuses to display. |
+| `MAX_CHUNK_BYTES` | `512` | Largest raw chunk bytes in one frame. |
+| `MAX_AIR_GAP_PARCEL_BYTES` | `131072` (128 KiB) | Defensive frame-layer parcel cap, named apart from `CourierEnvelope.MAX_ENVELOPE_CHARS` (12 * 1024). With 512-byte chunks and 64 frames the reachable maximum is 32768 bytes, inside this cap. |
+| `FRAME_MAGIC` | `"FLITPARCEL1"` | Domain tag for the per-frame CRC canonical bytes. |
+
+### 16.4 API (`ParcelCodec.kt`)
+
+```
+object ParcelCodec {
+  data class FrameDescriptor(val parcelId: String, val seq: Int, val count: Int,
+                             val totalBytes: Int, val crc: Long)
+  fun parse(frame: String): FrameDescriptor?
+  fun encodeParcel(payload: ByteArray, parcelId: String, recipientFp: String,
+                   signerFp: String, identity: TlsIdentity): List<String>
+  fun complete(frames: List<String>, recipientFp: String): ParcelPayload?
+  data class ParcelPayload(val parcelId: String, val recipientFp: String,
+                           val signerFp: String, val sha256: String,
+                           val bytes: ByteArray)
+}
+```
+
+`parse` returns `null` on any failed check and never throws at the caller.
+`encodeParcel` seals the payload through `CourierEnvelope.seal` and frames the
+encoded bytes; `complete` verifies frames, CRC, sequence, count, digest and
+recipient before decrypting through `CourierEnvelope.open`.
+
+### 16.5 No-new-route and v2.2 boundary
+
+1. The parcel is an air-gap sequence of QR strings, not a network exchange. No
+   `PATH_*` constant, Ktor route, `LinkProvider`, socket, HTTP header, DTO field
+   or status code is added (§1, §2, §3).
+2. `/info`, `/register`, `/prepare-upload`, `/upload` and `/cancel`, their DTO
+   shapes and their status behaviour stay as in §2. The v2.2 surface and the
+   Flit-only `/api/flit/v1` routes are unchanged; a stock LocalSend v2.2 peer is
+   unaffected (§4).
+3. No signing or encryption path is forked. `encodeParcel` and `complete` call
+   the §13 courier codec; the frame layer owns only framing, CRC, sequencing,
+   caps and digest/recipient gates (§13.4, §16.2).
+4. A parcel frame is a distinct string from a `flit://add` / `flit://pair` code;
+   no pairing key or address field crosses this seam (§8).

@@ -1,6 +1,10 @@
 package app.flit.share
 
 import app.flit.share.protocol.circle.CircleEvent
+import app.flit.share.protocol.courier.CarryState
+import app.flit.share.protocol.courier.CourierCarryCore
+import app.flit.share.protocol.courier.CourierParcel
+import app.flit.share.protocol.courier.MAX_PARCEL_TTL_MS
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
@@ -562,5 +566,86 @@ class FlitCircleStoreTest {
         assertEquals(s.deliveries, folded.deliveries)
         assertEquals(2, folded.events.size)
         assertEquals(4, folded.members.size)
+    }
+
+    // ==== courier bag (additive persisted string, local only) ==================
+
+    private fun parcel(
+        id: String = "p-1",
+        toFp: String = "FP-OTHER",
+        fromFp: String = "fp-owner",
+        created: Long = 1_000L,
+    ) = CourierParcel(
+        id = id, toFp = toFp, fromFp = fromFp,
+        createdMs = created, expiresMs = created + MAX_PARCEL_TTL_MS,
+        event = event(
+            id, fromFp, "parcel",
+            """{"toFp":"$toFp","envelope":"ENVELOPE-$id"}""",
+            created = created,
+        ),
+    )
+
+    @Test
+    fun `courierBag defaults to a blank string and old rows read as an empty bag`() {
+        // Additive field: every named-argument constructor above predates it.
+        assertEquals("", state().courierBag)
+        assertEquals(emptyList(), CourierCarryCore.decode(state().courierBag)?.parcels)
+
+        // A row written before the courier layer has no courierBag key at all.
+        val old = decodeCircle(
+            """{"id":"circle-1","keyB64":"k","role":"OWNER","members":""" +
+                """[{"fp":"fp-owner","alias":"Owner","role":"OWNER"}],"unknown":"x"}""",
+        )!!
+        assertEquals("k", old.keyB64)
+        assertEquals(1, old.members.size)
+        assertEquals(emptyList(), CourierCarryCore.decode(old.courierBag)?.parcels)
+    }
+
+    @Test
+    fun `courierBag roundtrips through encode and decode`() {
+        val bag = CarryState(listOf(parcel()))
+        val rawBag = CourierCarryCore.encode(bag)
+        val source = state(
+            events = listOf(event("e-1", "fp-owner", "message", """{"text":"hello"}""")),
+            deliveries = mapOf("sha-aabb" to delivery()),
+        ).copy(courierBag = rawBag)
+
+        val decoded = decodeCircle(encode(source))!!
+        assertEquals(rawBag, decoded.courierBag)
+        assertEquals(bag, CourierCarryCore.decode(decoded.courierBag))
+        assertEquals(source, decoded)
+    }
+
+    @Test
+    fun `courierBag corrupt row decodes tolerantly to an empty bag`() {
+        // The string is a valid JSON value but not a CarryState; the whole row
+        // must still decode and its other fields survive unchanged.
+        val s = decodeCircle(
+            """{"id":"circle-1","keyB64":"k","role":"OWNER","members":""" +
+                """[{"fp":"fp-owner","alias":"Owner","role":"OWNER"}],"courierBag":"{not json"}""",
+        )!!
+        assertEquals(emptyList(), CourierCarryCore.decode(s.courierBag)?.parcels)
+        assertEquals("k", s.keyB64)
+        assertEquals(1, s.members.size)
+        assertEquals(0, s.rekeyGen)
+    }
+
+    @Test
+    fun `a bag write leaves events roster and deliveries intact`() {
+        val d = delivery(statuses = mapOf("fp-admin" to CircleDelivery.SENT))
+        val before = state(
+            events = listOf(event("e-1", "fp-owner", "message")),
+            deliveries = mapOf(d.sha256 to d),
+        )
+        val bag = CarryState(listOf(parcel(id = "p-2")))
+        val after = decodeCircle(encode(before.copy(courierBag = CourierCarryCore.encode(bag))))!!
+
+        assertEquals(before.events, after.events)
+        assertEquals(before.members, after.members)
+        assertEquals(before.deliveries, after.deliveries)
+        assertEquals(before.keyB64, after.keyB64)
+        assertEquals(before.rekeyGen, after.rekeyGen)
+        assertEquals(bag, CourierCarryCore.decode(after.courierBag))
+        assertEquals(before, after.copy(courierBag = before.courierBag))
     }
 }
